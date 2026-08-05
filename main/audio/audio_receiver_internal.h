@@ -72,9 +72,11 @@ typedef struct {
   // Written by the RTSP task, read by the TCP buffered task — uint32_t write
   // is atomic on Xtensa; arm bool last so reader never sees stale threshold.
   uint32_t discard_before_rtp;
-  bool discard_before_rtp_valid;
   uint32_t discard_above_rtp;
-  bool discard_above_rtp_valid;
+  /* Non-zero epoch is the single source of truth that the RTP window is
+   * armed. The gate may only be disarmed if the epoch observed before decode
+   * still matches, so an in-flight frame cannot clear a newer seek window. */
+  uint32_t rtp_gate_epoch;
   // Set by audio_receiver_seek_flush() to ensure the gates are armed on the
   // next SETRATEANCHORTIME even when the buffer was already empty (forward
   // seek: flush empties buffer before anchor arrives, so seek detection in
@@ -95,6 +97,9 @@ typedef struct {
   // Cleared on flush/reset and consumed after one use.
   uint32_t paused_rtp;
   bool paused_rtp_valid;
+
+  /* Set by RTSP/flush paths, consumed only by the buffered decode task. */
+  bool decoder_reset_pending;
 } audio_receiver_state_t;
 
 // Lightweight RTP gate used by the buffered TCP task before decrypt/decode.

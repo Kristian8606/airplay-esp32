@@ -43,6 +43,7 @@ static int sorted_insert_pos(audio_buffer_t *b, uint32_t timestamp) {
 
 static bool audio_buffer_queue_chunk(audio_buffer_t *buffer,
                                      audio_stats_t *stats, uint32_t timestamp,
+                                     uint32_t generation,
                                      const int16_t *pcm_data, size_t samples,
                                      int channels) {
   if (samples == 0) {
@@ -80,6 +81,8 @@ static bool audio_buffer_queue_chunk(audio_buffer_t *buffer,
   hdr->samples_per_channel = (uint16_t)samples;
   hdr->channels = (uint8_t)channels;
   hdr->reserved = 0;
+  hdr->generation = generation;
+  hdr->reserved2 = 0;
 
   size_t pcm_bytes = samples * channels * sizeof(int16_t);
   memcpy(dest + sizeof(audio_frame_header_t), pcm_data, pcm_bytes);
@@ -261,40 +264,89 @@ bool audio_buffer_peek_newest_rtp(audio_buffer_t *buffer, uint32_t *rtp_out) {
   return found;
 }
 
-/* ---------- start of the contiguous tail run (diagnostics/startup) ----- */
+/* ---------- bounded contiguous-run search (startup) -------------------- */
 
-bool audio_buffer_bulk_start_rtp(audio_buffer_t *buffer, uint32_t *rtp_out) {
-  if (!buffer || !rtp_out || !buffer->pool || !buffer->sorted) {
+typedef struct {
+  uint32_t rtp_timestamp;
+  uint16_t samples_per_channel;
+  uint32_t generation;
+} frame_meta_t;
+
+#define STARTUP_SCAN_MAX_FRAMES 128
+
+static size_t snapshot_startup_meta(audio_buffer_t *buffer, frame_meta_t *meta,
+                                    size_t capacity) {
+  size_t count = 0;
+  portENTER_CRITICAL(&buffer->lock);
+  count = (size_t)buffer->count;
+  if (count > capacity) {
+    count = capacity;
+  }
+  for (size_t i = 0; i < count; i++) {
+    const audio_frame_header_t *hdr =
+        (const audio_frame_header_t *)slot_ptr(buffer, buffer->sorted[i]);
+    meta[i].rtp_timestamp = hdr->rtp_timestamp;
+    meta[i].samples_per_channel = hdr->samples_per_channel;
+    meta[i].generation = hdr->generation;
+  }
+  portEXIT_CRITICAL(&buffer->lock);
+  return count;
+}
+
+bool audio_buffer_find_contiguous_start(audio_buffer_t *buffer,
+                                        uint32_t generation, uint32_t min_rtp,
+                                        uint32_t required_samples,
+                                        uint32_t *rtp_out) {
+  if (!buffer || !rtp_out || !buffer->pool || !buffer->sorted ||
+      required_samples == 0) {
     return false;
   }
 
-  bool found = false;
-  portENTER_CRITICAL(&buffer->lock);
-  if (buffer->count > 0) {
-    /* Walk backward from the newest frame until the run breaks.  The
-     * result is the first frame of the contiguous region that includes
-     * the newest data — the "real" stream head, as opposed to stale
-     * islands (e.g. late pre-flush retransmissions) stranded below it. */
-    uint16_t slot = buffer->sorted[buffer->count - 1];
-    const audio_frame_header_t *cur =
-        (const audio_frame_header_t *)(buffer->pool +
-                                       (size_t)slot * buffer->slot_size);
-    uint32_t bulk = cur->rtp_timestamp;
-    for (int i = buffer->count - 1; i > 0; i--) {
-      uint16_t pslot = buffer->sorted[i - 1];
-      const audio_frame_header_t *prev =
-          (const audio_frame_header_t *)(buffer->pool +
-                                         (size_t)pslot * buffer->slot_size);
-      if (prev->rtp_timestamp + prev->samples_per_channel != bulk) {
+  frame_meta_t meta[STARTUP_SCAN_MAX_FRAMES];
+  size_t count = snapshot_startup_meta(buffer, meta, STARTUP_SCAN_MAX_FRAMES);
+  for (size_t i = 0; i < count; i++) {
+    if (meta[i].generation != generation ||
+        (int32_t)(meta[i].rtp_timestamp - min_rtp) < 0) {
+      continue;
+    }
+
+    uint32_t run_start = meta[i].rtp_timestamp;
+    uint32_t expected = run_start;
+    uint32_t accumulated = 0;
+    for (size_t j = i; j < count; j++) {
+      if (meta[j].generation != generation ||
+          meta[j].rtp_timestamp != expected ||
+          meta[j].samples_per_channel == 0) {
         break;
       }
-      bulk = prev->rtp_timestamp;
+      accumulated += meta[j].samples_per_channel;
+      expected += meta[j].samples_per_channel;
+      if (accumulated >= required_samples) {
+        *rtp_out = run_start;
+        return true;
+      }
     }
-    *rtp_out = bulk;
-    found = true;
   }
-  portEXIT_CRITICAL(&buffer->lock);
-  return found;
+  return false;
+}
+
+bool audio_buffer_find_first_generation_frame(audio_buffer_t *buffer,
+                                              uint32_t generation,
+                                              uint32_t min_rtp,
+                                              uint32_t *rtp_out) {
+  if (!buffer || !rtp_out || !buffer->pool || !buffer->sorted) {
+    return false;
+  }
+  frame_meta_t meta[STARTUP_SCAN_MAX_FRAMES];
+  size_t count = snapshot_startup_meta(buffer, meta, STARTUP_SCAN_MAX_FRAMES);
+  for (size_t i = 0; i < count; i++) {
+    if (meta[i].generation == generation &&
+        (int32_t)(meta[i].rtp_timestamp - min_rtp) >= 0) {
+      *rtp_out = meta[i].rtp_timestamp;
+      return true;
+    }
+  }
+  return false;
 }
 
 /* ---------- nearly full check (for back-pressure) ---------- */
@@ -405,8 +457,9 @@ bool audio_buffer_oldest_timestamp(audio_buffer_t *buffer,
 /* ---------- queue decoded (splits large frames into chunks) ---------- */
 
 bool audio_buffer_queue_decoded(audio_buffer_t *buffer, audio_stats_t *stats,
-                                uint32_t timestamp, const int16_t *pcm_data,
-                                size_t samples, int channels) {
+                                uint32_t timestamp, uint32_t generation,
+                                const int16_t *pcm_data, size_t samples,
+                                int channels) {
   if (!buffer || !pcm_data || samples == 0) {
     return false;
   }
@@ -424,7 +477,7 @@ bool audio_buffer_queue_decoded(audio_buffer_t *buffer, audio_stats_t *stats,
       chunk_samples = AAC_FRAMES_PER_PACKET;
     }
 
-    if (!audio_buffer_queue_chunk(buffer, stats, chunk_timestamp,
+    if (!audio_buffer_queue_chunk(buffer, stats, chunk_timestamp, generation,
                                   pcm_data + (offset * channels), chunk_samples,
                                   channels)) {
       return false;

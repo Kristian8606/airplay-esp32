@@ -24,6 +24,25 @@
 
 static const char *TAG = "audio_recv";
 
+static void arm_rtp_gate(audio_receiver_state_t *state, uint32_t lower,
+                         uint32_t upper) {
+  state->discard_before_rtp = lower;
+  state->discard_above_rtp = upper;
+  uint32_t epoch = __atomic_add_fetch(&state->rtp_gate_epoch, 1,
+                                      __ATOMIC_ACQ_REL);
+  if (epoch == 0) {
+    __atomic_store_n(&state->rtp_gate_epoch, 1, __ATOMIC_RELEASE);
+  }
+}
+
+static void disarm_rtp_gate(audio_receiver_state_t *state) {
+  __atomic_store_n(&state->rtp_gate_epoch, 0, __ATOMIC_RELEASE);
+}
+
+static void request_decoder_reset(audio_receiver_state_t *state) {
+  __atomic_store_n(&state->decoder_reset_pending, true, __ATOMIC_RELEASE);
+}
+
 static audio_receiver_state_t receiver = {0};
 
 static void audio_receiver_reset_stats(void) {
@@ -220,10 +239,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
   // already empty when the flush happened (forward-seek).
   if (receiver.arm_gate_on_next_anchor) {
     receiver.arm_gate_on_next_anchor = false;
-    receiver.discard_before_rtp = rtp_time;
-    receiver.discard_before_rtp_valid = true;
-    receiver.discard_above_rtp = rtp_time + gate_window;
-    receiver.discard_above_rtp_valid = true;
+    arm_rtp_gate(&receiver, rtp_time, rtp_time + gate_window);
     gates_armed = true;
     ESP_LOGI(TAG,
              "RTP gates armed on anchor: discard_before=%lu discard_above=%lu",
@@ -294,6 +310,8 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
                (unsigned long)reference_rtp, (unsigned long)rtp_time,
                (long)delta, (float)delta / sample_rate);
       audio_buffer_flush(&receiver.buffer);
+      audio_timing_generation_advance(&receiver.timing);
+      request_decoder_reset(&receiver);
       receiver.timing.playout_started = false;
       receiver.timing.pending_valid = false;
       receiver.timing.pending_frame_len = 0;
@@ -301,10 +319,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
       receiver.timing.deferred_flush_pending = false;
       audio_timing_reset_continuity(&receiver.timing);
       receiver.blocks_read_in_sequence = 0;
-      receiver.discard_before_rtp = rtp_time;
-      receiver.discard_before_rtp_valid = true;
-      receiver.discard_above_rtp = rtp_time + gate_window;
-      receiver.discard_above_rtp_valid = true;
+      arm_rtp_gate(&receiver, rtp_time, rtp_time + gate_window);
       receiver.timing.quick_start = true;
       gates_armed = true;
     } else {
@@ -335,6 +350,8 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
                (unsigned long)oldest_rtp, (unsigned long)rtp_time,
                (long)rtp_ahead, (float)rtp_ahead / sample_rate);
       audio_buffer_flush(&receiver.buffer);
+      audio_timing_generation_advance(&receiver.timing);
+      request_decoder_reset(&receiver);
       receiver.timing.playout_started = false;
       receiver.timing.pending_valid = false;
       receiver.timing.pending_frame_len = 0;
@@ -344,10 +361,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
       receiver.blocks_read_in_sequence = 0;
       receiver.timing.quick_start = true;
       if (!gates_armed) {
-        receiver.discard_before_rtp = rtp_time;
-        receiver.discard_before_rtp_valid = true;
-        receiver.discard_above_rtp = rtp_time + gate_window;
-        receiver.discard_above_rtp_valid = true;
+        arm_rtp_gate(&receiver, rtp_time, rtp_time + gate_window);
       }
     }
   }
@@ -457,6 +471,7 @@ esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port) {
   audio_receiver_reset_stats();
   audio_buffer_flush(&receiver.buffer);
   audio_timing_reset(&receiver.timing);
+  request_decoder_reset(&receiver);
   audio_receiver_reset_resend_state();
 
   receiver.timing.ptp_locked = ptp_clock_is_locked();
@@ -482,6 +497,7 @@ esp_err_t audio_receiver_start_buffered(uint16_t tcp_port) {
   audio_receiver_reset_stats();
   audio_buffer_flush(&receiver.buffer);
   audio_timing_reset(&receiver.timing);
+  request_decoder_reset(&receiver);
   audio_receiver_reset_resend_state();
 
   receiver.timing.ptp_locked = ptp_clock_is_locked();
@@ -595,10 +611,10 @@ void audio_receiver_flush(void) {
   // next track's frames.
   audio_buffer_flush(&receiver.buffer);
   audio_timing_reset(&receiver.timing);
+  request_decoder_reset(&receiver);
   audio_receiver_reset_resend_state();
 
-  receiver.discard_before_rtp_valid = false;
-  receiver.discard_above_rtp_valid = false;
+  disarm_rtp_gate(&receiver);
   receiver.arm_gate_on_next_anchor = false;
   receiver.discard_all_until_anchor = false;
   receiver.paused_rtp_valid = false;

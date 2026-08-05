@@ -16,6 +16,8 @@
 // timing check "on time" but actually exit the speaker several ms later.
 #define PIPELINE_LATENCY_US 5000 // ~5ms scheduling + write delay
 #define MIN_STARTUP_FRAMES  4
+#define QUICK_START_CONTIGUOUS_MS 180
+#define QUICK_START_FALLBACK_US 1000000LL
 
 // Position servo: corrects small standing playout offsets by trimming or
 // duplicating single samples.  Residual position errors arise from
@@ -131,11 +133,11 @@ typedef enum {
   SYNC_MODE_NTP,  // AirPlay 1 NTP sync
 } sync_mode_t;
 
-// Compute how early (positive) or late (negative) a frame is in microseconds
-static bool compute_early_us(const audio_timing_t *timing,
-                             const audio_format_t *format,
-                             uint32_t rtp_timestamp, sync_mode_t sync_mode,
-                             int64_t *early_us) {
+static bool compute_target_playout_ns(const audio_timing_t *timing,
+                                      const audio_format_t *format,
+                                      uint32_t rtp_timestamp,
+                                      sync_mode_t sync_mode,
+                                      int64_t *target_ns) {
   if (!timing->anchor_valid || format->sample_rate <= 0) {
     return false;
   }
@@ -166,22 +168,22 @@ static bool compute_early_us(const audio_timing_t *timing,
       ((int64_t)timing->playout_latency_samples * 1000000000LL) /
       format->sample_rate;
 
-  int64_t target_ns;
+  int64_t target;
   switch (sync_mode) {
   case SYNC_MODE_PTP:
     // AirPlay 2: use network time with PTP offset for multi-room sync
-    target_ns = (int64_t)timing->anchor_network_time_ns -
+    target = (int64_t)timing->anchor_network_time_ns -
                 ptp_clock_get_offset_ns() + frame_offset_ns + latency_ns;
     break;
   case SYNC_MODE_NTP:
     // AirPlay 1: use network time with NTP offset for multi-room sync
     // offset = remote_time - local_time, so local = remote - offset
-    target_ns = (int64_t)timing->anchor_network_time_ns -
+    target = (int64_t)timing->anchor_network_time_ns -
                 ntp_clock_get_offset_ns() + frame_offset_ns + latency_ns;
     break;
   default:
     // Fallback: use local anchor time (no multi-room sync)
-    target_ns = timing->anchor_local_time_ns + frame_offset_ns + latency_ns;
+    target = timing->anchor_local_time_ns + frame_offset_ns + latency_ns;
     break;
   }
 
@@ -189,13 +191,25 @@ static bool compute_early_us(const audio_timing_t *timing,
   // and pipeline latency for task scheduling and write blocking.
   // The hardware latency is computed from the DMA descriptor/frame
   // configuration rather than being hard-coded.
-  target_ns -=
+  target -=
       (int64_t)(audio_output_get_hardware_latency_us() + PIPELINE_LATENCY_US) *
       1000LL;
+  *target_ns = target;
+  return true;
+}
 
+// Compute how early (positive) or late (negative) a frame is in microseconds.
+static bool compute_early_us(const audio_timing_t *timing,
+                             const audio_format_t *format,
+                             uint32_t rtp_timestamp, sync_mode_t sync_mode,
+                             int64_t *early_us) {
+  int64_t target_ns = 0;
+  if (!compute_target_playout_ns(timing, format, rtp_timestamp, sync_mode,
+                                 &target_ns)) {
+    return false;
+  }
   int64_t now_ns = (int64_t)esp_timer_get_time() * 1000LL;
   *early_us = (target_ns - now_ns) / 1000LL;
-
   return true;
 }
 
@@ -220,6 +234,18 @@ static size_t quietest_sample_index(const int16_t *pcm, size_t frame_samples,
     }
   }
   return best;
+}
+
+uint32_t audio_timing_generation_get(const audio_timing_t *timing) {
+  return timing ? __atomic_load_n(&timing->stream_generation,
+                                  __ATOMIC_ACQUIRE)
+                : 0;
+}
+
+uint32_t audio_timing_generation_advance(audio_timing_t *timing) {
+  return timing ? __atomic_add_fetch(&timing->stream_generation, 1,
+                                     __ATOMIC_ACQ_REL)
+                : 0;
 }
 
 void audio_timing_init(audio_timing_t *timing, size_t pending_capacity) {
@@ -266,6 +292,11 @@ void audio_timing_reset(audio_timing_t *timing) {
   timing->late_drop_count = 0;
   timing->late_drop_active = false;
   timing->servo_trims = 0;
+  timing->startup_run_locked = false;
+  timing->startup_run_rtp = 0;
+  timing->startup_min_rtp = 0;
+  timing->startup_min_rtp_valid = false;
+  audio_timing_generation_advance(timing);
   audio_timing_reset_continuity(timing);
 }
 
@@ -338,6 +369,10 @@ void audio_timing_set_anchor(audio_timing_t *timing,
   timing->anchor_local_time_ns = now_ns;
   timing->ptp_locked = ptp_clock_is_locked();
   timing->anchor_valid = true;
+  timing->startup_run_locked = false;
+  timing->startup_run_rtp = 0;
+  timing->startup_min_rtp = rtp_time;
+  timing->startup_min_rtp_valid = true;
   // Reset frame counters so pre-buffered audio after a pause/resume or
   // track skip does not accumulate into the new anchor's counts.
   timing->consecutive_early_frames = 0;
@@ -395,29 +430,65 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                                           ? TIMING_THRESHOLD_US
                                           : RT_TIMING_THRESHOLD_US;
 
-  // Wait for enough buffer before starting.
-  // In quick_start mode (after a seek/skip), start as soon as 1 frame is
-  // available to minimise the gap between tracks.  Anchor-based timing
-  // still applies — if the frame is early, silence is output until its
-  // scheduled play time, just like shairport-sync.
-  // Normal startup waits for target_buffer_frames to build jitter margin.
+  // Wait for enough buffer before starting. Normal startup uses the existing
+  // frame target. Quick-start requires a contiguous same-generation PCM run
+  // measured in samples, not ring slots (a 1024-sample AAC frame is split
+  // into several 352-sample slots). A one-second fallback prevents indefinite
+  // silence when loss or an end-of-track tail never forms the full run.
   if (!timing->playout_started && !timing->pending_valid) {
-    int required = timing->quick_start ? 1 : (int)timing->target_buffer_frames;
-    if (buffered_frames < required) {
-      return 0;
+    int64_t now_us = esp_timer_get_time();
+    if (timing->ready_time_us == 0 && buffered_frames > 0) {
+      timing->ready_time_us = now_us;
     }
-    // Wait for anchor before playing.
-    // Normal startup: allow a 1-second fallback so a stream with no anchor
-    // (e.g. AirPlay 1 without NTP) can still start.
+
+    if (timing->quick_start && format->sample_rate > 0 &&
+        timing->anchor_valid) {
+      uint32_t generation = audio_timing_generation_get(timing);
+      uint32_t required_samples =
+          (uint32_t)(((uint64_t)format->sample_rate *
+                      QUICK_START_CONTIGUOUS_MS) /
+                     1000ULL);
+      uint32_t min_rtp = timing->startup_min_rtp_valid
+                             ? timing->startup_min_rtp
+                             : timing->anchor_rtp_time;
+      uint32_t run_rtp = 0;
+
+      if (!timing->startup_run_locked) {
+        if (audio_buffer_find_contiguous_start(
+                buffer, generation, min_rtp, required_samples, &run_rtp)) {
+          timing->startup_run_locked = true;
+          timing->startup_run_rtp = run_rtp;
+          ESP_LOGI(TAG,
+                   "Quick-start run locked: rtp=%" PRIu32
+                   " samples=%" PRIu32,
+                   run_rtp, required_samples);
+        } else if (timing->ready_time_us == 0 ||
+                   now_us - timing->ready_time_us <
+                       QUICK_START_FALLBACK_US) {
+          return 0;
+        } else if (audio_buffer_find_first_generation_frame(
+                       buffer, generation, min_rtp, &run_rtp)) {
+          timing->startup_run_locked = true;
+          timing->startup_run_rtp = run_rtp;
+          ESP_LOGW(TAG,
+                   "Quick-start fallback after 1 s: rtp=%" PRIu32,
+                   run_rtp);
+        } else {
+          return 0;
+        }
+      }
+    } else {
+      int required = (int)timing->target_buffer_frames;
+      if (buffered_frames < required) {
+        return 0;
+      }
+    }
+
     if (!timing->anchor_valid) {
-      int64_t now_us = esp_timer_get_time();
-      if (timing->ready_time_us == 0) {
-        timing->ready_time_us = now_us;
+      if (timing->ready_time_us == 0 ||
+          now_us - timing->ready_time_us < 1000000) {
+        return 0;
       }
-      if (now_us - timing->ready_time_us < 1000000) {
-        return 0; // Still waiting for anchor
-      }
-      // Waited 1 second, no anchor - proceed without sync
     }
   }
 
@@ -512,6 +583,20 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
       frame_samples = samples;
     }
 
+    uint32_t current_generation = audio_timing_generation_get(timing);
+    if (hdr->generation != current_generation) {
+      if (from_pending) {
+        timing->pending_valid = false;
+        timing->pending_frame_len = 0;
+      } else {
+        audio_buffer_return(buffer, item);
+      }
+      if (stats) {
+        stats->packets_dropped++;
+      }
+      continue;
+    }
+
     // Deferred flush check (AirPlay 2 FLUSHBUFFERED with flushFromSeq):
     // keep playing until the frame whose RTP timestamp reaches flush_until_ts,
     // then bulk-flush the remainder of the buffer and start fresh.
@@ -537,6 +622,9 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         // quick_start so the first frame of the next track starts playing
         // as soon as 1 frame arrives, with normal anchor timing applied.
         timing->quick_start = true;
+        timing->startup_run_locked = false;
+        timing->startup_min_rtp_valid = false;
+        audio_timing_generation_advance(timing);
         return 0;
       }
     }
@@ -549,41 +637,28 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // their scheduled play time, and late frames are dropped.  This mirrors
     // shairport-sync's approach and guarantees the first audible sample is
     // correctly synchronised.
-    // Stale start-island rejection.  A stream start (fresh or post-flush)
-    // can leave a small ISLAND of stale frames stranded at the head of the
-    // buffer, separated from the real stream by a large hole — typically
-    // late retransmissions answering NACKs from before the flush, which
-    // arrive after the RTP gates re-arm and fall inside their 10 s window.
-    // Starting playout from such an island plays a ~100 ms blip of audio,
-    // then the hole (concealed as silence), then the track — an audible pop
-    // at every affected stream start (observed on hardware: a 14-frame
-    // island followed by an 830 ms hole on a track change).  Until playout
-    // has started, skip any frame that sits more than ~100 ms below the
-    // start of the contiguous run that ends at the newest received frame:
-    // the discarded audio is stale by definition, and the real stream still
-    // starts at exactly its scheduled instant via the early-hold.
-    if (!timing->playout_started && format->sample_rate > 0) {
-      uint32_t bulk_rtp = 0;
-      if (audio_buffer_bulk_start_rtp(buffer, &bulk_rtp)) {
-        int32_t behind = (int32_t)(bulk_rtp - hdr->rtp_timestamp);
-        if (behind > (int32_t)(format->sample_rate / 10)) {
-          start_skips++;
-          if (from_pending) {
-            timing->pending_valid = false;
-            timing->pending_frame_len = 0;
-          } else {
-            audio_buffer_return(buffer, item);
-          }
-          continue;
-        }
+    // Startup boundary selected from a contiguous same-generation run. Skip
+    // only frames below the frozen boundary; do not chase the newest tail as
+    // more packets arrive. The consumer generation check above is the final
+    // guarantee against a frame racing with a flush.
+    if (!timing->playout_started && timing->quick_start &&
+        timing->startup_run_locked &&
+        (int32_t)(hdr->rtp_timestamp - timing->startup_run_rtp) < 0) {
+      start_skips++;
+      if (from_pending) {
+        timing->pending_valid = false;
+        timing->pending_frame_len = 0;
+      } else {
+        audio_buffer_return(buffer, item);
       }
-      if (start_skips > 0) {
-        ESP_LOGI(TAG,
-                 "Skipped %d stale start frame(s); contiguous stream begins "
-                 "at rtp=%" PRIu32,
-                 start_skips, hdr->rtp_timestamp);
-        start_skips = 0;
-      }
+      continue;
+    }
+    if (!timing->playout_started && start_skips > 0) {
+      ESP_LOGI(TAG,
+               "Skipped %d stale startup frame(s); locked run begins at "
+               "rtp=%" PRIu32,
+               start_skips, timing->startup_run_rtp);
+      start_skips = 0;
     }
 
     // RTP continuity vs the frame just played.  A fresh frame exactly at
@@ -920,6 +995,8 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
       timing->playout_started = true;
       bool was_quick = timing->quick_start;
       timing->quick_start = false;
+      timing->startup_run_locked = false;
+      timing->startup_min_rtp_valid = false;
       ESP_LOGI(TAG, "Playout started%s: rtp=%" PRIu32,
                was_quick ? " (quick_start)" : "", played_rtp_timestamp);
     }

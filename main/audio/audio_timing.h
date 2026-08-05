@@ -81,10 +81,21 @@ typedef struct {
   // one UART write per dropped frame.
   uint32_t late_drop_count;
   bool late_drop_active;
+
+  /* Cross-task stream epoch. Every seek/flush/anchor replacement advances
+   * it; queued PCM carries the epoch and stale frames are rejected at
+   * playout. Access only through the atomic helpers below. */
+  uint32_t stream_generation;
+  bool startup_run_locked;
+  uint32_t startup_run_rtp;
+  uint32_t startup_min_rtp;
+  bool startup_min_rtp_valid;
 } audio_timing_t;
 
 void audio_timing_init(audio_timing_t *timing, size_t pending_capacity);
 void audio_timing_reset(audio_timing_t *timing);
+uint32_t audio_timing_generation_get(const audio_timing_t *timing);
+uint32_t audio_timing_generation_advance(audio_timing_t *timing);
 // Clear playback-derived continuity + servo filter state. Must run on every
 // re-lock (flush/seek/track-change), else a stale expected_rtp or servo bias
 // survives into the new segment.

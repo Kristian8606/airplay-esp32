@@ -132,6 +132,15 @@ static void buffered_audio_task(void *pvParameters) {
       uint32_t timestamp =
           (packet[4] << 24) | (packet[5] << 16) | (packet[6] << 8) | packet[7];
 
+      bool reset_requested = __atomic_exchange_n(
+          &state->decoder_reset_pending, false, __ATOMIC_ACQ_REL);
+      if (reset_requested && !audio_decoder_reset(state->decoder)) {
+        __atomic_store_n(&state->decoder_reset_pending, true,
+                         __ATOMIC_RELEASE);
+        state->stats.packets_dropped++;
+        continue;
+      }
+
       // Drop stale pre-seek/old-track packets before AES and AAC work.  The
       // bytes still have to be drained from TCP (done above), but they no
       // longer consume decoder time or enter the PCM ring buffer.
@@ -159,6 +168,7 @@ static void buffered_audio_task(void *pvParameters) {
       state->stats.last_timestamp = timestamp;
 
       state->blocks_read++;
+      /* Also reset by RTSP/flush paths; diagnostics only. */
       state->blocks_read_in_sequence++;
 
       if (!audio_stream_process_accepted_frame(state, timestamp, decrypted,

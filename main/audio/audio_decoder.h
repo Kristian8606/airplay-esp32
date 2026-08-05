@@ -18,6 +18,7 @@ typedef struct {
 
 audio_decoder_t *audio_decoder_create(const audio_decoder_config_t *config);
 void audio_decoder_destroy(audio_decoder_t *decoder);
+bool audio_decoder_reset(audio_decoder_t *decoder);
 int audio_decoder_decode(audio_decoder_t *decoder, const uint8_t *input,
                          size_t input_len, int16_t *output,
                          size_t output_capacity_samples,

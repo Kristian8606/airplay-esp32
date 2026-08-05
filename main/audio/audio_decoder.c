@@ -36,7 +36,7 @@ static const char *TAG = "audio_dec";
 // Reopen the AAC decoder to reset its internal state after a corrupt frame.
 // The codec's state machine can get stuck after certain errors (e.g. error 20)
 // and will continue failing every subsequent frame until it is recreated.
-static void aac_decoder_reset(audio_decoder_t *decoder) {
+static bool aac_decoder_reset(audio_decoder_t *decoder) {
   if (decoder->aac_decoder) {
     esp_aac_dec_close(decoder->aac_decoder);
     decoder->aac_decoder = NULL;
@@ -55,9 +55,11 @@ static void aac_decoder_reset(audio_decoder_t *decoder) {
   if (err != ESP_AUDIO_ERR_OK) {
     ESP_LOGE(TAG, "AAC decoder reset failed: %d", err);
     decoder->aac_decoder = NULL;
-  } else {
-    ESP_LOGW(TAG, "AAC decoder reset OK");
+    return false;
   }
+
+  ESP_LOGW(TAG, "AAC decoder reset OK");
+  return true;
 }
 
 static bool codec_is_alac(const char *codec) {
@@ -308,6 +310,18 @@ int audio_decoder_decode(audio_decoder_t *decoder, const uint8_t *input,
   }
 
   return -1;
+}
+
+
+bool audio_decoder_reset(audio_decoder_t *decoder) {
+  if (!decoder) {
+    return false;
+  }
+  if (decoder->kind == AUDIO_DECODER_AAC) {
+    return aac_decoder_reset(decoder);
+  }
+  /* ALAC/PCM decoders are frame independent in this implementation. */
+  return true;
 }
 
 bool audio_decoder_is_aac(const audio_decoder_t *decoder) {
