@@ -371,7 +371,9 @@ void audio_timing_set_anchor(audio_timing_t *timing,
   timing->anchor_valid = true;
   timing->startup_run_locked = false;
   timing->startup_run_rtp = 0;
-  timing->startup_min_rtp = rtp_time;
+  uint32_t startup_tolerance_samples =
+      format->sample_rate > 0 ? (uint32_t)(format->sample_rate / 10) : 0;
+  timing->startup_min_rtp = rtp_time - startup_tolerance_samples;
   timing->startup_min_rtp_valid = true;
   // Reset frame counters so pre-buffered audio after a pause/resume or
   // track skip does not accumulate into the new anchor's counts.
@@ -430,19 +432,25 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                                           ? TIMING_THRESHOLD_US
                                           : RT_TIMING_THRESHOLD_US;
 
-  // Wait for enough buffer before starting. Normal startup uses the existing
-  // frame target. Quick-start requires a contiguous same-generation PCM run
-  // measured in samples, not ring slots (a 1024-sample AAC frame is split
-  // into several 352-sample slots). A one-second fallback prevents indefinite
-  // silence when loss or an end-of-track tail never forms the full run.
+  // Wait for enough buffer before starting. Normal startup keeps its
+  // configured jitter target; quick-start needs only one frame while an
+  // anchor is still pending. Once an anchor is available, both startup modes
+  // select a stable contiguous same-generation run so stale PCM islands are
+  // rejected on fresh connections as well as post-flush starts.
   if (!timing->playout_started && !timing->pending_valid) {
     int64_t now_us = esp_timer_get_time();
     if (timing->ready_time_us == 0 && buffered_frames > 0) {
       timing->ready_time_us = now_us;
     }
 
-    if (timing->quick_start && format->sample_rate > 0 &&
-        timing->anchor_valid) {
+    int required_frames = timing->quick_start
+                              ? 1
+                              : (int)timing->target_buffer_frames;
+    if (buffered_frames < required_frames) {
+      return 0;
+    }
+
+    if (timing->anchor_valid && format->sample_rate > 0) {
       uint32_t generation = audio_timing_generation_get(timing);
       uint32_t required_samples =
           (uint32_t)(((uint64_t)format->sample_rate *
@@ -459,8 +467,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
           timing->startup_run_locked = true;
           timing->startup_run_rtp = run_rtp;
           ESP_LOGI(TAG,
-                   "Quick-start run locked: rtp=%" PRIu32
-                   " samples=%" PRIu32,
+                   "Startup run locked: rtp=%" PRIu32 " samples=%" PRIu32,
                    run_rtp, required_samples);
         } else if (timing->ready_time_us == 0 ||
                    now_us - timing->ready_time_us <
@@ -470,17 +477,11 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                        buffer, generation, min_rtp, &run_rtp)) {
           timing->startup_run_locked = true;
           timing->startup_run_rtp = run_rtp;
-          ESP_LOGW(TAG,
-                   "Quick-start fallback after 1 s: rtp=%" PRIu32,
+          ESP_LOGW(TAG, "Startup fallback after 1 s: rtp=%" PRIu32,
                    run_rtp);
         } else {
           return 0;
         }
-      }
-    } else {
-      int required = (int)timing->target_buffer_frames;
-      if (buffered_frames < required) {
-        return 0;
       }
     }
 
@@ -641,8 +642,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // only frames below the frozen boundary; do not chase the newest tail as
     // more packets arrive. The consumer generation check above is the final
     // guarantee against a frame racing with a flush.
-    if (!timing->playout_started && timing->quick_start &&
-        timing->startup_run_locked &&
+    if (!timing->playout_started && timing->startup_run_locked &&
         (int32_t)(hdr->rtp_timestamp - timing->startup_run_rtp) < 0) {
       start_skips++;
       if (from_pending) {

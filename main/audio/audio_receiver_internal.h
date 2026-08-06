@@ -73,10 +73,11 @@ typedef struct {
   // is atomic on Xtensa; arm bool last so reader never sees stale threshold.
   uint32_t discard_before_rtp;
   uint32_t discard_above_rtp;
-  /* Non-zero epoch is the single source of truth that the RTP window is
-   * armed. The gate may only be disarmed if the epoch observed before decode
-   * still matches, so an in-flight frame cannot clear a newer seek window. */
+  /* Non-zero active epoch means the RTP window is armed. Epoch values are
+   * issued from a separate monotonic counter so disarm/re-arm cannot reuse the
+   * same value (avoids an ABA race with an in-flight consumer). */
   uint32_t rtp_gate_epoch;
+  uint32_t rtp_gate_next_epoch;
   // Set by audio_receiver_seek_flush() to ensure the gates are armed on the
   // next SETRATEANCHORTIME even when the buffer was already empty (forward
   // seek: flush empties buffer before anchor arrives, so seek detection in

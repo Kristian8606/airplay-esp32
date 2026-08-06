@@ -268,11 +268,17 @@ bool audio_buffer_peek_newest_rtp(audio_buffer_t *buffer, uint32_t *rtp_out) {
 
 typedef struct {
   uint32_t rtp_timestamp;
-  uint16_t samples_per_channel;
   uint32_t generation;
+  uint16_t samples_per_channel;
+  uint16_t reserved;
 } frame_meta_t;
 
-#define STARTUP_SCAN_MAX_FRAMES 128
+#define STARTUP_SCAN_MAX_FRAMES 192
+
+/* Only the playout task calls the startup search helpers. Keeping this
+ * scratch area out of that task's stack avoids a ~2 KiB stack spike on every
+ * callback while startup is still searching for a run. */
+static frame_meta_t startup_meta[STARTUP_SCAN_MAX_FRAMES];
 
 static size_t snapshot_startup_meta(audio_buffer_t *buffer, frame_meta_t *meta,
                                     size_t capacity) {
@@ -286,8 +292,9 @@ static size_t snapshot_startup_meta(audio_buffer_t *buffer, frame_meta_t *meta,
     const audio_frame_header_t *hdr =
         (const audio_frame_header_t *)slot_ptr(buffer, buffer->sorted[i]);
     meta[i].rtp_timestamp = hdr->rtp_timestamp;
-    meta[i].samples_per_channel = hdr->samples_per_channel;
     meta[i].generation = hdr->generation;
+    meta[i].samples_per_channel = hdr->samples_per_channel;
+    meta[i].reserved = 0;
   }
   portEXIT_CRITICAL(&buffer->lock);
   return count;
@@ -302,29 +309,35 @@ bool audio_buffer_find_contiguous_start(audio_buffer_t *buffer,
     return false;
   }
 
-  frame_meta_t meta[STARTUP_SCAN_MAX_FRAMES];
-  size_t count = snapshot_startup_meta(buffer, meta, STARTUP_SCAN_MAX_FRAMES);
+  size_t count = snapshot_startup_meta(buffer, startup_meta,
+                                       STARTUP_SCAN_MAX_FRAMES);
+  bool in_run = false;
+  uint32_t run_start = 0;
+  uint32_t expected = 0;
+  uint32_t accumulated = 0;
+
   for (size_t i = 0; i < count; i++) {
-    if (meta[i].generation != generation ||
-        (int32_t)(meta[i].rtp_timestamp - min_rtp) < 0) {
-      continue;
+    const frame_meta_t *frame = &startup_meta[i];
+    bool eligible = frame->generation == generation &&
+                    frame->samples_per_channel > 0 &&
+                    (int32_t)(frame->rtp_timestamp - min_rtp) >= 0;
+
+    if (!eligible || !in_run || frame->rtp_timestamp != expected) {
+      if (!eligible) {
+        in_run = false;
+        accumulated = 0;
+        continue;
+      }
+      in_run = true;
+      run_start = frame->rtp_timestamp;
+      accumulated = 0;
     }
 
-    uint32_t run_start = meta[i].rtp_timestamp;
-    uint32_t expected = run_start;
-    uint32_t accumulated = 0;
-    for (size_t j = i; j < count; j++) {
-      if (meta[j].generation != generation ||
-          meta[j].rtp_timestamp != expected ||
-          meta[j].samples_per_channel == 0) {
-        break;
-      }
-      accumulated += meta[j].samples_per_channel;
-      expected += meta[j].samples_per_channel;
-      if (accumulated >= required_samples) {
-        *rtp_out = run_start;
-        return true;
-      }
+    accumulated += frame->samples_per_channel;
+    expected = frame->rtp_timestamp + frame->samples_per_channel;
+    if (accumulated >= required_samples) {
+      *rtp_out = run_start;
+      return true;
     }
   }
   return false;
@@ -337,12 +350,12 @@ bool audio_buffer_find_first_generation_frame(audio_buffer_t *buffer,
   if (!buffer || !rtp_out || !buffer->pool || !buffer->sorted) {
     return false;
   }
-  frame_meta_t meta[STARTUP_SCAN_MAX_FRAMES];
-  size_t count = snapshot_startup_meta(buffer, meta, STARTUP_SCAN_MAX_FRAMES);
+  size_t count = snapshot_startup_meta(buffer, startup_meta,
+                                       STARTUP_SCAN_MAX_FRAMES);
   for (size_t i = 0; i < count; i++) {
-    if (meta[i].generation == generation &&
-        (int32_t)(meta[i].rtp_timestamp - min_rtp) >= 0) {
-      *rtp_out = meta[i].rtp_timestamp;
+    if (startup_meta[i].generation == generation &&
+        (int32_t)(startup_meta[i].rtp_timestamp - min_rtp) >= 0) {
+      *rtp_out = startup_meta[i].rtp_timestamp;
       return true;
     }
   }

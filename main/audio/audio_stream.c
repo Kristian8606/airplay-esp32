@@ -26,8 +26,35 @@ static bool apply_aac_transient_mute(audio_receiver_state_t *state,
   return false;
 }
 
-static uint32_t audio_stream_gate_epoch(const audio_receiver_state_t *state) {
-  return __atomic_load_n(&state->rtp_gate_epoch, __ATOMIC_ACQUIRE);
+typedef struct {
+  uint32_t epoch;
+  uint32_t lower;
+  uint32_t upper;
+} rtp_gate_snapshot_t;
+
+static bool audio_stream_gate_snapshot(const audio_receiver_state_t *state,
+                                       rtp_gate_snapshot_t *snapshot) {
+  for (;;) {
+    uint32_t before =
+        __atomic_load_n(&state->rtp_gate_epoch, __ATOMIC_ACQUIRE);
+    if (before == 0) {
+      return false;
+    }
+
+    uint32_t lower =
+        __atomic_load_n(&state->discard_before_rtp, __ATOMIC_RELAXED);
+    uint32_t upper =
+        __atomic_load_n(&state->discard_above_rtp, __ATOMIC_RELAXED);
+    uint32_t after =
+        __atomic_load_n(&state->rtp_gate_epoch, __ATOMIC_ACQUIRE);
+
+    if (before == after) {
+      snapshot->epoch = before;
+      snapshot->lower = lower;
+      snapshot->upper = upper;
+      return true;
+    }
+  }
 }
 
 bool audio_stream_accept_timestamp(audio_receiver_state_t *state,
@@ -36,19 +63,20 @@ bool audio_stream_accept_timestamp(audio_receiver_state_t *state,
     return false;
   }
 
-  uint32_t epoch = audio_stream_gate_epoch(state);
-  if (epoch == 0) {
+  rtp_gate_snapshot_t gate;
+  if (!audio_stream_gate_snapshot(state, &gate)) {
     return true;
   }
-  if ((int32_t)(timestamp - state->discard_before_rtp) < 0 ||
-      (int32_t)(timestamp - state->discard_above_rtp) > 0) {
+  if ((int32_t)(timestamp - gate.lower) < 0 ||
+      (int32_t)(timestamp - gate.upper) > 0) {
     return false;
   }
 
   /* Disarm only the exact window observed by this ordered pre-decode pass.
-   * A newer seek increments the epoch, so this compare-exchange cannot clear
-   * the replacement window. */
-  __atomic_compare_exchange_n(&state->rtp_gate_epoch, &epoch, 0, false,
+   * A newer seek receives a different monotonic epoch, so this CAS cannot
+   * clear the replacement window. */
+  uint32_t expected = gate.epoch;
+  __atomic_compare_exchange_n(&state->rtp_gate_epoch, &expected, 0, false,
                               __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
   return true;
 }
@@ -58,10 +86,13 @@ static bool timestamp_is_gated(const audio_receiver_state_t *state,
   if (state->discard_all_until_anchor) {
     return true;
   }
-  uint32_t epoch = audio_stream_gate_epoch(state);
-  return epoch != 0 &&
-         ((int32_t)(timestamp - state->discard_before_rtp) < 0 ||
-          (int32_t)(timestamp - state->discard_above_rtp) > 0);
+
+  rtp_gate_snapshot_t gate;
+  if (!audio_stream_gate_snapshot(state, &gate)) {
+    return false;
+  }
+  return (int32_t)(timestamp - gate.lower) < 0 ||
+         (int32_t)(timestamp - gate.upper) > 0;
 }
 
 bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,

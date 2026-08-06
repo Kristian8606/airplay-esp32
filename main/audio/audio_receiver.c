@@ -26,13 +26,20 @@ static const char *TAG = "audio_recv";
 
 static void arm_rtp_gate(audio_receiver_state_t *state, uint32_t lower,
                          uint32_t upper) {
-  state->discard_before_rtp = lower;
-  state->discard_above_rtp = upper;
-  uint32_t epoch = __atomic_add_fetch(&state->rtp_gate_epoch, 1,
-                                      __ATOMIC_ACQ_REL);
+  uint32_t epoch = __atomic_add_fetch(&state->rtp_gate_next_epoch, 1,
+                                      __ATOMIC_RELAXED);
   if (epoch == 0) {
-    __atomic_store_n(&state->rtp_gate_epoch, 1, __ATOMIC_RELEASE);
+    /* Reserve zero for "disarmed" after the issuing counter wraps. */
+    epoch = __atomic_add_fetch(&state->rtp_gate_next_epoch, 1,
+                               __ATOMIC_RELAXED);
   }
+
+  /* Publish the bounds before the release-store of the epoch. Readers use
+   * relaxed loads for the bounds and acquire-load the epoch as the snapshot
+   * publication barrier. */
+  __atomic_store_n(&state->discard_before_rtp, lower, __ATOMIC_RELAXED);
+  __atomic_store_n(&state->discard_above_rtp, upper, __ATOMIC_RELAXED);
+  __atomic_store_n(&state->rtp_gate_epoch, epoch, __ATOMIC_RELEASE);
 }
 
 static void disarm_rtp_gate(audio_receiver_state_t *state) {
