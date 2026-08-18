@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+set(PROJECT_VER "V19")
+set(EXTRA_COMPONENT_DIRS "${CMAKE_SOURCE_DIR}/components")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(airplay-esp32_V19)
+spiffs_create_partition_image(storage "${CMAKE_SOURCE_DIR}/data" FLASH_IN_PROJECT)

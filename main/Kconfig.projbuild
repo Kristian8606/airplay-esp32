@@ -1,0 +1,48 @@
+menu "AP2 RAW RX Debug"
+    config DEFAULT_AP_SSID
+        string "Setup AP SSID"
+        default "ESP32-AirPlay-Setup"
+    config DEFAULT_AP_PASSWORD
+        string "Setup AP password"
+        default ""
+    config DEFAULT_AP_CHANNEL
+        int "Setup AP channel"
+        default 1
+        range 1 13
+    config WIFI_PREFER_5GHZ
+        bool "Prefer 5 GHz when available"
+        default n
+    config WIFI_PREFER_5GHZ_MIN_RSSI
+        int "Minimum 5 GHz RSSI"
+        default -75
+        range -95 -30
+        depends on WIFI_PREFER_5GHZ
+    config ENABLE_AIRPLAY_ARTWORK
+        bool "Advertise artwork support"
+        default n
+endmenu
+
+menu "I2S Playout (V22)"
+    config I2S_SCK_IO
+        int "I2S MCLK GPIO"
+        default 8
+    config I2S_BCK_IO
+        int "I2S BCLK GPIO"
+        default 11
+    config I2S_WS_IO
+        int "I2S LRCK/WS GPIO"
+        default 13
+    config I2S_DO_IO
+        int "I2S DATA OUT GPIO"
+        default 12
+    config AP2_PLAYOUT_TEST_OFFSET_US
+        int "AirPlay playout test offset (us; positive advances ESP audio)"
+        default 0
+        range -200000 200000
+        help
+            Diagnostic-only presentation offset for multiroom testing.
+            Positive values advance the selected RTP content relative to the
+            physical I2S sample boundary; negative values delay it. V22 applies
+            this at the one-enable sample-alignment boundary. Keep 0 for normal
+            use. Nonzero values are diagnostic/manual trim only.
+endmenu

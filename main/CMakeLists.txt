@@ -1,0 +1,53 @@
+set(SRC_FILES
+    "main.c"
+    "settings.c"
+    "audio/audio_receiver.c"
+    "audio/aac_decoder.c"
+    "audio/aac_rtp_ring.c"
+    "audio/pcm_rtp_ring.c"
+    "audio/audio_playout.c"
+    "audio/audio_crypto.c"
+    "rtsp/rtsp_server.c"
+    "rtsp/rtsp_conn.c"
+    "rtsp/rtsp_message.c"
+    "rtsp/rtsp_handlers.c"
+    "rtsp/rtsp_fairplay.c"
+    "rtsp/rtsp_crypto.c"
+    "rtsp/rtsp_rsa.c"
+    "rtsp/rtsp_events.c"
+    "plist/plist_xml.c"
+    "plist/bplist_parser.c"
+    "plist/bplist_builder.c"
+    "plist/base64.c"
+    "hap/hap.c"
+    "hap/hap_pair_verify.c"
+    "hap/hap_pair_setup.c"
+    "hap/hap_crypto.c"
+    "hap/srp.c"
+    "hap/tlv8.c"
+    "network/wifi.c"
+    "network/mdns_airplay.c"
+    "network/ptp_clock.c"
+    "network/socket_utils.c"
+    "network/web_server.c"
+    "network/ota.c"
+    "network/dns_server.c"
+    "network/log_stream.c"
+)
+
+idf_component_register(
+    SRCS ${SRC_FILES}
+    INCLUDE_DIRS "." "audio" "rtsp" "plist" "hap" "network"
+    PRIV_REQUIRES
+        driver
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        esp_timer
+        esp_http_server
+        app_update
+        mbedtls
+        json
+        spiffs_storage
+)
