@@ -69,7 +69,7 @@
 #define AP2_PID_D_ALPHA                  0.20
 #define AP2_PID_I_TERM_LIMIT_PPM       110.0
 #define AP2_PCM_TARGET_MS           4000U
-#define AP2_PLAYOUT_PRIME_MS         250U
+#define AP2_PLAYOUT_PRIME_MS         500U
 #define AP2_TIMELINE_PAST_MS          1000U
 #define AP2_TIMELINE_FUTURE_MS       45000U
 #define AP2_DECODE_IDLE_TICKS       1U
