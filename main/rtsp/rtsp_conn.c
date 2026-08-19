@@ -13,7 +13,7 @@
 static const char *TAG = "rtsp_conn";
 
 static int32_t volume_db_to_q15(float volume_db) {
-  if (volume_db <= -144.0f) return 0;
+  if (volume_db <= -30.0f) return 0;
   if (volume_db >= 0.0f) return 32768;
   float gain = powf(10.0f, volume_db / 20.0f);
   int32_t q15 = (int32_t)(gain * 32768.0f + 0.5f);
@@ -122,7 +122,7 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
     return;
   }
 
-  // AirPlay uses dB attenuation: 0 dB is full scale and -144 dB is mute.
+  // AirPlay uses dB attenuation: 0 dB is full scale and -30 dB is mute.
   // Convert dB to a true linear amplitude gain; never boost above 0 dB.
   if (volume_db > 0.0f) volume_db = 0.0f;
   if (volume_db < -144.0f) volume_db = -144.0f;
