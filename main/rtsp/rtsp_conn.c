@@ -12,14 +12,15 @@
 
 static const char *TAG = "rtsp_conn";
 
-static int32_t volume_db_to_q15(float volume_db) {
-  if (volume_db <= -30.0f) return 0;
-  if (volume_db >= 0.0f) return 32768;
-  float gain = powf(10.0f, volume_db / 20.0f);
-  int32_t q15 = (int32_t)(gain * 32768.0f + 0.5f);
-  if (q15 < 0) q15 = 0;
-  if (q15 > 32768) q15 = 32768;
-  return q15;
+static int32_t volume_db_to_q15(float volume_db){
+    if (volume_db <= -30.0f)
+        return 0;
+    if (volume_db >= 0.0f)
+        return 32768;
+    float normalized = (volume_db + 30.0f) / 30.0f;
+    float curved = normalized * normalized;
+
+    return (int32_t)(curved * 32768.0f);
 }
 
 rtsp_conn_t *rtsp_conn_create(void) {
