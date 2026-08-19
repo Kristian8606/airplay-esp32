@@ -124,17 +124,12 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
   }
 
   // AirPlay uses dB attenuation: 0 dB is full scale and -30 dB is mute.
-  // Convert dB to a true linear amplitude gain; never boost above 0 dB.
   if (volume_db > 0.0f) volume_db = 0.0f;
   if (volume_db < -144.0f) volume_db = -144.0f;
   conn->volume_db = volume_db;
   conn->volume_q15 = volume_db_to_q15(volume_db);
   audio_receiver_set_volume_q15(conn->volume_q15);
 
-  /* V22: deliberately no ESP_LOG here. A fast phone volume gesture can
-   * deliver many RTSP commands per second; logging every step adds avoidable
-   * UART/control-path jitter. The audio stats task reports VOL and CMD in one
-   * compact line instead. */
 
   // Persist at disconnect.
   settings_set_volume(volume_db);
