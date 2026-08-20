@@ -6,7 +6,7 @@
 
 #include "esp_err.h"
 
-/* AP2 buffered AAC-only audio receiver. */
+/* AirPlay 2 audio receiver: buffered AAC plus realtime ALAC. */
 typedef struct {
   char codec[32];
   int sample_rate;
@@ -42,8 +42,8 @@ typedef struct {
 
 typedef enum {
   AUDIO_STREAM_NONE = 0,
-  AUDIO_STREAM_REALTIME = 96,  /* retained only so RTSP can reject it cleanly */
-  AUDIO_STREAM_BUFFERED = 103  /* supported AP2 TCP AAC path */
+  AUDIO_STREAM_REALTIME = 96,  /* AP2 realtime UDP ALAC */
+  AUDIO_STREAM_BUFFERED = 103  /* AP2 buffered TCP AAC */
 } audio_stream_type_t;
 
 esp_err_t audio_receiver_init(void);
@@ -73,7 +73,8 @@ bool audio_receiver_has_data(void);
 /* Timeline/generation control. These invalidate old PCM in O(1), no scan. */
 void audio_receiver_flush(void);
 void audio_receiver_seek_flush(void);
-void audio_receiver_set_deferred_flush(uint32_t flush_until_ts);
+void audio_receiver_flush_buffered_range(uint32_t flush_from_ts,
+                                         uint32_t flush_until_ts);
 void audio_receiver_pause(void);
 void audio_receiver_set_playing(bool playing);
 bool audio_receiver_is_playing(void);

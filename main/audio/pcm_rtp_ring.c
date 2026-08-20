@@ -53,6 +53,23 @@ static void validity_clear(uint32_t valid[VALID_WORDS]) {
   memset(valid, 0, VALID_WORDS * sizeof(valid[0]));
 }
 
+static void validity_clear_range(uint32_t valid[VALID_WORDS], uint32_t off,
+                                 uint32_t count) {
+  while (count) {
+    uint32_t word = off >> 5;
+    uint32_t bit = off & 31U;
+    uint32_t n = 32U - bit;
+    if (n > count) {
+      n = count;
+    }
+    uint32_t mask =
+        (n == 32U) ? 0xFFFFFFFFU : (((1U << n) - 1U) << bit);
+    valid[word] &= ~mask;
+    off += n;
+    count -= n;
+  }
+}
+
 static void validity_set_range(uint32_t valid[VALID_WORDS], uint32_t off,
                                uint32_t count) {
   while (count) {
@@ -138,6 +155,44 @@ void pcm_rtp_ring_set_generation(pcm_rtp_ring_t *r, uint32_t generation) {
   }
   r->generation = generation;
   r->tagged_slots = 0;
+}
+
+uint32_t pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *r, uint32_t from_rtp,
+                                       uint32_t until_rtp,
+                                       uint32_t generation) {
+  if (!r || generation != r->generation ||
+      rtp_delta(until_rtp, from_rtp) <= 0) {
+    return 0;
+  }
+
+  uint32_t invalidated = 0;
+  uint32_t cur = from_rtp;
+  while (rtp_delta(cur, until_rtp) < 0) {
+    uint32_t base = page_base(cur);
+    uint32_t offset = cur - base;
+    uint32_t chunk = PCM_RTP_SLOT_FRAMES - offset;
+    int32_t remain = rtp_delta(until_rtp, cur);
+    if ((int32_t)chunk > remain) {
+      chunk = (uint32_t)remain;
+    }
+
+    pcm_slot_tag_t *tag = &r->tags[slot_for_page(base)];
+    if (tag->generation == generation && tag->page_rtp == base) {
+      /* Called by the decoder task, the same single writer used by
+       * pcm_rtp_ring_write(). Readers are protected by the seqlock. */
+      uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_RELAXED);
+      if (seq & 1U) {
+        seq++;
+      }
+      __atomic_store_n(&tag->seq, seq + 1U, __ATOMIC_RELEASE);
+      validity_clear_range(tag->valid, offset, chunk);
+      __atomic_store_n(&tag->seq, seq + 2U, __ATOMIC_RELEASE);
+      invalidated += chunk;
+    }
+
+    cur += chunk;
+  }
+  return invalidated;
 }
 
 static bool old_page_is_future(const pcm_slot_tag_t *tag, uint32_t wanted_rtp) {

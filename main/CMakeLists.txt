@@ -4,6 +4,8 @@ set(SRC_FILES
     "audio/audio_receiver.c"
     "audio/audio_eq.c"
     "audio/aac_decoder.c"
+    "audio/alac_decoder.c"
+    "audio/realtime_receiver.c"
     "audio/aac_rtp_ring.c"
     "audio/pcm_rtp_ring.c"
     "audio/audio_playout.c"

@@ -51,6 +51,12 @@ void aac_rtp_ring_destroy(aac_rtp_ring_t *ring);
 /* O(1) logical clear. Old slots are invalid because their generation differs. */
 void aac_rtp_ring_set_generation(aac_rtp_ring_t *ring, uint32_t generation);
 
+/* Invalidate READY AAC AUs overlapping [from_rtp, until_rtp) in the current
+ * generation. Used by AirPlay 2 FLUSHBUFFERED replacement ranges. */
+uint32_t aac_rtp_ring_invalidate_range(aac_rtp_ring_t *ring,
+                                       uint32_t from_rtp, uint32_t until_rtp,
+                                       uint32_t generation);
+
 /*
  * Store one decrypted AAC AU by exact RTP key. This function never waits.
  * If the direct destination still contains useful future data from the current

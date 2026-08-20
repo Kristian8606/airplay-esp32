@@ -14,6 +14,7 @@
 #include "aac_rtp_ring.h"
 #include "pcm_rtp_ring.h"
 #include "audio_playout.h"
+#include "realtime_receiver.h"
 #include "esp_heap_caps.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -71,9 +72,11 @@
 #define AP2_PID_I_TERM_LIMIT_PPM       110.0
 #define AP2_PCM_TARGET_MS           4000U
 #define AP2_PLAYOUT_PRIME_MS         500U
+#define AP2_REALTIME_PRIME_MS        100U
 #define AP2_TIMELINE_PAST_MS          1000U
 #define AP2_TIMELINE_FUTURE_MS       45000U
 #define AP2_DECODE_IDLE_TICKS       1U
+#define AP2_MAX_PENDING_FLUSH_RANGES 8U
 
 static const char *TAG = "audio_v22";
 
@@ -84,6 +87,13 @@ static volatile int32_t s_volume_target_q15 = 32768;
 static volatile uint32_t s_volume_cmd_count = 0;
 
 typedef struct {
+  bool in_use;
+  uint32_t from_rtp;
+  uint32_t until_rtp;
+  uint32_t generation;
+} pending_flush_range_t;
+
+typedef struct {
   bool anchor_valid;
   bool playing;
   uint64_t anchor_ptp_ns;
@@ -91,9 +101,9 @@ typedef struct {
   uint32_t generation;
   audio_format_t format;
   uint32_t format_generation;
-  bool deferred_flush_valid;
-  uint32_t deferred_flush_rtp;
   bool timeline_reset_pending;
+  audio_stream_type_t stream_type;
+  uint32_t playout_latency_samples;
 } timing_snapshot_t;
 
 typedef struct {
@@ -185,9 +195,10 @@ typedef struct {
   uint32_t anchor_rtp;
   uint32_t generation;
   uint32_t format_generation;
-  bool deferred_flush_valid;
-  uint32_t deferred_flush_rtp;
+  pending_flush_range_t pending_flushes[AP2_MAX_PENDING_FLUSH_RANGES];
   bool timeline_reset_pending;
+  uint32_t playout_latency_samples;
+  uint32_t realtime_eq_generation;
   volatile bool i2s_flush_requested;
 
   diag_stats_t diag;
@@ -212,9 +223,9 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->generation = s.generation;
   out->format = s.format;
   out->format_generation = s.format_generation;
-  out->deferred_flush_valid = s.deferred_flush_valid;
-  out->deferred_flush_rtp = s.deferred_flush_rtp;
   out->timeline_reset_pending = s.timeline_reset_pending;
+  out->stream_type = s.stream_type;
+  out->playout_latency_samples = s.playout_latency_samples;
   taskEXIT_CRITICAL(&s.state_mux);
 }
 
@@ -230,7 +241,7 @@ static uint32_t next_generation(uint32_t generation) {
 static void mark_timeline_discontinuity(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.anchor_valid = false;
-  s.deferred_flush_valid = false;
+  memset(s.pending_flushes, 0, sizeof(s.pending_flushes));
   s.timeline_reset_pending = true;
   taskEXIT_CRITICAL(&s.state_mux);
   s.diag.last_decoded_end_rtp = 0;
@@ -251,7 +262,7 @@ static uint32_t commit_anchor_epoch_locked(void) {
     }
     s.generation = gen;
     s.timeline_reset_pending = false;
-    s.deferred_flush_valid = false;
+    memset(s.pending_flushes, 0, sizeof(s.pending_flushes));
     s.diag.last_decoded_end_rtp = 0;
   }
   return gen;
@@ -270,6 +281,7 @@ static bool wanted_rtp_now(const timing_snapshot_t *snap, uint32_t *out) {
   int64_t now_ns = (int64_t)ptp_clock_get_time_ns();
   int64_t dt_ns = now_ns - (int64_t)snap->anchor_ptp_ns;
   int64_t ds = (dt_ns * (int64_t)sr) / 1000000000LL;
+  ds -= (int64_t)snap->playout_latency_samples;
   *out = snap->anchor_rtp + (uint32_t)ds;
   return true;
 }
@@ -283,6 +295,7 @@ static bool wanted_rtp_at_ptp(const timing_snapshot_t *snap, uint64_t ptp_ns,
   int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
   int64_t dt_ns = (int64_t)ptp_ns - (int64_t)snap->anchor_ptp_ns;
   int64_t ds = (dt_ns * (int64_t)sr) / 1000000000LL;
+  ds -= (int64_t)snap->playout_latency_samples;
   *out = snap->anchor_rtp + (uint32_t)ds;
   return true;
 }
@@ -296,7 +309,9 @@ static bool rtp_to_ptp_ns(const timing_snapshot_t *snap, uint32_t rtp,
   const int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
   const int32_t ds = rtp_delta(rtp, snap->anchor_rtp);
   const int64_t dt_ns = ((int64_t)ds * 1000000000LL) / (int64_t)sr;
-  const int64_t ptp = (int64_t)snap->anchor_ptp_ns + dt_ns;
+  const int64_t latency_ns =
+      ((int64_t)snap->playout_latency_samples * 1000000000LL) / (int64_t)sr;
+  const int64_t ptp = (int64_t)snap->anchor_ptp_ns + dt_ns + latency_ns;
   if (ptp < 0) {
     return false;
   }
@@ -536,6 +551,123 @@ static void ap2_rx_task(void *arg) {
   vTaskDelete(NULL);
 }
 
+static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
+                              int channels, void *ctx) {
+  (void)ctx;
+  if (!pcm || frames == 0) {
+    return false;
+  }
+
+  /* Realtime type 96 does not necessarily publish SETRATEANCHORTIME like
+   * buffered type 103.  Treat the first decoded RTP packet after SETUP/FLUSH
+   * as the local epoch origin.  The negotiated latencyMin remains the jitter
+   * reserve: with anchor_rtp=first RTP at anchor_ptp=arrival time, wanted RTP
+   * starts latencyMin samples behind the packet and naturally catches the
+   * first buffered sample after that delay.  This keeps the existing
+   * sample-addressed PCM ring and I2S scheduler intact without requiring an
+   * AirPlay multiroom presentation anchor. */
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  if (snap.stream_type != AUDIO_STREAM_REALTIME) {
+    return false;
+  }
+
+  if (snap.timeline_reset_pending || !snap.anchor_valid) {
+    if (!ptp_clock_is_locked()) {
+      return false;
+    }
+
+    const uint64_t now_ptp_ns = ptp_clock_get_time_ns();
+    uint32_t gen = 0;
+    bool committed = false;
+
+    taskENTER_CRITICAL(&s.state_mux);
+    /* Re-check under the lock because RX and RTSP/flush can race. */
+    if (s.stream_type == AUDIO_STREAM_REALTIME &&
+        (s.timeline_reset_pending || !s.anchor_valid)) {
+      committed = s.timeline_reset_pending;
+      gen = commit_anchor_epoch_locked();
+      s.anchor_clock_id = 0;
+      s.anchor_ptp_ns = now_ptp_ns;
+      s.anchor_rtp = rtp;
+      s.anchor_valid = true;
+    } else {
+      gen = s.generation;
+    }
+    taskEXIT_CRITICAL(&s.state_mux);
+
+    if (committed) {
+      ESP_LOGI(TAG,
+               "REALTIME LOCAL ANCHOR ptp=%" PRIu64 " rtp=%" PRIu32
+               " gen=%" PRIu32 " latency=%" PRIu32 " samples",
+               now_ptp_ns, rtp, gen, s.playout_latency_samples);
+    }
+    snapshot_state(&snap);
+    if (!snap.anchor_valid || snap.timeline_reset_pending) {
+      return false;
+    }
+  }
+
+  if (frame_is_fully_stale(rtp, &snap, NULL)) {
+    s.diag.stale_predecode++;
+    s.public_stats.late_frames++;
+    s.public_stats.packets_dropped++;
+    return false;
+  }
+
+  if (s.realtime_eq_generation != snap.generation) {
+    audio_eq_reset_state();
+    s.realtime_eq_generation = snap.generation;
+  }
+
+  audio_eq_process(pcm, frames, channels, snap.format.sample_rate);
+
+  uint32_t wanted = 0;
+  bool wanted_valid = wanted_rtp_now(&snap, &wanted);
+  if (!pcm_rtp_ring_write(s.pcm_ring, rtp, pcm, frames, channels,
+                          snap.generation, wanted, wanted_valid)) {
+    s.diag.pcm_write_error++;
+    s.public_stats.packets_dropped++;
+    return false;
+  }
+
+  s.diag.decoded++;
+  s.diag.last_decoded_end_rtp = rtp + (uint32_t)frames;
+  s.public_stats.packets_received++;
+  s.public_stats.packets_decoded++;
+  s.public_stats.last_timestamp = rtp;
+  return true;
+}
+
+static void process_pending_flush_ranges(uint32_t generation) {
+  pending_flush_range_t local[AP2_MAX_PENDING_FLUSH_RANGES] = {0};
+  unsigned count = 0;
+
+  taskENTER_CRITICAL(&s.state_mux);
+  for (unsigned i = 0; i < AP2_MAX_PENDING_FLUSH_RANGES; ++i) {
+    pending_flush_range_t *f = &s.pending_flushes[i];
+    if (!f->in_use || f->generation != generation) {
+      continue;
+    }
+    local[count++] = *f;
+    memset(f, 0, sizeof(*f));
+  }
+  taskEXIT_CRITICAL(&s.state_mux);
+
+  for (unsigned i = 0; i < count; ++i) {
+    const pending_flush_range_t *f = &local[i];
+    uint32_t aac_invalidated = aac_rtp_ring_invalidate_range(
+        s.aac_ring, f->from_rtp, f->until_rtp, generation);
+    uint32_t pcm_invalidated = pcm_rtp_ring_invalidate_range(
+        s.pcm_ring, f->from_rtp, f->until_rtp, generation);
+    ESP_LOGI(TAG,
+             "FLUSHBUFFERED invalidated RTP=%" PRIu32 "..%" PRIu32
+             " aac=%" PRIu32 " pcm_frames=%" PRIu32 " gen=%" PRIu32,
+             f->from_rtp, f->until_rtp, aac_invalidated, pcm_invalidated,
+             generation);
+  }
+}
+
 static void ap2_decode_task(void *arg) {
   (void)arg;
   aac_decoder_t *decoder = NULL;
@@ -551,12 +683,26 @@ static void ap2_decode_task(void *arg) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
 
+    if (snap.stream_type != AUDIO_STREAM_BUFFERED) {
+      if (decoder) {
+        aac_decoder_destroy(decoder);
+        decoder = NULL;
+      }
+      next_decode_valid = false;
+      decoder_format_generation = 0;
+      decode_generation = snap.generation;
+      vTaskDelay(AP2_DECODE_IDLE_TICKS);
+      continue;
+    }
+
     if (decode_generation != snap.generation) {
       decode_generation = snap.generation;
       next_decode_valid = false;
       decoder_format_generation = 0;
       audio_eq_reset_state();
     }
+
+    process_pending_flush_ranges(snap.generation);
 
     /* Compressed AAC may accumulate before the anchor. Decode only when a
      * real PTP/RTP playback cursor exists; this keeps PCM near the cursor. */
@@ -875,18 +1021,6 @@ static void ap2_playout_task(void *arg) {
     snapshot_state(&snap);
     process_i2s_completions(&snap);
 
-    if (cursor_valid && state == PLAYOUT_RUNNING &&
-        snap.deferred_flush_valid &&
-        rtp_delta(cursor_rtp, snap.deferred_flush_rtp) >= 0) {
-      ESP_LOGI(TAG, "deferred flush boundary reached at rtp=%" PRIu32,
-               cursor_rtp);
-      mark_timeline_discontinuity();
-      cursor_valid = false;
-      state = PLAYOUT_STOPPED;
-      s.diag.playout_state = state;
-      continue;
-    }
-
     uint32_t desired_rtp = 0;
     bool timeline_ok = false;
     if (snap.playing && snap.anchor_valid && !snap.timeline_reset_pending &&
@@ -927,8 +1061,11 @@ static void ap2_playout_task(void *arg) {
 
     if (state == PLAYOUT_PRIMING) {
       const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+      const uint32_t prime_ms =
+          snap.stream_type == AUDIO_STREAM_REALTIME ? AP2_REALTIME_PRIME_MS
+                                                    : AP2_PLAYOUT_PRIME_MS;
       const uint32_t prime_frames =
-          (uint32_t)(((uint64_t)sr * AP2_PLAYOUT_PRIME_MS) / 1000ULL);
+          (uint32_t)(((uint64_t)sr * prime_ms) / 1000ULL);
 
       /* Wait until enough real PCM exists before starting the silent phase
        * probe.  Once I2S is enabled we intentionally never stop it between
@@ -1500,7 +1637,11 @@ void audio_receiver_set_encryption(const audio_encrypt_t *e) {
            (unsigned)s.encrypt.key_len);
 }
 
-void audio_receiver_set_stream_type(audio_stream_type_t t) { s.stream_type = t; }
+void audio_receiver_set_stream_type(audio_stream_type_t t) {
+  taskENTER_CRITICAL(&s.state_mux);
+  s.stream_type = t;
+  taskEXIT_CRITICAL(&s.state_mux);
+}
 
 esp_err_t audio_receiver_start_buffered(uint16_t port) {
   if (s.listen_sock >= 0) {
@@ -1537,13 +1678,25 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
 
 esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
                                       uint16_t tcp_port) {
-  (void)data_port;
-  (void)control_port;
-  if (s.stream_type != AUDIO_STREAM_BUFFERED) {
-    ESP_LOGW(TAG, "Ignoring non-buffered stream type=%d", (int)s.stream_type);
-    return ESP_ERR_NOT_SUPPORTED;
+  if (s.stream_type == AUDIO_STREAM_BUFFERED) {
+    return audio_receiver_start_buffered(tcp_port);
   }
-  return audio_receiver_start_buffered(tcp_port);
+
+  if (s.stream_type == AUDIO_STREAM_REALTIME) {
+    if (strcmp(s.format.codec, "ALAC") != 0) {
+      ESP_LOGW(TAG, "Realtime codec %s is not supported", s.format.codec);
+      return ESP_ERR_NOT_SUPPORTED;
+    }
+    realtime_receiver_config_t cfg = {
+        .format = s.format,
+        .encrypt = s.encrypt,
+        .pcm_sink = realtime_pcm_sink,
+        .pcm_sink_ctx = NULL,
+    };
+    return realtime_receiver_start(data_port, control_port, &cfg);
+  }
+
+  return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port) {
@@ -1553,6 +1706,7 @@ esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port) {
 }
 
 void audio_receiver_stop(void) {
+  realtime_receiver_stop();
   s.rx_running = false;
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
@@ -1592,12 +1746,47 @@ bool audio_receiver_has_data(void) { return false; }
 
 void audio_receiver_flush(void) { mark_timeline_discontinuity(); }
 void audio_receiver_seek_flush(void) { mark_timeline_discontinuity(); }
-void audio_receiver_set_deferred_flush(uint32_t ts) {
+void audio_receiver_flush_buffered_range(uint32_t from_ts, uint32_t until_ts) {
+  if (rtp_delta(until_ts, from_ts) <= 0) {
+    ESP_LOGW(TAG, "ignoring invalid FLUSHBUFFERED RTP range %" PRIu32
+                  "..%" PRIu32, from_ts, until_ts);
+    return;
+  }
+
+  int slot = -1;
+  uint32_t generation = 0;
   taskENTER_CRITICAL(&s.state_mux);
-  s.deferred_flush_rtp = ts;
-  s.deferred_flush_valid = true;
+  if (s.stream_type == AUDIO_STREAM_BUFFERED && !s.timeline_reset_pending) {
+    generation = s.generation;
+    for (unsigned i = 0; i < AP2_MAX_PENDING_FLUSH_RANGES; ++i) {
+      pending_flush_range_t *f = &s.pending_flushes[i];
+      if (f->in_use && f->generation == generation &&
+          f->from_rtp == from_ts && f->until_rtp == until_ts) {
+        slot = (int)i;
+        break;
+      }
+      if (!f->in_use && slot < 0) {
+        slot = (int)i;
+      }
+    }
+    if (slot >= 0) {
+      pending_flush_range_t *f = &s.pending_flushes[slot];
+      f->in_use = true;
+      f->from_rtp = from_ts;
+      f->until_rtp = until_ts;
+      f->generation = generation;
+    }
+  }
   taskEXIT_CRITICAL(&s.state_mux);
-  ESP_LOGI(TAG, "deferred flush armed for RTP=%" PRIu32, ts);
+
+  if (slot >= 0) {
+    ESP_LOGI(TAG, "FLUSHBUFFERED queued RTP=%" PRIu32 "..%" PRIu32
+                  " slot=%d gen=%" PRIu32,
+             from_ts, until_ts, slot, generation);
+  } else {
+    ESP_LOGW(TAG, "FLUSHBUFFERED range queue full/invalid state RTP=%" PRIu32
+                  "..%" PRIu32, from_ts, until_ts);
+  }
 }
 
 void audio_receiver_pause(void) {
@@ -1607,7 +1796,11 @@ void audio_receiver_pause(void) {
   mark_timeline_discontinuity();
 }
 
-void audio_receiver_set_playout_latency_samples(uint32_t v) { (void)v; }
+void audio_receiver_set_playout_latency_samples(uint32_t v) {
+  taskENTER_CRITICAL(&s.state_mux);
+  s.playout_latency_samples = v;
+  taskEXIT_CRITICAL(&s.state_mux);
+}
 void audio_receiver_set_output_latency_us(uint32_t v) { (void)v; }
 uint32_t audio_receiver_get_output_latency_us(void) { return 0; }
 uint32_t audio_receiver_get_hardware_latency_us(void) { return audio_playout_hardware_latency_us(); }
@@ -1636,8 +1829,7 @@ void audio_receiver_reset_timing(void) {
 }
 
 void audio_receiver_set_client_control(uint32_t ip, uint16_t port) {
-  (void)ip;
-  (void)port;
+  realtime_receiver_set_client_control(ip, port);
 }
 
 void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,

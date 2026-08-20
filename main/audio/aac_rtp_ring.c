@@ -108,6 +108,46 @@ void aac_rtp_ring_set_generation(aac_rtp_ring_t *r, uint32_t generation) {
   __atomic_store_n(&r->ready_slots, 0U, __ATOMIC_RELEASE);
 }
 
+uint32_t aac_rtp_ring_invalidate_range(aac_rtp_ring_t *r, uint32_t from_rtp,
+                                       uint32_t until_rtp,
+                                       uint32_t generation) {
+  if (!r || rtp_delta(until_rtp, from_rtp) <= 0 ||
+      generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
+    return 0;
+  }
+
+  uint32_t invalidated = 0;
+  for (uint32_t slot = 0; slot < AAC_RTP_SLOT_COUNT; ++slot) {
+    aac_slot_tag_t *tag = &r->tags[slot];
+    if (__atomic_load_n(&tag->state, __ATOMIC_ACQUIRE) != AAC_SLOT_READY ||
+        tag->generation != generation) {
+      continue;
+    }
+
+    const uint32_t au_rtp = tag->rtp;
+    const bool overlaps =
+        rtp_delta(au_rtp + AAC_RTP_FRAME_SAMPLES, from_rtp) > 0 &&
+        rtp_delta(au_rtp, until_rtp) < 0;
+    if (!overlaps) {
+      continue;
+    }
+
+    uint32_t expected = AAC_SLOT_READY;
+    if (__atomic_compare_exchange_n(&tag->state, &expected, AAC_SLOT_WRITING,
+                                    false, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE)) {
+      tag->len = 0;
+      __atomic_store_n(&tag->state, AAC_SLOT_FREE, __ATOMIC_RELEASE);
+      uint32_t ready = __atomic_load_n(&r->ready_slots, __ATOMIC_RELAXED);
+      if (ready > 0) {
+        __atomic_sub_fetch(&r->ready_slots, 1U, __ATOMIC_RELAXED);
+      }
+      invalidated++;
+    }
+  }
+  return invalidated;
+}
+
 static bool claim_for_write(aac_rtp_ring_t *r, aac_slot_tag_t *tag,
                             uint32_t rtp, uint32_t generation,
                             uint32_t wanted_rtp, bool wanted_valid,

@@ -39,6 +39,12 @@ void pcm_rtp_ring_destroy(pcm_rtp_ring_t *ring);
 /* O(1) invalidation: old PCM becomes unreachable by generation tag. */
 void pcm_rtp_ring_set_generation(pcm_rtp_ring_t *ring, uint32_t generation);
 
+/* Clear PCM validity bits overlapping [from_rtp, until_rtp) without changing
+ * generation or the RTP/PTP timeline. Returns the number of frames invalidated. */
+uint32_t pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *ring,
+                                       uint32_t from_rtp, uint32_t until_rtp,
+                                       uint32_t generation);
+
 /*
  * Write decoded stereo PCM at its exact RTP address.
  *
