@@ -10,8 +10,8 @@
 extern "C" {
 #endif
 
-#define AUDIO_EQ_CONFIG_VERSION 1U
-#define AUDIO_EQ_MAX_FILTERS 12U
+#define AUDIO_EQ_CONFIG_VERSION 2U
+#define AUDIO_EQ_MAX_FILTERS_PER_CHANNEL 24U
 
 typedef enum {
   AUDIO_EQ_FILTER_PK = 0,
@@ -42,33 +42,42 @@ typedef struct {
 } audio_eq_filter_config_t;
 
 typedef struct {
+  uint8_t filter_count;
+  uint8_t reserved[3];
+  audio_eq_filter_config_t filters[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+} audio_eq_output_config_t;
+
+typedef struct {
   uint32_t version;
   uint8_t enabled;
   uint8_t channel_mode;
-  uint8_t filter_count;
-  uint8_t reserved;
+  uint16_t reserved;
   float preamp_db;
-  audio_eq_filter_config_t filters[AUDIO_EQ_MAX_FILTERS];
+  audio_eq_output_config_t left;
+  audio_eq_output_config_t right;
 } audio_eq_config_t;
 
 /* Load the saved configuration and initialise the runtime DSP state. */
 esp_err_t audio_eq_init(void);
 
-/* Read/write the persistent configuration. Save does not change the active
- * runtime configuration; the web UI restarts the ESP after a successful save. */
+/* Read/write persistent configuration. Save does not change active runtime
+ * state; the web UI restarts the ESP after a successful save. */
 esp_err_t audio_eq_load_config(audio_eq_config_t *out);
 esp_err_t audio_eq_save_config(const audio_eq_config_t *config);
 void audio_eq_default_config(audio_eq_config_t *out);
 bool audio_eq_validate_config(const audio_eq_config_t *config);
 
-/* Process interleaved signed 16-bit PCM in place. Coefficients are calculated
- * once per sample-rate change, never per sample. Channel routing is always
- * applied; EQ/preamp are applied when config.enabled is true. */
+/* Process interleaved signed 16-bit stereo PCM in place.
+ * Source selection:
+ *   stereo: L source -> left EQ, R source -> right EQ
+ *   mono:   (L+R)/2 -> both independent EQ chains
+ *   left:   L source -> both independent EQ chains
+ *   right:  R source -> both independent EQ chains
+ * Coefficients are calculated once per sample-rate change, never per sample. */
 void audio_eq_process(int16_t *pcm, size_t frames, int channels,
                       int sample_rate);
 
-/* Clear only biquad delay state. Call at an AirPlay timeline generation
- * boundary so filter history never leaks across a flush/new stream. */
+/* Clear biquad delay state at AirPlay timeline generation boundaries. */
 void audio_eq_reset_state(void);
 
 const char *audio_eq_filter_type_name(audio_eq_filter_type_t type);

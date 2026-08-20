@@ -32,9 +32,10 @@ typedef struct {
 
 typedef struct {
   audio_eq_config_t config;
-  biquad_coeff_t coeff[AUDIO_EQ_MAX_FILTERS];
-  biquad_state_t state_l[AUDIO_EQ_MAX_FILTERS];
-  biquad_state_t state_r[AUDIO_EQ_MAX_FILTERS];
+  biquad_coeff_t coeff_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  biquad_coeff_t coeff_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  biquad_state_t state_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  biquad_state_t state_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   int sample_rate;
   float preamp_gain;
   bool ready;
@@ -57,20 +58,25 @@ void audio_eq_default_config(audio_eq_config_t *out) {
 bool audio_eq_validate_config(const audio_eq_config_t *config) {
   if (!config || config->version != AUDIO_EQ_CONFIG_VERSION ||
       config->enabled > 1 || config->channel_mode >= AUDIO_EQ_CHANNEL_COUNT ||
-      config->filter_count > AUDIO_EQ_MAX_FILTERS ||
       !eq_is_finite(config->preamp_db) || config->preamp_db < -24.0f ||
-      config->preamp_db > 0.0f) {
+      config->preamp_db > 0.0f ||
+      config->left.filter_count > AUDIO_EQ_MAX_FILTERS_PER_CHANNEL ||
+      config->right.filter_count > AUDIO_EQ_MAX_FILTERS_PER_CHANNEL) {
     return false;
   }
 
-  for (uint8_t i = 0; i < config->filter_count; ++i) {
-    const audio_eq_filter_config_t *f = &config->filters[i];
-    if (f->enabled > 1 || f->type >= AUDIO_EQ_FILTER_COUNT ||
-        !eq_is_finite(f->frequency_hz) || f->frequency_hz < 10.0f ||
-        f->frequency_hz > 20000.0f || !eq_is_finite(f->gain_db) ||
-        f->gain_db < -24.0f || f->gain_db > 24.0f || !eq_is_finite(f->q) ||
-        f->q < 0.05f || f->q > 50.0f) {
-      return false;
+  const audio_eq_output_config_t *outputs[2] = {&config->left, &config->right};
+  for (int ch = 0; ch < 2; ++ch) {
+    const audio_eq_output_config_t *output = outputs[ch];
+    for (uint8_t i = 0; i < output->filter_count; ++i) {
+      const audio_eq_filter_config_t *f = &output->filters[i];
+      if (f->enabled > 1 || f->type >= AUDIO_EQ_FILTER_COUNT ||
+          !eq_is_finite(f->frequency_hz) || f->frequency_hz < 10.0f ||
+          f->frequency_hz > 20000.0f || !eq_is_finite(f->gain_db) ||
+          f->gain_db < -24.0f || f->gain_db > 24.0f || !eq_is_finite(f->q) ||
+          f->q < 0.05f || f->q > 50.0f) {
+        return false;
+      }
     }
   }
   return true;
@@ -245,35 +251,48 @@ void audio_eq_reset_state(void) {
   memset(s_eq.state_r, 0, sizeof(s_eq.state_r));
 }
 
-static bool prepare_for_rate(int sample_rate) {
-  if (sample_rate <= 0) return false;
-  if (s_eq.ready && s_eq.sample_rate == sample_rate) return true;
-
-  for (uint8_t i = 0; i < s_eq.config.filter_count; ++i) {
-    const audio_eq_filter_config_t *f = &s_eq.config.filters[i];
+static bool prepare_output(const audio_eq_output_config_t *cfg,
+                           biquad_coeff_t *coeff, int sample_rate,
+                           const char *name) {
+  for (uint8_t i = 0; i < cfg->filter_count; ++i) {
+    const audio_eq_filter_config_t *f = &cfg->filters[i];
     if (!f->enabled) {
-      memset(&s_eq.coeff[i], 0, sizeof(s_eq.coeff[i]));
-      s_eq.coeff[i].b0 = 1.0f;
+      memset(&coeff[i], 0, sizeof(coeff[i]));
+      coeff[i].b0 = 1.0f;
       continue;
     }
     if (f->frequency_hz >= ((float)sample_rate * 0.5f) ||
         !calc_biquad((audio_eq_filter_type_t)f->type, f->frequency_hz,
-                     f->gain_db, f->q, sample_rate, &s_eq.coeff[i])) {
-      ESP_LOGE(TAG, "Invalid filter %u for %d Hz stream", (unsigned)(i + 1),
-               sample_rate);
-      s_eq.ready = false;
+                     f->gain_db, f->q, sample_rate, &coeff[i])) {
+      ESP_LOGE(TAG, "Invalid %s filter %u for %d Hz stream", name,
+               (unsigned)(i + 1), sample_rate);
       return false;
     }
+  }
+  return true;
+}
+
+static bool prepare_for_rate(int sample_rate) {
+  if (sample_rate <= 0) return false;
+  if (s_eq.ready && s_eq.sample_rate == sample_rate) return true;
+
+  if (!prepare_output(&s_eq.config.left, s_eq.coeff_l, sample_rate, "left") ||
+      !prepare_output(&s_eq.config.right, s_eq.coeff_r, sample_rate, "right")) {
+    s_eq.ready = false;
+    return false;
   }
 
   s_eq.preamp_gain = powf(10.0f, s_eq.config.preamp_db / 20.0f);
   s_eq.sample_rate = sample_rate;
   s_eq.ready = true;
   audio_eq_reset_state();
-  ESP_LOGI(TAG, "Ready: enabled=%u mode=%s filters=%u preamp=%.2fdB sr=%d",
+  ESP_LOGI(TAG,
+           "Ready: enabled=%u mode=%s left=%u right=%u preamp=%.2fdB sr=%d",
            (unsigned)s_eq.config.enabled,
-           audio_eq_channel_mode_name((audio_eq_channel_mode_t)s_eq.config.channel_mode),
-           (unsigned)s_eq.config.filter_count, s_eq.config.preamp_db,
+           audio_eq_channel_mode_name(
+               (audio_eq_channel_mode_t)s_eq.config.channel_mode),
+           (unsigned)s_eq.config.left.filter_count,
+           (unsigned)s_eq.config.right.filter_count, s_eq.config.preamp_db,
            sample_rate);
   return true;
 }
@@ -287,10 +306,13 @@ esp_err_t audio_eq_init(void) {
              esp_err_to_name(err));
     return ESP_OK;
   }
-  ESP_LOGI(TAG, "Config loaded: enabled=%u mode=%s filters=%u preamp=%.2fdB",
+  ESP_LOGI(TAG,
+           "Config loaded: enabled=%u mode=%s left=%u right=%u preamp=%.2fdB",
            (unsigned)s_eq.config.enabled,
-           audio_eq_channel_mode_name((audio_eq_channel_mode_t)s_eq.config.channel_mode),
-           (unsigned)s_eq.config.filter_count, s_eq.config.preamp_db);
+           audio_eq_channel_mode_name(
+               (audio_eq_channel_mode_t)s_eq.config.channel_mode),
+           (unsigned)s_eq.config.left.filter_count,
+           (unsigned)s_eq.config.right.filter_count, s_eq.config.preamp_db);
   return ESP_OK;
 }
 
@@ -302,12 +324,14 @@ static inline float biquad_process(float x, const biquad_coeff_t *c,
   return y;
 }
 
-static inline float process_chain(float x, biquad_state_t *states) {
+static inline float process_chain(float x, const audio_eq_output_config_t *cfg,
+                                  const biquad_coeff_t *coeff,
+                                  biquad_state_t *states) {
   if (!s_eq.config.enabled) return x;
   x *= s_eq.preamp_gain;
-  for (uint8_t i = 0; i < s_eq.config.filter_count; ++i) {
-    if (s_eq.config.filters[i].enabled) {
-      x = biquad_process(x, &s_eq.coeff[i], &states[i]);
+  for (uint8_t i = 0; i < cfg->filter_count; ++i) {
+    if (cfg->filters[i].enabled) {
+      x = biquad_process(x, &coeff[i], &states[i]);
     }
   }
   return x;
@@ -334,36 +358,42 @@ void audio_eq_process(int16_t *pcm, size_t frames, int channels,
   const audio_eq_channel_mode_t mode =
       (audio_eq_channel_mode_t)s_eq.config.channel_mode;
 
-  /* Default configuration is a true zero-cost audio bypass after the single
-   * block-level branch: no float conversion when EQ is off in stereo mode. */
-  if (!s_eq.config.enabled && mode == AUDIO_EQ_CHANNEL_STEREO) {
-    return;
-  }
+  if (!s_eq.config.enabled && mode == AUDIO_EQ_CHANNEL_STEREO) return;
 
-  if (mode == AUDIO_EQ_CHANNEL_STEREO) {
-    for (size_t i = 0; i < frames; ++i) {
-      float l = process_chain((float)pcm[i * 2], s_eq.state_l);
-      float r = process_chain((float)pcm[i * 2 + 1], s_eq.state_r);
-      pcm[i * 2] = saturate_s16(l);
-      pcm[i * 2 + 1] = saturate_s16(r);
-    }
-    return;
-  }
-
-  /* Mono/Left/Right are one signal duplicated to both I2S channels, so run
-   * only one biquad chain. This halves EQ work in these modes. */
   for (size_t i = 0; i < frames; ++i) {
-    float x;
-    if (mode == AUDIO_EQ_CHANNEL_LEFT) {
-      x = (float)pcm[i * 2];
-    } else if (mode == AUDIO_EQ_CHANNEL_RIGHT) {
-      x = (float)pcm[i * 2 + 1];
-    } else {
-      x = 0.5f * ((float)pcm[i * 2] + (float)pcm[i * 2 + 1]);
+    const float in_l = (float)pcm[i * 2];
+    const float in_r = (float)pcm[i * 2 + 1];
+    float source_l;
+    float source_r;
+
+    switch (mode) {
+      case AUDIO_EQ_CHANNEL_MONO: {
+        const float mono = 0.5f * (in_l + in_r);
+        source_l = mono;
+        source_r = mono;
+        break;
+      }
+      case AUDIO_EQ_CHANNEL_LEFT:
+        source_l = in_l;
+        source_r = in_l;
+        break;
+      case AUDIO_EQ_CHANNEL_RIGHT:
+        source_l = in_r;
+        source_r = in_r;
+        break;
+      case AUDIO_EQ_CHANNEL_STEREO:
+      default:
+        source_l = in_l;
+        source_r = in_r;
+        break;
     }
-    const int16_t out = saturate_s16(process_chain(x, s_eq.state_l));
-    pcm[i * 2] = out;
-    pcm[i * 2 + 1] = out;
+
+    const float out_l =
+        process_chain(source_l, &s_eq.config.left, s_eq.coeff_l, s_eq.state_l);
+    const float out_r = process_chain(source_r, &s_eq.config.right,
+                                      s_eq.coeff_r, s_eq.state_r);
+    pcm[i * 2] = saturate_s16(out_l);
+    pcm[i * 2 + 1] = saturate_s16(out_r);
   }
 }
 

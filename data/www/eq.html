@@ -2,48 +2,54 @@
 <meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>AirPlay Audio EQ</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);min-height:100vh;padding:20px;color:#fff}.wrap{max-width:760px;margin:0 auto}.header{text-align:center;padding:24px 0}.header h1{font-size:26px;font-weight:600;margin-bottom:8px}.header p,.hint{color:#9aa0ad;font-size:13px}.card{background:rgba(255,255,255,.05);backdrop-filter:blur(10px);border-radius:16px;padding:20px;margin-bottom:16px;border:1px solid rgba(255,255,255,.1)}.card h2{font-size:16px;font-weight:600;margin-bottom:16px;color:#e94560}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.form-group{margin-bottom:14px}.form-group label{display:block;font-size:11px;color:#999;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}input[type=number],select{width:100%;padding:11px 12px;background:#10172b;border:1px solid rgba(255,255,255,.14);border-radius:8px;color:#fff;font-size:14px}input:focus,select:focus{outline:none;border-color:#e94560}.toggle{display:flex;align-items:center;gap:10px;margin-bottom:16px}.filter{background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px;margin-bottom:10px}.filter-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.filter-title{font-weight:600;font-size:14px}.filter-grid{display:grid;grid-template-columns:1.1fr 1fr 1fr 1fr;gap:10px}.filter-grid .form-group{margin:0}.btn{display:inline-block;padding:11px 18px;border:none;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;text-decoration:none}.btn-primary{background:#e94560;color:#fff}.btn-secondary{background:rgba(255,255,255,.1);color:#fff}.btn-danger{background:#5c1a1a;color:#fff}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.msg{padding:10px;border-radius:6px;margin-top:12px;font-size:13px}.msg.ok{background:rgba(27,67,50,.65)}.msg.err{background:rgba(92,26,26,.65)}.msg.info{background:rgba(15,52,96,.65)}.disabled{opacity:.55}@media(max-width:650px){.grid,.filter-grid{grid-template-columns:1fr 1fr}.wrap{max-width:100%}}@media(max-width:430px){.grid,.filter-grid{grid-template-columns:1fr}}
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);min-height:100vh;padding:20px;color:#fff}.wrap{max-width:900px;margin:0 auto}.header{text-align:center;padding:24px 0}.header h1{font-size:26px;font-weight:600;margin-bottom:8px}.header p,.hint{color:#9aa0ad;font-size:13px}.card{background:rgba(255,255,255,.05);backdrop-filter:blur(10px);border-radius:16px;padding:20px;margin-bottom:16px;border:1px solid rgba(255,255,255,.1)}.card h2{font-size:16px;font-weight:600;margin-bottom:16px;color:#e94560}.output-title{display:flex;justify-content:space-between;align-items:center;gap:10px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.form-group{margin-bottom:14px}.form-group label{display:block;font-size:11px;color:#999;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px}input[type=number],select{width:100%;padding:11px 12px;background:#10172b;border:1px solid rgba(255,255,255,.14);border-radius:8px;color:#fff;font-size:14px}input:focus,select:focus{outline:none;border-color:#e94560}.toggle{display:flex;align-items:center;gap:10px;margin-bottom:16px}.filter{background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:14px;margin-bottom:10px}.filter-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.filter-title{font-weight:600;font-size:14px}.filter-grid{display:grid;grid-template-columns:1.1fr 1fr 1fr 1fr;gap:10px}.filter-grid .form-group{margin:0}.btn{display:inline-block;padding:11px 18px;border:none;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;text-decoration:none}.btn-primary{background:#e94560;color:#fff}.btn-secondary{background:rgba(255,255,255,.1);color:#fff}.btn-danger{background:#5c1a1a;color:#fff}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}.msg{padding:10px;border-radius:6px;margin-top:12px;font-size:13px}.msg.ok{background:rgba(27,67,50,.65)}.msg.err{background:rgba(92,26,26,.65)}.msg.info{background:rgba(15,52,96,.65)}.disabled{opacity:.55}.count{font-size:12px;color:#9aa0ad}@media(max-width:650px){.grid,.filter-grid{grid-template-columns:1fr 1fr}.wrap{max-width:100%}}@media(max-width:430px){.grid,.filter-grid{grid-template-columns:1fr}}
 </style></head><body><div class='wrap'>
-<div class='header'><h1>Audio EQ</h1><p>Biquad filters are saved to NVS and applied after restart.</p></div>
+<div class='header'><h1>Audio EQ</h1><p>Independent biquad chains for the left and right physical outputs.</p></div>
 <div class='card'>
-<h2>Output & Headroom</h2>
+<h2>Source & Headroom</h2>
 <div class='toggle'><input type='checkbox' id='eq-enabled'><label for='eq-enabled'>Enable EQ and preamp</label></div>
 <div class='grid'>
-<div class='form-group'><label>Channel mode</label><select id='channel-mode'><option value='stereo'>Stereo (L→L, R→R)</option><option value='mono'>Mono ((L+R)/2 → both)</option><option value='left'>Left input → both</option><option value='right'>Right input → both</option></select></div>
+<div class='form-group'><label>Source mode</label><select id='channel-mode'><option value='stereo'>Stereo (L→Left EQ, R→Right EQ)</option><option value='mono'>Mono ((L+R)/2 → both EQ chains)</option><option value='left'>Left input → both EQ chains</option><option value='right'>Right input → both EQ chains</option></select></div>
 <div class='form-group'><label>Preamp (dB)</label><input type='number' id='preamp' min='-24' max='0' step='0.1' value='0'></div>
 </div>
-<p class='hint'>Use a negative preamp when filters boost frequencies to keep headroom and avoid clipping.</p>
+<p class='hint'>Each physical output always has its own independent filters. In Mono, Left and Right receive the same mono source but are processed separately, so one output can be low-pass and the other high-pass.</p>
 </div>
 <div class='card'>
-<h2>Biquad Filters</h2>
-<div id='filters'></div>
-<div class='actions'><button class='btn btn-secondary' onclick='addFilter()'>+ Add Filter</button></div>
-<p class='hint' style='margin-top:12px'>PK uses Frequency/Gain/Q. LP, HP, BP and Notch use Frequency/Q. LS and HS use Frequency/Gain; Q is retained but not used by the supplied shelf equations.</p>
+<div class='output-title'><h2>Left Output Filters</h2><span id='left-count' class='count'></span></div>
+<div id='left-filters'></div>
+<div class='actions'><button class='btn btn-secondary' onclick="addFilter('left')">+ Add Left Filter</button></div>
+</div>
+<div class='card'>
+<div class='output-title'><h2>Right Output Filters</h2><span id='right-count' class='count'></span></div>
+<div id='right-filters'></div>
+<div class='actions'><button class='btn btn-secondary' onclick="addFilter('right')">+ Add Right Filter</button></div>
+<p class='hint' style='margin-top:12px'>Up to 24 filters per output. PK uses Frequency/Gain/Q. LP, HP, BP and Notch use Frequency/Q. LS and HS use Frequency/Gain.</p>
 </div>
 <div class='card'>
 <h2>Apply</h2>
-<p class='hint'>Settings are not changed live. Save writes one configuration to NVS, then the ESP restarts and builds all coefficients from a clean filter state.</p>
+<p class='hint'>Settings are not changed live. Save writes the complete configuration to NVS, then the ESP restarts and builds both filter chains from clean state.</p>
 <div class='actions'><button class='btn btn-primary' id='save-btn' onclick='saveEq()'>Save & Restart</button><a href='/' class='btn btn-secondary'>Back</a></div>
 <div id='eq-msg'></div>
 </div>
 </div><script>
-const MAX_FILTERS=12;
+const MAX_FILTERS=24;
 function msg(txt,type){var e=document.getElementById('eq-msg');e.innerHTML='<div class="msg '+type+'">'+txt+'</div>';}
 function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function box(side){return document.getElementById(side+'-filters');}
 function filterHtml(f){var types=['PK','LP','HP','BP','NOTCH','LS','HS'];return '<div class="filter">'+
 '<div class="filter-head"><div><input class="f-enabled" type="checkbox" '+(f.enabled!==false?'checked':'')+'> <span class="filter-title">Filter</span></div><button class="btn btn-danger" onclick="removeFilter(this)">Delete</button></div>'+
 '<div class="filter-grid">'+
 '<div class="form-group"><label>Type</label><select class="f-type" onchange="updateFilterUi(this)">'+types.map(t=>'<option value="'+t+'" '+(t===(f.type||'PK')?'selected':'')+'>'+t+'</option>').join('')+'</select></div>'+
 '<div class="form-group"><label>Frequency Hz</label><input class="f-freq" type="number" min="10" max="20000" step="0.01" value="'+esc(f.frequency_hz??1000)+'"></div>'+
 '<div class="form-group gain-group"><label>Gain dB</label><input class="f-gain" type="number" min="-24" max="24" step="0.1" value="'+esc(f.gain_db??0)+'"></div>'+
-'<div class="form-group q-group"><label>Q</label><input class="f-q" type="number" min="0.05" max="50" step="0.001" value="'+esc(f.q??0.707)+'"></div>'+
-'</div></div>';}
-function renumber(){document.querySelectorAll('.filter').forEach((el,i)=>{el.querySelector('.filter-title').textContent='Filter '+(i+1);updateFilterUi(el.querySelector('.f-type'));});}
-function addFilter(f={enabled:true,type:'PK',frequency_hz:1000,gain_db:0,q:0.707}){var box=document.getElementById('filters');if(box.children.length>=MAX_FILTERS){msg('Maximum '+MAX_FILTERS+' filters.','err');return;}box.insertAdjacentHTML('beforeend',filterHtml(f));renumber();}
-function removeFilter(btn){btn.closest('.filter').remove();renumber();}
-function updateFilterUi(sel){var row=sel.closest('.filter'),type=sel.value;var gain=row.querySelector('.gain-group'),q=row.querySelector('.q-group');gain.classList.toggle('disabled',!['PK','LS','HS'].includes(type));q.classList.toggle('disabled',['LS','HS'].includes(type));}
-async function loadEq(){try{var r=await fetch('/api/eq');var d=await r.json();if(!d.success)throw new Error();document.getElementById('eq-enabled').checked=!!d.enabled;document.getElementById('channel-mode').value=d.channel_mode||'stereo';document.getElementById('preamp').value=d.preamp_db??0;document.getElementById('filters').innerHTML='';(d.filters||[]).forEach(addFilter);}catch(e){msg('Failed to load EQ settings.','err');}}
-function collect(){var filters=[...document.querySelectorAll('.filter')].map(el=>({enabled:el.querySelector('.f-enabled').checked,type:el.querySelector('.f-type').value,frequency_hz:Number(el.querySelector('.f-freq').value),gain_db:Number(el.querySelector('.f-gain').value),q:Number(el.querySelector('.f-q').value)}));return{enabled:document.getElementById('eq-enabled').checked,channel_mode:document.getElementById('channel-mode').value,preamp_db:Number(document.getElementById('preamp').value),filters:filters};}
+'<div class="form-group q-group"><label>Q</label><input class="f-q" type="number" min="0.05" max="50" step="0.001" value="'+esc(f.q??0.707)+'"></div></div></div>';}
+function renumber(side){[...box(side).children].forEach((el,i)=>{el.querySelector('.filter-title').textContent=(side==='left'?'Left ':'Right ')+'Filter '+(i+1);updateFilterUi(el.querySelector('.f-type'));});document.getElementById(side+'-count').textContent=box(side).children.length+' / '+MAX_FILTERS;}
+function addFilter(side,f={enabled:true,type:'PK',frequency_hz:1000,gain_db:0,q:0.707}){if(box(side).children.length>=MAX_FILTERS){msg('Maximum '+MAX_FILTERS+' filters per output.','err');return;}box(side).insertAdjacentHTML('beforeend',filterHtml(f));renumber(side);}
+function removeFilter(btn){var container=btn.closest('[id$="-filters"]');var side=container.id.startsWith('left')?'left':'right';btn.closest('.filter').remove();renumber(side);}
+function updateFilterUi(sel){var row=sel.closest('.filter'),type=sel.value;row.querySelector('.gain-group').classList.toggle('disabled',!['PK','LS','HS'].includes(type));row.querySelector('.q-group').classList.toggle('disabled',['LS','HS'].includes(type));}
+function collectSide(side){return [...box(side).querySelectorAll('.filter')].map(el=>({enabled:el.querySelector('.f-enabled').checked,type:el.querySelector('.f-type').value,frequency_hz:Number(el.querySelector('.f-freq').value),gain_db:Number(el.querySelector('.f-gain').value),q:Number(el.querySelector('.f-q').value)}));}
+async function loadEq(){try{var r=await fetch('/api/eq');var d=await r.json();if(!d.success)throw new Error();document.getElementById('eq-enabled').checked=!!d.enabled;document.getElementById('channel-mode').value=d.channel_mode||'stereo';document.getElementById('preamp').value=d.preamp_db??0;box('left').innerHTML='';box('right').innerHTML='';(d.left_filters||[]).forEach(f=>addFilter('left',f));(d.right_filters||[]).forEach(f=>addFilter('right',f));renumber('left');renumber('right');}catch(e){msg('Failed to load EQ settings.','err');}}
+function collect(){return{enabled:document.getElementById('eq-enabled').checked,channel_mode:document.getElementById('channel-mode').value,preamp_db:Number(document.getElementById('preamp').value),left_filters:collectSide('left'),right_filters:collectSide('right')};}
 async function saveEq(){var b=document.getElementById('save-btn');b.disabled=true;msg('Saving settings...','info');try{var r=await fetch('/api/eq',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});if(!r.ok){var t=await r.text();throw new Error(t||'Invalid settings');}var d=await r.json();if(d.success){msg('Saved. Device is restarting...','ok');setTimeout(()=>location.href='/',5000);}else throw new Error('Save failed');}catch(e){b.disabled=false;msg('Save failed: '+esc(e.message),'err');}}
 window.onload=loadEq;
 </script></body></html>

@@ -93,15 +93,10 @@ static esp_err_t device_name_handler(httpd_req_t *req){
   char *out=cJSON_PrintUnformatted(r); httpd_resp_set_type(req,"application/json"); httpd_resp_sendstr(req,out); free(out); cJSON_Delete(r); if(j)cJSON_Delete(j); return ESP_OK;
 }
 
-static void eq_config_to_json(const audio_eq_config_t *cfg, cJSON *root) {
-  cJSON_AddBoolToObject(root, "enabled", cfg->enabled != 0);
-  cJSON_AddStringToObject(
-      root, "channel_mode",
-      audio_eq_channel_mode_name((audio_eq_channel_mode_t)cfg->channel_mode));
-  cJSON_AddNumberToObject(root, "preamp_db", cfg->preamp_db);
-  cJSON *filters = cJSON_AddArrayToObject(root, "filters");
-  for (uint8_t i = 0; i < cfg->filter_count; ++i) {
-    const audio_eq_filter_config_t *f = &cfg->filters[i];
+static void eq_output_to_json(const audio_eq_output_config_t *output,
+                              cJSON *array) {
+  for (uint8_t i = 0; i < output->filter_count; ++i) {
+    const audio_eq_filter_config_t *f = &output->filters[i];
     cJSON *item = cJSON_CreateObject();
     cJSON_AddBoolToObject(item, "enabled", f->enabled != 0);
     cJSON_AddStringToObject(
@@ -110,8 +105,20 @@ static void eq_config_to_json(const audio_eq_config_t *cfg, cJSON *root) {
     cJSON_AddNumberToObject(item, "frequency_hz", f->frequency_hz);
     cJSON_AddNumberToObject(item, "gain_db", f->gain_db);
     cJSON_AddNumberToObject(item, "q", f->q);
-    cJSON_AddItemToArray(filters, item);
+    cJSON_AddItemToArray(array, item);
   }
+}
+
+static void eq_config_to_json(const audio_eq_config_t *cfg, cJSON *root) {
+  cJSON_AddBoolToObject(root, "enabled", cfg->enabled != 0);
+  cJSON_AddStringToObject(
+      root, "channel_mode",
+      audio_eq_channel_mode_name((audio_eq_channel_mode_t)cfg->channel_mode));
+  cJSON_AddNumberToObject(root, "preamp_db", cfg->preamp_db);
+  cJSON *left = cJSON_AddArrayToObject(root, "left_filters");
+  cJSON *right = cJSON_AddArrayToObject(root, "right_filters");
+  eq_output_to_json(&cfg->left, left);
+  eq_output_to_json(&cfg->right, right);
 }
 
 static esp_err_t eq_get_handler(httpd_req_t *req) {
@@ -141,8 +148,34 @@ static bool json_number(const cJSON *obj, const char *name, float *out) {
   return true;
 }
 
+static bool parse_eq_output(cJSON *array, audio_eq_output_config_t *output) {
+  if (!cJSON_IsArray(array) || !output) return false;
+  const int count = cJSON_GetArraySize(array);
+  if (count < 0 || count > (int)AUDIO_EQ_MAX_FILTERS_PER_CHANNEL) return false;
+  output->filter_count = (uint8_t)count;
+
+  for (int i = 0; i < count; ++i) {
+    cJSON *item = cJSON_GetArrayItem(array, i);
+    if (!cJSON_IsObject(item)) return false;
+    cJSON *f_enabled = cJSON_GetObjectItemCaseSensitive(item, "enabled");
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(item, "type");
+    audio_eq_filter_type_t parsed_type;
+    audio_eq_filter_config_t *f = &output->filters[i];
+    if (!cJSON_IsBool(f_enabled) || !cJSON_IsString(type) ||
+        !audio_eq_filter_type_from_name(type->valuestring, &parsed_type) ||
+        !json_number(item, "frequency_hz", &f->frequency_hz) ||
+        !json_number(item, "gain_db", &f->gain_db) ||
+        !json_number(item, "q", &f->q)) {
+      return false;
+    }
+    f->enabled = cJSON_IsTrue(f_enabled) ? 1U : 0U;
+    f->type = (uint8_t)parsed_type;
+  }
+  return true;
+}
+
 static esp_err_t eq_post_handler(httpd_req_t *req) {
-  if (req->content_len <= 0 || req->content_len > 8192) {
+  if (req->content_len <= 0 || req->content_len > 16384) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid EQ body");
     return ESP_FAIL;
   }
@@ -168,59 +201,27 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
 
   audio_eq_config_t cfg;
   audio_eq_default_config(&cfg);
-  bool valid = true;
-
   cJSON *enabled = cJSON_GetObjectItemCaseSensitive(root, "enabled");
   cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "channel_mode");
-  cJSON *filters = cJSON_GetObjectItemCaseSensitive(root, "filters");
+  cJSON *left = cJSON_GetObjectItemCaseSensitive(root, "left_filters");
+  cJSON *right = cJSON_GetObjectItemCaseSensitive(root, "right_filters");
   audio_eq_channel_mode_t parsed_mode;
 
-  if (!cJSON_IsBool(enabled) || !cJSON_IsString(mode) ||
-      !audio_eq_channel_mode_from_name(mode->valuestring, &parsed_mode) ||
-      !json_number(root, "preamp_db", &cfg.preamp_db) ||
-      !cJSON_IsArray(filters)) {
-    valid = false;
-  }
+  bool valid = cJSON_IsBool(enabled) && cJSON_IsString(mode) &&
+               audio_eq_channel_mode_from_name(mode->valuestring, &parsed_mode) &&
+               json_number(root, "preamp_db", &cfg.preamp_db) &&
+               parse_eq_output(left, &cfg.left) &&
+               parse_eq_output(right, &cfg.right);
 
   if (valid) {
     cfg.enabled = cJSON_IsTrue(enabled) ? 1U : 0U;
     cfg.channel_mode = (uint8_t)parsed_mode;
-    const int count = cJSON_GetArraySize(filters);
-    if (count < 0 || count > (int)AUDIO_EQ_MAX_FILTERS) {
-      valid = false;
-    } else {
-      cfg.filter_count = (uint8_t)count;
-      for (int i = 0; i < count && valid; ++i) {
-        cJSON *item = cJSON_GetArrayItem(filters, i);
-        if (!cJSON_IsObject(item)) {
-          valid = false;
-          break;
-        }
-        cJSON *f_enabled = cJSON_GetObjectItemCaseSensitive(item, "enabled");
-        cJSON *type = cJSON_GetObjectItemCaseSensitive(item, "type");
-        audio_eq_filter_type_t parsed_type;
-        audio_eq_filter_config_t *f = &cfg.filters[i];
-        if (!cJSON_IsBool(f_enabled) ||
-            !cJSON_IsString(type) ||
-            !audio_eq_filter_type_from_name(type->valuestring, &parsed_type) ||
-            !json_number(item, "frequency_hz", &f->frequency_hz) ||
-            !json_number(item, "gain_db", &f->gain_db) ||
-            !json_number(item, "q", &f->q)) {
-          valid = false;
-          break;
-        }
-        f->enabled = cJSON_IsTrue(f_enabled) ? 1U : 0U;
-        f->type = (uint8_t)parsed_type;
-      }
-    }
+    valid = audio_eq_validate_config(&cfg);
   }
-
-  if (valid) valid = audio_eq_validate_config(&cfg);
   cJSON_Delete(root);
 
   if (!valid) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                        "Invalid EQ settings");
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid EQ settings");
     return ESP_ERR_INVALID_ARG;
   }
 
