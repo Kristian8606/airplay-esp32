@@ -1,4 +1,5 @@
 #include "audio_receiver.h"
+#include "audio_eq.h"
 #include "dns_server.h"
 #include "hap.h"
 #include "log_stream.h"
@@ -40,6 +41,7 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(e);
   ESP_ERROR_CHECK(settings_init());
+  ESP_ERROR_CHECK(audio_eq_init());
   ESP_ERROR_CHECK(spiffs_storage_init());
   ESP_ERROR_CHECK(log_stream_init());
 

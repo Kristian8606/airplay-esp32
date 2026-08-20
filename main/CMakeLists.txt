@@ -2,6 +2,7 @@ set(SRC_FILES
     "main.c"
     "settings.c"
     "audio/audio_receiver.c"
+    "audio/audio_eq.c"
     "audio/aac_decoder.c"
     "audio/aac_rtp_ring.c"
     "audio/pcm_rtp_ring.c"

@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "aac_decoder.h"
+#include "audio_eq.h"
 #include "audio_crypto.h"
 #include "aac_rtp_ring.h"
 #include "pcm_rtp_ring.h"
@@ -554,6 +555,7 @@ static void ap2_decode_task(void *arg) {
       decode_generation = snap.generation;
       next_decode_valid = false;
       decoder_format_generation = 0;
+      audio_eq_reset_state();
     }
 
     /* Compressed AAC may accumulate before the anchor. Decode only when a
@@ -674,6 +676,11 @@ static void ap2_decode_task(void *arg) {
         s.public_stats.packets_dropped++;
         next_decode_valid = false;
       } else {
+        /* DSP is deliberately outside the high-priority PTP/I2S playout path.
+         * It changes sample values only; RTP positions and timing are untouched. */
+        audio_eq_process(s.decode_pcm, (size_t)frames, info.channels,
+                         snap.format.sample_rate);
+
         uint32_t current_wanted = 0;
         bool current_wanted_valid = wanted_rtp_now(&snap, &current_wanted);
         bool stored = pcm_rtp_ring_write(
