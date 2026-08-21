@@ -1,10 +1,12 @@
 #include "aac_rtp_ring.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #define AAC_RING_MASK (AAC_RTP_SLOT_COUNT - 1U)
 
@@ -36,6 +38,15 @@ struct aac_rtp_ring {
   uint64_t oversized;
   uint64_t duplicates;
   uint64_t stale_replaced;
+  uint64_t reject_busy;
+  uint64_t reject_older;
+  uint64_t reject_cas;
+
+  /* Diagnostic log limiter only. Never affects ring/store behavior. */
+  int64_t diag_window_start_us;
+  uint32_t diag_logged_in_window;
+  uint32_t diag_suppressed_in_window;
+  uint64_t diag_suppressed_total;
 };
 
 static const char *TAG = "aac_rtp_ring";
@@ -108,53 +119,99 @@ void aac_rtp_ring_set_generation(aac_rtp_ring_t *r, uint32_t generation) {
   __atomic_store_n(&r->ready_slots, 0U, __ATOMIC_RELEASE);
 }
 
-uint32_t aac_rtp_ring_invalidate_range(aac_rtp_ring_t *r, uint32_t from_rtp,
-                                       uint32_t until_rtp,
-                                       uint32_t generation) {
-  if (!r || rtp_delta(until_rtp, from_rtp) <= 0 ||
-      generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
-    return 0;
+typedef enum {
+  AAC_REJECT_NONE = 0,
+  AAC_REJECT_DUPLICATE,
+  AAC_REJECT_BUSY,
+  AAC_REJECT_OLDER,
+  AAC_REJECT_CAS,
+} aac_reject_reason_t;
+
+typedef struct {
+  aac_reject_reason_t reason;
+  uint32_t state;
+  uint32_t old_rtp;
+  uint32_t old_generation;
+} aac_reject_info_t;
+
+static const char *reject_reason_name(aac_reject_reason_t reason) {
+  switch (reason) {
+  case AAC_REJECT_DUPLICATE:
+    return "duplicate";
+  case AAC_REJECT_BUSY:
+    return "busy";
+  case AAC_REJECT_OLDER:
+    return "older";
+  case AAC_REJECT_CAS:
+    return "cas";
+  default:
+    return "none";
+  }
+}
+
+#define AAC_REJECT_LOG_WINDOW_US (2000000LL)
+#define AAC_REJECT_LOG_BURST      4U
+
+static void log_reject_rate_limited(aac_rtp_ring_t *r,
+                                    const aac_reject_info_t *reject,
+                                    uint32_t slot, uint32_t seq, uint32_t rtp,
+                                    uint32_t generation, uint32_t wanted_rtp,
+                                    bool wanted_valid) {
+  if (!r || !reject || reject->reason == AAC_REJECT_DUPLICATE) {
+    return;
   }
 
-  uint32_t invalidated = 0;
-  for (uint32_t slot = 0; slot < AAC_RTP_SLOT_COUNT; ++slot) {
-    aac_slot_tag_t *tag = &r->tags[slot];
-    if (__atomic_load_n(&tag->state, __ATOMIC_ACQUIRE) != AAC_SLOT_READY ||
-        tag->generation != generation) {
-      continue;
+  const int64_t now = esp_timer_get_time();
+  if (r->diag_window_start_us == 0 ||
+      now - r->diag_window_start_us >= AAC_REJECT_LOG_WINDOW_US) {
+    if (r->diag_suppressed_in_window > 0) {
+      ESP_LOGW(TAG,
+               "STORE REJECT summary suppressed=%u total_suppressed=%llu | counters busy=%llu older=%llu cas=%llu",
+               (unsigned)r->diag_suppressed_in_window,
+               (unsigned long long)r->diag_suppressed_total,
+               (unsigned long long)r->reject_busy,
+               (unsigned long long)r->reject_older,
+               (unsigned long long)r->reject_cas);
     }
-
-    const uint32_t au_rtp = tag->rtp;
-    const bool overlaps =
-        rtp_delta(au_rtp + AAC_RTP_FRAME_SAMPLES, from_rtp) > 0 &&
-        rtp_delta(au_rtp, until_rtp) < 0;
-    if (!overlaps) {
-      continue;
-    }
-
-    uint32_t expected = AAC_SLOT_READY;
-    if (__atomic_compare_exchange_n(&tag->state, &expected, AAC_SLOT_WRITING,
-                                    false, __ATOMIC_ACQ_REL,
-                                    __ATOMIC_ACQUIRE)) {
-      tag->len = 0;
-      __atomic_store_n(&tag->state, AAC_SLOT_FREE, __ATOMIC_RELEASE);
-      uint32_t ready = __atomic_load_n(&r->ready_slots, __ATOMIC_RELAXED);
-      if (ready > 0) {
-        __atomic_sub_fetch(&r->ready_slots, 1U, __ATOMIC_RELAXED);
-      }
-      invalidated++;
-    }
+    r->diag_window_start_us = now;
+    r->diag_logged_in_window = 0;
+    r->diag_suppressed_in_window = 0;
   }
-  return invalidated;
+
+  if (r->diag_logged_in_window >= AAC_REJECT_LOG_BURST) {
+    r->diag_suppressed_in_window++;
+    r->diag_suppressed_total++;
+    return;
+  }
+
+  r->diag_logged_in_window++;
+  const int32_t old_to_new = rtp_delta(reject->old_rtp, rtp);
+  const int32_t new_to_wanted =
+      wanted_valid ? rtp_delta(rtp, wanted_rtp) : INT32_MIN;
+  const int32_t old_to_wanted =
+      wanted_valid ? rtp_delta(reject->old_rtp, wanted_rtp) : INT32_MIN;
+  ESP_LOGW(TAG,
+           "STORE REJECT reason=%s slot=%u state=%u new_seq=%u new_rtp=%u old_rtp=%u old_gen=%u new_gen=%u old-new=%ld wanted=%s%u new-wanted=%ld old-wanted=%ld ready=%u",
+           reject_reason_name(reject->reason), (unsigned)slot,
+           (unsigned)reject->state, (unsigned)seq, (unsigned)rtp,
+           (unsigned)reject->old_rtp, (unsigned)reject->old_generation,
+           (unsigned)generation, (long)old_to_new,
+           wanted_valid ? "" : "NA/", (unsigned)wanted_rtp,
+           (long)new_to_wanted, (long)old_to_wanted,
+           (unsigned)__atomic_load_n(&r->ready_slots, __ATOMIC_RELAXED));
 }
 
 static bool claim_for_write(aac_rtp_ring_t *r, aac_slot_tag_t *tag,
                             uint32_t rtp, uint32_t generation,
                             uint32_t wanted_rtp, bool wanted_valid,
-                            bool *replacing_current) {
+                            bool *replacing_current,
+                            aac_reject_info_t *reject) {
   (void)wanted_rtp;
   (void)wanted_valid;
   *replacing_current = false;
+  if (reject) {
+    memset(reject, 0, sizeof(*reject));
+  }
 
   /*
    * V6 ring rule:
@@ -181,6 +238,13 @@ static bool claim_for_write(aac_rtp_ring_t *r, aac_slot_tag_t *tag,
     }
 
     if (state != AAC_SLOT_READY) {
+      if (reject) {
+        reject->reason = AAC_REJECT_BUSY;
+        reject->state = state;
+        reject->old_rtp = tag->rtp;
+        reject->old_generation = tag->generation;
+      }
+      r->reject_busy++;
       return false;
     }
 
@@ -189,6 +253,12 @@ static bool claim_for_write(aac_rtp_ring_t *r, aac_slot_tag_t *tag,
 
     if (old_gen == generation && old_rtp == rtp) {
       r->duplicates++;
+      if (reject) {
+        reject->reason = AAC_REJECT_DUPLICATE;
+        reject->state = state;
+        reject->old_rtp = old_rtp;
+        reject->old_generation = old_gen;
+      }
       return false;
     }
 
@@ -199,6 +269,13 @@ static bool claim_for_write(aac_rtp_ring_t *r, aac_slot_tag_t *tag,
       replace = true;
       *replacing_current = true;
     } else {
+      if (reject) {
+        reject->reason = AAC_REJECT_OLDER;
+        reject->state = state;
+        reject->old_rtp = old_rtp;
+        reject->old_generation = old_gen;
+      }
+      r->reject_older++;
       return false;
     }
 
@@ -212,6 +289,13 @@ static bool claim_for_write(aac_rtp_ring_t *r, aac_slot_tag_t *tag,
       return true;
     }
   }
+  if (reject) {
+    reject->reason = AAC_REJECT_CAS;
+    reject->state = __atomic_load_n(&tag->state, __ATOMIC_ACQUIRE);
+    reject->old_rtp = tag->rtp;
+    reject->old_generation = tag->generation;
+  }
+  r->reject_cas++;
   return false;
 }
 
@@ -231,12 +315,15 @@ bool aac_rtp_ring_store(aac_rtp_ring_t *r, uint32_t seq, uint32_t rtp,
   uint32_t slot = slot_for_rtp(rtp);
   aac_slot_tag_t *tag = &r->tags[slot];
   bool replacing_current = false;
+  aac_reject_info_t reject = {0};
   if (!claim_for_write(r, tag, rtp, generation, wanted_rtp, wanted_valid,
-                       &replacing_current)) {
-    /* A duplicate is not a capacity collision. */
-    if (!(tag->generation == generation && tag->rtp == rtp &&
-          __atomic_load_n(&tag->state, __ATOMIC_ACQUIRE) == AAC_SLOT_READY)) {
+                       &replacing_current, &reject)) {
+    /* A duplicate is not a capacity collision. All other rejects are logged
+     * with enough slot/timeline context to explain periodic AU loss. */
+    if (reject.reason != AAC_REJECT_DUPLICATE) {
       r->collisions++;
+      log_reject_rate_limited(r, &reject, slot, seq, rtp, generation,
+                              wanted_rtp, wanted_valid);
     }
     return false;
   }
@@ -365,6 +452,49 @@ bool aac_rtp_ring_take_at_or_after(aac_rtp_ring_t *r, uint32_t wanted_rtp,
   return false;
 }
 
+bool aac_rtp_ring_take_next_ready(aac_rtp_ring_t *r, uint32_t after_rtp,
+                                  uint32_t max_rtp, uint32_t generation,
+                                  uint8_t *out, size_t out_capacity,
+                                  aac_rtp_item_t *meta) {
+  if (!r || !out || generation !=
+                         __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
+    return false;
+  }
+
+  bool have = false;
+  uint32_t best_rtp = 0;
+  int32_t best_delta = INT32_MAX;
+
+  /* Recovery-only scan. Normal AAC decode still uses take_exact() and never
+   * pays this cost. A READY AU later in the same TCP stream proves that a
+   * missing exact RTP position will not arrive in-order later. Keep the jump
+   * bounded by max_rtp so recovery never pulls far-future audio into PCM. */
+  for (uint32_t slot = 0; slot < AAC_RTP_SLOT_COUNT; ++slot) {
+    uint32_t rtp = 0;
+    if (!inspect_ready(r, slot, generation, &rtp)) {
+      continue;
+    }
+    int32_t after_delta = rtp_delta(rtp, after_rtp);
+    if (after_delta <= 0) {
+      continue;
+    }
+    if (rtp_delta(rtp, max_rtp) > 0) {
+      continue;
+    }
+    if (!have || after_delta < best_delta) {
+      have = true;
+      best_rtp = rtp;
+      best_delta = after_delta;
+    }
+  }
+
+  if (!have) {
+    return false;
+  }
+  return aac_rtp_ring_take_exact(r, best_rtp, generation, out, out_capacity,
+                                 meta);
+}
+
 void aac_rtp_ring_get_stats(const aac_rtp_ring_t *r,
                             aac_rtp_ring_stats_t *out) {
   if (!r || !out) {
@@ -378,4 +508,7 @@ void aac_rtp_ring_get_stats(const aac_rtp_ring_t *r,
   out->oversized = r->oversized;
   out->duplicates = r->duplicates;
   out->stale_replaced = r->stale_replaced;
+  out->reject_busy = r->reject_busy;
+  out->reject_older = r->reject_older;
+  out->reject_cas = r->reject_cas;
 }

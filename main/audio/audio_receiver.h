@@ -73,8 +73,7 @@ bool audio_receiver_has_data(void);
 /* Timeline/generation control. These invalidate old PCM in O(1), no scan. */
 void audio_receiver_flush(void);
 void audio_receiver_seek_flush(void);
-void audio_receiver_flush_buffered_range(uint32_t flush_from_ts,
-                                         uint32_t flush_until_ts);
+void audio_receiver_set_deferred_flush(uint32_t flush_until_ts);
 void audio_receiver_pause(void);
 void audio_receiver_set_playing(bool playing);
 bool audio_receiver_is_playing(void);

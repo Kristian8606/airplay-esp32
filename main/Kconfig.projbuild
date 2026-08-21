@@ -46,3 +46,69 @@ menu "I2S Playout (V22)"
             this at the one-enable sample-alignment boundary. Keep 0 for normal
             use. Nonzero values are diagnostic/manual trim only.
 endmenu
+
+menu "RGB Audio/VU LED"
+    config ENABLE_RGB_AUDIO_LED
+        bool "Enable WS2812 RGB audio/VU LED"
+        default y
+        help
+            Enable a single WS2812 RGB LED driven from final PCM blocks that
+            are successfully submitted to I2S. Disable this option to remove
+            RGB/VU processing from the audio path.
+
+    config RGB_AUDIO_LED_GPIO
+        int "WS2812 data GPIO"
+        default 38
+        range 0 48
+        depends on ENABLE_RGB_AUDIO_LED
+        help
+            GPIO connected to the WS2812 data input. Use 38 on the current
+            board; boards with an onboard RGB LED often use GPIO 48.
+
+    config RGB_AUDIO_LED_BRIGHTNESS
+        int "Maximum RGB brightness (0-255)"
+        default 96
+        range 0 255
+        depends on ENABLE_RGB_AUDIO_LED
+
+    config RGB_AUDIO_LED_UPDATE_HZ
+        int "VU refresh rate (Hz)"
+        default 30
+        range 5 60
+        depends on ENABLE_RGB_AUDIO_LED
+        help
+            Limits RMS/bass calculation and WS2812 refresh frequency. The
+            upstream implementation uses approximately 30 Hz.
+
+    choice RGB_AUDIO_LED_PLAYING_MODE
+        prompt "LED mode while playing"
+        default RGB_AUDIO_LED_PLAYING_VU
+        depends on ENABLE_RGB_AUDIO_LED
+        config RGB_AUDIO_LED_PLAYING_VU
+            bool "VU / color music"
+        config RGB_AUDIO_LED_PLAYING_STEADY
+            bool "Steady green"
+        config RGB_AUDIO_LED_PLAYING_OFF
+            bool "Off"
+    endchoice
+
+    choice RGB_AUDIO_LED_PAUSED_MODE
+        prompt "LED mode while paused/connected"
+        default RGB_AUDIO_LED_PAUSED_STEADY
+        depends on ENABLE_RGB_AUDIO_LED
+        config RGB_AUDIO_LED_PAUSED_STEADY
+            bool "Steady blue"
+        config RGB_AUDIO_LED_PAUSED_OFF
+            bool "Off"
+    endchoice
+
+    choice RGB_AUDIO_LED_STANDBY_MODE
+        prompt "LED mode while disconnected/standby"
+        default RGB_AUDIO_LED_STANDBY_OFF
+        depends on ENABLE_RGB_AUDIO_LED
+        config RGB_AUDIO_LED_STANDBY_OFF
+            bool "Off"
+        config RGB_AUDIO_LED_STANDBY_STEADY
+            bool "Steady dim green"
+    endchoice
+endmenu

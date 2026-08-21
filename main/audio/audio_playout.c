@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "led.h"
 
 #define TAG "audio_playout"
 
@@ -288,6 +289,9 @@ esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
 
   if (err == ESP_OK && written == bytes) {
     __atomic_add_fetch(&s_submitted_frames, frames, __ATOMIC_RELAXED);
+    /* Diagnostic RGB/VU is deliberately fed from the final I2S submission
+     * path. When disabled in menuconfig this compiles to a no-op. */
+    led_audio_feed(stereo, frames);
     return ESP_OK;
   }
 

@@ -76,7 +76,6 @@
 #define AP2_TIMELINE_PAST_MS          1000U
 #define AP2_TIMELINE_FUTURE_MS       45000U
 #define AP2_DECODE_IDLE_TICKS       1U
-#define AP2_MAX_PENDING_FLUSH_RANGES 8U
 
 static const char *TAG = "audio_v22";
 
@@ -87,13 +86,6 @@ static volatile int32_t s_volume_target_q15 = 32768;
 static volatile uint32_t s_volume_cmd_count = 0;
 
 typedef struct {
-  bool in_use;
-  uint32_t from_rtp;
-  uint32_t until_rtp;
-  uint32_t generation;
-} pending_flush_range_t;
-
-typedef struct {
   bool anchor_valid;
   bool playing;
   uint64_t anchor_ptp_ns;
@@ -101,6 +93,8 @@ typedef struct {
   uint32_t generation;
   audio_format_t format;
   uint32_t format_generation;
+  bool deferred_flush_valid;
+  uint32_t deferred_flush_rtp;
   bool timeline_reset_pending;
   audio_stream_type_t stream_type;
   uint32_t playout_latency_samples;
@@ -118,6 +112,7 @@ typedef struct {
   uint64_t decode_error;
   uint64_t empty_payload;
   uint64_t generation_drop;
+  uint64_t decode_reacquires;
   uint64_t seq_gap;
   uint64_t rtp_gap;
   uint32_t last_seq;
@@ -195,7 +190,8 @@ typedef struct {
   uint32_t anchor_rtp;
   uint32_t generation;
   uint32_t format_generation;
-  pending_flush_range_t pending_flushes[AP2_MAX_PENDING_FLUSH_RANGES];
+  bool deferred_flush_valid;
+  uint32_t deferred_flush_rtp;
   bool timeline_reset_pending;
   uint32_t playout_latency_samples;
   uint32_t realtime_eq_generation;
@@ -223,6 +219,8 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->generation = s.generation;
   out->format = s.format;
   out->format_generation = s.format_generation;
+  out->deferred_flush_valid = s.deferred_flush_valid;
+  out->deferred_flush_rtp = s.deferred_flush_rtp;
   out->timeline_reset_pending = s.timeline_reset_pending;
   out->stream_type = s.stream_type;
   out->playout_latency_samples = s.playout_latency_samples;
@@ -234,6 +232,20 @@ static uint32_t next_generation(uint32_t generation) {
   return generation ? generation : 1U;
 }
 
+/* Consume only the deferred boundary observed by the caller.  A newer
+ * FLUSHBUFFERED may race the playout task, so never clear a replacement that
+ * was armed after the snapshot was taken. */
+static bool consume_deferred_flush_boundary(uint32_t expected_rtp) {
+  bool consumed = false;
+  taskENTER_CRITICAL(&s.state_mux);
+  if (s.deferred_flush_valid && s.deferred_flush_rtp == expected_rtp) {
+    s.deferred_flush_valid = false;
+    consumed = true;
+  }
+  taskEXIT_CRITICAL(&s.state_mux);
+  return consumed;
+}
+
 /* Immediate FLUSH/pause ends the current timeline now, but V8 deliberately
  * does not publish a new generation yet. TCP may keep arriving while the
  * anchor is invalid; those packets are provisional and will be made
@@ -241,7 +253,7 @@ static uint32_t next_generation(uint32_t generation) {
 static void mark_timeline_discontinuity(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.anchor_valid = false;
-  memset(s.pending_flushes, 0, sizeof(s.pending_flushes));
+  s.deferred_flush_valid = false;
   s.timeline_reset_pending = true;
   taskEXIT_CRITICAL(&s.state_mux);
   s.diag.last_decoded_end_rtp = 0;
@@ -262,7 +274,7 @@ static uint32_t commit_anchor_epoch_locked(void) {
     }
     s.generation = gen;
     s.timeline_reset_pending = false;
-    memset(s.pending_flushes, 0, sizeof(s.pending_flushes));
+    s.deferred_flush_valid = false;
     s.diag.last_decoded_end_rtp = 0;
   }
   return gen;
@@ -365,6 +377,37 @@ static bool rtp_in_admission_window(uint32_t rtp,
     *delta_samples_out = delta;
   }
   return delta >= past_limit && delta <= future_limit;
+}
+
+static void log_admission_drop(const char *stage, uint32_t seq, uint32_t rtp,
+                               const timing_snapshot_t *snap) {
+  uint32_t wanted = 0;
+  if (!wanted_rtp_now(snap, &wanted)) {
+    ESP_LOGW(TAG,
+             "AAC ADMISSION DROP stage=%s seq=%" PRIu32
+             " rtp=%" PRIu32 " gen=%" PRIu32 " reason=no_wanted",
+             stage, seq, rtp, snap->generation);
+    return;
+  }
+
+  const int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
+  const int32_t past_limit =
+      -(int32_t)(((int64_t)sr * AP2_TIMELINE_PAST_MS) / 1000LL);
+  const int32_t future_limit =
+      (int32_t)(((int64_t)sr * AP2_TIMELINE_FUTURE_MS) / 1000LL);
+  const int32_t delta = rtp_delta(rtp, wanted);
+  const double delta_ms = ((double)delta * 1000.0) / (double)sr;
+  const char *reason = delta < past_limit ? "too_old"
+                       : delta > future_limit ? "too_future"
+                                              : "inside_window";
+
+  ESP_LOGW(TAG,
+           "AAC ADMISSION DROP stage=%s reason=%s seq=%" PRIu32
+           " rtp=%" PRIu32 " wanted=%" PRIu32
+           " delta=%" PRId32 " (%+.3fms) limits=[%" PRId32 ",%" PRId32
+           "] gen=%" PRIu32,
+           stage, reason, seq, rtp, wanted, delta, delta_ms, past_limit,
+           future_limit, snap->generation);
 }
 
 static bool frame_is_fully_stale(uint32_t rtp, const timing_snapshot_t *snap,
@@ -487,6 +530,7 @@ static void ap2_rx_task(void *arg) {
       /* A packet far outside the current PTP/RTP timeline is a transition
        * leftover, not useful AAC for this committed generation. */
       if (!rtp_in_admission_window(rtp, &snap, NULL)) {
+        log_admission_drop("predecrypt", seq, rtp, &snap);
         s.diag.timeline_drop++;
         s.public_stats.packets_dropped++;
         continue;
@@ -518,6 +562,7 @@ static void ap2_rx_task(void *arg) {
        * before publishing the AU into the direct RTP ring. */
       snapshot_state(&snap);
       if (!rtp_in_admission_window(rtp, &snap, NULL)) {
+        log_admission_drop("prestore", seq, rtp, &snap);
         s.diag.timeline_drop++;
         s.public_stats.packets_dropped++;
         continue;
@@ -639,35 +684,6 @@ static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
   return true;
 }
 
-static void process_pending_flush_ranges(uint32_t generation) {
-  pending_flush_range_t local[AP2_MAX_PENDING_FLUSH_RANGES] = {0};
-  unsigned count = 0;
-
-  taskENTER_CRITICAL(&s.state_mux);
-  for (unsigned i = 0; i < AP2_MAX_PENDING_FLUSH_RANGES; ++i) {
-    pending_flush_range_t *f = &s.pending_flushes[i];
-    if (!f->in_use || f->generation != generation) {
-      continue;
-    }
-    local[count++] = *f;
-    memset(f, 0, sizeof(*f));
-  }
-  taskEXIT_CRITICAL(&s.state_mux);
-
-  for (unsigned i = 0; i < count; ++i) {
-    const pending_flush_range_t *f = &local[i];
-    uint32_t aac_invalidated = aac_rtp_ring_invalidate_range(
-        s.aac_ring, f->from_rtp, f->until_rtp, generation);
-    uint32_t pcm_invalidated = pcm_rtp_ring_invalidate_range(
-        s.pcm_ring, f->from_rtp, f->until_rtp, generation);
-    ESP_LOGI(TAG,
-             "FLUSHBUFFERED invalidated RTP=%" PRIu32 "..%" PRIu32
-             " aac=%" PRIu32 " pcm_frames=%" PRIu32 " gen=%" PRIu32,
-             f->from_rtp, f->until_rtp, aac_invalidated, pcm_invalidated,
-             generation);
-  }
-}
-
 static void ap2_decode_task(void *arg) {
   (void)arg;
   aac_decoder_t *decoder = NULL;
@@ -702,8 +718,6 @@ static void ap2_decode_task(void *arg) {
       audio_eq_reset_state();
     }
 
-    process_pending_flush_ranges(snap.generation);
-
     /* Compressed AAC may accumulate before the anchor. Decode only when a
      * real PTP/RTP playback cursor exists; this keeps PCM near the cursor. */
     uint32_t wanted = 0;
@@ -729,6 +743,20 @@ static void ap2_decode_task(void *arg) {
           s.aac_ring, wanted, snap.generation, s.decode_aac,
           AAC_RTP_SLOT_BYTES, &item);
     } else {
+      /* If the locked cursor fell far behind the live PTP cursor, do not walk
+       * hundreds of 1024-sample holes one by one. Drop only decoder
+       * continuity; the RTP/PTP timeline, rings and I2S scheduler stay intact. */
+      const int32_t behind = rtp_delta(wanted, next_decode_rtp);
+      if (behind > (int32_t)(8U * AAC_RTP_FRAME_SAMPLES)) {
+        ESP_LOGI(TAG,
+                 "AAC REACQUIRE stale-cursor old=%" PRIu32
+                 " wanted=%" PRIu32 " behind=%ld gen=%" PRIu32,
+                 next_decode_rtp, wanted, (long)behind, snap.generation);
+        next_decode_valid = false;
+        s.diag.decode_reacquires++;
+        continue;
+      }
+
       /* If a missing AU has already passed the cursor, skip its RTP position
        * rather than waiting forever for data that can no longer be useful. */
       if (rtp_delta(next_decode_rtp + AAC_RTP_FRAME_SAMPLES, wanted) <= 0) {
@@ -740,9 +768,37 @@ static void ap2_decode_task(void *arg) {
         }
         continue;
       }
+
       got = aac_rtp_ring_take_exact(
           s.aac_ring, next_decode_rtp, snap.generation, s.decode_aac,
           AAC_RTP_SLOT_BYTES, &item);
+
+      if (!got) {
+        /* Buffered TCP is ordered. If a later READY AU already exists in the
+         * current generation while this exact RTP is absent, waiting forever
+         * cannot repair the hole. Rarely scan for the nearest later AU, but
+         * only inside the normal PCM decode horizon. This preserves the
+         * physical RTP timeline: no anchor/cursor jump is performed. */
+        aac_rtp_ring_stats_t rs = {0};
+        aac_rtp_ring_get_stats(s.aac_ring, &rs);
+        if (rs.ready_slots > 0U) {
+          const uint32_t max_rtp = wanted + target_samples;
+          const uint32_t old_next = next_decode_rtp;
+          got = aac_rtp_ring_take_next_ready(
+              s.aac_ring, old_next, max_rtp, snap.generation, s.decode_aac,
+              AAC_RTP_SLOT_BYTES, &item);
+          if (got) {
+            const int32_t gap = rtp_delta(item.rtp, old_next);
+            ESP_LOGW(TAG,
+                     "AAC REACQUIRE exact-miss old=%" PRIu32
+                     " wanted=%" PRIu32 " found=%" PRIu32
+                     " gap=%ld ready=%u gen=%" PRIu32,
+                     old_next, wanted, item.rtp, (long)gap,
+                     (unsigned)rs.ready_slots, snap.generation);
+            s.diag.decode_reacquires++;
+          }
+        }
+      }
     }
 
     if (!got) {
@@ -1020,6 +1076,29 @@ static void ap2_playout_task(void *arg) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
     process_i2s_completions(&snap);
+
+    if (cursor_valid && state == PLAYOUT_RUNNING &&
+        snap.deferred_flush_valid &&
+        rtp_delta(cursor_rtp, snap.deferred_flush_rtp) >= 0) {
+      /* FLUSHBUFFERED is a content boundary, not necessarily a new timing
+       * epoch.  Buffered senders can continue streaming the replacement track
+       * on the same PTP/RTP mapping without sending another anchor.  The AAC
+       * decoder runs ~4 s ahead and v10 can already reacquire the replacement
+       * AU phase before playout reaches this point.  Therefore do NOT call
+       * mark_timeline_discontinuity(), do NOT flush I2S, and do NOT move the
+       * RTP cursor.  Consume this boundary and keep exact PTP/RTP playout.
+       *
+       * If an actual immediate FLUSH/pause/new epoch occurs, the existing
+       * mark_timeline_discontinuity()/anchor-generation path still owns it. */
+      if (consume_deferred_flush_boundary(snap.deferred_flush_rtp)) {
+        ESP_LOGI(TAG,
+                 "deferred flush boundary passed at rtp=%" PRIu32
+                 " until=%" PRIu32 " | continuing same timeline",
+                 cursor_rtp, snap.deferred_flush_rtp);
+      }
+      /* A newer deferred boundary may have raced this snapshot.  Either way,
+       * continue the current cursor; the next loop will observe current state. */
+    }
 
     uint32_t desired_rtp = 0;
     bool timeline_ok = false;
@@ -1448,6 +1527,7 @@ static void ap2_stats_task(void *arg) {
                   now.stale_predecrypt != prev.stale_predecrypt ||
                   now.stale_predecode != prev.stale_predecode ||
                   now.decode_error != prev.decode_error ||
+                  now.decode_reacquires != prev.decode_reacquires ||
                   now.aac_store_drop != prev.aac_store_drop ||
                   now.pcm_write_error != prev.pcm_write_error ||
                   aac.collisions != aac_prev.collisions ||
@@ -1508,22 +1588,25 @@ static void ap2_stats_task(void *arg) {
       ESP_LOGI(TAG,
                "SYNC=%+.2fms S=%+d/%+dppm d=%+.3fms/s | PCM=%dms AAC=%dms"
                " | U=%" PRIu64 " R=%" PRIu64 " DROP=%" PRIu64
-               " COLL=%" PRIu64 " DEC=%" PRIu64 " DMA=%" PRIu64,
+               " COLL=%" PRIu64 " DEC=%" PRIu64 " RA=%" PRIu64
+               " DMA=%" PRIu64,
                sync_ms, now.servo_ppm, now.servo_target_ppm,
                (double)now.servo_slope_us_per_s / 1000.0,
                pcm_ahead_ms, aac_buffer_ms,
                now.playout_underruns - prev.playout_underruns,
                now.playout_resyncs - prev.playout_resyncs, drops, collisions,
-               now.decode_error - prev.decode_error, dma_diag_err);
+               now.decode_error - prev.decode_error,
+               now.decode_reacquires - prev.decode_reacquires, dma_diag_err);
     } else {
       ESP_LOGI(TAG,
                "SYNC=-- | PCM=%dms AAC=%dms | U=%" PRIu64 " R=%" PRIu64
                " DROP=%" PRIu64 " COLL=%" PRIu64 " DEC=%" PRIu64
-               " DMA=%" PRIu64 " | %s",
+               " RA=%" PRIu64 " DMA=%" PRIu64 " | %s",
                pcm_ahead_ms, aac_buffer_ms,
                now.playout_underruns - prev.playout_underruns,
                now.playout_resyncs - prev.playout_resyncs, drops, collisions,
-               now.decode_error - prev.decode_error, dma_diag_err,
+               now.decode_error - prev.decode_error,
+               now.decode_reacquires - prev.decode_reacquires, dma_diag_err,
                now.playout_state == 1 ? "PRIME" : "STOP");
     }
     prev = now;
@@ -1746,47 +1829,12 @@ bool audio_receiver_has_data(void) { return false; }
 
 void audio_receiver_flush(void) { mark_timeline_discontinuity(); }
 void audio_receiver_seek_flush(void) { mark_timeline_discontinuity(); }
-void audio_receiver_flush_buffered_range(uint32_t from_ts, uint32_t until_ts) {
-  if (rtp_delta(until_ts, from_ts) <= 0) {
-    ESP_LOGW(TAG, "ignoring invalid FLUSHBUFFERED RTP range %" PRIu32
-                  "..%" PRIu32, from_ts, until_ts);
-    return;
-  }
-
-  int slot = -1;
-  uint32_t generation = 0;
+void audio_receiver_set_deferred_flush(uint32_t ts) {
   taskENTER_CRITICAL(&s.state_mux);
-  if (s.stream_type == AUDIO_STREAM_BUFFERED && !s.timeline_reset_pending) {
-    generation = s.generation;
-    for (unsigned i = 0; i < AP2_MAX_PENDING_FLUSH_RANGES; ++i) {
-      pending_flush_range_t *f = &s.pending_flushes[i];
-      if (f->in_use && f->generation == generation &&
-          f->from_rtp == from_ts && f->until_rtp == until_ts) {
-        slot = (int)i;
-        break;
-      }
-      if (!f->in_use && slot < 0) {
-        slot = (int)i;
-      }
-    }
-    if (slot >= 0) {
-      pending_flush_range_t *f = &s.pending_flushes[slot];
-      f->in_use = true;
-      f->from_rtp = from_ts;
-      f->until_rtp = until_ts;
-      f->generation = generation;
-    }
-  }
+  s.deferred_flush_rtp = ts;
+  s.deferred_flush_valid = true;
   taskEXIT_CRITICAL(&s.state_mux);
-
-  if (slot >= 0) {
-    ESP_LOGI(TAG, "FLUSHBUFFERED queued RTP=%" PRIu32 "..%" PRIu32
-                  " slot=%d gen=%" PRIu32,
-             from_ts, until_ts, slot, generation);
-  } else {
-    ESP_LOGW(TAG, "FLUSHBUFFERED range queue full/invalid state RTP=%" PRIu32
-                  "..%" PRIu32, from_ts, until_ts);
-  }
+  ESP_LOGI(TAG, "deferred flush armed for RTP=%" PRIu32, ts);
 }
 
 void audio_receiver_pause(void) {

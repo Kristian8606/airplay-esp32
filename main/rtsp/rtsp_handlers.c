@@ -1699,12 +1699,15 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
   size_t body_len = req->body_len;
 
   // AirPlay 2 FLUSHBUFFERED carries an optional bplist with:
-  //   flushFromSeq / flushFromTS   — start of buffered media to invalidate
-  //   flushUntilSeq / flushUntilTS — end of buffered media to invalidate
+  //   flushFromSeq / flushFromTS  — first sequence/timestamp to discard
+  //   flushUntilSeq / flushUntilTS — last sequence/timestamp to discard
   //
-  // If the range is present, invalidate only that already-buffered RTP range.
-  // The RTP/PTP timeline itself does not jump; replacement packets refill it.
-  // If the range is absent, this is an immediate flush/pause transition.
+  // If flushFromSeq is absent → immediate flush (stop and discard everything).
+  // If flushFromSeq is present → deferred flush: keep playing existing buffered
+  //   content until flushUntilTS is reached, then discard and start fresh.
+  //   The phone simultaneously starts streaming the new track, which fills the
+  //   buffer beyond flushUntilTS; audio_timing_read detects the boundary and
+  //   triggers the bulk-flush at the right moment.
   bool has_deferred = false;
   if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
     int64_t flush_from_seq = 0, flush_from_ts = 0;
@@ -1724,8 +1727,9 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
                "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
                " untilSeq=%" PRId64 " untilTS=%" PRId64,
                flush_from_seq, flush_from_ts, flush_until_seq, flush_until_ts);
-      audio_receiver_flush_buffered_range((uint32_t)flush_from_ts,
-                                          (uint32_t)flush_until_ts);
+      // Arm the deferred flush.  Do NOT flush the audio output immediately —
+      // let it drain naturally to the boundary so the current track finishes.
+      audio_receiver_set_deferred_flush((uint32_t)flush_until_ts);
     } else {
       ESP_LOGI(TAG, "FLUSHBUFFERED immediate (missing from/until fields)");
     }

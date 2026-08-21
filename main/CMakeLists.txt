@@ -1,6 +1,7 @@
 set(SRC_FILES
     "main.c"
     "settings.c"
+    "led.c"
     "audio/audio_receiver.c"
     "audio/audio_eq.c"
     "audio/aac_decoder.c"
