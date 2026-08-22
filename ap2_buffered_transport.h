@@ -18,6 +18,20 @@ typedef struct {
 typedef struct {
   uint64_t socket_bytes;
   uint64_t fifo_bytes_read;
+  uint64_t fifo_full_waits;
+  uint64_t fifo_empty_waits;
+  uint64_t recv_calls;
+  uint64_t recv_bursts;
+  uint64_t current_burst_bytes;
+  uint64_t last_burst_bytes;
+  uint64_t full_stall_events;
+  uint64_t full_stall_total_ms;
+  uint32_t full_stall_max_ms;
+  uint32_t last_recv_age_ms;
+  uint32_t max_recv_gap_ms;
+  int socket_pending_bytes;
+  int socket_rcvbuf_bytes;
+  size_t reader_limit_bytes;
   size_t fifo_occupancy;
   size_t fifo_high_water;
 } ap2_buffered_transport_stats_t;

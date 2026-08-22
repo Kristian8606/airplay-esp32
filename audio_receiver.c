@@ -83,6 +83,9 @@ static const char *TAG = "audio_shairport";
 
 /* Updated by RTSP control on Core0, consumed by playout on Core1. */
 static volatile int32_t s_volume_target_q15 = 32768;
+/* Number of output-volume target updates since the last compact STAT line.
+ * Kept atomic so RTSP/Core0 never needs to log or lock on the control path. */
+static volatile uint32_t s_volume_cmd_count = 0;
 
 typedef struct {
   bool in_use;
@@ -225,6 +228,7 @@ typedef struct {
   size_t immediate_flush_start_fifo;
   uint64_t immediate_flush_start_socket_bytes;
   uint64_t immediate_flush_start_fifo_read;
+  uint64_t immediate_flush_start_full_waits;
   ap2_flush_request_t deferred_flush[AP2_MAX_DEFERRED_FLUSH];
   uint32_t playout_latency_samples;
   uint32_t realtime_eq_generation;
@@ -407,6 +411,7 @@ static bool immediate_flush_should_drop(uint32_t seq) {
   size_t start_fifo = 0;
   uint64_t start_socket = 0;
   uint64_t start_read = 0;
+  uint64_t start_full_waits = 0;
 
   taskENTER_CRITICAL(&s.state_mux);
   if (s.immediate_flush_requested) {
@@ -421,6 +426,7 @@ static bool immediate_flush_should_drop(uint32_t seq) {
       start_fifo = s.immediate_flush_start_fifo;
       start_socket = s.immediate_flush_start_socket_bytes;
       start_read = s.immediate_flush_start_fifo_read;
+      start_full_waits = s.immediate_flush_start_full_waits;
       completed = s.immediate_flush_diag_active;
       s.immediate_flush_requested = false;
       s.immediate_flush_has_endpoint = false;
@@ -448,16 +454,19 @@ static bool immediate_flush_should_drop(uint32_t seq) {
     uint64_t dropped = s.diag.timeline_drop - start_drop;
     uint64_t drained = ts.fifo_bytes_read - start_read;
     uint64_t received = ts.socket_bytes - start_socket;
+    uint64_t bp_added = ts.fifo_full_waits - start_full_waits;
     ESP_LOGI(TAG,
-             "FLUSH complete seq=%" PRIu32 " until=%" PRIu32
+             "FLUSH immediate complete seq=%" PRIu32 " until=%" PRIu32
+             " overshoot=%" PRId32 " start_seq=%" PRIu32
              " elapsed=%.1fms dropped=%" PRIu64
-             " fifo=%u/%uKiB start=%uKiB drained=%" PRIu64
-             "KiB recv=%" PRIu64 "KiB",
-             seq, until_seq, (double)elapsed_us / 1000.0, dropped,
+             " fifo=%u/%uKiB(start=%uKiB) drained=%" PRIu64
+             "KiB recv=%" PRIu64 "KiB BP+=%" PRIu64,
+             seq, until_seq, seq23_delta(seq, until_seq), start_seq,
+             (double)elapsed_us / 1000.0, dropped,
              (unsigned)(ts.fifo_occupancy / 1024U),
              (unsigned)(ts.fifo_high_water / 1024U),
              (unsigned)(start_fifo / 1024U), drained / 1024U,
-             received / 1024U);
+             received / 1024U, bp_added);
   }
   return drop;
 }
@@ -1471,6 +1480,7 @@ static void ap2_stats_task(void *arg) {
   (void)arg;
   diag_stats_t prev = {0};
   pcm_rtp_ring_stats_t pcm_prev = {0};
+  ap2_buffered_transport_stats_t transport_prev = {0};
   unsigned idle_periods = 0;
   ESP_LOGI(TAG, "stats task started on core %d", xPortGetCoreID());
 
@@ -1539,6 +1549,9 @@ static void ap2_stats_task(void *arg) {
     audio_playout_get_diag(&pdiag);
     ap2_buffered_transport_stats_t transport = {0};
     if (s.transport) ap2_buffered_transport_get_stats(s.transport, &transport);
+    const uint64_t bp_delta = transport.fifo_full_waits - transport_prev.fifo_full_waits;
+    const int sock_k = transport.socket_pending_bytes >= 0 ? transport.socket_pending_bytes / 1024 : -1;
+    const int rcvbuf_k = transport.socket_rcvbuf_bytes >= 0 ? transport.socket_rcvbuf_bytes / 1024 : -1;
 
     /* The old compressed AAC RTP ring no longer exists. Raw compressed audio is
      * represented by FIFO=... below, so do not print a fake millisecond value. */
@@ -1555,12 +1568,18 @@ static void ap2_stats_task(void *arg) {
         (pcm.future_collisions - pcm_prev.future_collisions);
     const uint64_t dma_diag_err =
         pdiag.untagged_completions + pdiag.completion_overflows;
+    /* Drain the command counter so it cannot grow indefinitely; it is no
+     * longer printed in the archive log. */
+    (void)__atomic_exchange_n(&s_volume_cmd_count, 0, __ATOMIC_ACQ_REL);
+
     if (now.playout_state == 2 && now.output_sync_valid) {
       ESP_LOGI(TAG,
                "SYNC=%+.2fms S=%+d/%+dppm d=%+.3fms/s | PCM=%dms"
                " | U=%" PRIu64 " R=%" PRIu64 " DROP=%" PRIu64
                " COLL=%" PRIu64 " DEC=%" PRIu64 " DMA=%" PRIu64
-               " | FIFO=%u/%uK",
+               " | FIFO=%u/%uK LIM=%uK BP=%" PRIu64
+               " SOCK=%dK RCVBUF=%dK RXAGE=%ums GAPMAX=%ums"
+               " BURST=%" PRIu64 "K/%" PRIu64 "K FULLMAX=%ums",
                sync_ms, now.servo_ppm, now.servo_target_ppm,
                (double)now.servo_slope_us_per_s / 1000.0,
                pcm_ahead_ms,
@@ -1568,22 +1587,37 @@ static void ap2_stats_task(void *arg) {
                now.playout_resyncs - prev.playout_resyncs, drops, collisions,
                now.decode_error - prev.decode_error, dma_diag_err,
                (unsigned)(transport.fifo_occupancy / 1024U),
-               (unsigned)(transport.fifo_high_water / 1024U));
+               (unsigned)(transport.fifo_high_water / 1024U),
+               (unsigned)(transport.reader_limit_bytes / 1024U), bp_delta,
+               sock_k, rcvbuf_k, transport.last_recv_age_ms,
+               transport.max_recv_gap_ms,
+               transport.current_burst_bytes / 1024U,
+               transport.last_burst_bytes / 1024U,
+               transport.full_stall_max_ms);
     } else {
       ESP_LOGI(TAG,
                "SYNC=-- | PCM=%dms | U=%" PRIu64 " R=%" PRIu64
                " DROP=%" PRIu64 " COLL=%" PRIu64 " DEC=%" PRIu64
-               " DMA=%" PRIu64 " | FIFO=%u/%uK | %s",
+               " DMA=%" PRIu64 " | FIFO=%u/%uK LIM=%uK BP=%" PRIu64
+               " SOCK=%dK RCVBUF=%dK RXAGE=%ums GAPMAX=%ums"
+               " BURST=%" PRIu64 "K/%" PRIu64 "K FULLMAX=%ums | %s",
                pcm_ahead_ms,
                now.playout_underruns - prev.playout_underruns,
                now.playout_resyncs - prev.playout_resyncs, drops, collisions,
                now.decode_error - prev.decode_error, dma_diag_err,
                (unsigned)(transport.fifo_occupancy / 1024U),
                (unsigned)(transport.fifo_high_water / 1024U),
+               (unsigned)(transport.reader_limit_bytes / 1024U), bp_delta,
+               sock_k, rcvbuf_k, transport.last_recv_age_ms,
+               transport.max_recv_gap_ms,
+               transport.current_burst_bytes / 1024U,
+               transport.last_burst_bytes / 1024U,
+               transport.full_stall_max_ms,
                now.playout_state == 1 ? "PRIME" : "STOP");
     }
     prev = now;
     pcm_prev = pcm;
+    transport_prev = transport;
   }
 
   s.stats_task = NULL;
@@ -1633,14 +1667,27 @@ esp_err_t audio_receiver_init(void) {
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
   if (!s.transport) {
-    ap2_buffered_transport_config_t tcfg = {
-        .fifo_bytes = AP2_BUFFERED_FIFO_REQUEST_BYTES,
-        .task_core = AP2_NETWORK_CORE,
-        .task_priority = AP2_RX_PRIORITY,
-        .task_stack = AP2_RX_STACK,
-    };
-    ESP_RETURN_ON_ERROR(ap2_buffered_transport_create(&s.transport, &tcfg),
-                        TAG, "buffered transport create failed");
+    /* This target has 8 MiB PSRAM total, so an 8 MiB raw FIFO can never coexist
+     * with the PCM ring and the rest of the application. Prefer 6 MiB; if that
+     * does not fit contiguously, try 5 MiB before falling back further. The RTSP
+     * SETUP response always advertises the capacity that was actually allocated. */
+    static const size_t fifo_candidates[] = {
+        6U * 1024U * 1024U, 5U * 1024U * 1024U, 4U * 1024U * 1024U,
+        2U * 1024U * 1024U, 1U * 1024U * 1024U, 512U * 1024U};
+    esp_err_t terr = ESP_ERR_NO_MEM;
+    for (size_t i = 0; i < sizeof(fifo_candidates) / sizeof(fifo_candidates[0]); ++i) {
+      ap2_buffered_transport_config_t tcfg = {
+          .fifo_bytes = fifo_candidates[i],
+          .task_core = AP2_NETWORK_CORE,
+          .task_priority = AP2_RX_PRIORITY,
+          .task_stack = AP2_RX_STACK,
+      };
+      terr = ap2_buffered_transport_create(&s.transport, &tcfg);
+      if (terr == ESP_OK) break;
+      ESP_LOGW(TAG, "AP2 raw FIFO allocation %u KiB failed; trying smaller",
+               (unsigned)(fifo_candidates[i] / 1024U));
+    }
+    ESP_RETURN_ON_ERROR(terr, TAG, "buffered transport create failed");
   }
   ESP_LOGI(TAG,
            "PSRAM after raw FIFO: total=%u KiB free=%u KiB largest=%u KiB fifo=%u KiB",
@@ -1669,6 +1716,7 @@ esp_err_t audio_receiver_init(void) {
            (unsigned)(AP2_BUFFERED_FIFO_REQUEST_BYTES / 1024U),
            (unsigned)AP2_PCM_TARGET_MS);
   ESP_LOGI(TAG, "AP2 buffered: future audio is held/backpressured, FLUSH uses 23-bit sender sequence ranges");
+  ESP_LOGI(TAG, "AP2 sender test: ADVERTISED_512K (physical FIFO unchanged, no soft limit)");
   ESP_LOGI(TAG, "AP2 output: existing exact PTP/RTP PCM playout and I2S PID preserved");
   return ESP_OK;
 }
@@ -1771,7 +1819,9 @@ void audio_receiver_stop_buffered_only(void) { audio_receiver_stop(); }
 uint16_t audio_receiver_get_buffered_port(void) { return s.port; }
 
 size_t audio_receiver_get_buffered_audio_buffer_size(void) {
-  return ap2_buffered_transport_capacity(s.transport);
+  const size_t physical = ap2_buffered_transport_capacity(s.transport);
+  const size_t advertised = 512U * 1024U;
+  return physical < advertised ? physical : advertised;
 }
 
 uint16_t audio_receiver_get_stream_port(void) { return s.port; }
@@ -1779,6 +1829,7 @@ void audio_receiver_set_volume_q15(int32_t volume_q15) {
   if (volume_q15 < 0) volume_q15 = 0;
   if (volume_q15 > 32768) volume_q15 = 32768;
   __atomic_store_n(&s_volume_target_q15, volume_q15, __ATOMIC_RELEASE);
+  __atomic_add_fetch(&s_volume_cmd_count, 1, __ATOMIC_RELAXED);
 }
 
 int32_t audio_receiver_get_volume_q15(void) {
@@ -1837,6 +1888,7 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
   s.immediate_flush_start_fifo = ts.fifo_occupancy;
   s.immediate_flush_start_socket_bytes = ts.socket_bytes;
   s.immediate_flush_start_fifo_read = ts.fifo_bytes_read;
+  s.immediate_flush_start_full_waits = ts.fifo_full_waits;
   /* Endpoint-bounded immediate FLUSH follows Shairport Sync: keep deferred
    * requests alive until the immediate endpoint is actually reached. A
    * no-endpoint flush is a full local reset, so preserving deferred ranges
@@ -1851,11 +1903,15 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
 
   if (has_endpoint) {
     ESP_LOGI(TAG,
-             "FLUSH armed current_seq=%" PRIu32 " until=%" PRIu32
-             " seqdist=%" PRId32 " fifo=%u/%uKiB",
-             current_seq, until_seq, distance,
+             "FLUSH immediate armed current_seq=%" PRIu32 " until=%" PRIu32
+             " seqdist=%" PRId32 " until_rtp=%" PRIu32
+             " fifo=%u/%uKiB socket=%" PRIu64 "KiB read=%" PRIu64
+             "KiB BP=%" PRIu64,
+             current_seq, until_seq, distance, until_ts,
              (unsigned)(ts.fifo_occupancy / 1024U),
-             (unsigned)(ts.fifo_high_water / 1024U));
+             (unsigned)(ts.fifo_high_water / 1024U),
+             ts.socket_bytes / 1024U, ts.fifo_bytes_read / 1024U,
+             ts.fifo_full_waits);
   } else {
     ESP_LOGI(TAG,
              "FLUSH immediate no endpoint: clearing raw FIFO occupancy=%uKiB",

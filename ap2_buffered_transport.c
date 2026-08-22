@@ -4,9 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -14,6 +16,7 @@
 #include "network/socket_utils.h"
 
 #define AP2_TCP_READ_CHUNK 4096U
+#define AP2_TCP_BURST_GAP_US 200000LL
 
 static const char *TAG = "ap2_tcp_fifo";
 
@@ -43,7 +46,29 @@ struct ap2_buffered_transport {
 
   uint64_t socket_bytes;
   uint64_t fifo_bytes_read;
+  uint64_t fifo_full_waits;
+  uint64_t fifo_empty_waits;
+  uint64_t recv_calls;
+  uint64_t recv_bursts;
+  uint64_t current_burst_bytes;
+  uint64_t last_burst_bytes;
+  int64_t last_recv_us;
+  uint32_t max_recv_gap_ms;
+  int64_t full_since_us;
+  uint64_t full_stall_events;
+  uint64_t full_stall_total_ms;
+  uint32_t full_stall_max_ms;
 };
+
+static void finish_full_stall(ap2_buffered_transport_t *t, int64_t now_us) {
+  if (!t || t->full_since_us == 0) return;
+  uint64_t ms = (uint64_t)((now_us - t->full_since_us) / 1000LL);
+  t->full_stall_events++;
+  t->full_stall_total_ms += ms;
+  if (ms > t->full_stall_max_ms) t->full_stall_max_ms = (uint32_t)ms;
+  t->full_since_us = 0;
+}
+
 
 static void fifo_reset(ap2_buffered_transport_t *t) {
   xSemaphoreTake(t->mutex, portMAX_DELAY);
@@ -61,6 +86,7 @@ static bool fifo_write_all(ap2_buffered_transport_t *t, const uint8_t *src,
     const size_t limit = t->size;
     size_t free_bytes = t->used < limit ? limit - t->used : 0;
     if (free_bytes == 0) {
+      t->fifo_full_waits++;
       xSemaphoreGive(t->mutex);
       xSemaphoreTake(t->space_ready, pdMS_TO_TICKS(100));
       continue;
@@ -117,15 +143,34 @@ static void tcp_reader_task(void *arg) {
        * AirPlay-2 backpressure point: the sender is throttled by the TCP
        * receive window instead of dropping future audio. */
       xSemaphoreTake(t->mutex, portMAX_DELAY);
-      bool full = (t->used >= t->size);
+      const int64_t now_us = esp_timer_get_time();
+      const size_t limit = t->size;
+      bool full = (t->used >= limit);
+      if (full && t->full_since_us == 0) t->full_since_us = now_us;
+      if (!full) finish_full_stall(t, now_us);
       xSemaphoreGive(t->mutex);
       if (full) {
-          xSemaphoreTake(t->space_ready, pdMS_TO_TICKS(100));
+        t->fifo_full_waits++;
+        xSemaphoreTake(t->space_ready, pdMS_TO_TICKS(100));
         continue;
       }
 
       ssize_t n = recv(c, scratch, AP2_TCP_READ_CHUNK, 0);
       if (n > 0) {
+        const int64_t rx_us = esp_timer_get_time();
+        if (t->last_recv_us > 0) {
+          const int64_t gap_us = rx_us - t->last_recv_us;
+          uint32_t gap_ms = gap_us > 0 ? (uint32_t)(gap_us / 1000LL) : 0;
+          if (gap_ms > t->max_recv_gap_ms) t->max_recv_gap_ms = gap_ms;
+          if (gap_us >= AP2_TCP_BURST_GAP_US && t->current_burst_bytes > 0) {
+            t->last_burst_bytes = t->current_burst_bytes;
+            t->current_burst_bytes = 0;
+            t->recv_bursts++;
+          }
+        }
+        t->last_recv_us = rx_us;
+        t->recv_calls++;
+        t->current_burst_bytes += (uint64_t)n;
         t->socket_bytes += (uint64_t)n;
         if (!fifo_write_all(t, scratch, (size_t)n)) break;
       } else {
@@ -245,6 +290,7 @@ ssize_t ap2_buffered_transport_read_exact(ap2_buffered_transport_t *t,
     if (t->used == 0) {
       bool closed = t->peer_closed;
       int err = t->peer_error;
+      t->fifo_empty_waits++;
       xSemaphoreGive(t->mutex);
       if (closed) return off ? (ssize_t)off : 0;
       if (err) { errno = err; return -1; }
@@ -273,6 +319,32 @@ void ap2_buffered_transport_get_stats(ap2_buffered_transport_t *t,
   xSemaphoreTake(t->mutex, portMAX_DELAY);
   out->socket_bytes = t->socket_bytes;
   out->fifo_bytes_read = t->fifo_bytes_read;
+  out->fifo_full_waits = t->fifo_full_waits;
+  out->fifo_empty_waits = t->fifo_empty_waits;
+  out->recv_calls = t->recv_calls;
+  out->recv_bursts = t->recv_bursts;
+  out->current_burst_bytes = t->current_burst_bytes;
+  out->last_burst_bytes = t->last_burst_bytes;
+  out->full_stall_events = t->full_stall_events;
+  out->full_stall_total_ms = t->full_stall_total_ms;
+  out->full_stall_max_ms = t->full_stall_max_ms;
+  out->max_recv_gap_ms = t->max_recv_gap_ms;
+  out->reader_limit_bytes = t->size;
+  if (t->last_recv_us > 0) {
+    int64_t age_us = esp_timer_get_time() - t->last_recv_us;
+    out->last_recv_age_ms = age_us > 0 ? (uint32_t)(age_us / 1000LL) : 0;
+  }
+  if (t->client_sock >= 0) {
+    int pending = 0;
+    out->socket_pending_bytes = ioctl(t->client_sock, FIONREAD, &pending) == 0 ? pending : -1;
+    int rcvbuf = 0;
+    socklen_t olen = sizeof(rcvbuf);
+    out->socket_rcvbuf_bytes =
+        getsockopt(t->client_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, &olen) == 0 ? rcvbuf : -1;
+  } else {
+    out->socket_pending_bytes = -1;
+    out->socket_rcvbuf_bytes = -1;
+  }
   out->fifo_occupancy = t->used;
   out->fifo_high_water = t->high_water;
   xSemaphoreGive(t->mutex);
