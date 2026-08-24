@@ -69,5 +69,9 @@ uint32_t audio_playout_hardware_latency_us(void);
  * between writes. target_ppm is relative to the nominal MCLK measured at init. */
 esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
                                  audio_playout_tune_info_t *out);
+/* Reset the physical MCLK correction to nominal while preserving the current
+ * enabled/disabled channel state. Intended for a hard audio-session boundary,
+ * not for normal track/anchor changes inside one session. */
+esp_err_t audio_playout_reset_tune(void);
 int32_t audio_playout_get_tune_ppm(void);
 uint32_t audio_playout_get_nominal_mclk_hz(void);

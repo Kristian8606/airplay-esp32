@@ -334,6 +334,52 @@ void audio_playout_get_diag(audio_playout_diag_t *out) {
   out->write_max_us = __atomic_load_n(&s_write_max_us, __ATOMIC_RELAXED);
 }
 
+esp_err_t audio_playout_reset_tune(void) {
+  if (!s_tx || s_nominal_mclk_hz == 0U) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (s_tune_ppm == 0) {
+    return ESP_OK;
+  }
+
+  const bool was_enabled = s_enabled;
+  if (was_enabled) {
+    esp_err_t de = i2s_channel_disable(s_tx);
+    if (de != ESP_OK) return de;
+    s_enabled = false;
+  }
+
+  /* ADDSUB is relative to the current MCLK. Query the actual clock first and
+   * return it to the nominal value. This avoids retaining a few Hz of rounding
+   * residue after several incremental ppm changes in the previous session. */
+  i2s_tuning_info_t before = {0};
+  esp_err_t query_err = i2s_channel_tune_rate(s_tx, NULL, &before);
+  const int32_t step_delta_hz = query_err == ESP_OK
+      ? (int32_t)s_nominal_mclk_hz - (int32_t)before.curr_mclk_hz
+      : (int32_t)(-((int64_t)s_nominal_mclk_hz *
+                    (int64_t)s_tune_ppm) / 1000000LL);
+  const int32_t limit_hz = (int32_t)(
+      ((int64_t)s_nominal_mclk_hz * 160LL) / 1000000LL) + 4;
+  i2s_tuning_config_t cfg = {
+      .tune_mode = I2S_TUNING_MODE_ADDSUB,
+      .tune_mclk_val = step_delta_hz,
+      .max_delta_mclk = limit_hz,
+      .min_delta_mclk = -limit_hz,
+  };
+  i2s_tuning_info_t info = {0};
+  esp_err_t err = i2s_channel_tune_rate(s_tx, &cfg, &info);
+  if (err == ESP_OK) {
+    s_tune_ppm = 0;
+  }
+
+  if (was_enabled) {
+    esp_err_t ee = i2s_channel_enable(s_tx);
+    if (ee == ESP_OK) s_enabled = true;
+    if (err == ESP_OK && ee != ESP_OK) err = ee;
+  }
+  return err;
+}
+
 int32_t audio_playout_get_tune_ppm(void) {
   return s_tune_ppm;
 }

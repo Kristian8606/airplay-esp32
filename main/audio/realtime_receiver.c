@@ -29,17 +29,26 @@
 #define RT_MAX_NACK_COUNT       32U
 #define RT_REORDER_SLOTS         64U
 #define RT_REORDER_PACKET_MAX    2048U
-#define RT_GAP_WAIT_MS          140U
+#define RT_RESEND_FIRST_MS        10U
+#define RT_RESEND_RETRY_MS        35U
+#define RT_RESEND_SAFETY_MS       15U
+#define RT_RESEND_SCAN_MS         10U
 #define RT_NACK_TRACK_SLOTS      128U
 #define RT_LATENCY_LOGS           20U
+#define RT_OVERFLOW_LOG_PERIOD_MS 500U
 
 static const char *TAG = "airplay_rt";
 
 typedef struct {
   bool valid;
+  bool missing;
   uint16_t seq;
   uint16_t len;
   bool retransmitted;
+  uint32_t missing_rtp;
+  TickType_t missing_since;
+  TickType_t last_nack;
+  uint8_t nack_count;
   uint8_t data[RT_REORDER_PACKET_MAX];
 } reorder_slot_t;
 
@@ -74,11 +83,16 @@ typedef struct {
   reorder_slot_t *reorder;
   uint16_t expected_seq;
   bool expected_valid;
-  TickType_t gap_since;
-  bool gap_waiting;
+  uint16_t newest_seq;
+  bool newest_valid;
   uint32_t reorder_late;
   uint32_t reorder_overwrite;
   uint32_t gap_skips;
+  uint32_t resend_scans;
+  uint32_t resend_retries;
+  uint32_t resend_giveups;
+  uint32_t hard_resyncs;
+  TickType_t last_overflow_log;
   nack_track_t nack_track[RT_NACK_TRACK_SLOTS];
   uint32_t rtx_latency_samples;
   uint64_t rtx_latency_sum_us;
@@ -245,6 +259,36 @@ static bool decode_audio_packet(alac_decoder_t *decoder,
   return true;
 }
 
+
+static void reorder_clear_state(void) {
+  if (s_rt.reorder) {
+    memset(s_rt.reorder, 0, RT_REORDER_SLOTS * sizeof(*s_rt.reorder));
+  }
+  memset(s_rt.nack_track, 0, sizeof(s_rt.nack_track));
+  s_rt.expected_seq = 0;
+  s_rt.expected_valid = false;
+  s_rt.newest_seq = 0;
+  s_rt.newest_valid = false;
+}
+
+static void reorder_hard_resync(uint16_t got_seq, uint16_t missing) {
+  const uint16_t old_expected = s_rt.expected_seq;
+  reorder_clear_state();
+  s_rt.expected_seq = got_seq;
+  s_rt.expected_valid = true;
+  s_rt.hard_resyncs++;
+
+  ESP_LOGW(TAG,
+           "RTP hard resync #%" PRIu32
+           " expected=%u got=%u missing=%u window=%u",
+           s_rt.hard_resyncs, old_expected, got_seq, missing,
+           (unsigned)RT_REORDER_SLOTS);
+
+  if (s_rt.cfg.resync_cb) {
+    s_rt.cfg.resync_cb(s_rt.cfg.resync_ctx);
+  }
+}
+
 static reorder_slot_t *reorder_slot_for(uint16_t seq) {
   return &s_rt.reorder[(uint32_t)seq % RT_REORDER_SLOTS];
 }
@@ -252,6 +296,29 @@ static reorder_slot_t *reorder_slot_for(uint16_t seq) {
 static bool reorder_has(uint16_t seq) {
   reorder_slot_t *slot = reorder_slot_for(seq);
   return slot->valid && slot->seq == seq;
+}
+
+static bool reorder_is_missing(uint16_t seq) {
+  reorder_slot_t *slot = reorder_slot_for(seq);
+  return slot->missing && slot->seq == seq && !slot->valid;
+}
+
+static void reorder_mark_missing(uint16_t seq, uint32_t rtp, TickType_t now) {
+  reorder_slot_t *slot = reorder_slot_for(seq);
+  if (slot->valid && slot->seq == seq) {
+    return;
+  }
+  if (slot->seq != seq) {
+    memset(slot, 0, sizeof(*slot));
+    slot->seq = seq;
+  }
+  if (!slot->missing) {
+    slot->missing = true;
+    slot->missing_rtp = rtp;
+    slot->missing_since = now;
+    slot->last_nack = 0;
+    slot->nack_count = 0;
+  }
 }
 
 static bool reorder_store(const uint8_t *packet, size_t packet_len,
@@ -270,7 +337,14 @@ static bool reorder_store(const uint8_t *packet, size_t packet_len,
   reorder_slot_t *slot = reorder_slot_for(seq);
   if (slot->valid && slot->seq != seq) {
     s_rt.reorder_overwrite++;
-    ESP_LOGW(TAG, "reorder overflow seq=%u replacing=%u", seq, slot->seq);
+    TickType_t now = xTaskGetTickCount();
+    if (s_rt.last_overflow_log == 0 ||
+        (now - s_rt.last_overflow_log) >= pdMS_TO_TICKS(RT_OVERFLOW_LOG_PERIOD_MS)) {
+      ESP_LOGW(TAG,
+               "reorder overflow seq=%u replacing=%u total=%" PRIu32,
+               seq, slot->seq, s_rt.reorder_overwrite);
+      s_rt.last_overflow_log = now;
+    }
   }
   if (slot->valid && slot->seq == seq) {
     return true; /* Duplicate original/retransmit. */
@@ -281,6 +355,16 @@ static bool reorder_store(const uint8_t *packet, size_t packet_len,
   slot->seq = seq;
   slot->retransmitted = retransmitted;
   slot->valid = true;
+  slot->missing = false;
+  slot->missing_rtp = 0;
+  slot->missing_since = 0;
+  slot->last_nack = 0;
+  slot->nack_count = 0;
+
+  if (!s_rt.newest_valid || (int16_t)(seq - s_rt.newest_seq) > 0) {
+    s_rt.newest_seq = seq;
+    s_rt.newest_valid = true;
+  }
   return true;
 }
 
@@ -293,13 +377,12 @@ static void reorder_drain(alac_decoder_t *decoder, uint32_t *first_logs) {
     const uint16_t seq = s_rt.expected_seq;
     (void)decode_audio_packet(decoder, slot->data, slot->len,
                               slot->retransmitted, first_logs);
-    slot->valid = false;
+    memset(slot, 0, sizeof(*slot));
     s_rt.expected_seq = (uint16_t)(seq + 1U);
-    s_rt.gap_waiting = false;
   }
 }
 
-static void reorder_note_gap(uint16_t got_seq) {
+static void reorder_note_gap(uint16_t got_seq, uint32_t got_rtp) {
   if (!s_rt.expected_valid) {
     s_rt.expected_seq = got_seq;
     s_rt.expected_valid = true;
@@ -309,42 +392,177 @@ static void reorder_note_gap(uint16_t got_seq) {
   if (delta <= 0) {
     return;
   }
-  if (s_rt.gap_waiting) {
-    return;
-  }
-  uint16_t missing = (uint16_t)delta;
-  ESP_LOGW(TAG, "RTP sequence gap expected=%u got=%u missing=%u",
-           s_rt.expected_seq, got_seq, missing);
-  send_retransmit_request(s_rt.expected_seq, missing);
-  s_rt.gap_waiting = true;
-  s_rt.gap_since = xTaskGetTickCount();
-}
+  const uint16_t missing = (uint16_t)delta;
 
-static void reorder_timeout_skip(alac_decoder_t *decoder,
-                                 uint32_t *first_logs) {
-  if (!s_rt.expected_valid || !s_rt.gap_waiting ||
-      reorder_has(s_rt.expected_seq)) {
-    return;
-  }
-  if ((xTaskGetTickCount() - s_rt.gap_since) < pdMS_TO_TICKS(RT_GAP_WAIT_MS)) {
+  /* The reorder store is modulo RT_REORDER_SLOTS. Once the sender is one
+   * complete window ahead, retaining expected_seq would make new packets
+   * overwrite the very old slots we are still waiting for and recovery can
+   * never converge. Treat that as a new realtime epoch instead. */
+  if (missing >= RT_REORDER_SLOTS) {
+    reorder_hard_resync(got_seq, missing);
     return;
   }
 
-  /* Recovery did not arrive in time. Skip only up to the nearest buffered
-   * sequence so realtime playback cannot deadlock forever. */
-  for (uint16_t d = 1; d < RT_REORDER_SLOTS; ++d) {
-    uint16_t candidate = (uint16_t)(s_rt.expected_seq + d);
-    if (reorder_has(candidate)) {
-      ESP_LOGW(TAG, "retransmit timeout; skipping %u packet(s) from seq=%u",
-               d, s_rt.expected_seq);
-      s_rt.gap_skips += d;
-      s_rt.expected_seq = candidate;
-      s_rt.gap_waiting = false;
-      reorder_drain(decoder, first_logs);
-      return;
+  const TickType_t now = xTaskGetTickCount();
+  const uint32_t frame_samples =
+      s_rt.cfg.format.frame_size > 0 ? (uint32_t)s_rt.cfg.format.frame_size : 352U;
+  uint16_t newly_missing = 0;
+  for (uint16_t d = 0; d < missing; ++d) {
+    const uint16_t seq = (uint16_t)(s_rt.expected_seq + d);
+    if (!reorder_has(seq) && !reorder_is_missing(seq)) {
+      const uint16_t packets_before_got = (uint16_t)(missing - d);
+      const uint32_t missing_rtp =
+          got_rtp - (uint32_t)packets_before_got * frame_samples;
+      reorder_mark_missing(seq, missing_rtp, now);
+      newly_missing++;
     }
   }
-  s_rt.gap_since = xTaskGetTickCount();
+
+  if (newly_missing != 0U) {
+    ESP_LOGW(TAG,
+             "RTP sequence gap expected=%u got=%u missing=%u new=%u",
+             s_rt.expected_seq, got_seq, missing, newly_missing);
+  }
+}
+
+static bool resend_time_to_play_us(const reorder_slot_t *slot,
+                                   int64_t *out_us) {
+  if (!slot || !out_us || !s_rt.cfg.deadline_cb) {
+    return false;
+  }
+  return s_rt.cfg.deadline_cb(slot->missing_rtp, out_us,
+                              s_rt.cfg.deadline_ctx);
+}
+
+static bool resend_slot_due(const reorder_slot_t *slot, TickType_t now) {
+  if (!slot || !slot->missing || slot->valid) {
+    return false;
+  }
+
+  const TickType_t age = now - slot->missing_since;
+  if (age < pdMS_TO_TICKS(RT_RESEND_FIRST_MS)) {
+    return false;
+  }
+
+  int64_t time_to_play_us = 0;
+  const bool deadline_valid = resend_time_to_play_us(slot, &time_to_play_us);
+  if (deadline_valid &&
+      time_to_play_us <= (int64_t)RT_RESEND_SAFETY_MS * 1000LL) {
+    return false;
+  }
+
+  if (slot->nack_count == 0U) {
+    return true;
+  }
+
+  /* Before the first valid realtime anchor, allow one request to avoid
+   * deadlocking expected_seq on an early hole, but do not keep retrying an
+   * audio range whose playout deadline is not known yet. */
+  if (!deadline_valid) {
+    return false;
+  }
+
+  return (now - slot->last_nack) >= pdMS_TO_TICKS(RT_RESEND_RETRY_MS);
+}
+
+static void reorder_resend_scan(void) {
+  if (!s_rt.expected_valid || !s_rt.newest_valid) {
+    return;
+  }
+
+  const TickType_t now = xTaskGetTickCount();
+  s_rt.resend_scans++;
+
+  uint16_t seq = s_rt.expected_seq;
+  const uint16_t span = (uint16_t)((int16_t)(s_rt.newest_seq - s_rt.expected_seq) + 1);
+  for (uint16_t walked = 0; walked < span && walked < RT_REORDER_SLOTS;) {
+    reorder_slot_t *slot = reorder_slot_for(seq);
+    if (!reorder_is_missing(seq) || !resend_slot_due(slot, now)) {
+      seq = (uint16_t)(seq + 1U);
+      walked++;
+      continue;
+    }
+
+    const uint16_t first = seq;
+    uint16_t count = 0;
+    while (walked + count < span && count < RT_MAX_NACK_COUNT &&
+           count < RT_REORDER_SLOTS) {
+      const uint16_t candidate = (uint16_t)(first + count);
+      reorder_slot_t *candidate_slot = reorder_slot_for(candidate);
+      if (!reorder_is_missing(candidate) ||
+          !resend_slot_due(candidate_slot, now)) {
+        break;
+      }
+      count++;
+    }
+
+    if (count != 0U && send_retransmit_request(first, count)) {
+      for (uint16_t i = 0; i < count; ++i) {
+        reorder_slot_t *requested = reorder_slot_for((uint16_t)(first + i));
+        if (requested->nack_count != 0U) {
+          s_rt.resend_retries++;
+        }
+        requested->last_nack = now;
+        if (requested->nack_count != UINT8_MAX) {
+          requested->nack_count++;
+        }
+      }
+    }
+
+    seq = (uint16_t)(first + (count ? count : 1U));
+    walked = (uint16_t)(walked + (count ? count : 1U));
+  }
+}
+
+static void reorder_giveup_expired(alac_decoder_t *decoder,
+                                   uint32_t *first_logs) {
+  if (!s_rt.expected_valid) {
+    return;
+  }
+
+  uint16_t skipped = 0;
+  const uint16_t first = s_rt.expected_seq;
+  int64_t first_deadline_us = 0;
+
+  while (skipped < RT_REORDER_SLOTS && reorder_is_missing(s_rt.expected_seq)) {
+    reorder_slot_t *slot = reorder_slot_for(s_rt.expected_seq);
+    int64_t time_to_play_us = 0;
+
+    /* No anchor yet: keep the hole buffered. A single bootstrap NACK may have
+     * been sent by resend_slot_due(), but there is no safe basis for dropping
+     * audio until RTP has a physical PTP playout deadline. */
+    if (!resend_time_to_play_us(slot, &time_to_play_us)) {
+      break;
+    }
+    if (time_to_play_us > (int64_t)RT_RESEND_SAFETY_MS * 1000LL) {
+      break;
+    }
+    if (skipped == 0U) {
+      first_deadline_us = time_to_play_us;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    s_rt.expected_seq = (uint16_t)(s_rt.expected_seq + 1U);
+    skipped++;
+  }
+
+  if (skipped != 0U) {
+    s_rt.gap_skips += skipped;
+    s_rt.resend_giveups += skipped;
+    ESP_LOGW(TAG,
+             "resend playout deadline; skipping %u packet(s) from seq=%u "
+             "t_play=%" PRId64 "ms margin=%ums",
+             skipped, first, first_deadline_us / 1000LL,
+             (unsigned)RT_RESEND_SAFETY_MS);
+    reorder_drain(decoder, first_logs);
+  }
+}
+
+static void reorder_service(alac_decoder_t *decoder, uint32_t *first_logs) {
+  // Drop holes that can no longer make their real playout deadline first.
+  // This prevents sending a NACK for a packet that we immediately discard.
+  reorder_giveup_expired(decoder, first_logs);
+  reorder_resend_scan();
 }
 
 static void note_retransmit_latency(const uint8_t *packet, size_t packet_len) {
@@ -460,7 +678,7 @@ static void realtime_task(void *arg) {
       break;
     }
 
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+    struct timeval tv = {.tv_sec = 0, .tv_usec = RT_RESEND_SCAN_MS * 1000U};
     int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
     if (!s_rt.running) {
       break;
@@ -472,7 +690,7 @@ static void realtime_task(void *arg) {
       continue;
     }
     if (ready == 0) {
-      reorder_timeout_skip(decoder, &first_logs);
+      reorder_service(decoder, &first_logs);
       continue;
     }
 
@@ -496,19 +714,23 @@ static void realtime_task(void *arg) {
     if (packet_len >= 12U) {
       const uint16_t seq =
           (uint16_t)(((uint16_t)s_rt.packet[2] << 8) | s_rt.packet[3]);
+      const uint32_t rtp = ((uint32_t)s_rt.packet[4] << 24) |
+                           ((uint32_t)s_rt.packet[5] << 16) |
+                           ((uint32_t)s_rt.packet[6] << 8) |
+                           (uint32_t)s_rt.packet[7];
       s_rt.rx_packets++;
       if (!s_rt.expected_valid) {
         s_rt.expected_seq = seq;
         s_rt.expected_valid = true;
       }
       if ((int16_t)(seq - s_rt.expected_seq) > 0) {
-        reorder_note_gap(seq);
+        reorder_note_gap(seq, rtp);
       }
       if (!reorder_store(s_rt.packet, packet_len, false)) {
         s_rt.retransmit_bad++;
       }
       reorder_drain(decoder, &first_logs);
-      reorder_timeout_skip(decoder, &first_logs);
+      reorder_service(decoder, &first_logs);
     }
   }
 
@@ -518,11 +740,13 @@ static void realtime_task(void *arg) {
            " decrypt_err=%" PRIu32 " decode_err=%" PRIu32
            " sink_drop=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32
            " rtx_bad=%" PRIu32 " late=%" PRIu32 " skip=%" PRIu32
+           " retry=%" PRIu32 " giveup=%" PRIu32 " resync=%" PRIu32
            " rtx_lat=%.2f/%.2f/%.2fms(n=%" PRIu32 ")",
            s_rt.rx_packets, s_rt.decoded_packets, s_rt.decrypt_errors,
            s_rt.decode_errors, s_rt.sink_drops, s_rt.nack_requests,
            s_rt.retransmit_packets, s_rt.retransmit_bad,
-           s_rt.reorder_late, s_rt.gap_skips,
+           s_rt.reorder_late, s_rt.gap_skips, s_rt.resend_retries,
+           s_rt.resend_giveups, s_rt.hard_resyncs,
            s_rt.rtx_latency_samples ? (double)s_rt.rtx_latency_min_us / 1000.0 : 0.0,
            s_rt.rtx_latency_samples ? ((double)s_rt.rtx_latency_sum_us /
                                        (double)s_rt.rtx_latency_samples) / 1000.0 : 0.0,
@@ -558,19 +782,19 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.nack_requests = 0;
   s_rt.retransmit_packets = 0;
   s_rt.retransmit_bad = 0;
-  s_rt.expected_valid = false;
-  s_rt.gap_waiting = false;
   s_rt.reorder_late = 0;
   s_rt.reorder_overwrite = 0;
   s_rt.gap_skips = 0;
-  memset(s_rt.nack_track, 0, sizeof(s_rt.nack_track));
+  s_rt.resend_scans = 0;
+  s_rt.resend_retries = 0;
+  s_rt.resend_giveups = 0;
+  s_rt.hard_resyncs = 0;
+  s_rt.last_overflow_log = 0;
+  reorder_clear_state();
   s_rt.rtx_latency_samples = 0;
   s_rt.rtx_latency_sum_us = 0;
   s_rt.rtx_latency_min_us = 0;
   s_rt.rtx_latency_max_us = 0;
-  if (s_rt.reorder) {
-    memset(s_rt.reorder, 0, RT_REORDER_SLOTS * sizeof(*s_rt.reorder));
-  }
 
   if (!s_rt.packet) {
     s_rt.packet = heap_caps_malloc(RT_PACKET_MAX,
