@@ -22,7 +22,7 @@ menu "AP2 RAW RX Debug"
         default n
 endmenu
 
-menu "I2S Playout (V22)"
+menu "I2S Playout"
     config I2S_SCK_IO
         int "I2S MCLK GPIO"
         default 8
@@ -42,7 +42,7 @@ menu "I2S Playout (V22)"
         help
             Diagnostic-only presentation offset for multiroom testing.
             Positive values advance the selected RTP content relative to the
-            physical I2S sample boundary; negative values delay it. V22 applies
+            physical I2S sample boundary; negative values delay it. The playout engine applies
             this at the one-enable sample-alignment boundary. Keep 0 for normal
             use. Nonzero values are diagnostic/manual trim only.
 endmenu

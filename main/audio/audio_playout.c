@@ -202,11 +202,11 @@ esp_err_t audio_playout_init(void) {
              esp_err_to_name(err), s_nominal_mclk_hz);
   }
 
-  /* Keep the channel READY/disabled. V22 preloads both DMA descriptors before
+  /* Keep the channel READY/disabled. Preload both DMA descriptors before
    * the exact PTP start edge, then enables the channel. This removes the
    * zero-descriptor ambiguity that made earlier EOF counting unreliable. */
   ESP_LOGI(TAG,
-           "I2S V22: 44100Hz stereo 16-bit, DMA=%ux%u, MCLK=%" PRIu32
+           "I2S: 44100Hz stereo 16-bit, DMA=%ux%u, MCLK=%" PRIu32
            "Hz, pins %d/%d/%d/%d",
            (unsigned)I2S_DMA_DESC_NUM, (unsigned)I2S_DMA_FRAME_NUM,
            s_nominal_mclk_hz, CONFIG_I2S_SCK_IO, CONFIG_I2S_BCK_IO,

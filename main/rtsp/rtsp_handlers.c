@@ -865,7 +865,7 @@ static void parse_sdp(rtsp_conn_t *conn, const char *sdp, size_t len) {
 
   /*
    * Legacy ALAC rice/magic-cookie fields were deliberately removed from the
-   * V5 AAC-only audio format.  This project only decodes AP2 AAC type=103.  Keep SDP
+   * Buffered AAC audio format. This path decodes AP2 AAC type=103. Keep SDP
    * parsing generic enough for RTSP negotiation, but do not carry ALAC state
    * into the audio engine.
    */

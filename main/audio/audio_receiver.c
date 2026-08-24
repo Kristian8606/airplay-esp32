@@ -49,18 +49,18 @@
 #define AP2_PID_MIN_TUNE_PPM            5
 #define AP2_PID_MAX_JUMP_PPM            80
 
-/* V22 continuous-start alignment.  A new generation enables I2S only once.
+/* Continuous-start alignment. A new generation enables I2S only once.
  * Two silent DMA blocks establish the actual running sample-clock phase.  The
  * first tagged EOF gives a precise PTP observation; while the second silent
  * block is still playing, the first real block is queued from the RTP sample
  * that belongs at the next physical DMA boundary.  I2S is never disabled
- * between phase measurement and real audio, removing V21's non-repeatable
+ * between phase measurement and real audio, avoiding non-repeatable
  * second-enable latency. */
 #define AP2_START_SILENCE_FUTURE_BLOCKS    4U
 #define AP2_START_ALIGN_TIMEOUT_US      30000LL
 #define AP2_START_PRIME_GUARD_BLOCKS        8U
 
-/* V22 true PID around tagged DMA-EOF phase.
+/* PID servo around tagged DMA-EOF phase.
  * P reacts to phase error, I learns the steady crystal/rate bias, D damps
  * motion through zero.  The derivative is low-pass filtered because the PTP
  * timestamp itself has some jitter.  PID is evaluated more often than the
@@ -117,18 +117,15 @@ typedef struct {
   uint64_t stale_predecrypt;
   uint64_t stale_predecode;
   uint64_t timeline_drop;
-  uint64_t aac_store_drop;
   uint64_t pcm_write_error;
   uint64_t decrypt_error;
   uint64_t decode_error;
   uint64_t empty_payload;
-  uint64_t generation_drop;
   uint64_t decode_reacquires;
   uint64_t seq_gap;
   uint64_t rtp_gap;
   uint32_t last_seq;
   uint32_t last_rtp;
-  uint32_t last_rtp_generation;
   uint32_t last_decoded_end_rtp;
   uint64_t playout_blocks;
   uint64_t playout_underruns;
@@ -138,17 +135,9 @@ typedef struct {
   uint64_t playout_starts;
   uint32_t playout_state; /* 0=STOPPED, 1=PRIMING, 2=RUNNING */
   uint32_t last_playout_rtp;
-  int32_t tx_start_err_us;
-  int32_t tx_end_err_us;
-  int32_t tx_end_err_ema_us;
   uint32_t tx_fetch_us;
-  /* V18 scheduler phase probe. Positive means the block RTP cursor is ahead
-   * of the RTP wanted by PTP at that observation point. */
-  int32_t sched_err_frames;
-  int32_t write_start_err_frames;
-  int32_t write_end_err_frames;
   int32_t desired_cursor_err_frames;
-  /* V22: tagged TX DMA EOF phase. + means physical DMA completion was early
+  /* Tagged TX DMA EOF phase. + means physical DMA completion was early
    * versus the AirPlay PTP target, - means late. */
   int32_t output_sync_frames;
   int32_t output_sync_us;      /* EMA used by compact log */
@@ -261,7 +250,7 @@ static uint32_t next_generation(uint32_t generation) {
   return generation ? generation : 1U;
 }
 
-/* Immediate FLUSH/pause ends the current timeline now, but V8 deliberately
+/* Immediate FLUSH/pause ends the current timeline now, but the processor deliberately
  * does not publish a new generation yet. TCP may keep arriving while the
  * anchor is invalid; those packets are provisional and will be made
  * unreachable atomically when the next valid anchor commits a new epoch. */
@@ -341,7 +330,7 @@ static bool rtp_to_ptp_ns(const timing_snapshot_t *snap, uint32_t rtp,
   return true;
 }
 
-/* V22: pace DMA submission from the AirPlay PTP/RTP timeline instead of
+/* Pace DMA submission from the AirPlay PTP/RTP timeline instead of
  * letting an empty DMA ring decide how far the software cursor runs ahead.
  * Long waits yield to FreeRTOS; only the final sub-millisecond interval uses
  * short ROM delays. */
@@ -1274,7 +1263,7 @@ static void ap2_playout_task(void *arg) {
       }
 
       /* Report the raw one-enable startup phase only as a diagnostic.  It is
-       * NOT used as a second-enable compensation as in V21. */
+       * It is not used as a second-enable compensation. */
       uint64_t probe_target_end_ptp = 0;
       int32_t probe_sync_us = 0;
       if (rtp_to_ptp_ns(&snap, silence_rtp + AUDIO_PLAYOUT_FRAMES,
@@ -1325,7 +1314,7 @@ static void ap2_playout_task(void *arg) {
         block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
     process_i2s_completions(&snap);
 
-    /* V22 true PID clock servo.
+    /* PID clock servo.
      *
      * Sign convention from tagged DMA EOF:
      *   SYNC < 0 : ESP is late  -> positive ppm (speed I2S up)
@@ -1543,7 +1532,7 @@ static void ap2_stats_task(void *arg) {
     /* The old compressed AAC RTP ring no longer exists. Raw compressed audio is
      * represented by FIFO=... below, so do not print a fake millisecond value. */
 
-    /* V22 compact archive log. SYNC comes from the EOF ISR for an RTP-tagged
+    /* Compact runtime log. SYNC comes from the EOF ISR for an RTP-tagged
      * DMA block, not from a guessed queue depth. Keep only timing/buffer/error
      * diagnostics here; volume/level telemetry is intentionally omitted. */
     const double sync_ms = now.output_sync_valid
@@ -1786,9 +1775,6 @@ int32_t audio_receiver_get_volume_q15(void) {
 }
 
 void audio_receiver_get_stats(audio_stats_t *out) { if (out) *out = s.public_stats; }
-size_t audio_receiver_read(int16_t *b, size_t n) { (void)b; (void)n; return 0; }
-bool audio_receiver_has_data(void) { return false; }
-
 void audio_receiver_flush(void) { mark_timeline_discontinuity(); }
 void audio_receiver_seek_flush(void) { mark_timeline_discontinuity(); }
 void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
@@ -1878,10 +1864,7 @@ void audio_receiver_set_playout_latency_samples(uint32_t v) {
   s.playout_latency_samples = v;
   taskEXIT_CRITICAL(&s.state_mux);
 }
-void audio_receiver_set_output_latency_us(uint32_t v) { (void)v; }
-uint32_t audio_receiver_get_output_latency_us(void) { return 0; }
 uint32_t audio_receiver_get_hardware_latency_us(void) { return audio_playout_hardware_latency_us(); }
-uint32_t audio_receiver_get_advertised_latency_us(void) { return 0; }
 
 void audio_receiver_set_playing(bool p) {
   taskENTER_CRITICAL(&s.state_mux);

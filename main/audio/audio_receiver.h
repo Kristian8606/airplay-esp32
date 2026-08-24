@@ -71,10 +71,6 @@ void audio_receiver_get_stats(audio_stats_t *stats);
 void audio_receiver_set_volume_q15(int32_t volume_q15);
 int32_t audio_receiver_get_volume_q15(void);
 
-/* Compatibility read APIs; V8 uses the internal RTP-addressed playout task. */
-size_t audio_receiver_read(int16_t *buffer, size_t samples);
-bool audio_receiver_has_data(void);
-
 /* Timeline/generation control. These invalidate old PCM in O(1), no scan. */
 void audio_receiver_flush(void);
 void audio_receiver_seek_flush(void);
@@ -94,7 +90,4 @@ void audio_receiver_set_client_control(uint32_t client_ip,
 
 /* RTSP compatibility: buffered AP2 uses zero extra playout latency here. */
 void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
-void audio_receiver_set_output_latency_us(uint32_t latency_us);
-uint32_t audio_receiver_get_output_latency_us(void);
 uint32_t audio_receiver_get_hardware_latency_us(void);
-uint32_t audio_receiver_get_advertised_latency_us(void);

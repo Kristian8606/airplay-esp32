@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-/* V22 I2S backend: two 256-frame DMA descriptors. Every application audio
+/* I2S playout backend: two 256-frame DMA descriptors. Every application audio
  * block is tagged with its RTP/generation before it reaches DMA. The TX EOF
  * ISR records the local completion timestamp for that exact tag, allowing the
  * playout task to compare the physical DMA completion edge against AirPlay PTP.

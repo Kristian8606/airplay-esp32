@@ -133,7 +133,7 @@ esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out) {
   }
 
   ESP_LOGI(TAG,
-           "direct RTP PCM ring V22: %u slots x %u frames = %u frames, %u bytes, %u ms @44.1k",
+           "direct RTP PCM ring: %u slots x %u frames = %u frames, %u bytes, %u ms @44.1k",
            (unsigned)PCM_RTP_SLOT_COUNT, (unsigned)PCM_RTP_SLOT_FRAMES,
            (unsigned)PCM_RTP_RING_FRAMES, (unsigned)pcm_bytes,
            (unsigned)(((uint64_t)PCM_RTP_RING_FRAMES * 1000ULL) / 44100ULL));

@@ -7,7 +7,7 @@
 #include "esp_err.h"
 
 /*
- * V5 direct RTP PCM store.
+ * Direct RTP-addressed PCM store.
  *
  * 256 slots x 1024 stereo frames = 262144 frames = 5.94 s @ 44.1 kHz.
  * A slot is keyed by absolute RTP page base (rtp & ~1023). RTP itself is the
