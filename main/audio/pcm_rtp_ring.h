@@ -61,5 +61,11 @@ bool pcm_rtp_ring_read_256(const pcm_rtp_ring_t *ring, uint32_t first_rtp,
 bool pcm_rtp_ring_has_range(const pcm_rtp_ring_t *ring, uint32_t first_rtp,
                             uint32_t frames, uint32_t generation);
 
+
+/* Rare control-path operation used by FLUSHBUFFERED. Clears PCM validity in
+ * [from_rtp, until_rtp) for the current generation without changing timeline. */
+void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *ring, uint32_t from_rtp,
+                                   uint32_t until_rtp, uint32_t generation);
+
 void pcm_rtp_ring_get_stats(const pcm_rtp_ring_t *ring,
                             pcm_rtp_ring_stats_t *out);

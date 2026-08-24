@@ -43,6 +43,9 @@ typedef struct {
   uint64_t oversized;
   uint64_t duplicates;
   uint64_t stale_replaced;
+  uint64_t reject_busy;
+  uint64_t reject_older;
+  uint64_t reject_cas;
 } aac_rtp_ring_stats_t;
 
 esp_err_t aac_rtp_ring_create(aac_rtp_ring_t **out);
@@ -78,6 +81,24 @@ bool aac_rtp_ring_take_at_or_after(aac_rtp_ring_t *ring, uint32_t wanted_rtp,
                                    uint32_t generation, uint8_t *out,
                                    size_t out_capacity,
                                    aac_rtp_item_t *meta);
+
+/*
+ * Rare discontinuity recovery for an already-locked decoder. Search the
+ * current generation for the nearest READY AU strictly after after_rtp, but
+ * never beyond max_rtp. This is O(slot_count) by design and must only be used
+ * after an exact lookup misses; the steady-state decode path remains O(1).
+ */
+bool aac_rtp_ring_take_next_ready(aac_rtp_ring_t *ring, uint32_t after_rtp,
+                                  uint32_t max_rtp, uint32_t generation,
+                                  uint8_t *out, size_t out_capacity,
+                                  aac_rtp_item_t *meta);
+
+
+/* Rare control-path operation used by FLUSHBUFFERED. Invalidates READY AUs
+ * whose RTP start lies in [from_rtp, until_rtp) for the current generation.
+ * O(slot_count), never used in steady-state. */
+void aac_rtp_ring_invalidate_range(aac_rtp_ring_t *ring, uint32_t from_rtp,
+                                   uint32_t until_rtp, uint32_t generation);
 
 void aac_rtp_ring_get_stats(const aac_rtp_ring_t *ring,
                             aac_rtp_ring_stats_t *out);

@@ -70,6 +70,24 @@ static void validity_set_range(uint32_t valid[VALID_WORDS], uint32_t off,
   }
 }
 
+
+static void validity_clear_range(uint32_t valid[VALID_WORDS], uint32_t off,
+                                 uint32_t count) {
+  while (count) {
+    uint32_t word = off >> 5;
+    uint32_t bit = off & 31U;
+    uint32_t n = 32U - bit;
+    if (n > count) {
+      n = count;
+    }
+    uint32_t mask =
+        (n == 32U) ? 0xFFFFFFFFU : (((1U << n) - 1U) << bit);
+    valid[word] &= ~mask;
+    off += n;
+    count -= n;
+  }
+}
+
 static bool validity_has_range(const uint32_t valid[VALID_WORDS], uint32_t off,
                                uint32_t count) {
   while (count) {
@@ -339,6 +357,40 @@ bool pcm_rtp_ring_read_256(const pcm_rtp_ring_t *r, uint32_t first_rtp,
   }
   return read_page_range(r, first_rtp + first, generation, need - first,
                          out + ((size_t)first * PCM_RTP_CHANNELS));
+}
+
+
+void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *r, uint32_t from_rtp,
+                                   uint32_t until_rtp, uint32_t generation) {
+  if (!r || (int32_t)(until_rtp - from_rtp) <= 0) {
+    return;
+  }
+
+  uint32_t cur = from_rtp;
+  uint32_t remaining = until_rtp - from_rtp;
+  while (remaining) {
+    uint32_t base = page_base(cur);
+    uint32_t off = cur - base;
+    uint32_t chunk = PCM_RTP_SLOT_FRAMES - off;
+    if (chunk > remaining) {
+      chunk = remaining;
+    }
+
+    pcm_slot_tag_t *tag = &r->tags[slot_for_page(base)];
+    uint32_t seq0 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
+    if (!(seq0 & 1U) && tag->generation == generation && tag->page_rtp == base) {
+      uint32_t expected = seq0;
+      if (__atomic_compare_exchange_n(&tag->seq, &expected, seq0 + 1U,
+                                      false, __ATOMIC_ACQ_REL,
+                                      __ATOMIC_ACQUIRE)) {
+        validity_clear_range(tag->valid, off, chunk);
+        __atomic_store_n(&tag->seq, seq0 + 2U, __ATOMIC_RELEASE);
+      }
+    }
+
+    cur += chunk;
+    remaining -= chunk;
+  }
 }
 
 void pcm_rtp_ring_get_stats(const pcm_rtp_ring_t *r,

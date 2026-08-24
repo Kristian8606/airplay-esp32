@@ -1281,17 +1281,21 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   if (is_bplist) {
     uint8_t plist_body[256];
+    uint32_t audio_buffer_size = (stream_type == AUDIO_STREAM_BUFFERED)
+        ? (uint32_t)audio_receiver_get_buffered_audio_buffer_size() : 0U;
     size_t plist_len = bplist_build_stream_setup(
         plist_body, sizeof(plist_body), stream_type, response_data_port,
-        conn->control_port, AP2_AUDIO_BUFFER_SIZE);
+        conn->control_port, audio_buffer_size);
     if (plist_len == 0) {
       audio_receiver_stop();
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                          NULL, 0);
       return;
     }
-    ESP_LOGI(TAG, "SETUP response: type=%lld dataPort=%u controlPort=%u",
-             (long long)stream_type, response_data_port, conn->control_port);
+    ESP_LOGI(TAG,
+             "SETUP response: type=%lld dataPort=%u controlPort=%u audioBufferSize=%u",
+             (long long)stream_type, response_data_port, conn->control_port,
+             (unsigned)audio_buffer_size);
     rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                        "Content-Type: application/x-apple-binary-plist\r\n",
                        (const char *)plist_body, plist_len);
@@ -1727,18 +1731,20 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
                "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
                " untilSeq=%" PRId64 " untilTS=%" PRId64,
                flush_from_seq, flush_from_ts, flush_until_seq, flush_until_ts);
-      // Arm the deferred flush.  Do NOT flush the audio output immediately —
-      // let it drain naturally to the boundary so the current track finishes.
-      audio_receiver_set_deferred_flush((uint32_t)flush_until_ts);
+      audio_receiver_set_deferred_flush_range((uint32_t)flush_from_seq,
+                                              (uint32_t)flush_from_ts,
+                                              (uint32_t)flush_until_seq,
+                                              (uint32_t)flush_until_ts);
     } else {
-      ESP_LOGI(TAG, "FLUSHBUFFERED immediate (missing from/until fields)");
+      ESP_LOGI(TAG, "FLUSHBUFFERED immediate");
+      audio_receiver_set_immediate_flush((uint32_t)flush_until_seq,
+                                         (uint32_t)flush_until_ts,
+                                         got_until_seq && got_until_ts);
     }
   }
 
-  if (!has_deferred) {
-    // Immediate flush: discard everything and reset now.
-    audio_receiver_seek_flush();
-    /* no PCM/output path in AP2 RAW RX build */
+  if (!has_deferred && !(body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)) {
+    audio_receiver_set_immediate_flush(0, 0, false);
   }
 
   rtsp_send_ok(socket, conn, req->cseq);

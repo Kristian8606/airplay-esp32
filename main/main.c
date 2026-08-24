@@ -3,6 +3,7 @@
 #include "dns_server.h"
 #include "hap.h"
 #include "log_stream.h"
+#include "led.h"
 #include "mdns_airplay.h"
 #include "nvs_flash.h"
 #include "ptp_clock.h"
@@ -18,7 +19,7 @@
 
 static const char *TAG = "main";
 #define AP_IP_ADDR 0x0104A8C0
-#define FW_NAME "airplay-esp32_V22"
+#define FW_NAME "airplay-esp32_V22_ALAC_R17_13_STATE_PARITY"
 
 static void print_firmware_banner(void) {
   const esp_app_desc_t *app = esp_app_get_description();
@@ -59,6 +60,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(ptp_clock_init());
   ESP_ERROR_CHECK(hap_init());
   ESP_ERROR_CHECK(audio_receiver_init());
+  led_init();
   mdns_airplay_init();
   ESP_ERROR_CHECK(rtsp_server_start());
 
