@@ -28,14 +28,11 @@
 #define RT_RESEND_REQUEST_PT    85U
 #define RT_MAX_NACK_COUNT       32U
 #define RT_REORDER_SLOTS         64U
-#define RT_REORDER_PACKET_MAX    2048U
-#define RT_RESEND_FIRST_MS        10U
+#define RT_RESEND_FIRST_MS         0U
 #define RT_RESEND_RETRY_MS        35U
-#define RT_RESEND_SAFETY_MS       15U
+#define RT_RESEND_SAFETY_MS       50U
 #define RT_RESEND_SCAN_MS         10U
 #define RT_NACK_TRACK_SLOTS      128U
-#define RT_LATENCY_LOGS           20U
-#define RT_OVERFLOW_LOG_PERIOD_MS 500U
 
 static const char *TAG = "airplay_rt";
 
@@ -43,13 +40,10 @@ typedef struct {
   bool valid;
   bool missing;
   uint16_t seq;
-  uint16_t len;
-  bool retransmitted;
   uint32_t missing_rtp;
   TickType_t missing_since;
   TickType_t last_nack;
   uint8_t nack_count;
-  uint8_t data[RT_REORDER_PACKET_MAX];
 } reorder_slot_t;
 
 typedef struct {
@@ -92,7 +86,18 @@ typedef struct {
   uint32_t resend_retries;
   uint32_t resend_giveups;
   uint32_t hard_resyncs;
-  TickType_t last_overflow_log;
+  uint32_t gap_events;
+  uint32_t missing_packets;
+  uint32_t select_errors;
+  uint32_t recv_errors;
+  uint32_t nack_send_errors;
+  int64_t last_data_rx_us;
+  uint32_t processing_samples;
+  uint64_t processing_sum_us;
+  uint32_t interval_max_processing_us;
+  uint32_t interval_max_control_us;
+  uint32_t interval_max_interarrival_us;
+  uint16_t interval_max_gap_packets;
   nack_track_t nack_track[RT_NACK_TRACK_SLOTS];
   uint32_t rtx_latency_samples;
   uint64_t rtx_latency_sum_us;
@@ -171,17 +176,10 @@ static bool send_retransmit_request(uint16_t first_missing, uint16_t count) {
       t->sent_us = sent_us;
     }
     s_rt.nack_requests++;
-    if (s_rt.nack_requests <= 10U) {
-      ESP_LOGI(TAG, "NACK #%" PRIu32 " first=%u count=%u",
-               s_rt.nack_requests, first_missing, count);
-    }
     return true;
   }
 
-  if (s_rt.nack_requests < 10U) {
-    ESP_LOGW(TAG, "NACK send failed first=%u count=%u errno=%d",
-             first_missing, count, errno);
-  }
+  s_rt.nack_send_errors++;
   return false;
 }
 
@@ -244,18 +242,8 @@ static bool decode_audio_packet(alac_decoder_t *decoder,
   s_rt.decoded_packets++;
   if (retransmitted) {
     s_rt.retransmit_packets++;
-    if (s_rt.retransmit_packets <= 10U) {
-      ESP_LOGI(TAG, "RETRANSMIT #%" PRIu32 " seq=%u rtp=%" PRIu32,
-               s_rt.retransmit_packets, seq, rtp);
-    }
-  } else if (*first_logs < RT_FIRST_PACKET_LOGS) {
-    (*first_logs)++;
-    ESP_LOGI(TAG,
-             "RTP+ALAC OK #%u seq=%u rtp=%" PRIu32
-             " packet=%u alac=%d pcm_frames=%d ch=%d",
-             (unsigned)*first_logs, seq, rtp, (unsigned)packet_len, dec_len,
-             frames, info.channels);
   }
+  (void)first_logs;
   return true;
 }
 
@@ -322,38 +310,28 @@ static void reorder_mark_missing(uint16_t seq, uint32_t rtp, TickType_t now) {
 }
 
 static bool reorder_store(const uint8_t *packet, size_t packet_len,
-                          bool retransmitted) {
-  if (!packet || packet_len < 12U || packet_len > RT_REORDER_PACKET_MAX) {
-    return false;
-  }
+                          bool retransmitted, bool *should_decode) {
+  (void)retransmitted;
+  if (should_decode) *should_decode = false;
+  if (!packet || packet_len < 12U) return false;
+
   const uint16_t seq =
       (uint16_t)(((uint16_t)packet[2] << 8) | packet[3]);
 
+  /* expected_seq is only the oldest unresolved sequence in the 64-packet
+   * loss/NACK window. Audio bytes are never queued here: every accepted
+   * normal or retransmitted ALAC packet is decoded immediately and the RTP
+   * PCM ring performs the actual out-of-order placement. */
   if (s_rt.expected_valid && (int16_t)(seq - s_rt.expected_seq) < 0) {
     s_rt.reorder_late++;
-    return true; /* Already played/decoded. */
+    return true; /* Already resolved/decoded; ignore duplicate/late RTX. */
   }
 
   reorder_slot_t *slot = reorder_slot_for(seq);
-  if (slot->valid && slot->seq != seq) {
-    s_rt.reorder_overwrite++;
-    TickType_t now = xTaskGetTickCount();
-    if (s_rt.last_overflow_log == 0 ||
-        (now - s_rt.last_overflow_log) >= pdMS_TO_TICKS(RT_OVERFLOW_LOG_PERIOD_MS)) {
-      ESP_LOGW(TAG,
-               "reorder overflow seq=%u replacing=%u total=%" PRIu32,
-               seq, slot->seq, s_rt.reorder_overwrite);
-      s_rt.last_overflow_log = now;
-    }
-  }
-  if (slot->valid && slot->seq == seq) {
-    return true; /* Duplicate original/retransmit. */
-  }
+  if (slot->valid && slot->seq != seq) s_rt.reorder_overwrite++;
+  if (slot->valid && slot->seq == seq) return true;
 
-  memcpy(slot->data, packet, packet_len);
-  slot->len = (uint16_t)packet_len;
   slot->seq = seq;
-  slot->retransmitted = retransmitted;
   slot->valid = true;
   slot->missing = false;
   slot->missing_rtp = 0;
@@ -365,20 +343,16 @@ static bool reorder_store(const uint8_t *packet, size_t packet_len,
     s_rt.newest_seq = seq;
     s_rt.newest_valid = true;
   }
+  if (should_decode) *should_decode = true;
   return true;
 }
 
-static void reorder_drain(alac_decoder_t *decoder, uint32_t *first_logs) {
-  if (!s_rt.expected_valid) {
-    return;
-  }
+static void reorder_advance_frontier(void) {
+  if (!s_rt.expected_valid) return;
   while (reorder_has(s_rt.expected_seq)) {
     reorder_slot_t *slot = reorder_slot_for(s_rt.expected_seq);
-    const uint16_t seq = s_rt.expected_seq;
-    (void)decode_audio_packet(decoder, slot->data, slot->len,
-                              slot->retransmitted, first_logs);
     memset(slot, 0, sizeof(*slot));
-    s_rt.expected_seq = (uint16_t)(seq + 1U);
+    s_rt.expected_seq = (uint16_t)(s_rt.expected_seq + 1U);
   }
 }
 
@@ -419,9 +393,11 @@ static void reorder_note_gap(uint16_t got_seq, uint32_t got_rtp) {
   }
 
   if (newly_missing != 0U) {
-    ESP_LOGW(TAG,
-             "RTP sequence gap expected=%u got=%u missing=%u new=%u",
-             s_rt.expected_seq, got_seq, missing, newly_missing);
+    s_rt.gap_events++;
+    s_rt.missing_packets += newly_missing;
+    if (missing > s_rt.interval_max_gap_packets) {
+      s_rt.interval_max_gap_packets = missing;
+    }
   }
 }
 
@@ -514,8 +490,7 @@ static void reorder_resend_scan(void) {
   }
 }
 
-static void reorder_giveup_expired(alac_decoder_t *decoder,
-                                   uint32_t *first_logs) {
+static void reorder_giveup_expired(void) {
   if (!s_rt.expected_valid) {
     return;
   }
@@ -549,19 +524,16 @@ static void reorder_giveup_expired(alac_decoder_t *decoder,
   if (skipped != 0U) {
     s_rt.gap_skips += skipped;
     s_rt.resend_giveups += skipped;
-    ESP_LOGW(TAG,
-             "resend playout deadline; skipping %u packet(s) from seq=%u "
-             "t_play=%" PRId64 "ms margin=%ums",
-             skipped, first, first_deadline_us / 1000LL,
-             (unsigned)RT_RESEND_SAFETY_MS);
-    reorder_drain(decoder, first_logs);
+    (void)first;
+    (void)first_deadline_us;
+    reorder_advance_frontier();
   }
 }
 
-static void reorder_service(alac_decoder_t *decoder, uint32_t *first_logs) {
-  // Drop holes that can no longer make their real playout deadline first.
-  // This prevents sending a NACK for a packet that we immediately discard.
-  reorder_giveup_expired(decoder, first_logs);
+static void reorder_service(void) {
+  /* Drop holes that cannot make their playout deadline before requesting
+   * anything else. The tracker no longer gates audio decode. */
+  reorder_giveup_expired();
   reorder_resend_scan();
 }
 
@@ -591,45 +563,32 @@ static void note_retransmit_latency(const uint8_t *packet, size_t packet_len) {
   s_rt.rtx_latency_sum_us += us;
   s_rt.rtx_latency_samples++;
 
-  if (s_rt.rtx_latency_samples <= RT_LATENCY_LOGS) {
-    ESP_LOGI(TAG, "RTX latency #%" PRIu32 " seq=%u %.2f ms",
-             s_rt.rtx_latency_samples, seq, (double)us / 1000.0);
-  }
 }
 
 static void handle_control_socket(alac_decoder_t *decoder,
                                   uint32_t *first_logs) {
-  /* Do not put RT_PACKET_MAX (8 KiB) on this task's 7 KiB stack.
-   * Reuse the persistent RX packet buffer: control and data sockets are
-   * serviced serially by this same task, and retransmit data is copied into
-   * the reorder queue before the next recv(). */
   uint8_t *buf = s_rt.packet;
-  if (!buf) {
-    return;
-  }
+  if (!buf) return;
+
   while (s_rt.control_sock >= 0) {
     ssize_t n = recv(s_rt.control_sock, buf, RT_PACKET_MAX, MSG_DONTWAIT);
-    if (n <= 0) {
-      break;
-    }
-    if (n < 4) {
-      continue;
-    }
+    if (n <= 0) break;
+    if (n < 4) continue;
 
     const uint8_t pt = buf[1] & 0x7fU;
     if (pt == RT_RETRANSMIT_PT) {
-      /* Retransmit response (PT=86): 4-byte resend wrapper followed by the
-       * complete original RTP audio packet. */
-      if (n > 4) {
-        note_retransmit_latency(buf + 4, (size_t)n - 4U);
-      }
-      if (n <= 4 || !reorder_store(buf + 4, (size_t)n - 4U, true)) {
+      if (n > 4) note_retransmit_latency(buf + 4, (size_t)n - 4U);
+
+      bool should_decode = false;
+      if (n <= 4 ||
+          !reorder_store(buf + 4, (size_t)n - 4U, true, &should_decode)) {
         s_rt.retransmit_bad++;
-        if (s_rt.retransmit_bad <= 10U) {
-          ESP_LOGW(TAG, "bad retransmit response bytes=%d", (int)n);
-        }
       } else {
-        reorder_drain(decoder, first_logs);
+        if (should_decode) {
+          (void)decode_audio_packet(decoder, buf + 4, (size_t)n - 4U, true,
+                                    first_logs);
+        }
+        reorder_advance_frontier();
       }
       continue;
     }
@@ -685,17 +644,27 @@ static void realtime_task(void *arg) {
     }
     if (ready < 0) {
       if (errno != EINTR && s_rt.running) {
-        ESP_LOGW(TAG, "select error: %d", errno);
+        s_rt.select_errors++;
       }
       continue;
     }
     if (ready == 0) {
-      reorder_service(decoder, &first_logs);
+      reorder_service();
       continue;
     }
 
     if (s_rt.control_sock >= 0 && FD_ISSET(s_rt.control_sock, &rfds)) {
+      const int64_t control_start_us = esp_timer_get_time();
       handle_control_socket(decoder, &first_logs);
+      const int64_t control_us64 = esp_timer_get_time() - control_start_us;
+      if (control_us64 >= 0) {
+        const uint32_t control_us = control_us64 > UINT32_MAX
+                                        ? UINT32_MAX
+                                        : (uint32_t)control_us64;
+        if (control_us > s_rt.interval_max_control_us) {
+          s_rt.interval_max_control_us = control_us;
+        }
+      }
     }
 
     if (s_rt.data_sock < 0 || !FD_ISSET(s_rt.data_sock, &rfds)) {
@@ -705,10 +674,22 @@ static void realtime_task(void *arg) {
     ssize_t n = recv(s_rt.data_sock, s_rt.packet, RT_PACKET_MAX, 0);
     if (n <= 0) {
       if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-        ESP_LOGW(TAG, "recv error: %d", errno);
+        s_rt.recv_errors++;
       }
       continue;
     }
+
+    const int64_t packet_rx_us = esp_timer_get_time();
+    if (s_rt.last_data_rx_us != 0) {
+      const int64_t gap_us64 = packet_rx_us - s_rt.last_data_rx_us;
+      if (gap_us64 > 0) {
+        const uint32_t gap_us = gap_us64 > UINT32_MAX ? UINT32_MAX : (uint32_t)gap_us64;
+        if (gap_us > s_rt.interval_max_interarrival_us) {
+          s_rt.interval_max_interarrival_us = gap_us;
+        }
+      }
+    }
+    s_rt.last_data_rx_us = packet_rx_us;
 
     const size_t packet_len = (size_t)n;
     if (packet_len >= 12U) {
@@ -726,11 +707,30 @@ static void realtime_task(void *arg) {
       if ((int16_t)(seq - s_rt.expected_seq) > 0) {
         reorder_note_gap(seq, rtp);
       }
-      if (!reorder_store(s_rt.packet, packet_len, false)) {
+      bool should_decode = false;
+      if (!reorder_store(s_rt.packet, packet_len, false, &should_decode)) {
         s_rt.retransmit_bad++;
+      } else if (should_decode) {
+        /* Decode every live packet immediately. Missing earlier sequence
+         * numbers remain only in the NACK/deadline tracker; PCM placement is
+         * by RTP timestamp in the common ring. */
+        (void)decode_audio_packet(decoder, s_rt.packet, packet_len, false,
+                                  &first_logs);
       }
-      reorder_drain(decoder, &first_logs);
-      reorder_service(decoder, &first_logs);
+      reorder_advance_frontier();
+      reorder_service();
+
+      const int64_t processing_us64 = esp_timer_get_time() - packet_rx_us;
+      if (processing_us64 >= 0) {
+        const uint32_t processing_us = processing_us64 > UINT32_MAX
+                                           ? UINT32_MAX
+                                           : (uint32_t)processing_us64;
+        s_rt.processing_samples++;
+        s_rt.processing_sum_us += processing_us;
+        if (processing_us > s_rt.interval_max_processing_us) {
+          s_rt.interval_max_processing_us = processing_us;
+        }
+      }
     }
   }
 
@@ -789,7 +789,18 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.resend_retries = 0;
   s_rt.resend_giveups = 0;
   s_rt.hard_resyncs = 0;
-  s_rt.last_overflow_log = 0;
+  s_rt.gap_events = 0;
+  s_rt.missing_packets = 0;
+  s_rt.select_errors = 0;
+  s_rt.recv_errors = 0;
+  s_rt.nack_send_errors = 0;
+  s_rt.last_data_rx_us = 0;
+  s_rt.processing_samples = 0;
+  s_rt.processing_sum_us = 0;
+  s_rt.interval_max_processing_us = 0;
+  s_rt.interval_max_control_us = 0;
+  s_rt.interval_max_interarrival_us = 0;
+  s_rt.interval_max_gap_packets = 0;
   reorder_clear_state();
   s_rt.rtx_latency_samples = 0;
   s_rt.rtx_latency_sum_us = 0;
@@ -887,6 +898,47 @@ void realtime_receiver_set_client_control(uint32_t client_ip,
   ESP_LOGI(TAG, "retransmit target=%s:%u",
            inet_ntoa(s_rt.client_control_addr.sin_addr),
            (unsigned)client_control_port);
+}
+
+void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
+                                bool reset_interval_peaks) {
+  if (!out) {
+    return;
+  }
+
+  memset(out, 0, sizeof(*out));
+  out->rx_packets = s_rt.rx_packets;
+  out->gap_events = s_rt.gap_events;
+  out->missing_packets = s_rt.missing_packets;
+  out->nack_requests = s_rt.nack_requests;
+  out->retransmit_packets = s_rt.retransmit_packets;
+  out->retransmit_bad = s_rt.retransmit_bad;
+  out->reorder_late = s_rt.reorder_late;
+  out->reorder_overwrite = s_rt.reorder_overwrite;
+  out->gap_skips = s_rt.gap_skips;
+  out->resend_retries = s_rt.resend_retries;
+  out->resend_giveups = s_rt.resend_giveups;
+  out->hard_resyncs = s_rt.hard_resyncs;
+  out->select_errors = s_rt.select_errors;
+  out->recv_errors = s_rt.recv_errors;
+  out->nack_send_errors = s_rt.nack_send_errors;
+  out->processing_samples = s_rt.processing_samples;
+  out->processing_sum_us = s_rt.processing_sum_us;
+  out->interval_max_processing_us = s_rt.interval_max_processing_us;
+  out->interval_max_control_us = s_rt.interval_max_control_us;
+  out->interval_max_interarrival_us = s_rt.interval_max_interarrival_us;
+  out->interval_max_gap_packets = s_rt.interval_max_gap_packets;
+  out->rtx_latency_samples = s_rt.rtx_latency_samples;
+  out->rtx_latency_sum_us = s_rt.rtx_latency_sum_us;
+  out->rtx_latency_min_us = s_rt.rtx_latency_min_us;
+  out->rtx_latency_max_us = s_rt.rtx_latency_max_us;
+
+  if (reset_interval_peaks) {
+    s_rt.interval_max_processing_us = 0;
+    s_rt.interval_max_control_us = 0;
+    s_rt.interval_max_interarrival_us = 0;
+    s_rt.interval_max_gap_packets = 0;
+  }
 }
 
 bool realtime_receiver_is_running(void) { return s_rt.running; }

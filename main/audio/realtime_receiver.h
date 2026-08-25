@@ -22,6 +22,35 @@ typedef void (*realtime_resync_cb_t)(void *ctx);
 typedef bool (*realtime_deadline_cb_t)(uint32_t rtp,
                                        int64_t *time_to_play_us, void *ctx);
 
+
+typedef struct {
+  uint32_t rx_packets;
+  uint32_t gap_events;
+  uint32_t missing_packets;
+  uint32_t nack_requests;
+  uint32_t retransmit_packets;
+  uint32_t retransmit_bad;
+  uint32_t reorder_late;
+  uint32_t reorder_overwrite;
+  uint32_t gap_skips;
+  uint32_t resend_retries;
+  uint32_t resend_giveups;
+  uint32_t hard_resyncs;
+  uint32_t select_errors;
+  uint32_t recv_errors;
+  uint32_t nack_send_errors;
+  uint32_t processing_samples;
+  uint64_t processing_sum_us;
+  uint32_t interval_max_processing_us;
+  uint32_t interval_max_control_us;
+  uint32_t interval_max_interarrival_us;
+  uint16_t interval_max_gap_packets;
+  uint32_t rtx_latency_samples;
+  uint64_t rtx_latency_sum_us;
+  uint32_t rtx_latency_min_us;
+  uint32_t rtx_latency_max_us;
+} realtime_receiver_diag_t;
+
 typedef struct {
   audio_format_t format;
   audio_encrypt_t encrypt;
@@ -37,4 +66,5 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
                                   const realtime_receiver_config_t *config);
 void realtime_receiver_stop(void);
 bool realtime_receiver_is_running(void);
+void realtime_receiver_get_diag(realtime_receiver_diag_t *out, bool reset_interval_peaks);
 void realtime_receiver_set_client_control(uint32_t client_ip, uint16_t client_control_port);

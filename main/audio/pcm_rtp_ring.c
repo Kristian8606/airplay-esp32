@@ -339,24 +339,35 @@ bool pcm_rtp_ring_has_range(const pcm_rtp_ring_t *r, uint32_t first_rtp,
   return true;
 }
 
+bool pcm_rtp_ring_read(const pcm_rtp_ring_t *r, uint32_t first_rtp,
+                       uint32_t frames, uint32_t generation, int16_t *out) {
+  if (!r || !out || frames == 0 || generation != r->generation) {
+    return false;
+  }
+
+  uint32_t cur = first_rtp;
+  uint32_t remain = frames;
+  size_t out_frame = 0;
+  while (remain) {
+    uint32_t offset = cur & (PCM_RTP_SLOT_FRAMES - 1U);
+    uint32_t chunk = PCM_RTP_SLOT_FRAMES - offset;
+    if (chunk > remain) {
+      chunk = remain;
+    }
+    if (!read_page_range(r, cur, generation, chunk,
+                         out + out_frame * PCM_RTP_CHANNELS)) {
+      return false;
+    }
+    cur += chunk;
+    remain -= chunk;
+    out_frame += chunk;
+  }
+  return true;
+}
+
 bool pcm_rtp_ring_read_256(const pcm_rtp_ring_t *r, uint32_t first_rtp,
                            uint32_t generation, int16_t *out) {
-  if (!r || !out || generation != r->generation) {
-    return false;
-  }
-
-  const uint32_t need = 256U;
-  uint32_t offset = first_rtp & (PCM_RTP_SLOT_FRAMES - 1U);
-  uint32_t first = PCM_RTP_SLOT_FRAMES - offset;
-  if (first >= need) {
-    return read_page_range(r, first_rtp, generation, need, out);
-  }
-
-  if (!read_page_range(r, first_rtp, generation, first, out)) {
-    return false;
-  }
-  return read_page_range(r, first_rtp + first, generation, need - first,
-                         out + ((size_t)first * PCM_RTP_CHANNELS));
+  return pcm_rtp_ring_read(r, first_rtp, 256U, generation, out);
 }
 
 

@@ -52,7 +52,12 @@ bool pcm_rtp_ring_write(pcm_rtp_ring_t *ring, uint32_t first_rtp,
                         uint32_t generation, uint32_t wanted_rtp,
                         bool wanted_valid);
 
-/* Future playout API: exact O(1) RTP lookup, at most two memcpy operations. */
+/* Exact RTP lookup for an arbitrary contiguous stereo range. */
+bool pcm_rtp_ring_read(const pcm_rtp_ring_t *ring, uint32_t first_rtp,
+                       uint32_t frames, uint32_t generation,
+                       int16_t *out_stereo);
+
+/* Playout fast path: exact RTP lookup, at most two memcpy operations. */
 bool pcm_rtp_ring_read_256(const pcm_rtp_ring_t *ring, uint32_t first_rtp,
                            uint32_t generation, int16_t *out_stereo_256);
 
