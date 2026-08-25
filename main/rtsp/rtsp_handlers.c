@@ -52,6 +52,10 @@ static const rtsp_codec_t codec_registry[] = {
 
 bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
                           int64_t sample_rate, int64_t samples_per_frame) {
+  if (!fmt) {
+    return false;
+  }
+  memset(fmt, 0, sizeof(*fmt));
   for (const rtsp_codec_t *codec = codec_registry; codec->name; codec++) {
     if (codec->type_id == type_id) {
       configure_codec(fmt, codec->name, sample_rate, samples_per_frame);
@@ -61,10 +65,25 @@ bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
       return true;
     }
   }
-  // Default to ALAC if unknown codec type
-  ESP_LOGW(TAG, "Unknown codec type %lld, defaulting to ALAC",
-           (long long)type_id);
-  configure_codec(fmt, "ALAC", sample_rate, samples_per_frame);
+
+  /* Never guess an unknown codec as ALAC. Doing so can send arbitrary
+   * compressed payload into the ALAC decoder while the I2S/timeline remains
+   * configured for 44.1 kHz. Unknown formats are rejected by SETUP. */
+  ESP_LOGW(TAG, "Unknown codec type %lld", (long long)type_id);
+  return false;
+}
+
+static bool ap2_audio_format_supported(int64_t stream_type, int64_t codec_type,
+                                       int64_t sample_rate,
+                                       int64_t samples_per_frame) {
+  if (stream_type == AUDIO_STREAM_REALTIME) {
+    return codec_type == 2 && sample_rate == 44100 &&
+           samples_per_frame == 352;
+  }
+  if (stream_type == AUDIO_STREAM_BUFFERED) {
+    return codec_type == 4 && sample_rate == 44100 &&
+           samples_per_frame == 1024;
+  }
   return false;
 }
 
@@ -1003,45 +1022,75 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   if (body && body_len > 0 && is_bplist && request_has_streams) {
     conn->protocol_version = 2;
-    for (size_t i = 0; i < stream_count; i++) {
-      int64_t stream_type = -1;
-      size_t ekey_len = 0, eiv_len = 0, shk_len = 0;
-      if (bplist_get_stream_info(body, body_len, i, &stream_type, &ekey_len,
-                                 &eiv_len, &shk_len)) {
-        if (i == 0) {
-          conn->stream_type = stream_type;
-          audio_receiver_set_stream_type((audio_stream_type_t)stream_type);
-        }
 
-        bplist_kv_info_t kv[16];
-        size_t kv_count = 0;
-        int64_t codec_type = -1;
-        int64_t sample_rate = 44100;
-        int64_t samples_per_frame = 352;
+    /* This receiver owns one audio stream at a time. Validate the first
+     * negotiated stream before committing any codec/stream state. Do not let
+     * a later unsupported stream dictionary overwrite the active audio format. */
+    int64_t stream_type = -1;
+    size_t ekey_len = 0, eiv_len = 0, shk_len = 0;
+    if (stream_count == 0 ||
+        !bplist_get_stream_info(body, body_len, 0, &stream_type, &ekey_len,
+                                &eiv_len, &shk_len)) {
+      ESP_LOGE(TAG, "SETUP: malformed AirPlay 2 audio stream");
+      rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL,
+                         NULL, 0);
+      return;
+    }
 
-        if (bplist_get_stream_kv_info(body, body_len, i, kv, 16, &kv_count)) {
-          for (size_t k = 0; k < kv_count; k++) {
-            if (kv[k].value_type == BPLIST_VALUE_INT) {
-              if (strcmp(kv[k].key, "ct") == 0) {
-                codec_type = kv[k].int_value;
-              } else if (strcmp(kv[k].key, "sr") == 0) {
-                sample_rate = kv[k].int_value;
-              } else if (strcmp(kv[k].key, "spf") == 0) {
-                samples_per_frame = kv[k].int_value;
-              } else if (strcmp(kv[k].key, "controlPort") == 0) {
-                conn->client_control_port = (uint16_t)kv[k].int_value;
-              }
-            }
-          }
+    bplist_kv_info_t kv[16];
+    size_t kv_count = 0;
+    int64_t codec_type = -1;
+    /* Keep the established 44.1 kHz / frame-size defaults when optional keys
+     * are omitted, but never guess the codec itself. An explicitly supplied
+     * unsupported rate/frame size is still rejected below. */
+    int64_t sample_rate = 44100;
+    int64_t samples_per_frame =
+        stream_type == AUDIO_STREAM_BUFFERED ? 1024 :
+        (stream_type == AUDIO_STREAM_REALTIME ? 352 : -1);
+    if (!bplist_get_stream_kv_info(body, body_len, 0, kv, 16, &kv_count)) {
+      ESP_LOGE(TAG, "SETUP: missing AirPlay 2 audio format dictionary");
+      rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL,
+                         NULL, 0);
+      return;
+    }
 
-          // Use codec registry to configure audio format
-          audio_format_t format = {0};
-          rtsp_codec_configure(codec_type, &format, sample_rate,
-                               samples_per_frame);
-          audio_receiver_set_format(&format);
-        }
+    for (size_t k = 0; k < kv_count; k++) {
+      if (kv[k].value_type != BPLIST_VALUE_INT) {
+        continue;
+      }
+      if (strcmp(kv[k].key, "ct") == 0) {
+        codec_type = kv[k].int_value;
+      } else if (strcmp(kv[k].key, "sr") == 0) {
+        sample_rate = kv[k].int_value;
+      } else if (strcmp(kv[k].key, "spf") == 0) {
+        samples_per_frame = kv[k].int_value;
+      } else if (strcmp(kv[k].key, "controlPort") == 0) {
+        conn->client_control_port = (uint16_t)kv[k].int_value;
       }
     }
+
+    audio_format_t format = {0};
+    const bool known_codec = rtsp_codec_configure(
+        codec_type, &format, sample_rate, samples_per_frame);
+    if (!known_codec ||
+        !ap2_audio_format_supported(stream_type, codec_type, sample_rate,
+                                    samples_per_frame)) {
+      ESP_LOGE(TAG,
+               "SETUP: unsupported AP2 audio format type=%lld ct=%lld "
+               "sr=%lld spf=%lld (supported: 96/ALAC/44100/352, "
+               "103/AAC/44100/1024)",
+               (long long)stream_type, (long long)codec_type,
+               (long long)sample_rate, (long long)samples_per_frame);
+      conn->stream_type = AUDIO_STREAM_NONE;
+      audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
+      rtsp_send_response(socket, conn, 400, "Unsupported Audio Format",
+                         req->cseq, NULL, NULL, 0);
+      return;
+    }
+
+    conn->stream_type = stream_type;
+    audio_receiver_set_stream_type((audio_stream_type_t)stream_type);
+    audio_receiver_set_format(&format);
   }
 
   // Process encryption keys

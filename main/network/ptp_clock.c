@@ -114,6 +114,13 @@ static struct {
   uint64_t expected_clock_id;
 } ptp = {0};
 
+/* PTP state is written by the PTP task on Core 0 and read/reset from RTSP/audio
+ * control paths that can run concurrently with Core 1 playout. ESP32-S3 is a
+ * 32-bit CPU, so 64-bit offset/clock-id fields must not be read or written
+ * lock-free across cores. Keep this lock extremely short: no socket I/O, task
+ * delays or logging is performed while it is held. */
+static portMUX_TYPE ptp_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
 // Parse 8-byte clockIdentity (big-endian) from PTP sourcePortIdentity
 // (header bytes 20-27).
 static uint64_t parse_ptp_clock_id(const uint8_t *data) {
@@ -155,8 +162,40 @@ static inline int64_t get_local_time_ns(void) {
 // dampening negative jitter (smaller offset = longer delay) slowly, the
 // filter converges to the offset corresponding to the minimum network
 // delay — the best available approximation of the true clock offset.
-static void update_offset(int64_t new_offset_ns) {
-  uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+typedef enum {
+  PTP_OFFSET_EVENT_NONE = 0,
+  PTP_OFFSET_EVENT_LOCKED,
+  PTP_OFFSET_EVENT_LOST,
+} ptp_offset_event_t;
+
+typedef struct {
+  ptp_offset_event_t event;
+  int64_t filtered_offset_ns;
+  int64_t dev_ns;
+  uint32_t sample_count;
+  uint32_t sync_count;
+  uint32_t followup_count;
+} ptp_offset_log_t;
+
+static void log_offset_event(const ptp_offset_log_t *ev) {
+  if (!ev) return;
+  if (ev->event == PTP_OFFSET_EVENT_LOCKED) {
+    ESP_LOGI(TAG,
+             "LOCKED: offset=%+lldns dev=%lldns samples=%lu sync=%lu followup=%lu",
+             (long long)ev->filtered_offset_ns, (long long)ev->dev_ns,
+             (unsigned long)ev->sample_count, (unsigned long)ev->sync_count,
+             (unsigned long)ev->followup_count);
+  } else if (ev->event == PTP_OFFSET_EVENT_LOST) {
+    ESP_LOGW(TAG, "LOST LOCK: dev=%lldns (threshold=%lldns)",
+             (long long)ev->dev_ns, (long long)(LOCK_THRESHOLD_NS * 4));
+  }
+}
+
+/* Caller must hold ptp_state_mux. */
+static void update_offset_locked(int64_t new_offset_ns, uint32_t now_ms,
+                                 ptp_offset_log_t *log_ev) {
+  if (log_ev) memset(log_ev, 0, sizeof(*log_ev));
+
   ptp.last_sync_ms = now_ms;
   ptp.sample_count++;
   // Record the raw sample before any smoothing or outlier rejection, so the
@@ -172,9 +211,7 @@ static void update_offset(int64_t new_offset_ns) {
   } else {
     // Reject obvious outliers (more than 50ms from current estimate)
     int64_t diff = new_offset_ns - ptp.filtered_offset_ns;
-    if (diff < 0) {
-      diff = -diff;
-    }
+    if (diff < 0) diff = -diff;
     if (diff > OUTLIER_THRESHOLD_NS) {
       ptp.outlier_count++;
       return;
@@ -184,16 +221,12 @@ static void update_offset(int64_t new_offset_ns) {
     uint32_t mastership_time_ms = now_ms - ptp.mastership_start_ms;
 
     if (jitter >= 0) {
-      // Positive jitter: offset increased → shorter network delay → more
-      // accurate.  Accept quickly, especially during startup.
       if (mastership_time_ms < STARTUP_DURATION_MS) {
         smoothed_offset = ptp.previous_offset + jitter / SMOOTH_POS_STARTUP_DIV;
       } else {
         smoothed_offset = ptp.previous_offset + jitter / SMOOTH_POS_STEADY_DIV;
       }
     } else {
-      // Negative jitter: offset decreased → longer network delay → less
-      // reliable.  Clamp and apply only a tiny fraction.
       int64_t clamped_jitter = jitter;
       if (clamped_jitter < SMOOTH_NEG_CLAMP_NS) {
         clamped_jitter = SMOOTH_NEG_CLAMP_NS;
@@ -206,14 +239,9 @@ static void update_offset(int64_t new_offset_ns) {
   ptp.previous_offset_time_ms = now_ms;
   ptp.filtered_offset_ns = smoothed_offset;
 
-  // Check lock status: once we have enough samples and the offset is stable,
-  // declare lock.  Use the deviation between the raw sample and the smoothed
-  // value as a stability indicator.
   if (ptp.sample_count >= MIN_SAMPLES_FOR_LOCK) {
     int64_t dev = new_offset_ns - smoothed_offset;
-    if (dev < 0) {
-      dev = -dev;
-    }
+    if (dev < 0) dev = -dev;
 
     if (dev < LOCK_THRESHOLD_NS) {
       if (!ptp.locked) {
@@ -224,13 +252,14 @@ static void update_offset(int64_t new_offset_ns) {
           ptp.locked = true;
           ptp.lock_start_ms = now_ms;
           ptp.lock_candidate_start_ms = 0;
-          ESP_LOGI(TAG,
-                   "LOCKED: offset=%+lldns dev=%lldns samples=%lu "
-                   "sync=%lu followup=%lu",
-                   (long long)ptp.filtered_offset_ns, (long long)dev,
-                   (unsigned long)ptp.sample_count,
-                   (unsigned long)ptp.sync_count,
-                   (unsigned long)ptp.followup_count);
+          if (log_ev) {
+            log_ev->event = PTP_OFFSET_EVENT_LOCKED;
+            log_ev->filtered_offset_ns = ptp.filtered_offset_ns;
+            log_ev->dev_ns = dev;
+            log_ev->sample_count = ptp.sample_count;
+            log_ev->sync_count = ptp.sync_count;
+            log_ev->followup_count = ptp.followup_count;
+          }
         }
       }
     } else {
@@ -238,52 +267,72 @@ static void update_offset(int64_t new_offset_ns) {
       if (ptp.locked && dev > LOCK_THRESHOLD_NS * 4) {
         ptp.locked = false;
         ptp.lock_start_ms = 0;
-        ESP_LOGW(TAG, "LOST LOCK: dev=%lldns (threshold=%lldns)",
-                 (long long)dev, (long long)(LOCK_THRESHOLD_NS * 4));
+        if (log_ev) {
+          log_ev->event = PTP_OFFSET_EVENT_LOST;
+          log_ev->dev_ns = dev;
+        }
       }
     }
   }
 }
 
+// Master filter check. Caller must hold ptp_state_mux.
+static bool master_matches_locked(const uint8_t *data) {
+  if (ptp.expected_clock_id == 0) return true;
+  if (parse_ptp_clock_id(data) == ptp.expected_clock_id) return true;
+  ptp.rejected_master_count++;
+  return false;
+}
+
 // Process SYNC message (records receive time)
 static void process_sync(const uint8_t *data, size_t len, uint16_t seq) {
+  const int64_t local_sync_ns = get_local_time_ns();
+  const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  ptp_offset_log_t log_ev = {0};
+
+  taskENTER_CRITICAL(&ptp_state_mux);
+  if (!master_matches_locked(data)) {
+    taskEXIT_CRITICAL(&ptp_state_mux);
+    return;
+  }
+
   ptp.sync_count++;
   ptp.last_sync_seq = seq;
-  ptp.last_sync_local_ns = get_local_time_ns();
+  ptp.last_sync_local_ns = local_sync_ns;
   ptp.awaiting_followup = true;
 
-  // Check if this is a one-step sync (timestamp in SYNC itself)
-  // One-step: flags bit 9 (twoStepFlag) is 0
   uint16_t flags = ((uint16_t)data[6] << 8) | data[7];
   bool two_step = (flags & 0x0200) != 0;
 
   if (!two_step && len >= PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) {
-    // One-step sync - timestamp is in the SYNC message
     uint64_t ptp_time_ns = parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
-    // Apply correctionField for one-step sync as well
     if (len >= 16) {
       int64_t correction_field =
           ((int64_t)data[8] << 56) | ((int64_t)data[9] << 48) |
           ((int64_t)data[10] << 40) | ((int64_t)data[11] << 32) |
           ((int64_t)data[12] << 24) | ((int64_t)data[13] << 16) |
           ((int64_t)data[14] << 8) | (int64_t)data[15];
-      correction_field /= 65536; // convert from 2^-16 ns to ns
+      correction_field /= 65536;
       ptp_time_ns = (uint64_t)((int64_t)ptp_time_ns + correction_field);
     }
-    int64_t offset = (int64_t)ptp_time_ns - ptp.last_sync_local_ns;
-    update_offset(offset);
+    const int64_t offset = (int64_t)ptp_time_ns - local_sync_ns;
+    update_offset_locked(offset, now_ms, &log_ev);
     ptp.awaiting_followup = false;
   }
+  taskEXIT_CRITICAL(&ptp_state_mux);
+
+  log_offset_event(&log_ev);
 }
 
 // Process FOLLOW_UP message (contains precise timestamp for preceding SYNC)
 static void process_followup(const uint8_t *data, size_t len, uint16_t seq) {
-  if (!ptp.awaiting_followup) {
-    return;
-  }
+  const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  ptp_offset_log_t log_ev = {0};
 
-  // FOLLOW_UP should match the sequence of the last SYNC
-  if (seq != ptp.last_sync_seq) {
+  taskENTER_CRITICAL(&ptp_state_mux);
+  if (!master_matches_locked(data) || !ptp.awaiting_followup ||
+      seq != ptp.last_sync_seq) {
+    taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
 
@@ -292,25 +341,22 @@ static void process_followup(const uint8_t *data, size_t len, uint16_t seq) {
 
   if (len >= PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) {
     uint64_t ptp_time_ns = parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
-
-    // Apply correctionField (IEEE 1588 §11.4.4.2.1):
-    // The correctionField accumulates residence time and path delay
-    // corrections from PTP-aware network elements.  It is a signed
-    // 64-bit value in units of 2^-16 nanoseconds.
     if (len >= 16) {
       int64_t correction_field =
           ((int64_t)data[8] << 56) | ((int64_t)data[9] << 48) |
           ((int64_t)data[10] << 40) | ((int64_t)data[11] << 32) |
           ((int64_t)data[12] << 24) | ((int64_t)data[13] << 16) |
           ((int64_t)data[14] << 8) | (int64_t)data[15];
-      correction_field /= 65536; // convert from 2^-16 ns to ns
+      correction_field /= 65536;
       ptp_time_ns = (uint64_t)((int64_t)ptp_time_ns + correction_field);
     }
 
-    // offset = PTP_time - local_time_at_sync_receipt
-    int64_t offset = (int64_t)ptp_time_ns - ptp.last_sync_local_ns;
-    update_offset(offset);
+    const int64_t offset = (int64_t)ptp_time_ns - ptp.last_sync_local_ns;
+    update_offset_locked(offset, now_ms, &log_ev);
   }
+  taskEXIT_CRITICAL(&ptp_state_mux);
+
+  log_offset_event(&log_ev);
 }
 
 // Process received PTP message
@@ -322,18 +368,6 @@ static void process_ptp_message(const uint8_t *data, size_t len,
 
   uint8_t msg_type = data[0] & 0x0F;
   uint16_t seq = ((uint16_t)data[30] << 8) | data[31];
-
-  // If a master filter is set, reject messages from other clocks.
-  // This applies only to messages that contribute to offset estimation
-  // (SYNC / FOLLOW_UP); ANNOUNCE and others are ignored anyway.
-  if (ptp.expected_clock_id != 0 &&
-      (msg_type == PTP_MSG_SYNC || msg_type == PTP_MSG_FOLLOW_UP)) {
-    uint64_t src_clock_id = parse_ptp_clock_id(data);
-    if (src_clock_id != ptp.expected_clock_id) {
-      ptp.rejected_master_count++;
-      return;
-    }
-  }
 
   switch (msg_type) {
   case PTP_MSG_SYNC:
@@ -349,7 +383,9 @@ static void process_ptp_message(const uint8_t *data, size_t len,
     break;
 
   case PTP_MSG_ANNOUNCE:
+    taskENTER_CRITICAL(&ptp_state_mux);
     ptp.announce_count++;
+    taskEXIT_CRITICAL(&ptp_state_mux);
     // Could track master identity here if needed
     break;
 
@@ -543,11 +579,13 @@ void ptp_clock_stop(void) {
 }
 
 void ptp_clock_clear(void) {
+  taskENTER_CRITICAL(&ptp_state_mux);
   ptp.locked = false;
   ptp.lock_start_ms = 0;
   ptp.lock_candidate_start_ms = 0;
   ptp.last_sync_ms = 0;
   ptp.filtered_offset_ns = 0;
+  ptp.raw_offset_ns = 0;
   ptp.sample_count = 0;
   ptp.previous_offset = 0;
   ptp.previous_offset_time_ms = 0;
@@ -563,24 +601,17 @@ void ptp_clock_clear(void) {
   // Drop the master filter so the next session can lock to whatever master
   // its anchor packet names (which may differ from the previous session).
   ptp.expected_clock_id = 0;
+  taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
 void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
-  if (pause_duration_ms < PTP_LONG_PAUSE_THRESHOLD_MS) {
-    return; // drift too small to matter
-  }
-  // Reset the "previous sample" pointer so the very next PTP FOLLOW_UP is
-  // accepted unconditionally (the first-sample path in update_offset()).
-  // This mirrors what nqptp does on its "B" (begin) signal:
-  //   "when the clock goes from inactive to active, NQPTP resets clock
-  //    smoothing to the new offset" -- nqptp-shm-structures.h
-  //
-  // We keep filtered_offset_ns so that audio_timing can continue to use the
-  // last-known offset until the first new sample arrives (~125 ms away).
-  // We also reset mastership_start_ms so the STARTUP_DURATION_MS aggressive-
-  // positive window kicks in again for a faster upward catch-up.
+  if (pause_duration_ms < PTP_LONG_PAUSE_THRESHOLD_MS) return;
+
+  taskENTER_CRITICAL(&ptp_state_mux);
   ptp.previous_offset_time_ms = 0;
   ptp.mastership_start_ms = 0;
+  taskEXIT_CRITICAL(&ptp_state_mux);
+
   ESP_LOGI(TAG,
            "notify_resume: pause=%lu ms, resetting PTP smoothing "
            "(est. drift %.1f ms @ 50ppm)",
@@ -589,66 +620,93 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
 }
 
 bool ptp_clock_is_locked(void) {
-  if (ptp.locked && ptp.last_sync_ms > 0) {
-    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    if ((now_ms - ptp.last_sync_ms) > LOCK_TIMEOUT_MS) {
-      ptp.locked = false;
-      ptp.lock_start_ms = 0;
-      ptp.lock_candidate_start_ms = 0;
-    }
-  }
+  const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  bool locked;
 
-  return ptp.locked;
+  taskENTER_CRITICAL(&ptp_state_mux);
+  if (ptp.locked && ptp.last_sync_ms > 0 &&
+      (now_ms - ptp.last_sync_ms) > LOCK_TIMEOUT_MS) {
+    ptp.locked = false;
+    ptp.lock_start_ms = 0;
+    ptp.lock_candidate_start_ms = 0;
+  }
+  locked = ptp.locked;
+  taskEXIT_CRITICAL(&ptp_state_mux);
+  return locked;
 }
 
 uint64_t ptp_clock_get_time_ns(void) {
-  int64_t local_ns = get_local_time_ns();
-  return (uint64_t)(local_ns + ptp.filtered_offset_ns);
+  const int64_t local_ns = get_local_time_ns();
+  int64_t offset_ns;
+  taskENTER_CRITICAL(&ptp_state_mux);
+  offset_ns = ptp.filtered_offset_ns;
+  taskEXIT_CRITICAL(&ptp_state_mux);
+  return (uint64_t)(local_ns + offset_ns);
 }
 
 int64_t ptp_clock_get_offset_ns(void) {
-  return ptp.filtered_offset_ns;
+  int64_t offset_ns;
+  taskENTER_CRITICAL(&ptp_state_mux);
+  offset_ns = ptp.filtered_offset_ns;
+  taskEXIT_CRITICAL(&ptp_state_mux);
+  return offset_ns;
 }
 
 void ptp_clock_set_master_clock_id(uint64_t clock_id) {
-  if (clock_id == ptp.expected_clock_id) {
-    return;
+  bool changed = false;
+
+  taskENTER_CRITICAL(&ptp_state_mux);
+  if (clock_id != ptp.expected_clock_id) {
+    changed = true;
+    ptp.expected_clock_id = clock_id;
+
+    // Drop accumulated samples / lock state — they may have come from a
+    // different (wrong) master. Serialized against SYNC/FOLLOW_UP updates.
+    ptp.locked = false;
+    ptp.lock_start_ms = 0;
+    ptp.lock_candidate_start_ms = 0;
+    ptp.last_sync_ms = 0;
+    ptp.filtered_offset_ns = 0;
+    ptp.raw_offset_ns = 0;
+    ptp.sample_count = 0;
+    ptp.previous_offset = 0;
+    ptp.previous_offset_time_ms = 0;
+    ptp.mastership_start_ms = 0;
+    ptp.last_sync_seq = 0;
+    ptp.last_sync_local_ns = 0;
+    ptp.awaiting_followup = false;
   }
+  taskEXIT_CRITICAL(&ptp_state_mux);
 
-  ESP_LOGI(TAG, "PTP master clock_id %s: %016llx", clock_id ? "set" : "cleared",
-           (unsigned long long)clock_id);
-  ptp.expected_clock_id = clock_id;
-
-  // Drop accumulated samples / lock state — they may have come from a
-  // different (wrong) master.
-  ptp.locked = false;
-  ptp.lock_start_ms = 0;
-  ptp.lock_candidate_start_ms = 0;
-  ptp.filtered_offset_ns = 0;
-  ptp.sample_count = 0;
-  ptp.previous_offset = 0;
-  ptp.previous_offset_time_ms = 0;
-  ptp.awaiting_followup = false;
+  if (changed) {
+    ESP_LOGI(TAG, "PTP master clock_id %s: %016llx",
+             clock_id ? "set" : "cleared", (unsigned long long)clock_id);
+  }
 }
 
 uint64_t ptp_clock_get_master_clock_id(void) {
-  return ptp.expected_clock_id;
+  uint64_t clock_id;
+  taskENTER_CRITICAL(&ptp_state_mux);
+  clock_id = ptp.expected_clock_id;
+  taskEXIT_CRITICAL(&ptp_state_mux);
+  return clock_id;
 }
 
 void ptp_clock_get_stats(ptp_stats_t *stats) {
+  if (!stats) return;
+
+  const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  taskENTER_CRITICAL(&ptp_state_mux);
   stats->sync_count = ptp.sync_count;
   stats->followup_count = ptp.followup_count;
-  // last_offset_ns previously reported previous_offset, which is itself a
-  // smoothed value — so it could never reveal filter divergence.  Report the
-  // genuinely raw sample instead.
   stats->last_offset_ns = ptp.raw_offset_ns;
   stats->filtered_offset_ns = ptp.filtered_offset_ns;
   stats->outlier_count = ptp.outlier_count;
-
   if (ptp.locked && ptp.lock_start_ms > 0) {
-    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     stats->lock_time_ms = now_ms - ptp.lock_start_ms;
   } else {
     stats->lock_time_ms = 0;
   }
+  taskEXIT_CRITICAL(&ptp_state_mux);
 }
+

@@ -195,6 +195,9 @@ esp_err_t ap2_buffered_transport_start(ap2_buffered_transport_t *t,
   t->listen_sock = socket_utils_bind_tcp_listener(requested_port, 1, true, &bound);
   if (t->listen_sock < 0) return ESP_FAIL;
   t->port = bound;
+  xSemaphoreTake(t->mutex, portMAX_DELAY);
+  t->high_water = t->used;
+  xSemaphoreGive(t->mutex);
   t->running = true;
   if (xTaskCreatePinnedToCore(tcp_reader_task, "ap2_tcp_reader", t->task_stack,
                               t, t->task_priority, &t->reader_task,

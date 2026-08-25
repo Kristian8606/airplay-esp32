@@ -24,6 +24,7 @@
 #define RT_RX_PRIORITY         7
 #define RT_RX_CORE             0
 #define RT_FIRST_PACKET_LOGS   5U
+#define RT_SYNC_PT              84U
 #define RT_RETRANSMIT_PT        86U
 #define RT_RESEND_REQUEST_PT    85U
 #define RT_MAX_NACK_COUNT       32U
@@ -32,6 +33,8 @@
 #define RT_RESEND_RETRY_MS        35U
 #define RT_RESEND_SAFETY_MS       50U
 #define RT_RESEND_SCAN_MS         10U
+#define RT_CONTROL_BUDGET_US     6000U
+#define RT_CONTROL_MAX_PACKETS      4U
 #define RT_NACK_TRACK_SLOTS      128U
 
 static const char *TAG = "airplay_rt";
@@ -103,12 +106,31 @@ typedef struct {
   uint64_t rtx_latency_sum_us;
   uint32_t rtx_latency_min_us;
   uint32_t rtx_latency_max_us;
+
+  /* Passive PT=84 source-timeline observation. Never used to steer playout. */
+  uint32_t sync_packets;
+  uint32_t sync_malformed;
+  uint16_t last_sync_flags;
+  uint32_t last_sync_rtp_less_latency;
+  uint32_t last_sync_rtp;
+  uint32_t last_sync_latency_frames;
+  uint32_t last_sync_time_seconds;
+  uint32_t last_sync_time_fraction;
 } realtime_state_t;
 
 static realtime_state_t s_rt = {
     .data_sock = -1,
     .control_sock = -1,
 };
+
+static inline uint16_t read_be16(const uint8_t *p) {
+  return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static inline uint32_t read_be32(const uint8_t *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
 
 static size_t rtp_payload_offset(const uint8_t *packet, size_t len) {
   if (!packet || len < 12U || (packet[0] >> 6) != 2U) {
@@ -324,7 +346,17 @@ static bool reorder_store(const uint8_t *packet, size_t packet_len,
    * PCM ring performs the actual out-of-order placement. */
   if (s_rt.expected_valid && (int16_t)(seq - s_rt.expected_seq) < 0) {
     s_rt.reorder_late++;
-    return true; /* Already resolved/decoded; ignore duplicate/late RTX. */
+
+    /* The transport frontier may have advanced because we stopped requesting
+     * this hole at the resend safety margin. A retransmit that was already in
+     * flight can still be useful until the chronological ALAC staging cursor
+     * has actually consumed that RTP range. Decode old RTX packets and let
+     * realtime_pcm_sink() make that final RTP/cursor decision. Normal old/
+     * duplicate data packets remain ignored. */
+    if (retransmitted && should_decode) {
+      *should_decode = true;
+    }
+    return true;
   }
 
   reorder_slot_t *slot = reorder_slot_for(seq);
@@ -570,9 +602,21 @@ static void handle_control_socket(alac_decoder_t *decoder,
   uint8_t *buf = s_rt.packet;
   if (!buf) return;
 
+  /* Never let a retransmit burst monopolize the realtime receiver. Service a
+   * small bounded amount of control traffic, then return to select() so live
+   * UDP data gets another chance immediately. Remaining RTX packets stay in
+   * the socket and are picked up on the next pass. */
+  const int64_t budget_start_us = esp_timer_get_time();
+  uint32_t processed = 0;
   while (s_rt.control_sock >= 0) {
+    if (processed >= RT_CONTROL_MAX_PACKETS ||
+        esp_timer_get_time() - budget_start_us >= RT_CONTROL_BUDGET_US) {
+      break;
+    }
+
     ssize_t n = recv(s_rt.control_sock, buf, RT_PACKET_MAX, MSG_DONTWAIT);
     if (n <= 0) break;
+    processed++;
     if (n < 4) continue;
 
     const uint8_t pt = buf[1] & 0x7fU;
@@ -593,8 +637,37 @@ static void handle_control_socket(alac_decoder_t *decoder,
       continue;
     }
 
-    /* PT=84 sync/timing and other control packets are intentionally ignored
-     * by the local-anchor realtime mode. */
+    if (pt == RT_SYNC_PT) {
+      /* AirPlay sync packet (marker + PT=84). Shairport Sync documents the
+       * classic/realtime layout as:
+       *   2..3   flags
+       *   4..7   RTP timestamp less latency
+       *   8..15  source/network time in 32.32 fixed-point seconds
+       *   16..19 RTP timestamp before subtracting latency
+       *
+       * Decode it for diagnostics only. The local realtime anchor remains the
+       * sole playout input in this test build. */
+      if (n < 20) {
+        s_rt.sync_malformed++;
+        continue;
+      }
+      const uint16_t flags = read_be16(buf + 2);
+      const uint32_t rtp_less_latency = read_be32(buf + 4);
+      const uint32_t time_seconds = read_be32(buf + 8);
+      const uint32_t time_fraction = read_be32(buf + 12);
+      const uint32_t rtp = read_be32(buf + 16);
+
+      s_rt.last_sync_flags = flags;
+      s_rt.last_sync_rtp_less_latency = rtp_less_latency;
+      s_rt.last_sync_rtp = rtp;
+      s_rt.last_sync_latency_frames = rtp - rtp_less_latency;
+      s_rt.last_sync_time_seconds = time_seconds;
+      s_rt.last_sync_time_fraction = time_fraction;
+      s_rt.sync_packets++;
+      continue;
+    }
+
+    /* Other control payload types remain intentionally ignored. */
   }
 }
 
@@ -741,12 +814,14 @@ static void realtime_task(void *arg) {
            " sink_drop=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32
            " rtx_bad=%" PRIu32 " late=%" PRIu32 " skip=%" PRIu32
            " retry=%" PRIu32 " giveup=%" PRIu32 " resync=%" PRIu32
+           " pt84=%" PRIu32 "/bad=%" PRIu32
            " rtx_lat=%.2f/%.2f/%.2fms(n=%" PRIu32 ")",
            s_rt.rx_packets, s_rt.decoded_packets, s_rt.decrypt_errors,
            s_rt.decode_errors, s_rt.sink_drops, s_rt.nack_requests,
            s_rt.retransmit_packets, s_rt.retransmit_bad,
            s_rt.reorder_late, s_rt.gap_skips, s_rt.resend_retries,
            s_rt.resend_giveups, s_rt.hard_resyncs,
+           s_rt.sync_packets, s_rt.sync_malformed,
            s_rt.rtx_latency_samples ? (double)s_rt.rtx_latency_min_us / 1000.0 : 0.0,
            s_rt.rtx_latency_samples ? ((double)s_rt.rtx_latency_sum_us /
                                        (double)s_rt.rtx_latency_samples) / 1000.0 : 0.0,
@@ -806,6 +881,14 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.rtx_latency_sum_us = 0;
   s_rt.rtx_latency_min_us = 0;
   s_rt.rtx_latency_max_us = 0;
+  s_rt.sync_packets = 0;
+  s_rt.sync_malformed = 0;
+  s_rt.last_sync_flags = 0;
+  s_rt.last_sync_rtp_less_latency = 0;
+  s_rt.last_sync_rtp = 0;
+  s_rt.last_sync_latency_frames = 0;
+  s_rt.last_sync_time_seconds = 0;
+  s_rt.last_sync_time_fraction = 0;
 
   if (!s_rt.packet) {
     s_rt.packet = heap_caps_malloc(RT_PACKET_MAX,
@@ -932,6 +1015,14 @@ void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
   out->rtx_latency_sum_us = s_rt.rtx_latency_sum_us;
   out->rtx_latency_min_us = s_rt.rtx_latency_min_us;
   out->rtx_latency_max_us = s_rt.rtx_latency_max_us;
+  out->sync_packets = s_rt.sync_packets;
+  out->sync_malformed = s_rt.sync_malformed;
+  out->last_sync_flags = s_rt.last_sync_flags;
+  out->last_sync_rtp_less_latency = s_rt.last_sync_rtp_less_latency;
+  out->last_sync_rtp = s_rt.last_sync_rtp;
+  out->last_sync_latency_frames = s_rt.last_sync_latency_frames;
+  out->last_sync_time_seconds = s_rt.last_sync_time_seconds;
+  out->last_sync_time_fraction = s_rt.last_sync_time_fraction;
 
   if (reset_interval_peaks) {
     s_rt.interval_max_processing_us = 0;

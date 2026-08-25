@@ -154,7 +154,7 @@ void pcm_rtp_ring_set_generation(pcm_rtp_ring_t *r, uint32_t generation) {
   if (!r) {
     return;
   }
-  r->generation = generation;
+  __atomic_store_n(&r->generation, generation, __ATOMIC_RELEASE);
   r->tagged_slots = 0;
 }
 
@@ -163,76 +163,135 @@ static bool old_page_is_future(const pcm_slot_tag_t *tag, uint32_t wanted_rtp) {
   return rtp_delta(end_rtp, wanted_rtp) > 0;
 }
 
-/* Check every destination slot before copying, so a collision never causes a
- * partially-published AAC frame. A 1024-frame AU touches at most two slots. */
-static bool preflight_write(pcm_rtp_ring_t *r, uint32_t first_rtp,
-                            size_t frames, uint32_t generation,
-                            uint32_t wanted_rtp, bool wanted_valid) {
-  uint32_t cur = first_rtp;
-  size_t remain = frames;
-  while (remain) {
-    uint32_t base = page_base(cur);
-    uint32_t offset = cur - base;
-    uint32_t chunk = PCM_RTP_SLOT_FRAMES - offset;
-    if ((size_t)chunk > remain) {
-      chunk = (uint32_t)remain;
+/* Acquire a slot writer token with CAS. Readers only trust even sequence
+ * values; invalidate_range() uses the same odd/even ownership protocol.
+ * Keep retries bounded: if a lower-priority task on the same core was
+ * preempted while holding the slot, an unbounded spin here could deadlock it. */
+static bool slot_writer_acquire(pcm_slot_tag_t *tag, uint32_t *seq_even) {
+  for (int retry = 0; retry < 32; ++retry) {
+    uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
+    if (seq & 1U) {
+      continue;
     }
-
-    pcm_slot_tag_t *tag = &r->tags[slot_for_page(base)];
-    if (tag->generation == generation && tag->page_rtp != base) {
-      if (wanted_valid && old_page_is_future(tag, wanted_rtp)) {
-        r->future_collisions++;
-        return false;
-      }
-      if (!wanted_valid) {
-        r->unanchored_replacements++;
-      }
+    uint32_t expected = seq;
+    if (__atomic_compare_exchange_n(&tag->seq, &expected, seq + 1U, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      *seq_even = seq;
+      return true;
     }
-
-    cur += chunk;
-    remain -= chunk;
   }
-  return true;
+  return false;
 }
+
+typedef struct {
+  pcm_slot_tag_t *tag;
+  uint32_t slot;
+  uint32_t base;
+  uint32_t offset;
+  uint32_t chunk;
+  size_t src_frame;
+  uint32_t seq_even;
+  bool locked;
+} pcm_write_chunk_t;
 
 bool pcm_rtp_ring_write(pcm_rtp_ring_t *r, uint32_t first_rtp,
                         const int16_t *pcm, size_t frames, int channels,
                         uint32_t generation, uint32_t wanted_rtp,
                         bool wanted_valid) {
   if (!r || !pcm || channels != (int)PCM_RTP_CHANNELS || frames == 0 ||
-      generation != r->generation) {
+      generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
     return false;
   }
 
-  if (!preflight_write(r, first_rtp, frames, generation, wanted_rtp,
-                       wanted_valid)) {
+  /* Current producers are AAC (1024 frames) and ALAC (352 frames), therefore
+   * one decoded block can touch at most two 1024-frame RTP pages. Keeping that
+   * invariant explicit lets us acquire every destination page before copying,
+   * so a concurrent FLUSH invalidate can never leave a partially-published AU. */
+  if (frames > PCM_RTP_SLOT_FRAMES) {
     return false;
   }
 
-  size_t src_frame = 0;
+  pcm_write_chunk_t chunks[2] = {0};
+  unsigned chunk_count = 0;
   uint32_t cur_rtp = first_rtp;
   size_t remain = frames;
-
+  size_t src_frame = 0;
   while (remain) {
+    if (chunk_count >= 2U) {
+      return false;
+    }
     uint32_t base = page_base(cur_rtp);
     uint32_t offset = cur_rtp - base;
     uint32_t chunk = PCM_RTP_SLOT_FRAMES - offset;
     if ((size_t)chunk > remain) {
       chunk = (uint32_t)remain;
     }
-
     uint32_t slot = slot_for_page(base);
-    pcm_slot_tag_t *tag = &r->tags[slot];
-    bool replacing = tag->generation != generation || tag->page_rtp != base;
+    chunks[chunk_count++] = (pcm_write_chunk_t){
+        .tag = &r->tags[slot],
+        .slot = slot,
+        .base = base,
+        .offset = offset,
+        .chunk = chunk,
+        .src_frame = src_frame,
+    };
+    src_frame += chunk;
+    cur_rtp += chunk;
+    remain -= chunk;
+  }
 
-    uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_RELAXED);
-    if (seq & 1U) {
-      seq++;
+  /* Acquire all destination pages first. If invalidate_range() currently owns
+   * one of them, publish nothing from this decoded block. */
+  for (unsigned i = 0; i < chunk_count; ++i) {
+    if (!slot_writer_acquire(chunks[i].tag, &chunks[i].seq_even)) {
+      for (unsigned j = 0; j < i; ++j) {
+        if (chunks[j].locked) {
+          __atomic_store_n(&chunks[j].tag->seq, chunks[j].seq_even + 2U,
+                           __ATOMIC_RELEASE);
+        }
+      }
+      return false;
     }
-    __atomic_store_n(&tag->seq, seq + 1U, __ATOMIC_RELEASE);
+    chunks[i].locked = true;
+  }
+
+  /* A session generation can change while we are acquiring pages. Never let a
+   * producer from the old timeline publish after the O(1) generation reset. */
+  if (generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
+    for (unsigned j = 0; j < chunk_count; ++j) {
+      __atomic_store_n(&chunks[j].tag->seq, chunks[j].seq_even + 2U,
+                       __ATOMIC_RELEASE);
+    }
+    return false;
+  }
+
+  /* Collision decisions must be made while we own the tags; a preflight done
+   * before acquiring the seqlock can itself race with FLUSH/invalidation. */
+  for (unsigned i = 0; i < chunk_count; ++i) {
+    pcm_slot_tag_t *tag = chunks[i].tag;
+    if (tag->generation == generation && tag->page_rtp != chunks[i].base) {
+      if (wanted_valid && old_page_is_future(tag, wanted_rtp)) {
+        r->future_collisions++;
+        for (unsigned j = 0; j < chunk_count; ++j) {
+          __atomic_store_n(&chunks[j].tag->seq, chunks[j].seq_even + 2U,
+                           __ATOMIC_RELEASE);
+        }
+        return false;
+      }
+      if (!wanted_valid) {
+        r->unanchored_replacements++;
+      }
+    }
+  }
+
+  for (unsigned i = 0; i < chunk_count; ++i) {
+    pcm_write_chunk_t *w = &chunks[i];
+    pcm_slot_tag_t *tag = w->tag;
+    const bool replacing =
+        tag->generation != generation || tag->page_rtp != w->base;
 
     if (replacing) {
-      tag->page_rtp = base;
+      tag->page_rtp = w->base;
       tag->generation = generation;
       validity_clear(tag->valid);
       if (r->tagged_slots < PCM_RTP_SLOT_COUNT) {
@@ -240,18 +299,17 @@ bool pcm_rtp_ring_write(pcm_rtp_ring_t *r, uint32_t first_rtp,
       }
     }
 
-    memcpy(r->pcm + ((size_t)slot * PCM_SLOT_SAMPLES) +
-               ((size_t)offset * PCM_RTP_CHANNELS),
-           pcm + (src_frame * PCM_RTP_CHANNELS),
-           (size_t)chunk * PCM_RTP_CHANNELS * sizeof(int16_t));
-    validity_set_range(tag->valid, offset, chunk);
-
-    __atomic_store_n(&tag->seq, seq + 2U, __ATOMIC_RELEASE);
+    memcpy(r->pcm + ((size_t)w->slot * PCM_SLOT_SAMPLES) +
+               ((size_t)w->offset * PCM_RTP_CHANNELS),
+           pcm + (w->src_frame * PCM_RTP_CHANNELS),
+           (size_t)w->chunk * PCM_RTP_CHANNELS * sizeof(int16_t));
+    validity_set_range(tag->valid, w->offset, w->chunk);
     r->slot_writes++;
+  }
 
-    src_frame += chunk;
-    cur_rtp += chunk;
-    remain -= chunk;
+  for (unsigned i = 0; i < chunk_count; ++i) {
+    __atomic_store_n(&chunks[i].tag->seq, chunks[i].seq_even + 2U,
+                     __ATOMIC_RELEASE);
   }
   return true;
 }
@@ -319,7 +377,7 @@ static bool has_page_range(const pcm_rtp_ring_t *r, uint32_t rtp,
 
 bool pcm_rtp_ring_has_range(const pcm_rtp_ring_t *r, uint32_t first_rtp,
                             uint32_t frames, uint32_t generation) {
-  if (!r || frames == 0 || generation != r->generation) {
+  if (!r || frames == 0 || generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
     return false;
   }
   uint32_t cur = first_rtp;
@@ -341,7 +399,7 @@ bool pcm_rtp_ring_has_range(const pcm_rtp_ring_t *r, uint32_t first_rtp,
 
 bool pcm_rtp_ring_read(const pcm_rtp_ring_t *r, uint32_t first_rtp,
                        uint32_t frames, uint32_t generation, int16_t *out) {
-  if (!r || !out || frames == 0 || generation != r->generation) {
+  if (!r || !out || frames == 0 || generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
     return false;
   }
 
@@ -409,7 +467,7 @@ void pcm_rtp_ring_get_stats(const pcm_rtp_ring_t *r,
   if (!r || !out) {
     return;
   }
-  out->generation = r->generation;
+  out->generation = __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE);
   out->tagged_slots = r->tagged_slots;
   out->slot_writes = r->slot_writes;
   out->future_collisions = r->future_collisions;

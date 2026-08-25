@@ -233,6 +233,7 @@ typedef struct {
   uint32_t playout_latency_samples;
   uint32_t realtime_eq_generation;
   volatile bool realtime_stage_running;
+  volatile bool realtime_stage_idle;
   bool realtime_stage_cursor_valid;
   uint32_t realtime_stage_cursor_rtp;
   uint32_t realtime_stage_generation;
@@ -261,6 +262,7 @@ static ap2_state_t s = {
     .format_generation = 1,
     .timeline_reset_pending = true,
     .state_mux = portMUX_INITIALIZER_UNLOCKED,
+    .realtime_stage_idle = true,
 };
 
 static void snapshot_state(timing_snapshot_t *out) {
@@ -1027,6 +1029,7 @@ static void realtime_stage_task(void *arg) {
   }
   if (!pcm) {
     ESP_LOGE(TAG, "ALAC staging PCM allocation failed");
+    __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
     s.realtime_stage_task = NULL;
     vTaskDelete(NULL);
     return;
@@ -1039,12 +1042,15 @@ static void realtime_stage_task(void *arg) {
   uint32_t local_generation = 0;
   uint32_t missing_cursor = 0;
   int64_t missing_since_us = 0;
+  __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
 
   while (s.engine_running) {
     if (!__atomic_load_n(&s.realtime_stage_running, __ATOMIC_ACQUIRE)) {
+      __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
       vTaskDelay(1);
       continue;
     }
+    __atomic_store_n(&s.realtime_stage_idle, false, __ATOMIC_RELEASE);
 
     timing_snapshot_t snap;
     snapshot_state(&snap);
@@ -1143,6 +1149,7 @@ static void realtime_stage_task(void *arg) {
     taskEXIT_CRITICAL(&s.state_mux);
   }
 
+  __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
   free(pcm);
   s.realtime_stage_task = NULL;
   vTaskDelete(NULL);
@@ -1467,7 +1474,7 @@ static void ap2_playout_task(void *arg) {
           /* No real-generation completion can exist yet. Ignore any stale
            * diagnostic item left over from a prior disabled epoch. */
         } else {
-          vTaskDelay(1);
+          taskYIELD();
         }
       }
       if (!have_probe) {
@@ -1753,6 +1760,7 @@ static void ap2_stats_task(void *arg) {
   uint32_t stg_late_prev = 0;
   unsigned idle_periods = 0;
   __atomic_store_n(&s.realtime_stage_min_ahead_us, INT32_MAX, __ATOMIC_RELAXED);
+  __atomic_store_n(&s.realtime_stage_wait_max_us, 0U, __ATOMIC_RELAXED);
   prev = s.diag;
   pcm_rtp_ring_get_stats(s.pcm_ring, &pcm_prev);
   audio_playout_get_diag(&pdiag_prev);
@@ -1834,6 +1842,15 @@ static void ap2_stats_task(void *arg) {
     audio_playout_get_diag(&pdiag);
     ap2_buffered_transport_stats_t transport = {0};
     if (s.transport) ap2_buffered_transport_get_stats(s.transport, &transport);
+    const size_t fifo_capacity =
+        s.transport ? ap2_buffered_transport_capacity(s.transport) : 0U;
+    ptp_stats_t ptpdiag = {0};
+    ptp_clock_get_stats(&ptpdiag);
+    /* Positive means the latest raw PTP sample is ahead of the filtered clock
+     * currently used by RTP/I2S timing. This is diagnostic only: no PTP
+     * filtering behaviour is changed here. */
+    const double ptp_raw_filter_ms =
+        (double)(ptpdiag.last_offset_ns - ptpdiag.filtered_offset_ns) / 1000000.0;
 
     /* The old compressed AAC RTP ring no longer exists. Raw compressed audio is
      * represented by FIFO=... below, so do not print a fake millisecond value. */
@@ -1878,52 +1895,57 @@ static void ap2_stats_task(void *arg) {
         ESP_LOGI(TAG,
                  "ALAC SYNC=%+.2fms S=%+d/%+dppm d=%+.3fms/s | PCM=%dms"
                  " | U=%" PRIu64 " R=%" PRIu64 " DROP=%" PRIu64
-                 " COLL=%" PRIu64 " DEC=%" PRIu64 " DMAERR=%" PRIu64 "/%" PRIu64,
+                 " COLL=%" PRIu64 " DEC=%" PRIu64 " DMAERR=%" PRIu64 "/%" PRIu64
+                 " PTPraw-filter=%+.2fms",
                  sync_ms, now.servo_ppm, now.servo_target_ppm,
                  (double)now.servo_slope_us_per_s / 1000.0, pcm_ahead_ms,
                  now.playout_underruns - prev.playout_underruns,
                  now.playout_resyncs - prev.playout_resyncs, drops, collisions,
                  now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta);
+                 dma_overflow_delta, ptp_raw_filter_ms);
       } else {
         ESP_LOGI(TAG,
                  "AAC SYNC=%+.2fms S=%+d/%+dppm d=%+.3fms/s | PCM=%dms"
                  " | U=%" PRIu64 " R=%" PRIu64 " DROP=%" PRIu64
                  " COLL=%" PRIu64 " DEC=%" PRIu64 " DMAERR=%" PRIu64 "/%" PRIu64
-                 " | FIFO=%u/%uK",
+                 " PTPraw-filter=%+.2fms | FIFO=%uK peak=%uK cap=%uK",
                  sync_ms, now.servo_ppm, now.servo_target_ppm,
                  (double)now.servo_slope_us_per_s / 1000.0, pcm_ahead_ms,
                  now.playout_underruns - prev.playout_underruns,
                  now.playout_resyncs - prev.playout_resyncs, drops, collisions,
                  now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta,
+                 dma_overflow_delta, ptp_raw_filter_ms,
                  (unsigned)(transport.fifo_occupancy / 1024U),
-                 (unsigned)(transport.fifo_high_water / 1024U));
+                 (unsigned)(transport.fifo_high_water / 1024U),
+                 (unsigned)(fifo_capacity / 1024U));
       }
     } else {
       if (snap.stream_type == AUDIO_STREAM_REALTIME) {
         ESP_LOGI(TAG,
                  "ALAC SYNC=-- | PCM=%dms | U=%" PRIu64 " R=%" PRIu64
                  " DROP=%" PRIu64 " COLL=%" PRIu64 " DEC=%" PRIu64
-                 " DMAERR=%" PRIu64 "/%" PRIu64 " | %s",
+                 " DMAERR=%" PRIu64 "/%" PRIu64
+                 " PTPraw-filter=%+.2fms | %s",
                  pcm_ahead_ms,
                  now.playout_underruns - prev.playout_underruns,
                  now.playout_resyncs - prev.playout_resyncs, drops, collisions,
                  now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta,
+                 dma_overflow_delta, ptp_raw_filter_ms,
                  now.playout_state == 1 ? "PRIME" : "STOP");
       } else {
         ESP_LOGI(TAG,
                  "AAC SYNC=-- | PCM=%dms | U=%" PRIu64 " R=%" PRIu64
                  " DROP=%" PRIu64 " COLL=%" PRIu64 " DEC=%" PRIu64
-                 " DMAERR=%" PRIu64 "/%" PRIu64 " | FIFO=%u/%uK | %s",
+                 " DMAERR=%" PRIu64 "/%" PRIu64
+                 " PTPraw-filter=%+.2fms | FIFO=%uK peak=%uK cap=%uK | %s",
                  pcm_ahead_ms,
                  now.playout_underruns - prev.playout_underruns,
                  now.playout_resyncs - prev.playout_resyncs, drops, collisions,
                  now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta,
+                 dma_overflow_delta, ptp_raw_filter_ms,
                  (unsigned)(transport.fifo_occupancy / 1024U),
                  (unsigned)(transport.fifo_high_water / 1024U),
+                 (unsigned)(fifo_capacity / 1024U),
                  now.playout_state == 1 ? "PRIME" : "STOP");
       }
     }
@@ -1934,7 +1956,7 @@ static void ap2_stats_task(void *arg) {
       ESP_LOGI(TAG,
                "ALAC RX gap=%" PRIu32 " miss=%" PRIu32 " nack=%" PRIu32
                " rtx=%" PRIu32 " retry=%" PRIu32 " give=%" PRIu32
-               " late=%" PRIu32 " IAmax=%.1fms",
+               " old=%" PRIu32 " IAmax=%.1fms",
                DELTA32(rt.gap_events, rt_prev.gap_events),
                DELTA32(rt.missing_packets, rt_prev.missing_packets),
                DELTA32(rt.nack_requests, rt_prev.nack_requests),
@@ -1943,6 +1965,54 @@ static void ap2_stats_task(void *arg) {
                DELTA32(rt.resend_giveups, rt_prev.resend_giveups),
                DELTA32(rt.reorder_late, rt_prev.reorder_late),
                (double)rt.interval_max_interarrival_us / 1000.0);
+
+      const uint32_t sync_delta = DELTA32(rt.sync_packets, rt_prev.sync_packets);
+      const uint32_t sync_bad_delta =
+          DELTA32(rt.sync_malformed, rt_prev.sync_malformed);
+      if (sync_delta != 0U && rt.last_sync_time_seconds != 0U) {
+        const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+        const double sync_latency_ms =
+            (double)rt.last_sync_latency_frames * 1000.0 / (double)sr;
+        const uint64_t remote_sync_ns =
+            (uint64_t)rt.last_sync_time_seconds * 1000000000ULL +
+            (((uint64_t)rt.last_sync_time_fraction * 1000000000ULL) >> 32);
+
+        bool map_valid = false;
+        double map_delta_ms = 0.0;
+        if (snap.anchor_valid && !snap.timeline_reset_pending) {
+          const int32_t ds = rtp_delta(rt.last_sync_rtp_less_latency,
+                                       snap.anchor_rtp);
+          const int64_t local_source_ns =
+              (int64_t)snap.anchor_ptp_ns +
+              ((int64_t)ds * 1000000000LL) / (int64_t)sr;
+          map_delta_ms =
+              (double)(local_source_ns - (int64_t)remote_sync_ns) / 1000000.0;
+          map_valid = true;
+        }
+
+        if (map_valid) {
+          ESP_LOGI(TAG,
+                   "ALAC PT84 n=%" PRIu32 " bad=%" PRIu32
+                   " flags=%u rtp=%" PRIu32
+                   " rtlt=%" PRIu32 " lat=%" PRIu32 "(%.2fms)"
+                   " src32.32=%" PRIu32 ":%08" PRIx32 " mapDelta=%+.2fms",
+                   sync_delta, sync_bad_delta, (unsigned)rt.last_sync_flags,
+                   rt.last_sync_rtp, rt.last_sync_rtp_less_latency,
+                   rt.last_sync_latency_frames, sync_latency_ms,
+                   rt.last_sync_time_seconds, rt.last_sync_time_fraction,
+                   map_delta_ms);
+        } else {
+          ESP_LOGI(TAG,
+                   "ALAC PT84 n=%" PRIu32 " bad=%" PRIu32
+                   " flags=%u rtp=%" PRIu32
+                   " rtlt=%" PRIu32 " lat=%" PRIu32 "(%.2fms)"
+                   " src32.32=%" PRIu32 ":%08" PRIx32 " mapDelta=--",
+                   sync_delta, sync_bad_delta, (unsigned)rt.last_sync_flags,
+                   rt.last_sync_rtp, rt.last_sync_rtp_less_latency,
+                   rt.last_sync_latency_frames, sync_latency_ms,
+                   rt.last_sync_time_seconds, rt.last_sync_time_fraction);
+        }
+      }
 #undef DELTA32
       rt_prev = rt;
 
@@ -2107,6 +2177,23 @@ esp_err_t audio_receiver_init(void) {
   return ESP_OK;
 }
 
+static void realtime_stage_stop_and_wait(void) {
+  __atomic_store_n(&s.realtime_stage_running, false, __ATOMIC_RELEASE);
+
+  /* Session-bound handshake only. Never put a mutex around audio_eq_process():
+   * the control path merely waits until the persistent staging task has
+   * observed the stop flag and is outside its current EQ/write iteration. */
+  for (int i = 0; s.realtime_stage_task &&
+                  !__atomic_load_n(&s.realtime_stage_idle, __ATOMIC_ACQUIRE) &&
+                  i < 20; ++i) {
+    vTaskDelay(1);
+  }
+  if (s.realtime_stage_task &&
+      !__atomic_load_n(&s.realtime_stage_idle, __ATOMIC_ACQUIRE)) {
+    ESP_LOGW(TAG, "ALAC staging did not become idle before codec switch");
+  }
+}
+
 void audio_receiver_set_format(const audio_format_t *f) {
   if (!f) {
     return;
@@ -2140,7 +2227,20 @@ void audio_receiver_set_stream_type(audio_stream_type_t t) {
 }
 
 esp_err_t audio_receiver_start_buffered(uint16_t port) {
-  __atomic_store_n(&s.realtime_stage_running, false, __ATOMIC_RELEASE);
+  timing_snapshot_t fmt_snap;
+  snapshot_state(&fmt_snap);
+  if (strcmp(fmt_snap.format.codec, "AAC") != 0 ||
+      fmt_snap.format.sample_rate != 44100 || fmt_snap.format.channels != 2 ||
+      fmt_snap.format.bits_per_sample != 16 || fmt_snap.format.frame_size != 1024) {
+    ESP_LOGE(TAG,
+             "Buffered format rejected codec=%s sr=%d ch=%d bits=%d frame=%d",
+             fmt_snap.format.codec, fmt_snap.format.sample_rate,
+             fmt_snap.format.channels, fmt_snap.format.bits_per_sample,
+             fmt_snap.format.frame_size);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  realtime_stage_stop_and_wait();
   if (!s.transport) return ESP_ERR_INVALID_STATE;
   if (s.rx_running) return ESP_OK;
 
@@ -2184,10 +2284,19 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
   }
 
   if (s.stream_type == AUDIO_STREAM_REALTIME) {
-    if (strcmp(s.format.codec, "ALAC") != 0) {
-      ESP_LOGW(TAG, "Realtime codec %s is not supported", s.format.codec);
+    timing_snapshot_t fmt_snap;
+    snapshot_state(&fmt_snap);
+    if (strcmp(fmt_snap.format.codec, "ALAC") != 0 ||
+        fmt_snap.format.sample_rate != 44100 || fmt_snap.format.channels != 2 ||
+        fmt_snap.format.bits_per_sample != 16 || fmt_snap.format.frame_size != 352) {
+      ESP_LOGE(TAG,
+               "Realtime format rejected codec=%s sr=%d ch=%d bits=%d frame=%d",
+               fmt_snap.format.codec, fmt_snap.format.sample_rate,
+               fmt_snap.format.channels, fmt_snap.format.bits_per_sample,
+               fmt_snap.format.frame_size);
       return ESP_ERR_NOT_SUPPORTED;
     }
+    realtime_stage_stop_and_wait();
     taskENTER_CRITICAL(&s.state_mux);
     s.realtime_stage_cursor_valid = false;
     s.realtime_stage_generation = s.generation;
@@ -2195,7 +2304,7 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
     __atomic_store_n(&s.realtime_stage_running, true, __ATOMIC_RELEASE);
 
     realtime_receiver_config_t cfg = {
-        .format = s.format,
+        .format = fmt_snap.format,
         .encrypt = s.encrypt,
         .pcm_sink = realtime_pcm_sink,
         .pcm_sink_ctx = NULL,
@@ -2227,7 +2336,7 @@ void audio_receiver_stop(void) {
   /* A codec switch is a hard session boundary. Stop both possible producers
    * first; no compressed, decoded or timing state is allowed to bleed into
    * the next AAC/ALAC SETUP. */
-  __atomic_store_n(&s.realtime_stage_running, false, __ATOMIC_RELEASE);
+  realtime_stage_stop_and_wait();
   realtime_receiver_stop();
   taskENTER_CRITICAL(&s.state_mux);
   s.realtime_stage_cursor_valid = false;

@@ -49,6 +49,18 @@ typedef struct {
   uint64_t rtx_latency_sum_us;
   uint32_t rtx_latency_min_us;
   uint32_t rtx_latency_max_us;
+
+  /* Passive PT=84 sync diagnostics. These fields are observational only and
+   * never feed the realtime playout timeline. AirPlay sync packets carry two
+   * RTP timestamps plus a 32.32 source/network time value. */
+  uint32_t sync_packets;
+  uint32_t sync_malformed;
+  uint16_t last_sync_flags;
+  uint32_t last_sync_rtp_less_latency;
+  uint32_t last_sync_rtp;
+  uint32_t last_sync_latency_frames;
+  uint32_t last_sync_time_seconds;
+  uint32_t last_sync_time_fraction;
 } realtime_receiver_diag_t;
 
 typedef struct {

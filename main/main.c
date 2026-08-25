@@ -27,8 +27,8 @@ static void print_firmware_banner(void) {
   ESP_LOGI(TAG, "FIRMWARE: %s", FW_NAME);
   ESP_LOGI(TAG, "BUILD: %s %s", __DATE__, __TIME__);
   ESP_LOGI(TAG, "IDF: %s", app ? app->idf_ver : "unknown");
-  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP/AP2 TCP RX + decrypt");
-  ESP_LOGI(TAG, "CORE PLAN: Core1=high-priority PTP/RTP playout + lower-priority AAC decode");
+  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP + AAC TCP/decode/EQ + ALAC UDP/decrypt/decode");
+  ESP_LOGI(TAG, "CORE PLAN: Core1=high-priority PTP/RTP playout + ALAC ordered staging/EQ");
   ESP_LOGI(TAG, "============================================================");
 }
 
