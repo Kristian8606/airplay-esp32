@@ -35,18 +35,21 @@ static int32_t s_tune_ppm;
  * completions. Capacity is intentionally larger than the two DMA descriptors
  * so the producer can publish the next tag before a blocking write wakes on
  * the previous descriptor's EOF. */
-static tx_tag_t s_tag_q[TX_TAG_Q_CAP];
-static uint32_t s_tag_head;
-static uint32_t s_tag_tail;
-static audio_playout_completion_t s_done_q[TX_DONE_Q_CAP];
-static uint32_t s_done_head;
-static uint32_t s_done_tail;
+static DRAM_ATTR tx_tag_t s_tag_q[TX_TAG_Q_CAP];
+static DRAM_ATTR uint32_t s_tag_head;
+static DRAM_ATTR uint32_t s_tag_tail;
+static DRAM_ATTR audio_playout_completion_t s_done_q[TX_DONE_Q_CAP];
+static DRAM_ATTR uint32_t s_done_head;
+static DRAM_ATTR uint32_t s_done_tail;
 
 static uint64_t s_submitted_frames;
-static uint64_t s_completed_frames;
-static uint64_t s_tagged_completions;
-static uint64_t s_untagged_completions;
-static uint64_t s_completion_overflows;
+/* ISR-owned diagnostics stay 32-bit so Xtensa does not need 64-bit atomic
+ * helper calls while flash cache is disabled. They reset at session/flush
+ * boundaries; at 44.1 kHz completed_frames wraps only after ~27 hours. */
+static DRAM_ATTR uint32_t s_completed_frames;
+static DRAM_ATTR uint32_t s_tagged_completions;
+static DRAM_ATTR uint32_t s_untagged_completions;
+static DRAM_ATTR uint32_t s_completion_overflows;
 static uint64_t s_write_calls;
 static uint64_t s_write_total_us;
 static uint32_t s_write_last_us;
@@ -79,7 +82,11 @@ static bool IRAM_ATTR tag_pop_isr(tx_tag_t *out) {
   if (tail == head) {
     return false;
   }
-  *out = s_tag_q[tail];
+  /* Keep this copy explicit: an IRAM ISR must not acquire an out-of-line
+   * memcpy helper from flash. */
+  out->rtp = s_tag_q[tail].rtp;
+  out->generation = s_tag_q[tail].generation;
+  out->frames = s_tag_q[tail].frames;
   __atomic_store_n(&s_tag_tail, (tail + 1U) % TX_TAG_Q_CAP,
                    __ATOMIC_RELEASE);
   return true;
@@ -109,7 +116,7 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
 
   tx_tag_t tag;
   if (!tag_pop_isr(&tag)) {
-    __atomic_add_fetch(&s_untagged_completions, 1ULL, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_untagged_completions, 1U, __ATOMIC_RELAXED);
     return false;
   }
 
@@ -117,19 +124,19 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
    * the DMA EOF itself; conversion to PTP is done later in task context. */
   const int64_t done_local_us = esp_timer_get_time();
   __atomic_add_fetch(&s_completed_frames, tag.frames, __ATOMIC_RELAXED);
-  __atomic_add_fetch(&s_tagged_completions, 1ULL, __ATOMIC_RELAXED);
+  __atomic_add_fetch(&s_tagged_completions, 1U, __ATOMIC_RELAXED);
   if (!done_push_isr(&tag, done_local_us)) {
-    __atomic_add_fetch(&s_completion_overflows, 1ULL, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&s_completion_overflows, 1U, __ATOMIC_RELAXED);
   }
   return false;
 }
 
 static void diag_reset(void) {
   __atomic_store_n(&s_submitted_frames, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_completed_frames, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_tagged_completions, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_untagged_completions, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_completion_overflows, 0ULL, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_completed_frames, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_tagged_completions, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_untagged_completions, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_completion_overflows, 0U, __ATOMIC_RELAXED);
   __atomic_store_n(&s_write_calls, 0ULL, __ATOMIC_RELAXED);
   __atomic_store_n(&s_write_total_us, 0ULL, __ATOMIC_RELAXED);
   __atomic_store_n(&s_write_last_us, 0U, __ATOMIC_RELAXED);
@@ -207,10 +214,16 @@ esp_err_t audio_playout_init(void) {
    * zero-descriptor ambiguity that made earlier EOF counting unreliable. */
   ESP_LOGI(TAG,
            "I2S: 44100Hz stereo 16-bit, DMA=%ux%u, MCLK=%" PRIu32
-           "Hz, pins %d/%d/%d/%d",
+           "Hz, pins %d/%d/%d/%d, ISR_IRAM=%d",
            (unsigned)I2S_DMA_DESC_NUM, (unsigned)I2S_DMA_FRAME_NUM,
            s_nominal_mclk_hz, CONFIG_I2S_SCK_IO, CONFIG_I2S_BCK_IO,
-           CONFIG_I2S_WS_IO, CONFIG_I2S_DO_IO);
+           CONFIG_I2S_WS_IO, CONFIG_I2S_DO_IO,
+#if CONFIG_I2S_ISR_IRAM_SAFE
+           1
+#else
+           0
+#endif
+  );
   return ESP_OK;
 }
 
@@ -324,10 +337,10 @@ void audio_playout_get_diag(audio_playout_diag_t *out) {
     return;
   }
   out->submitted_frames = __atomic_load_n(&s_submitted_frames, __ATOMIC_RELAXED);
-  out->completed_frames = __atomic_load_n(&s_completed_frames, __ATOMIC_RELAXED);
-  out->tagged_completions = __atomic_load_n(&s_tagged_completions, __ATOMIC_RELAXED);
-  out->untagged_completions = __atomic_load_n(&s_untagged_completions, __ATOMIC_RELAXED);
-  out->completion_overflows = __atomic_load_n(&s_completion_overflows, __ATOMIC_RELAXED);
+  out->completed_frames = (uint64_t)__atomic_load_n(&s_completed_frames, __ATOMIC_RELAXED);
+  out->tagged_completions = (uint64_t)__atomic_load_n(&s_tagged_completions, __ATOMIC_RELAXED);
+  out->untagged_completions = (uint64_t)__atomic_load_n(&s_untagged_completions, __ATOMIC_RELAXED);
+  out->completion_overflows = (uint64_t)__atomic_load_n(&s_completion_overflows, __ATOMIC_RELAXED);
   out->write_calls = __atomic_load_n(&s_write_calls, __ATOMIC_RELAXED);
   out->write_total_us = __atomic_load_n(&s_write_total_us, __ATOMIC_RELAXED);
   out->write_last_us = __atomic_load_n(&s_write_last_us, __ATOMIC_RELAXED);
