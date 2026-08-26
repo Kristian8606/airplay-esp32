@@ -890,12 +890,14 @@ static bool realtime_playout_deadline(uint32_t rtp,
 static void realtime_timeline_resync(void *ctx) {
   (void)ctx;
   /* ALAC transport continuity was lost beyond the bounded reorder window.
-   * Invalidate the common PCM/PTP epoch immediately. The first good ALAC
-   * packet after the receiver catches up will create a fresh local anchor. */
+   * Invalidate the common PCM/PTP epoch immediately. FIX11 deliberately does
+   * not fabricate a replacement anchor from packet arrival time; synchronized
+   * playout resumes when the next valid AirPlay 2 D7 sender anchor arrives. */
   mark_timeline_discontinuity();
   /* Stateful ALAC EQ is owned by the chronological staging task and resets
    * there when the new generation is observed. */
-  ESP_LOGW(TAG, "REALTIME transport resync: old PCM/timing epoch invalidated");
+  ESP_LOGW(TAG,
+           "REALTIME transport resync: waiting for next AP2 D7 anchor");
 }
 
 static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
@@ -916,39 +918,14 @@ static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
   }
 
   if (snap.timeline_reset_pending || !snap.anchor_valid) {
-    if (!ptp_clock_is_locked()) {
-      s.diag.realtime_sink_no_ptp++;
-      return false;
-    }
-
-    const uint64_t now_ptp_ns = ptp_clock_get_time_ns();
-    uint32_t gen = 0;
-    bool committed = false;
-    taskENTER_CRITICAL(&s.state_mux);
-    if (s.stream_type == AUDIO_STREAM_REALTIME &&
-        (s.timeline_reset_pending || !s.anchor_valid)) {
-      committed = s.timeline_reset_pending;
-      gen = commit_anchor_epoch_locked();
-      s.anchor_clock_id = 0;
-      s.anchor_ptp_ns = now_ptp_ns;
-      s.anchor_rtp = rtp;
-      s.anchor_valid = true;
-    } else {
-      gen = s.generation;
-    }
-    taskEXIT_CRITICAL(&s.state_mux);
-
-    if (committed) {
-      ESP_LOGI(TAG,
-               "REALTIME LOCAL ANCHOR ptp=%" PRIu64 " rtp=%" PRIu32
-               " gen=%" PRIu32 " latency=%" PRIu32 " samples",
-               now_ptp_ns, rtp, gen, s.playout_latency_samples);
-    }
-    snapshot_state(&snap);
-    if (!snap.anchor_valid || snap.timeline_reset_pending) {
-      s.diag.realtime_sink_no_ptp++;
-      return false;
-    }
+    /* AP2 realtime is synchronized by the sender's D7 RTP<->PTP mapping.
+     * Packet arrival time is transport timing, not presentation timing. Never
+     * create a local/fabricated anchor here: packets received before the first
+     * valid D7 (or after a hard transport resync) are simply not admitted to
+     * the synchronized PCM epoch. The next D7 commits the generation and
+     * normal RTP-addressed decode/staging continues unchanged. */
+    s.diag.realtime_sink_no_ptp++;
+    return false;
   }
 
   if (frame_is_fully_stale(rtp, &snap, NULL)) {
@@ -2011,6 +1988,60 @@ static void ap2_stats_task(void *arg) {
                    rt.last_sync_rtp, rt.last_sync_rtp_less_latency,
                    rt.last_sync_latency_frames, sync_latency_ms,
                    rt.last_sync_time_seconds, rt.last_sync_time_fraction);
+        }
+      }
+
+      const uint32_t d7_delta = DELTA32(rt.d7_packets, rt_prev.d7_packets);
+      const uint32_t d7_bad_delta =
+          DELTA32(rt.d7_malformed, rt_prev.d7_malformed);
+      if (d7_delta != 0U && rt.last_d7_ptp_ns != 0U) {
+        const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+        const double d7_frame_delta_ms =
+            (double)rt.last_d7_delta_frames * 1000.0 / (double)sr;
+        const double playout_latency_ms =
+            (double)snap.playout_latency_samples * 1000.0 / (double)sr;
+
+        bool map_valid = false;
+        double map_delta_ms = 0.0;
+        if (snap.anchor_valid && !snap.timeline_reset_pending) {
+          const int32_t ds = rtp_delta(rt.last_d7_frame1, snap.anchor_rtp);
+          const int64_t local_source_ns =
+              (int64_t)snap.anchor_ptp_ns +
+              ((int64_t)ds * 1000000000LL) / (int64_t)sr;
+          map_delta_ms =
+              (double)(local_source_ns - (int64_t)rt.last_d7_ptp_ns) / 1000000.0;
+          map_valid = true;
+        }
+
+        const uint64_t expected_master = ptp_clock_get_master_clock_id();
+        if (map_valid) {
+          ESP_LOGI(TAG,
+                   "ALAC D7 n=%" PRIu32 " bad=%" PRIu32
+                   " frame1=%" PRIu32 " frame2=%" PRIu32
+                   " delta=%" PRIu32 "(%.2fms)"
+                   " ptp=%" PRIu64 " clock=%016" PRIx64
+                   " master=%016" PRIx64 " lock=%d"
+                   " playLat=%" PRIu32 "(%.2fms) mapDelta=%+.2fms",
+                   d7_delta, d7_bad_delta, rt.last_d7_frame1,
+                   rt.last_d7_frame2, rt.last_d7_delta_frames,
+                   d7_frame_delta_ms, rt.last_d7_ptp_ns,
+                   rt.last_d7_clock_id, expected_master,
+                   ptp_clock_is_locked() ? 1 : 0,
+                   snap.playout_latency_samples, playout_latency_ms, map_delta_ms);
+        } else {
+          ESP_LOGI(TAG,
+                   "ALAC D7 n=%" PRIu32 " bad=%" PRIu32
+                   " frame1=%" PRIu32 " frame2=%" PRIu32
+                   " delta=%" PRIu32 "(%.2fms)"
+                   " ptp=%" PRIu64 " clock=%016" PRIx64
+                   " master=%016" PRIx64 " lock=%d"
+                   " playLat=%" PRIu32 "(%.2fms) mapDelta=--",
+                   d7_delta, d7_bad_delta, rt.last_d7_frame1,
+                   rt.last_d7_frame2, rt.last_d7_delta_frames,
+                   d7_frame_delta_ms, rt.last_d7_ptp_ns,
+                   rt.last_d7_clock_id, expected_master,
+                   ptp_clock_is_locked() ? 1 : 0,
+                   snap.playout_latency_samples, playout_latency_ms);
         }
       }
 #undef DELTA32

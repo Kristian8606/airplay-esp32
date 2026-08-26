@@ -1897,14 +1897,24 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
       rtp_time = (uint64_t)value;
     }
 
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: secs=%llu, rtp=%llu, rate=%.1f",
+    ESP_LOGI(TAG,
+             "SETRATEANCHORTIME: secs=%llu frac=0x%016llx rtp=%llu"
+             " clock=%016llx rate=%.1f stream=%lld",
              (unsigned long long)network_time_secs,
-             (unsigned long long)rtp_time, rate);
+             (unsigned long long)network_time_frac,
+             (unsigned long long)rtp_time,
+             (unsigned long long)clock_id, rate,
+             (long long)conn->stream_type);
 
     if (network_time_secs != 0 && rtp_time != 0) {
       uint64_t frac = network_time_frac >> 32;
       frac = (frac * 1000000000ULL) >> 32;
       uint64_t network_time_ns = network_time_secs * 1000000000ULL + frac;
+      ESP_LOGI(TAG,
+               "SETRATEANCHORTIME MAP: clock=%016llx ptp=%llu rtp=%llu",
+               (unsigned long long)clock_id,
+               (unsigned long long)network_time_ns,
+               (unsigned long long)rtp_time);
       audio_receiver_set_anchor_time(clock_id, network_time_ns,
                                      (uint32_t)rtp_time);
     }

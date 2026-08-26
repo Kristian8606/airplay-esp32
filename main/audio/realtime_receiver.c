@@ -17,6 +17,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "network/socket_utils.h"
+#include "network/ptp_clock.h"
 
 #define RT_PACKET_MAX          8192U
 #define RT_PCM_CAPACITY_FRAMES 4096U
@@ -25,6 +26,7 @@
 #define RT_RX_CORE             0
 #define RT_FIRST_PACKET_LOGS   5U
 #define RT_SYNC_PT              84U
+#define RT_AP2_ANCHOR_PT        87U
 #define RT_RETRANSMIT_PT        86U
 #define RT_RESEND_REQUEST_PT    85U
 #define RT_MAX_NACK_COUNT       32U
@@ -116,6 +118,20 @@ typedef struct {
   uint32_t last_sync_latency_frames;
   uint32_t last_sync_time_seconds;
   uint32_t last_sync_time_fraction;
+
+  /* AirPlay 2 realtime D7/PT=87 sender-anchor diagnostics. */
+  uint32_t d7_packets;
+  uint32_t d7_malformed;
+  uint32_t last_d7_frame1;
+  uint32_t last_d7_frame2;
+  uint32_t last_d7_delta_frames;
+  uint64_t last_d7_ptp_ns;
+  uint64_t last_d7_clock_id;
+
+  /* First-seen mask for unhandled realtime control payload types. This is
+   * diagnostic only and prevents an unknown Apple control packet from being
+   * silently discarded without flooding the log. */
+  uint64_t unhandled_control_seen[2];
 } realtime_state_t;
 
 static realtime_state_t s_rt = {
@@ -130,6 +146,13 @@ static inline uint16_t read_be16(const uint8_t *p) {
 static inline uint32_t read_be32(const uint8_t *p) {
   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
          ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static inline uint64_t read_be64(const uint8_t *p) {
+  return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+         ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+         ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+         ((uint64_t)p[6] << 8) | (uint64_t)p[7];
 }
 
 static size_t rtp_payload_offset(const uint8_t *packet, size_t len) {
@@ -637,6 +660,76 @@ static void handle_control_socket(alac_decoder_t *decoder,
       continue;
     }
 
+    if (pt == RT_AP2_ANCHOR_PT) {
+      /* AirPlay 2 realtime PTP anchor announcement (raw packet type 0xD7).
+       * This is the sender-defined RTP <-> PTP timeline used for synchronized
+       * realtime playout:
+       *   4..7   RTP frame 1
+       *   8..15  PTP/network time in nanoseconds
+       *   16..19 RTP frame 2
+       *   20..27 PTP clockIdentity
+       *
+       * FIX11: restore the authoritative D7 anchor path that existed in the
+       * original rbouteiller realtime backend. The transport still decodes
+       * immediately, but physical playout is scheduled from this sender
+       * timeline rather than from packet arrival time. */
+      if (n < 28) {
+        s_rt.d7_malformed++;
+        ESP_LOGW(TAG, "AP2 D7 malformed len=%d bad=%" PRIu32,
+                 (int)n, s_rt.d7_malformed);
+        continue;
+      }
+
+      const uint32_t frame1 = read_be32(buf + 4);
+      const uint64_t network_time_ns = read_be64(buf + 8);
+      const uint32_t frame2 = read_be32(buf + 16);
+      const uint64_t clock_id = read_be64(buf + 20);
+      const uint32_t delta_frames = frame2 - frame1;
+
+      s_rt.last_d7_frame1 = frame1;
+      s_rt.last_d7_frame2 = frame2;
+      s_rt.last_d7_delta_frames = delta_frames;
+      s_rt.last_d7_ptp_ns = network_time_ns;
+      s_rt.last_d7_clock_id = clock_id;
+      s_rt.d7_packets++;
+
+      /* D7 is authoritative for AP2 realtime. audio_receiver_set_anchor_time()
+       * commits a pending generation only on the first anchor of a new epoch;
+       * subsequent D7 packets update the RTP/PTP map without flushing rings,
+       * resetting EQ, or resetting the I2S/MCLK servo. Setting clock_id also
+       * makes PTP lock to the exact master named by the sender. */
+      if (network_time_ns != 0U && clock_id != 0U) {
+        audio_receiver_set_anchor_time(clock_id, network_time_ns, frame1);
+      } else {
+        s_rt.d7_malformed++;
+        ESP_LOGW(TAG,
+                 "AP2 D7 invalid anchor ptp=%" PRIu64
+                 " clock=%016" PRIx64 " bad=%" PRIu32,
+                 network_time_ns, clock_id, s_rt.d7_malformed);
+        continue;
+      }
+
+      /* Keep immediate logging bounded. The periodic audio diagnostic below
+       * performs the useful D7-vs-current-anchor map comparison. */
+      if (s_rt.d7_packets <= 8U || (s_rt.d7_packets % 32U) == 0U) {
+        const int sr = s_rt.cfg.format.sample_rate > 0
+                           ? s_rt.cfg.format.sample_rate
+                           : 44100;
+        const double delta_ms =
+            (double)delta_frames * 1000.0 / (double)sr;
+        const uint64_t expected_clock = ptp_clock_get_master_clock_id();
+        ESP_LOGI(TAG,
+                 "AP2 D7 n=%" PRIu32 " frame1=%" PRIu32
+                 " frame2=%" PRIu32 " delta=%" PRIu32 "(%.2fms)"
+                 " ptp=%" PRIu64 " clock=%016" PRIx64
+                 " master=%016" PRIx64 " lock=%d",
+                 s_rt.d7_packets, frame1, frame2, delta_frames, delta_ms,
+                 network_time_ns, clock_id, expected_clock,
+                 ptp_clock_is_locked() ? 1 : 0);
+      }
+      continue;
+    }
+
     if (pt == RT_SYNC_PT) {
       /* AirPlay sync packet (marker + PT=84). Shairport Sync documents the
        * classic/realtime layout as:
@@ -667,7 +760,16 @@ static void handle_control_socket(alac_decoder_t *decoder,
       continue;
     }
 
-    /* Other control payload types remain intentionally ignored. */
+    /* Log each unhandled control payload type once. This is deliberately
+     * narrow: it can reveal another Apple timing/control packet that was
+     * dropped during the audio-backend rewrite without creating log spam. */
+    const unsigned word = pt >> 6;
+    const uint64_t bit = 1ULL << (pt & 63U);
+    if (word < 2U && (s_rt.unhandled_control_seen[word] & bit) == 0U) {
+      s_rt.unhandled_control_seen[word] |= bit;
+      ESP_LOGI(TAG, "AP2 CTRL unhandled raw=0x%02x pt=%u len=%d",
+               (unsigned)buf[1], (unsigned)pt, (int)n);
+    }
   }
 }
 
@@ -815,6 +917,7 @@ static void realtime_task(void *arg) {
            " rtx_bad=%" PRIu32 " late=%" PRIu32 " skip=%" PRIu32
            " retry=%" PRIu32 " giveup=%" PRIu32 " resync=%" PRIu32
            " pt84=%" PRIu32 "/bad=%" PRIu32
+           " d7=%" PRIu32 "/bad=%" PRIu32
            " rtx_lat=%.2f/%.2f/%.2fms(n=%" PRIu32 ")",
            s_rt.rx_packets, s_rt.decoded_packets, s_rt.decrypt_errors,
            s_rt.decode_errors, s_rt.sink_drops, s_rt.nack_requests,
@@ -822,6 +925,7 @@ static void realtime_task(void *arg) {
            s_rt.reorder_late, s_rt.gap_skips, s_rt.resend_retries,
            s_rt.resend_giveups, s_rt.hard_resyncs,
            s_rt.sync_packets, s_rt.sync_malformed,
+           s_rt.d7_packets, s_rt.d7_malformed,
            s_rt.rtx_latency_samples ? (double)s_rt.rtx_latency_min_us / 1000.0 : 0.0,
            s_rt.rtx_latency_samples ? ((double)s_rt.rtx_latency_sum_us /
                                        (double)s_rt.rtx_latency_samples) / 1000.0 : 0.0,
@@ -889,6 +993,15 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.last_sync_latency_frames = 0;
   s_rt.last_sync_time_seconds = 0;
   s_rt.last_sync_time_fraction = 0;
+  s_rt.d7_packets = 0;
+  s_rt.d7_malformed = 0;
+  s_rt.last_d7_frame1 = 0;
+  s_rt.last_d7_frame2 = 0;
+  s_rt.last_d7_delta_frames = 0;
+  s_rt.last_d7_ptp_ns = 0;
+  s_rt.last_d7_clock_id = 0;
+  s_rt.unhandled_control_seen[0] = 0;
+  s_rt.unhandled_control_seen[1] = 0;
 
   if (!s_rt.packet) {
     s_rt.packet = heap_caps_malloc(RT_PACKET_MAX,
@@ -1023,6 +1136,13 @@ void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
   out->last_sync_latency_frames = s_rt.last_sync_latency_frames;
   out->last_sync_time_seconds = s_rt.last_sync_time_seconds;
   out->last_sync_time_fraction = s_rt.last_sync_time_fraction;
+  out->d7_packets = s_rt.d7_packets;
+  out->d7_malformed = s_rt.d7_malformed;
+  out->last_d7_frame1 = s_rt.last_d7_frame1;
+  out->last_d7_frame2 = s_rt.last_d7_frame2;
+  out->last_d7_delta_frames = s_rt.last_d7_delta_frames;
+  out->last_d7_ptp_ns = s_rt.last_d7_ptp_ns;
+  out->last_d7_clock_id = s_rt.last_d7_clock_id;
 
   if (reset_interval_peaks) {
     s_rt.interval_max_processing_us = 0;
