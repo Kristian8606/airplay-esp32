@@ -119,14 +119,22 @@ typedef struct {
   uint32_t last_sync_time_seconds;
   uint32_t last_sync_time_fraction;
 
-  /* AirPlay 2 realtime D7/PT=87 sender-anchor diagnostics. */
+  /* AirPlay 2 realtime D7/PT=87 observation. The first validated D7 may
+   * establish the initial RTP/PTP map; later D7 packets only authorize PTP
+   * clock-domain handovers and never move the running RTP cursor. */
   uint32_t d7_packets;
   uint32_t d7_malformed;
   uint32_t last_d7_frame1;
   uint32_t last_d7_frame2;
   uint32_t last_d7_delta_frames;
+  uint64_t last_d7_raw_ptp_ns;
+  /* Diagnostic comparison timestamp: raw before the current clock domain can
+   * be translated, continuous-timeline time once translation is available. */
   uint64_t last_d7_ptp_ns;
   uint64_t last_d7_clock_id;
+  bool initial_d7_anchor_committed;
+  uint32_t initial_d7_anchor_commit_count;
+  uint64_t initial_d7_timeline_ns;
 
   /* First-seen mask for unhandled realtime control payload types. This is
    * diagnostic only and prevents an unknown Apple control packet from being
@@ -620,6 +628,43 @@ static void note_retransmit_latency(const uint8_t *packet, size_t packet_len) {
 
 }
 
+/* Commit D7 into the existing audio timing API only once per realtime
+ * receiver start. After that, master handovers are performed entirely inside
+ * ptp_clock as epoch translations, so no handover can move the lower RTP
+ * cursor, generation, PCM rings, EQ state, PID, DMA or I2S state. */
+static void service_initial_d7_anchor(void) {
+  if (s_rt.initial_d7_anchor_committed || s_rt.last_d7_raw_ptp_ns == 0 ||
+      s_rt.last_d7_clock_id == 0) {
+    return;
+  }
+
+  uint64_t timeline_ptp_ns = 0;
+  if (!ptp_clock_translate_realtime_time(s_rt.last_d7_clock_id,
+                                         s_rt.last_d7_raw_ptp_ns,
+                                         &timeline_ptp_ns)) {
+    return;
+  }
+
+  /* clock_id=0 is deliberate: D7 must not select/reset the PTP source. The
+   * translated timestamp is already in the continuous clock domain exported
+   * by ptp_clock_get_time_ns(). */
+  audio_receiver_set_anchor_time(0, timeline_ptp_ns, s_rt.last_d7_frame1);
+  s_rt.initial_d7_anchor_committed = true;
+  s_rt.initial_d7_anchor_commit_count++;
+  s_rt.initial_d7_timeline_ns = timeline_ptp_ns;
+
+  ptp_realtime_snapshot_t ps = {0};
+  ptp_clock_get_realtime_snapshot(&ps);
+  ESP_LOGI(TAG,
+           "ALAC D7 INITIAL ANCHOR raw=%" PRIu64 " timeline=%" PRIu64
+           " rtp=%" PRIu32 " clock=%016" PRIx64
+           " gm=%016" PRIx64 " bias=%+" PRId64 "ns age=%lums samples=%lu",
+           s_rt.last_d7_raw_ptp_ns, timeline_ptp_ns, s_rt.last_d7_frame1,
+           s_rt.last_d7_clock_id, ps.master_clock_id, ps.domain_bias_ns,
+           (unsigned long)ps.mastership_age_ms,
+           (unsigned long)ps.sample_count);
+}
+
 static void handle_control_socket(alac_decoder_t *decoder,
                                   uint32_t *first_logs) {
   uint8_t *buf = s_rt.packet;
@@ -661,18 +706,16 @@ static void handle_control_socket(alac_decoder_t *decoder,
     }
 
     if (pt == RT_AP2_ANCHOR_PT) {
-      /* AirPlay 2 realtime PTP anchor announcement (raw packet type 0xD7).
-       * This is the sender-defined RTP <-> PTP timeline used for synchronized
-       * realtime playout:
+      /* AirPlay 2 realtime D7 media anchor:
        *   4..7   RTP frame 1
-       *   8..15  PTP/network time in nanoseconds
+       *   8..15  raw PTP/network time in nanoseconds
        *   16..19 RTP frame 2
        *   20..27 PTP clockIdentity
        *
-       * FIX11: restore the authoritative D7 anchor path that existed in the
-       * original rbouteiller realtime backend. The transport still decodes
-       * immediately, but physical playout is scheduled from this sender
-       * timeline rather than from packet arrival time. */
+       * D7 confirms which grandmaster domain carries the media timeline. It
+       * NEVER selects the PTP packet source. After the first validated D7 has
+       * established the realtime RTP mapping, later D7 packets are handover
+       * evidence only; the lower audio timing state is not rewritten. */
       if (n < 28) {
         s_rt.d7_malformed++;
         ESP_LOGW(TAG, "AP2 D7 malformed len=%d bad=%" PRIu32,
@@ -689,25 +732,18 @@ static void handle_control_socket(alac_decoder_t *decoder,
       s_rt.last_d7_frame1 = frame1;
       s_rt.last_d7_frame2 = frame2;
       s_rt.last_d7_delta_frames = delta_frames;
+      s_rt.last_d7_raw_ptp_ns = network_time_ns;
       s_rt.last_d7_ptp_ns = network_time_ns;
       s_rt.last_d7_clock_id = clock_id;
       s_rt.d7_packets++;
 
-      /* D7 is authoritative for AP2 realtime. audio_receiver_set_anchor_time()
-       * commits a pending generation only on the first anchor of a new epoch;
-       * subsequent D7 packets update the RTP/PTP map without flushing rings,
-       * resetting EQ, or resetting the I2S/MCLK servo. Setting clock_id also
-       * makes PTP lock to the exact master named by the sender. */
-      if (network_time_ns != 0U && clock_id != 0U) {
-        audio_receiver_set_anchor_time(clock_id, network_time_ns, frame1);
-      } else {
-        s_rt.d7_malformed++;
-        ESP_LOGW(TAG,
-                 "AP2 D7 invalid anchor ptp=%" PRIu64
-                 " clock=%016" PRIx64 " bad=%" PRIu32,
-                 network_time_ns, clock_id, s_rt.d7_malformed);
-        continue;
+      ptp_clock_note_realtime_d7(clock_id);
+      uint64_t d7_timeline_ns = 0;
+      if (ptp_clock_translate_realtime_time(clock_id, network_time_ns,
+                                             &d7_timeline_ns)) {
+        s_rt.last_d7_ptp_ns = d7_timeline_ns;
       }
+      service_initial_d7_anchor();
 
       /* Keep immediate logging bounded. The periodic audio diagnostic below
        * performs the useful D7-vs-current-anchor map comparison. */
@@ -717,15 +753,19 @@ static void handle_control_socket(alac_decoder_t *decoder,
                            : 44100;
         const double delta_ms =
             (double)delta_frames * 1000.0 / (double)sr;
-        const uint64_t expected_clock = ptp_clock_get_master_clock_id();
+        ptp_realtime_snapshot_t ps = {0};
+        ptp_clock_get_realtime_snapshot(&ps);
         ESP_LOGI(TAG,
                  "AP2 D7 n=%" PRIu32 " frame1=%" PRIu32
                  " frame2=%" PRIu32 " delta=%" PRIu32 "(%.2fms)"
-                 " ptp=%" PRIu64 " clock=%016" PRIx64
-                 " master=%016" PRIx64 " lock=%d",
+                 " rawPTP=%" PRIu64 " clock=%016" PRIx64
+                 " gm=%016" PRIx64 " src=%016" PRIx64
+                 " ready=%d handover=%d age=%lums bias=%+" PRId64 "ns",
                  s_rt.d7_packets, frame1, frame2, delta_frames, delta_ms,
-                 network_time_ns, clock_id, expected_clock,
-                 ptp_clock_is_locked() ? 1 : 0);
+                 network_time_ns, clock_id, ps.master_clock_id,
+                 ps.source_clock_id, ps.master_ready ? 1 : 0,
+                 ps.handover_active ? 1 : 0,
+                 (unsigned long)ps.handover_age_ms, ps.domain_bias_ns);
       }
       continue;
     }
@@ -795,6 +835,8 @@ static void realtime_task(void *arg) {
 
   ESP_LOGI(TAG, "realtime ALAC receiver started core=%d sr=%d ch=%d frame=%d",
            xPortGetCoreID(), dcfg.sample_rate, dcfg.channels, dcfg.frame_size);
+  ESP_LOGI(TAG,
+           "build=FIX10_SHAIRPORT_SEAMLESS_ALAC handover=400ms/5s lower_audio=unchanged");
 
   while (s_rt.running) {
     fd_set rfds;
@@ -817,6 +859,7 @@ static void realtime_task(void *arg) {
     if (!s_rt.running) {
       break;
     }
+    service_initial_d7_anchor();
     if (ready < 0) {
       if (errno != EINTR && s_rt.running) {
         s_rt.select_errors++;
@@ -998,8 +1041,12 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.last_d7_frame1 = 0;
   s_rt.last_d7_frame2 = 0;
   s_rt.last_d7_delta_frames = 0;
+  s_rt.last_d7_raw_ptp_ns = 0;
   s_rt.last_d7_ptp_ns = 0;
   s_rt.last_d7_clock_id = 0;
+  s_rt.initial_d7_anchor_committed = false;
+  s_rt.initial_d7_anchor_commit_count = 0;
+  s_rt.initial_d7_timeline_ns = 0;
   s_rt.unhandled_control_seen[0] = 0;
   s_rt.unhandled_control_seen[1] = 0;
 
@@ -1033,10 +1080,16 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   memset(s_rt.reorder, 0, RT_REORDER_SLOTS * sizeof(*s_rt.reorder));
 
   uint16_t bound_data = 0;
-  s_rt.data_sock = socket_utils_bind_udp(data_port, 0, 64 * 1024, &bound_data);
+  s_rt.data_sock = socket_utils_bind_udp(data_port, 0, 128 * 1024, &bound_data);
   if (s_rt.data_sock < 0 || bound_data != data_port) {
     realtime_receiver_stop();
     return ESP_FAIL;
+  }
+  int actual_rcvbuf = 0;
+  socklen_t actual_rcvbuf_len = sizeof(actual_rcvbuf);
+  if (getsockopt(s_rt.data_sock, SOL_SOCKET, SO_RCVBUF, &actual_rcvbuf,
+                 &actual_rcvbuf_len) == 0) {
+    ESP_LOGI(TAG, "DATA SO_RCVBUF requested=131072 actual=%d", actual_rcvbuf);
   }
 
   if (control_port != 0) {

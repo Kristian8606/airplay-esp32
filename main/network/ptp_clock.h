@@ -76,6 +76,54 @@ typedef struct {
 
 void ptp_clock_get_stats(ptp_stats_t *stats);
 
+
+/**
+ * Enable the AirPlay 2 realtime clock-domain handover path.
+ *
+ * In realtime mode the PTP source is selected by the RTSP client's IPv4
+ * address, Announce supplies the actual grandmasterIdentity, and grandmaster
+ * changes are bridged onto one continuous exported PTP timeline.  The audio
+ * engine therefore never sees an epoch/phase jump merely because Apple elects
+ * another PTP grandmaster.
+ *
+ * Buffered AAC leaves this mode disabled and keeps the existing PTP behaviour.
+ */
+void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip);
+
+/**
+ * Record the clockIdentity carried by the latest realtime D7 anchor.  A new
+ * grandmaster is allowed to replace the old clock domain as soon as it has at
+ * least 400 ms of nqptp-style Follow-Up history and D7 names that grandmaster.
+ * Without matching D7, the old exported timeline is held for up to 5 seconds
+ * and then rebased onto the new ready grandmaster without a timeline jump.
+ */
+void ptp_clock_note_realtime_d7(uint64_t clock_id);
+
+/**
+ * Translate a raw PTP timestamp in the current realtime grandmaster domain to
+ * the continuous timeline exported by ptp_clock_get_time_ns().
+ */
+bool ptp_clock_translate_realtime_time(uint64_t clock_id,
+                                       uint64_t remote_ptp_ns,
+                                       uint64_t *timeline_ptp_ns);
+
+typedef struct {
+  bool realtime_mode;
+  bool master_ready;
+  bool handover_active;
+  bool domain_bound;
+  uint64_t master_clock_id;
+  uint64_t source_clock_id;
+  int64_t master_offset_ns;
+  int64_t timeline_offset_ns;
+  int64_t domain_bias_ns;
+  uint32_t mastership_age_ms;
+  uint32_t handover_age_ms;
+  uint32_t sample_count;
+} ptp_realtime_snapshot_t;
+
+void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot);
+
 /**
  * Restrict the PTP clock to a single master identified by its 8-byte
  * clockIdentity (the value carried in the AirPlay 2 0xD7 anchor packet at
@@ -84,11 +132,11 @@ void ptp_clock_get_stats(ptp_stats_t *stats);
  *
  * Pass 0 to clear the filter (accept any master — the default at startup).
  *
- * When the expected clock_id changes, the filter resets samples and lock
- * state so a stale offset to a previous (possibly wrong) master is not
- * carried over.  On a network with multiple PTP-speaking Apple devices
- * (HomePods, AppleTVs, other receivers), this is what prevents us from
- * locking to the wrong master and computing nonsense early/late deltas.
+ * In buffered/legacy mode this retains the original behaviour: changing the
+ * expected clock resets samples and filters PTP by sourcePortIdentity.
+ * In AirPlay 2 realtime mode it is only an anchor-clock hint; PTP source
+ * selection comes from the RTSP client IP and Announce determines the actual
+ * grandmaster, matching the Shairport/NQPTP model.
  */
 void ptp_clock_set_master_clock_id(uint64_t clock_id);
 

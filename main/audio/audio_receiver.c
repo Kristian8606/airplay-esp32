@@ -890,14 +890,12 @@ static bool realtime_playout_deadline(uint32_t rtp,
 static void realtime_timeline_resync(void *ctx) {
   (void)ctx;
   /* ALAC transport continuity was lost beyond the bounded reorder window.
-   * Invalidate the common PCM/PTP epoch immediately. FIX11 deliberately does
-   * not fabricate a replacement anchor from packet arrival time; synchronized
-   * playout resumes when the next valid AirPlay 2 D7 sender anchor arrives. */
+   * Invalidate the common PCM/PTP epoch immediately. The first good ALAC
+   * packet after the receiver catches up will create a fresh local anchor. */
   mark_timeline_discontinuity();
   /* Stateful ALAC EQ is owned by the chronological staging task and resets
    * there when the new generation is observed. */
-  ESP_LOGW(TAG,
-           "REALTIME transport resync: waiting for next AP2 D7 anchor");
+  ESP_LOGW(TAG, "REALTIME transport resync: old PCM/timing epoch invalidated");
 }
 
 static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
@@ -918,14 +916,39 @@ static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
   }
 
   if (snap.timeline_reset_pending || !snap.anchor_valid) {
-    /* AP2 realtime is synchronized by the sender's D7 RTP<->PTP mapping.
-     * Packet arrival time is transport timing, not presentation timing. Never
-     * create a local/fabricated anchor here: packets received before the first
-     * valid D7 (or after a hard transport resync) are simply not admitted to
-     * the synchronized PCM epoch. The next D7 commits the generation and
-     * normal RTP-addressed decode/staging continues unchanged. */
-    s.diag.realtime_sink_no_ptp++;
-    return false;
+    if (!ptp_clock_is_locked()) {
+      s.diag.realtime_sink_no_ptp++;
+      return false;
+    }
+
+    const uint64_t now_ptp_ns = ptp_clock_get_time_ns();
+    uint32_t gen = 0;
+    bool committed = false;
+    taskENTER_CRITICAL(&s.state_mux);
+    if (s.stream_type == AUDIO_STREAM_REALTIME &&
+        (s.timeline_reset_pending || !s.anchor_valid)) {
+      committed = s.timeline_reset_pending;
+      gen = commit_anchor_epoch_locked();
+      s.anchor_clock_id = 0;
+      s.anchor_ptp_ns = now_ptp_ns;
+      s.anchor_rtp = rtp;
+      s.anchor_valid = true;
+    } else {
+      gen = s.generation;
+    }
+    taskEXIT_CRITICAL(&s.state_mux);
+
+    if (committed) {
+      ESP_LOGI(TAG,
+               "REALTIME LOCAL ANCHOR ptp=%" PRIu64 " rtp=%" PRIu32
+               " gen=%" PRIu32 " latency=%" PRIu32 " samples",
+               now_ptp_ns, rtp, gen, s.playout_latency_samples);
+    }
+    snapshot_state(&snap);
+    if (!snap.anchor_valid || snap.timeline_reset_pending) {
+      s.diag.realtime_sink_no_ptp++;
+      return false;
+    }
   }
 
   if (frame_is_fully_stale(rtp, &snap, NULL)) {

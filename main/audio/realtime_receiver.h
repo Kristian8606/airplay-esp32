@@ -11,14 +11,14 @@ typedef bool (*realtime_pcm_sink_t)(uint32_t rtp, int16_t *pcm,
                                     size_t frames, int channels, void *ctx);
 
 /* Called when the realtime RTP receiver can no longer recover continuity
- * inside its bounded reorder window. The owner invalidates the current
- * PCM/timing epoch; synchronized playout resumes on the next valid AP2 D7
- * sender anchor. */
+ * inside its bounded reorder window. The owner must invalidate the current
+ * PCM/timing epoch; the first subsequently decoded packet will establish a
+ * fresh realtime anchor. */
 typedef void (*realtime_resync_cb_t)(void *ctx);
 
 /* Return the remaining time until the first sample at `rtp` reaches the
  * physical playout deadline. False means that no valid PTP/RTP timeline is
- * available yet (for example before the first AP2 D7 sender anchor). */
+ * available yet (for example before the first realtime local anchor). */
 typedef bool (*realtime_deadline_cb_t)(uint32_t rtp,
                                        int64_t *time_to_play_us, void *ctx);
 
@@ -62,7 +62,7 @@ typedef struct {
   uint32_t last_sync_time_seconds;
   uint32_t last_sync_time_fraction;
 
-  /* AirPlay 2 realtime D7/PT=87 sender-anchor diagnostics. */
+  /* Passive AirPlay 2 realtime D7/PT=87 anchor diagnostics. */
   uint32_t d7_packets;
   uint32_t d7_malformed;
   uint32_t last_d7_frame1;
