@@ -143,6 +143,11 @@ static struct {
   int64_t rt_handover_start_ns;
   int64_t rt_hold_timeline_offset_ns;
   int64_t rt_domain_bias_ns;
+  /* During a GM handover accepted before the nqptp-style 1 s startup phase
+   * has completed, keep the exported phase frozen. domain_bias follows the
+   * still-converging remote estimate instead of exposing its startup steps to
+   * the existing audio/PID path. */
+  int64_t rt_phase_hold_until_ns;
   uint64_t rt_last_d7_clock_id;
   uint32_t rt_gm_changes;
   uint32_t rt_handover_commits;
@@ -360,6 +365,7 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.rt_master_ready = false;
   ptp.rt_domain_bound = false;
   ptp.rt_domain_bias_ns = 0;
+  ptp.rt_phase_hold_until_ns = 0;
   /* A D7 from the previous grandmaster must never authorize the new epoch. */
   ptp.rt_last_d7_clock_id = 0;
   ptp.rt_handover_timeout_reported = false;
@@ -410,11 +416,15 @@ static rt_bind_event_t realtime_maybe_bind_locked(int64_t now_ns) {
   }
 
   if (!ptp.rt_have_timeline) {
-    /* First realtime clock domain: keep its native epoch. The existing RTSP
-     * anchor-clock hint (or D7) must agree with Announce when one is known. */
-    if (ptp.expected_clock_id != 0 &&
-        ptp.expected_clock_id != ptp.grandmaster_clock_id &&
-        ptp.rt_last_d7_clock_id != ptp.grandmaster_clock_id) {
+    /* PTP alone cannot place RTP on the AirPlay media timeline. Before the
+     * first realtime lock, require a sender media-clock hint (SETRATEANCHORTIME
+     * or D7) that names the same grandmaster reported by Announce. This keeps
+     * realtime_pcm_sink() from inventing a local-arrival anchor merely because
+     * PTP became ready a little before the media anchor arrived. */
+    const bool media_clock_confirmed =
+        ptp.expected_clock_id == ptp.grandmaster_clock_id ||
+        ptp.rt_last_d7_clock_id == ptp.grandmaster_clock_id;
+    if (!media_clock_confirmed) {
       return RT_BIND_NONE;
     }
     ptp.rt_domain_bias_ns = 0;
@@ -438,11 +448,22 @@ static rt_bind_event_t realtime_maybe_bind_locked(int64_t now_ns) {
     if (d7_matches || handover_age_ms >= RT_HANDOVER_MAX_MS) {
       ptp.rt_domain_bias_ns =
           ptp.rt_hold_timeline_offset_ns - ptp.rt_master_offset_ns;
-      /* Exact continuity at the bind instant. */
+      /* Exact continuity at the bind instant. If D7 authorizes an early bind
+       * while the new master is still in nqptp's aggressive first second,
+       * keep the exported phase frozen until that startup interval ends. The
+       * remote estimator may continue moving, but only domain_bias absorbs it. */
       ptp.filtered_offset_ns = ptp.rt_hold_timeline_offset_ns;
       ptp.rt_domain_bound = true;
       ptp.rt_handover_active = false;
       ptp.rt_handover_timeout_reported = false;
+      if (d7_matches && master_age_ms < STARTUP_DURATION_MS &&
+          ptp.rt_mastership_start_ns > 0) {
+        ptp.rt_phase_hold_until_ns =
+            ptp.rt_mastership_start_ns +
+            (int64_t)STARTUP_DURATION_MS * 1000000LL;
+      } else {
+        ptp.rt_phase_hold_until_ns = 0;
+      }
       ptp.locked = true;
       ptp.lock_start_ms = (uint32_t)(now_ns / 1000000LL);
       ptp.rt_handover_commits++;
@@ -454,7 +475,20 @@ static rt_bind_event_t realtime_maybe_bind_locked(int64_t now_ns) {
   }
 
   if (ptp.rt_domain_bound) {
-    ptp.filtered_offset_ns = ptp.rt_master_offset_ns + ptp.rt_domain_bias_ns;
+    if (ptp.rt_phase_hold_until_ns > 0) {
+      /* Recompute the epoch bias on every startup sample so the lower clock
+       * remains exactly on the pre-handover phase while the new remote offset
+       * converges. At release, freeze the final bias; subsequent /16 and /256
+       * estimator motion then reaches the existing PID only in small steps. */
+      ptp.rt_domain_bias_ns =
+          ptp.rt_hold_timeline_offset_ns - ptp.rt_master_offset_ns;
+      ptp.filtered_offset_ns = ptp.rt_hold_timeline_offset_ns;
+      if (now_ns >= ptp.rt_phase_hold_until_ns) {
+        ptp.rt_phase_hold_until_ns = 0;
+      }
+    } else {
+      ptp.filtered_offset_ns = ptp.rt_master_offset_ns + ptp.rt_domain_bias_ns;
+    }
     ptp.locked = true;
   }
   return RT_BIND_NONE;
@@ -1002,6 +1036,7 @@ void ptp_clock_clear(void) {
   ptp.rt_handover_start_ns = 0;
   ptp.rt_hold_timeline_offset_ns = 0;
   ptp.rt_domain_bias_ns = 0;
+  ptp.rt_phase_hold_until_ns = 0;
   ptp.rt_last_d7_clock_id = 0;
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
@@ -1026,6 +1061,7 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
     ptp.rt_sample_count = 0;
     ptp.rt_master_ready = false;
     ptp.rt_domain_bound = false;
+    ptp.rt_phase_hold_until_ns = 0;
     ptp.rt_handover_timeout_reported = false;
   } else {
     ptp.previous_offset_time_ms = 0;
@@ -1130,6 +1166,7 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.rt_handover_start_ns = 0;
     ptp.rt_hold_timeline_offset_ns = 0;
     ptp.rt_domain_bias_ns = 0;
+    ptp.rt_phase_hold_until_ns = 0;
     ptp.rt_last_d7_clock_id = 0;
   }
   task_handle = ptp.task_handle;
