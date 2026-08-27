@@ -16,6 +16,11 @@ typedef bool (*realtime_pcm_sink_t)(uint32_t rtp, int16_t *pcm,
 typedef bool (*realtime_deadline_cb_t)(uint32_t rtp,
                                        int64_t *time_to_play_us, void *ctx);
 
+/* Shairport-style recovery ends only when ordered staging must commit the
+ * frame. Keep the final loss decision and the staging silence deadline on the
+ * same boundary so an in-flight RTX remains useful after the last NACK. */
+#define REALTIME_RECOVERY_FINAL_MARGIN_US 50000LL
+
 
 typedef struct {
   uint32_t rx_packets;
@@ -43,6 +48,15 @@ typedef struct {
   uint64_t rtx_latency_sum_us;
   uint32_t rtx_latency_min_us;
   uint32_t rtx_latency_max_us;
+
+  /* Lightweight runtime health snapshot for the 2 s compact log. These are
+   * current/cumulative counters only; no high-water/peak instrumentation. */
+  uint32_t work_queue_depth;
+  uint32_t data_pool_waits;
+  uint32_t rtx_pool_drops;
+  uint32_t work_queue_drops;
+  uint32_t resend_event_drops;
+  uint32_t missing_tracker_overflow;
 
   /* Passive PT=84 sync diagnostics. These fields are observational only and
    * never feed the realtime playout timeline. AirPlay sync packets carry two
@@ -79,7 +93,7 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
                                   const realtime_receiver_config_t *config);
 void realtime_receiver_stop(void);
 bool realtime_receiver_is_running(void);
-void realtime_receiver_get_diag(realtime_receiver_diag_t *out, bool reset_interval_peaks);
+void realtime_receiver_get_diag(realtime_receiver_diag_t *out, bool reset_interval_maxima);
 void realtime_receiver_set_client_control(uint32_t client_ip, uint16_t client_control_port);
 /* Explicit realtime FLUSH without an RTP boundary: allow the next matching D7
  * to establish a fresh lower RTP<->PTP epoch. Normal GM handover never calls

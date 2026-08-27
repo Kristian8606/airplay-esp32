@@ -38,7 +38,7 @@
 
 #define RT_DATA_POOL_SLOTS        64U
 #define RT_RTX_POOL_SLOTS         32U
-#define RT_WORK_QUEUE_SLOTS       (RT_DATA_POOL_SLOTS + RT_RTX_POOL_SLOTS)
+#define RT_WORK_QUEUE_SLOTS       96U
 #define RT_RESEND_EVENT_SLOTS     512U
 #define RT_SEEN_SLOTS             1024U
 #define RT_MISSING_SLOTS          512U
@@ -49,9 +49,14 @@
 #define RT_RETRANSMIT_PT          86U
 #define RT_RESEND_REQUEST_PT      85U
 #define RT_MAX_NACK_COUNT         32U
+/* Match Shairport Sync defaults: wait 100 ms before the first request, retry
+ * at 250 ms intervals, and stop issuing NEW requests 100 ms before output.
+ * Do not declare final loss there: an already-requested RTX may still arrive.
+ * Final loss is the ordered-staging commit boundary below. */
 #define RT_RESEND_FIRST_MS        100U
 #define RT_RESEND_RETRY_MS        250U
-#define RT_RESEND_SAFETY_MS       100U
+#define RT_RESEND_LAST_REQUEST_MS 100U
+#define RT_FINAL_LOSS_MARGIN_MS   ((uint32_t)(REALTIME_RECOVERY_FINAL_MARGIN_US / 1000LL))
 #define RT_RESEND_SCAN_MS         10U
 #define RT_SOCKET_TIMEOUT_MS      100U
 
@@ -165,7 +170,7 @@ typedef struct {
   uint32_t work_queue_drops;
   uint32_t resend_event_drops;
   uint32_t missing_tracker_overflow;
-  uint32_t max_work_queue_depth;
+
 
   /* Passive PT=84 source-timeline observation. Never used to steer playout. */
   uint32_t sync_packets;
@@ -377,25 +382,12 @@ static void release_packet_slot(rt_packet_slot_t *slot) {
   slot->len = 0;
   QueueHandle_t q = slot->pool_kind == RT_POOL_RTX ? s_rt.rtx_free_q
                                                    : s_rt.data_free_q;
-  if (q) {
-    (void)xQueueSend(q, &slot, 0);
-  }
-}
-
-static void update_work_queue_peak(void) {
-  if (!s_rt.work_q) return;
-  const UBaseType_t depth = uxQueueMessagesWaiting(s_rt.work_q);
-  if ((uint32_t)depth > s_rt.max_work_queue_depth) {
-    s_rt.max_work_queue_depth = (uint32_t)depth;
-  }
+  if (q) (void)xQueueSend(q, &slot, 0);
 }
 
 static bool queue_work_packet(rt_packet_slot_t *slot) {
   if (!slot || !s_rt.work_q) return false;
-  if (xQueueSend(s_rt.work_q, &slot, 0) == pdTRUE) {
-    update_work_queue_peak();
-    return true;
-  }
+  if (xQueueSend(s_rt.work_q, &slot, 0) == pdTRUE) return true;
   s_rt.work_queue_drops++;
   return false;
 }
@@ -404,15 +396,11 @@ static bool queue_resend_event(uint8_t kind, uint32_t ext_seq, uint16_t count,
                                uint32_t rtp) {
   if (!s_rt.resend_event_q || count == 0) return false;
   rt_resend_event_t ev = {
-      .kind = kind,
-      .count = count,
-      .ext_seq = ext_seq,
-      .rtp = rtp,
+      .kind = kind, .count = count, .ext_seq = ext_seq, .rtp = rtp,
       .event_us = esp_timer_get_time(),
   };
-  if (xQueueSend(s_rt.resend_event_q, &ev, pdMS_TO_TICKS(2)) == pdTRUE) {
+  if (xQueueSend(s_rt.resend_event_q, &ev, pdMS_TO_TICKS(2)) == pdTRUE)
     return true;
-  }
   s_rt.resend_event_drops++;
   return false;
 }
@@ -431,13 +419,10 @@ static missing_slot_t *missing_slot_for(uint32_t ext_seq) {
 }
 
 
-static uint32_t missing_active_count(void) {
-  if (!s_rt.missing) return 0;
-  uint32_t count = 0;
-  for (uint32_t i = 0; i < RT_MISSING_SLOTS; ++i) {
-    if (s_rt.missing[i].active) count++;
-  }
-  return count;
+
+static void missing_clear_slot(missing_slot_t *slot) {
+  if (!slot || !slot->active) return;
+  memset(slot, 0, sizeof(*slot));
 }
 
 static bool missing_find_min(uint32_t *min_ext) {
@@ -515,7 +500,7 @@ static void missing_mark_received(uint32_t ext_seq, int64_t received_us) {
   missing_slot_t *slot = missing_slot_for(ext_seq);
   if (!slot->active || slot->ext_seq != ext_seq) return;
   note_rtx_latency_from_slot(slot, received_us);
-  memset(slot, 0, sizeof(*slot));
+  missing_clear_slot(slot);
 }
 
 static bool missing_slot_due(const missing_slot_t *slot, TickType_t now) {
@@ -526,7 +511,7 @@ static bool missing_slot_due(const missing_slot_t *slot, TickType_t now) {
   int64_t time_to_play_us = 0;
   const bool deadline_valid = missing_time_to_play_us(slot, &time_to_play_us);
   if (deadline_valid &&
-      time_to_play_us <= (int64_t)RT_RESEND_SAFETY_MS * 1000LL) {
+      time_to_play_us <= (int64_t)RT_RESEND_LAST_REQUEST_MS * 1000LL) {
     return false;
   }
   if (slot->nack_count == 0U) return true;
@@ -550,9 +535,9 @@ static void resend_giveup_expired(void) {
     if (!slot->active) continue;
     int64_t time_to_play_us = 0;
     if (!missing_time_to_play_us(slot, &time_to_play_us)) continue;
-    if (time_to_play_us > (int64_t)RT_RESEND_SAFETY_MS * 1000LL) continue;
+    if (time_to_play_us > (int64_t)RT_FINAL_LOSS_MARGIN_MS * 1000LL) continue;
 
-    memset(slot, 0, sizeof(*slot));
+    missing_clear_slot(slot);
     s_rt.gap_skips++;
     s_rt.resend_giveups++;
   }
@@ -713,7 +698,7 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
     }
     service_initial_d7_anchor();
 
-    if (s_rt.d7_packets <= 8U || (s_rt.d7_packets % 32U) == 0U) {
+    if (s_rt.d7_packets <= 3U || (s_rt.d7_packets % 64U) == 0U) {
       const int sr = s_rt.cfg.format.sample_rate > 0
                          ? s_rt.cfg.format.sample_rate
                          : 44100;
@@ -792,6 +777,7 @@ static void data_rx_task(void *arg) {
       s_rt.data_pool_waits++;
       continue;
     }
+    slot->pool_kind = RT_POOL_DATA;
     if (!s_rt.running || s_rt.data_sock < 0) {
       release_packet_slot(slot);
       break;
@@ -821,7 +807,6 @@ static void data_rx_task(void *arg) {
     }
     s_rt.last_data_rx_us = rx_us;
 
-    slot->pool_kind = RT_POOL_DATA;
     slot->retransmitted = false;
     slot->rx_us = rx_us;
     slot->len = (uint16_t)n;
@@ -893,7 +878,7 @@ static void alac_worker_task(void *arg) {
            xPortGetCoreID(), RT_WORK_PRIORITY, dcfg.sample_rate, dcfg.channels,
            dcfg.frame_size);
   ESP_LOGI(TAG,
-           "build=FIX10_SHAIRPORT_ALAC_TRUE_ANCHOR_RX_SPLIT handover=400ms/5s startupHold=1s noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
+           "build=FIX10_SHAIRPORT_ALAC_R23D_COMPACT_DIAG handover=400ms/5s startupHold=1s noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
            (unsigned)RT_MISSING_SLOTS, (unsigned)RT_DATA_POOL_SLOTS,
            (unsigned)RT_RTX_POOL_SLOTS);
 
@@ -979,12 +964,11 @@ static void alac_worker_task(void *arg) {
 
 static void resend_task(void *arg) {
   (void)arg;
-  ESP_LOGI(TAG, "RESEND started core=%d prio=%d scan=%ums first=%ums retry=%ums safety=%ums",
+  ESP_LOGI(TAG, "RESEND started core=%d prio=%d scan=%ums first=%ums retry=%ums lastReq=%ums finalLoss=%ums",
            xPortGetCoreID(), RT_RESEND_PRIORITY, (unsigned)RT_RESEND_SCAN_MS,
            (unsigned)RT_RESEND_FIRST_MS, (unsigned)RT_RESEND_RETRY_MS,
-           (unsigned)RT_RESEND_SAFETY_MS);
-  int64_t last_diag_us = esp_timer_get_time();
-
+           (unsigned)RT_RESEND_LAST_REQUEST_MS,
+           (unsigned)RT_FINAL_LOSS_MARGIN_MS);
   while (s_rt.running) {
     rt_resend_event_t ev = {0};
     if (xQueueReceive(s_rt.resend_event_q, &ev,
@@ -999,22 +983,6 @@ static void resend_task(void *arg) {
     resend_giveup_expired();
     resend_scan_due();
 
-    const int64_t now_us = esp_timer_get_time();
-    if (now_us - last_diag_us >= 5000000LL) {
-      ESP_LOGI(TAG,
-               "RXPIPE q=%u/qmax=%" PRIu32 " freeD=%u freeRTX=%u miss=%" PRIu32
-               " poolWait=%" PRIu32 " workDrop=%" PRIu32
-               " rtxPoolDrop=%" PRIu32 " evDrop=%" PRIu32
-               " missOverflow=%" PRIu32,
-               s_rt.work_q ? (unsigned)uxQueueMessagesWaiting(s_rt.work_q) : 0U,
-               s_rt.max_work_queue_depth,
-               s_rt.data_free_q ? (unsigned)uxQueueMessagesWaiting(s_rt.data_free_q) : 0U,
-               s_rt.rtx_free_q ? (unsigned)uxQueueMessagesWaiting(s_rt.rtx_free_q) : 0U,
-               missing_active_count(), s_rt.data_pool_waits,
-               s_rt.work_queue_drops, s_rt.rtx_pool_drops,
-               s_rt.resend_event_drops, s_rt.missing_tracker_overflow);
-      last_diag_us = now_us;
-    }
   }
 
   s_rt.resend_task = NULL;
@@ -1064,7 +1032,8 @@ static esp_err_t ensure_transport_resources(void) {
   if (!s_rt.data_free_q) s_rt.data_free_q = xQueueCreate(RT_DATA_POOL_SLOTS, sizeof(rt_packet_slot_t *));
   if (!s_rt.rtx_free_q) s_rt.rtx_free_q = xQueueCreate(RT_RTX_POOL_SLOTS, sizeof(rt_packet_slot_t *));
   if (!s_rt.work_q) s_rt.work_q = xQueueCreate(RT_WORK_QUEUE_SLOTS, sizeof(rt_packet_slot_t *));
-  if (!s_rt.resend_event_q) s_rt.resend_event_q = xQueueCreate(RT_RESEND_EVENT_SLOTS, sizeof(rt_resend_event_t));
+  if (!s_rt.resend_event_q)
+    s_rt.resend_event_q = xQueueCreate(RT_RESEND_EVENT_SLOTS, sizeof(rt_resend_event_t));
 
   if (!s_rt.data_pool || !s_rt.rtx_pool || !s_rt.control_packet ||
       !s_rt.decrypt_buf || !s_rt.pcm || !s_rt.seen || !s_rt.missing ||
@@ -1144,7 +1113,6 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.work_queue_drops = 0;
   s_rt.resend_event_drops = 0;
   s_rt.missing_tracker_overflow = 0;
-  s_rt.max_work_queue_depth = 0;
   s_rt.sync_packets = 0;
   s_rt.sync_malformed = 0;
   s_rt.last_sync_flags = 0;
@@ -1252,21 +1220,19 @@ void realtime_receiver_stop(void) {
 
   ESP_LOGI(TAG,
            "realtime stopped rx=%" PRIu32 " dec=%" PRIu32
-           " nack=%" PRIu32 " rtx=%" PRIu32 " miss=%" PRIu32
-           " giveup=%" PRIu32 " resync=%" PRIu32
-           " qmax=%" PRIu32 " workDrop=%" PRIu32
-           " rtxPoolDrop=%" PRIu32 " resendEvDrop=%" PRIu32
-           " missOverflow=%" PRIu32
-           " rtxLat=%.2f/%.2f/%.2fms(n=%" PRIu32 ")",
-           s_rt.rx_packets, s_rt.decoded_packets, s_rt.nack_requests,
-           s_rt.retransmit_packets, s_rt.missing_packets,
-           s_rt.resend_giveups, s_rt.hard_resyncs,
-           s_rt.max_work_queue_depth, s_rt.work_queue_drops,
-           s_rt.rtx_pool_drops, s_rt.resend_event_drops,
-           s_rt.missing_tracker_overflow,
+           " miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32
+           " retry=%" PRIu32 " give=%" PRIu32 " resync=%" PRIu32
+           " err[pool=%" PRIu32 " work=%" PRIu32 " rtx=%" PRIu32
+           " ev=%" PRIu32 " miss=%" PRIu32 "]"
+           " rtxLat=%.1f/%.1f/%.1fms(n=%" PRIu32 ")",
+           s_rt.rx_packets, s_rt.decoded_packets, s_rt.missing_packets,
+           s_rt.nack_requests, s_rt.retransmit_packets, s_rt.resend_retries,
+           s_rt.resend_giveups, s_rt.hard_resyncs, s_rt.data_pool_waits,
+           s_rt.work_queue_drops, s_rt.rtx_pool_drops,
+           s_rt.resend_event_drops, s_rt.missing_tracker_overflow,
            s_rt.rtx_latency_samples ? (double)s_rt.rtx_latency_min_us / 1000.0 : 0.0,
-           s_rt.rtx_latency_samples ? ((double)s_rt.rtx_latency_sum_us /
-                                       (double)s_rt.rtx_latency_samples) / 1000.0 : 0.0,
+           s_rt.rtx_latency_samples ?
+               (double)s_rt.rtx_latency_sum_us / (double)s_rt.rtx_latency_samples / 1000.0 : 0.0,
            s_rt.rtx_latency_samples ? (double)s_rt.rtx_latency_max_us / 1000.0 : 0.0,
            s_rt.rtx_latency_samples);
 }
@@ -1293,7 +1259,7 @@ void realtime_receiver_set_client_control(uint32_t client_ip,
 }
 
 void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
-                                bool reset_interval_peaks) {
+                                bool reset_interval_maxima) {
   if (!out) {
     return;
   }
@@ -1324,6 +1290,12 @@ void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
   out->rtx_latency_sum_us = s_rt.rtx_latency_sum_us;
   out->rtx_latency_min_us = s_rt.rtx_latency_min_us;
   out->rtx_latency_max_us = s_rt.rtx_latency_max_us;
+  out->work_queue_depth = s_rt.work_q ? (uint32_t)uxQueueMessagesWaiting(s_rt.work_q) : 0U;
+  out->data_pool_waits = s_rt.data_pool_waits;
+  out->rtx_pool_drops = s_rt.rtx_pool_drops;
+  out->work_queue_drops = s_rt.work_queue_drops;
+  out->resend_event_drops = s_rt.resend_event_drops;
+  out->missing_tracker_overflow = s_rt.missing_tracker_overflow;
   out->sync_packets = s_rt.sync_packets;
   out->sync_malformed = s_rt.sync_malformed;
   out->last_sync_flags = s_rt.last_sync_flags;
@@ -1340,7 +1312,7 @@ void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
   out->last_d7_ptp_ns = s_rt.last_d7_ptp_ns;
   out->last_d7_clock_id = s_rt.last_d7_clock_id;
 
-  if (reset_interval_peaks) {
+  if (reset_interval_maxima) {
     s_rt.interval_max_processing_us = 0;
     s_rt.interval_max_control_us = 0;
     s_rt.interval_max_interarrival_us = 0;

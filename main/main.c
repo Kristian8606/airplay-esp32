@@ -19,7 +19,7 @@
 
 static const char *TAG = "main";
 #define AP_IP_ADDR 0x0104A8C0
-#define FW_NAME "airplay-esp32_V22_ALAC_R22_DEADLINE_MARGIN"
+#define FW_NAME "airplay-esp32_V22_ALAC_R23D_COMPACT_DIAG"
 
 static void print_firmware_banner(void) {
   const esp_app_desc_t *app = esp_app_get_description();

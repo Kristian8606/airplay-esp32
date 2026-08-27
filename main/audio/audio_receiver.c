@@ -84,7 +84,7 @@
 /* ALAC reorder release point. Missing PCM stays absent in the raw RTP ring
  * while retransmission runs independently. Only when the physical PTP
  * deadline is this close do we commit one frame of silence through EQ. */
-#define AP2_RT_STAGE_COMMIT_MARGIN_US 50000LL
+#define AP2_RT_STAGE_COMMIT_MARGIN_US REALTIME_RECOVERY_FINAL_MARGIN_US
 
 static const char *TAG = "audio_shairport";
 
@@ -1807,14 +1807,6 @@ static void ap2_stats_task(void *arg) {
     if (s.transport) ap2_buffered_transport_get_stats(s.transport, &transport);
     const size_t fifo_capacity =
         s.transport ? ap2_buffered_transport_capacity(s.transport) : 0U;
-    ptp_stats_t ptpdiag = {0};
-    ptp_clock_get_stats(&ptpdiag);
-    /* Positive means the latest raw PTP sample is ahead of the filtered clock
-     * currently used by RTP/I2S timing. This is diagnostic only: no PTP
-     * filtering behaviour is changed here. */
-    const double ptp_raw_filter_ms =
-        (double)(ptpdiag.last_offset_ns - ptpdiag.filtered_offset_ns) / 1000000.0;
-
     /* The old compressed AAC RTP ring no longer exists. Raw compressed audio is
      * represented by FIFO=... below, so do not print a fake millisecond value. */
 
@@ -1853,185 +1845,48 @@ static void ap2_stats_task(void *arg) {
                " ring=%" PRIu64,
                rt_drop_no_ptp, rt_drop_stale, rt_drop_ring);
     }
-    if (now.playout_state == 2 && now.output_sync_valid) {
-      if (snap.stream_type == AUDIO_STREAM_REALTIME) {
-        ESP_LOGI(TAG,
-                 "ALAC SYNC=%+.2fms S=%+d/%+dppm d=%+.3fms/s | PCM=%dms"
-                 " | U=%" PRIu64 " R=%" PRIu64 " DROP=%" PRIu64
-                 " COLL=%" PRIu64 " DEC=%" PRIu64 " DMAERR=%" PRIu64 "/%" PRIu64
-                 " PTPraw-filter=%+.2fms",
-                 sync_ms, now.servo_ppm, now.servo_target_ppm,
-                 (double)now.servo_slope_us_per_s / 1000.0, pcm_ahead_ms,
-                 now.playout_underruns - prev.playout_underruns,
-                 now.playout_resyncs - prev.playout_resyncs, drops, collisions,
-                 now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta, ptp_raw_filter_ms);
-      } else {
-        ESP_LOGI(TAG,
-                 "AAC SYNC=%+.2fms S=%+d/%+dppm d=%+.3fms/s | PCM=%dms"
-                 " | U=%" PRIu64 " R=%" PRIu64 " DROP=%" PRIu64
-                 " COLL=%" PRIu64 " DEC=%" PRIu64 " DMAERR=%" PRIu64 "/%" PRIu64
-                 " PTPraw-filter=%+.2fms | FIFO=%uK peak=%uK cap=%uK",
-                 sync_ms, now.servo_ppm, now.servo_target_ppm,
-                 (double)now.servo_slope_us_per_s / 1000.0, pcm_ahead_ms,
-                 now.playout_underruns - prev.playout_underruns,
-                 now.playout_resyncs - prev.playout_resyncs, drops, collisions,
-                 now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta, ptp_raw_filter_ms,
-                 (unsigned)(transport.fifo_occupancy / 1024U),
-                 (unsigned)(transport.fifo_high_water / 1024U),
-                 (unsigned)(fifo_capacity / 1024U));
-      }
-    } else {
-      if (snap.stream_type == AUDIO_STREAM_REALTIME) {
-        ESP_LOGI(TAG,
-                 "ALAC SYNC=-- | PCM=%dms | U=%" PRIu64 " R=%" PRIu64
-                 " DROP=%" PRIu64 " COLL=%" PRIu64 " DEC=%" PRIu64
-                 " DMAERR=%" PRIu64 "/%" PRIu64
-                 " PTPraw-filter=%+.2fms | %s",
-                 pcm_ahead_ms,
-                 now.playout_underruns - prev.playout_underruns,
-                 now.playout_resyncs - prev.playout_resyncs, drops, collisions,
-                 now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta, ptp_raw_filter_ms,
-                 now.playout_state == 1 ? "PRIME" : "STOP");
-      } else {
-        ESP_LOGI(TAG,
-                 "AAC SYNC=-- | PCM=%dms | U=%" PRIu64 " R=%" PRIu64
-                 " DROP=%" PRIu64 " COLL=%" PRIu64 " DEC=%" PRIu64
-                 " DMAERR=%" PRIu64 "/%" PRIu64
-                 " PTPraw-filter=%+.2fms | FIFO=%uK peak=%uK cap=%uK | %s",
-                 pcm_ahead_ms,
-                 now.playout_underruns - prev.playout_underruns,
-                 now.playout_resyncs - prev.playout_resyncs, drops, collisions,
-                 now.decode_error - prev.decode_error, dma_untagged_delta,
-                 dma_overflow_delta, ptp_raw_filter_ms,
-                 (unsigned)(transport.fifo_occupancy / 1024U),
-                 (unsigned)(transport.fifo_high_water / 1024U),
-                 (unsigned)(fifo_capacity / 1024U),
-                 now.playout_state == 1 ? "PRIME" : "STOP");
-      }
+    const uint64_t underrun_delta =
+        now.playout_underruns - prev.playout_underruns;
+    const uint64_t resync_delta =
+        now.playout_resyncs - prev.playout_resyncs;
+    const uint64_t decode_delta = now.decode_error - prev.decode_error;
+
+    /* Keep the normal 2 s heartbeat compact. Exceptional conditions are
+     * emitted as a separate warning only when they actually occur. */
+    if (underrun_delta || resync_delta || drops || collisions || decode_delta ||
+        dma_untagged_delta || dma_overflow_delta) {
+      ESP_LOGW(TAG,
+               "AUDIO err U=%" PRIu64 " R=%" PRIu64 " drop=%" PRIu64
+               " coll=%" PRIu64 " dec=%" PRIu64 " dma=%" PRIu64 "/%" PRIu64,
+               underrun_delta, resync_delta, drops, collisions, decode_delta,
+               dma_untagged_delta, dma_overflow_delta);
     }
+
     if (snap.stream_type == AUDIO_STREAM_REALTIME) {
       realtime_receiver_diag_t rt = {0};
       realtime_receiver_get_diag(&rt, true);
 #define DELTA32(cur, old) ((cur) >= (old) ? (cur) - (old) : (cur))
-      ESP_LOGI(TAG,
-               "ALAC RX gap=%" PRIu32 " miss=%" PRIu32 " nack=%" PRIu32
-               " rtx=%" PRIu32 " retry=%" PRIu32 " give=%" PRIu32
-               " old=%" PRIu32 " IAmax=%.1fms",
-               DELTA32(rt.gap_events, rt_prev.gap_events),
-               DELTA32(rt.missing_packets, rt_prev.missing_packets),
-               DELTA32(rt.nack_requests, rt_prev.nack_requests),
-               DELTA32(rt.retransmit_packets, rt_prev.retransmit_packets),
-               DELTA32(rt.resend_retries, rt_prev.resend_retries),
-               DELTA32(rt.resend_giveups, rt_prev.resend_giveups),
-               DELTA32(rt.reorder_late, rt_prev.reorder_late),
-               (double)rt.interval_max_interarrival_us / 1000.0);
+      const uint32_t miss_delta = DELTA32(rt.missing_packets, rt_prev.missing_packets);
+      const uint32_t nack_delta = DELTA32(rt.nack_requests, rt_prev.nack_requests);
+      const uint32_t rtx_delta = DELTA32(rt.retransmit_packets, rt_prev.retransmit_packets);
+      const uint32_t retry_delta = DELTA32(rt.resend_retries, rt_prev.resend_retries);
+      const uint32_t give_delta = DELTA32(rt.resend_giveups, rt_prev.resend_giveups);
+      const uint32_t d7_bad_delta = DELTA32(rt.d7_malformed, rt_prev.d7_malformed);
+      const uint32_t pt84_bad_delta = DELTA32(rt.sync_malformed, rt_prev.sync_malformed);
 
-      const uint32_t sync_delta = DELTA32(rt.sync_packets, rt_prev.sync_packets);
-      const uint32_t sync_bad_delta =
-          DELTA32(rt.sync_malformed, rt_prev.sync_malformed);
-      if (sync_delta != 0U && rt.last_sync_time_seconds != 0U) {
+      bool map_valid = false;
+      double map_delta_ms = 0.0;
+      if (rt.last_d7_ptp_ns != 0U && snap.anchor_valid &&
+          !snap.timeline_reset_pending) {
         const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
-        const double sync_latency_ms =
-            (double)rt.last_sync_latency_frames * 1000.0 / (double)sr;
-        const uint64_t remote_sync_ns =
-            (uint64_t)rt.last_sync_time_seconds * 1000000000ULL +
-            (((uint64_t)rt.last_sync_time_fraction * 1000000000ULL) >> 32);
-
-        bool map_valid = false;
-        double map_delta_ms = 0.0;
-        if (snap.anchor_valid && !snap.timeline_reset_pending) {
-          const int32_t ds = rtp_delta(rt.last_sync_rtp_less_latency,
-                                       snap.anchor_rtp);
-          const int64_t local_source_ns =
-              (int64_t)snap.anchor_ptp_ns +
-              ((int64_t)ds * 1000000000LL) / (int64_t)sr;
-          map_delta_ms =
-              (double)(local_source_ns - (int64_t)remote_sync_ns) / 1000000.0;
-          map_valid = true;
-        }
-
-        if (map_valid) {
-          ESP_LOGI(TAG,
-                   "ALAC PT84 n=%" PRIu32 " bad=%" PRIu32
-                   " flags=%u rtp=%" PRIu32
-                   " rtlt=%" PRIu32 " lat=%" PRIu32 "(%.2fms)"
-                   " src32.32=%" PRIu32 ":%08" PRIx32 " mapDelta=%+.2fms",
-                   sync_delta, sync_bad_delta, (unsigned)rt.last_sync_flags,
-                   rt.last_sync_rtp, rt.last_sync_rtp_less_latency,
-                   rt.last_sync_latency_frames, sync_latency_ms,
-                   rt.last_sync_time_seconds, rt.last_sync_time_fraction,
-                   map_delta_ms);
-        } else {
-          ESP_LOGI(TAG,
-                   "ALAC PT84 n=%" PRIu32 " bad=%" PRIu32
-                   " flags=%u rtp=%" PRIu32
-                   " rtlt=%" PRIu32 " lat=%" PRIu32 "(%.2fms)"
-                   " src32.32=%" PRIu32 ":%08" PRIx32 " mapDelta=--",
-                   sync_delta, sync_bad_delta, (unsigned)rt.last_sync_flags,
-                   rt.last_sync_rtp, rt.last_sync_rtp_less_latency,
-                   rt.last_sync_latency_frames, sync_latency_ms,
-                   rt.last_sync_time_seconds, rt.last_sync_time_fraction);
-        }
+        const int32_t ds = rtp_delta(rt.last_d7_frame1, snap.anchor_rtp);
+        const int64_t local_source_ns =
+            (int64_t)snap.anchor_ptp_ns +
+            ((int64_t)ds * 1000000000LL) / (int64_t)sr;
+        map_delta_ms =
+            (double)(local_source_ns - (int64_t)rt.last_d7_ptp_ns) / 1000000.0;
+        map_valid = true;
       }
-
-      const uint32_t d7_delta = DELTA32(rt.d7_packets, rt_prev.d7_packets);
-      const uint32_t d7_bad_delta =
-          DELTA32(rt.d7_malformed, rt_prev.d7_malformed);
-      if (d7_delta != 0U && rt.last_d7_ptp_ns != 0U) {
-        const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
-        const double d7_frame_delta_ms =
-            (double)rt.last_d7_delta_frames * 1000.0 / (double)sr;
-        const double playout_latency_ms =
-            (double)snap.playout_latency_samples * 1000.0 / (double)sr;
-
-        bool map_valid = false;
-        double map_delta_ms = 0.0;
-        if (snap.anchor_valid && !snap.timeline_reset_pending) {
-          const int32_t ds = rtp_delta(rt.last_d7_frame1, snap.anchor_rtp);
-          const int64_t local_source_ns =
-              (int64_t)snap.anchor_ptp_ns +
-              ((int64_t)ds * 1000000000LL) / (int64_t)sr;
-          map_delta_ms =
-              (double)(local_source_ns - (int64_t)rt.last_d7_ptp_ns) / 1000000.0;
-          map_valid = true;
-        }
-
-        const uint64_t expected_master = ptp_clock_get_master_clock_id();
-        if (map_valid) {
-          ESP_LOGI(TAG,
-                   "ALAC D7 n=%" PRIu32 " bad=%" PRIu32
-                   " frame1=%" PRIu32 " frame2=%" PRIu32
-                   " delta=%" PRIu32 "(%.2fms)"
-                   " ptp=%" PRIu64 " clock=%016" PRIx64
-                   " master=%016" PRIx64 " lock=%d"
-                   " playLat=%" PRIu32 "(%.2fms) mapDelta=%+.2fms",
-                   d7_delta, d7_bad_delta, rt.last_d7_frame1,
-                   rt.last_d7_frame2, rt.last_d7_delta_frames,
-                   d7_frame_delta_ms, rt.last_d7_ptp_ns,
-                   rt.last_d7_clock_id, expected_master,
-                   ptp_clock_is_locked() ? 1 : 0,
-                   snap.playout_latency_samples, playout_latency_ms, map_delta_ms);
-        } else {
-          ESP_LOGI(TAG,
-                   "ALAC D7 n=%" PRIu32 " bad=%" PRIu32
-                   " frame1=%" PRIu32 " frame2=%" PRIu32
-                   " delta=%" PRIu32 "(%.2fms)"
-                   " ptp=%" PRIu64 " clock=%016" PRIx64
-                   " master=%016" PRIx64 " lock=%d"
-                   " playLat=%" PRIu32 "(%.2fms) mapDelta=--",
-                   d7_delta, d7_bad_delta, rt.last_d7_frame1,
-                   rt.last_d7_frame2, rt.last_d7_delta_frames,
-                   d7_frame_delta_ms, rt.last_d7_ptp_ns,
-                   rt.last_d7_clock_id, expected_master,
-                   ptp_clock_is_locked() ? 1 : 0,
-                   snap.playout_latency_samples, playout_latency_ms);
-        }
-      }
-#undef DELTA32
-      rt_prev = rt;
 
       const uint32_t stg_missing =
           __atomic_load_n(&s.realtime_stage_missing, __ATOMIC_RELAXED);
@@ -2048,23 +1903,89 @@ static void ap2_stats_task(void *arg) {
       const uint32_t stg_wait_max = __atomic_exchange_n(
           &s.realtime_stage_wait_max_us, 0U, __ATOMIC_RELAXED);
       if (stg_min_ahead == INT32_MAX) stg_min_ahead = stg_ahead;
-#define DELTA32(cur, old) ((cur) >= (old) ? (cur) - (old) : (cur))
-      ESP_LOGI(TAG,
-               "ALAC STAGE miss=%" PRIu32 " rec=%" PRIu32
-               " sil=%" PRIu32 " late=%" PRIu32
-               " ahead=%.1f/%.1fms waitMax=%.1fms (2s delta)",
-               DELTA32(stg_missing, stg_missing_prev),
-               DELTA32(stg_recovered, stg_recovered_prev),
-               DELTA32(stg_silence, stg_silence_prev),
-               DELTA32(stg_late, stg_late_prev),
-               (double)stg_ahead / 1000.0,
-               (double)stg_min_ahead / 1000.0,
-               (double)stg_wait_max / 1000.0);
-#undef DELTA32
+      const uint32_t sil_delta = DELTA32(stg_silence, stg_silence_prev);
+      const uint32_t late_delta = DELTA32(stg_late, stg_late_prev);
+
+      const uint32_t pool_err = DELTA32(rt.data_pool_waits, rt_prev.data_pool_waits);
+      const uint32_t work_err = DELTA32(rt.work_queue_drops, rt_prev.work_queue_drops);
+      const uint32_t rtx_err = DELTA32(rt.rtx_pool_drops, rt_prev.rtx_pool_drops);
+      const uint32_t ev_err = DELTA32(rt.resend_event_drops, rt_prev.resend_event_drops);
+      const uint32_t miss_err =
+          DELTA32(rt.missing_tracker_overflow, rt_prev.missing_tracker_overflow);
+      if (pool_err || work_err || rtx_err || ev_err || miss_err ||
+          d7_bad_delta || pt84_bad_delta) {
+        ESP_LOGW(TAG,
+                 "ALAC transport err pool=%" PRIu32 " work=%" PRIu32
+                 " rtx=%" PRIu32 " ev=%" PRIu32 " miss=%" PRIu32
+                 " d7bad=%" PRIu32 " pt84bad=%" PRIu32,
+                 pool_err, work_err, rtx_err, ev_err, miss_err,
+                 d7_bad_delta, pt84_bad_delta);
+      }
+
+      if (now.playout_state == 2 && now.output_sync_valid) {
+        if (map_valid) {
+          ESP_LOGI(TAG,
+                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=%+.2fms"
+                   " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
+                   " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
+                   " | sil=%" PRIu32 " late=%" PRIu32
+                   " stgMin=%.0fms wait=%.0fms",
+                   sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
+                   map_delta_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   (double)rt.interval_max_interarrival_us / 1000.0,
+                   rt.work_queue_depth, sil_delta, late_delta,
+                   (double)stg_min_ahead / 1000.0,
+                   (double)stg_wait_max / 1000.0);
+        } else {
+          ESP_LOGI(TAG,
+                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=--"
+                   " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
+                   " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
+                   " | sil=%" PRIu32 " late=%" PRIu32
+                   " stgMin=%.0fms wait=%.0fms",
+                   sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
+                   miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   (double)rt.interval_max_interarrival_us / 1000.0,
+                   rt.work_queue_depth, sil_delta, late_delta,
+                   (double)stg_min_ahead / 1000.0,
+                   (double)stg_wait_max / 1000.0);
+        }
+      } else {
+        ESP_LOGI(TAG,
+                 "ALAC sync=-- pcm=%dms map=%s | miss=%" PRIu32
+                 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32 " give=%" PRIu32
+                 " ia=%.0fms q=%" PRIu32 " | sil=%" PRIu32
+                 " late=%" PRIu32 " stgMin=%.0fms wait=%.0fms | %s",
+                 pcm_ahead_ms, map_valid ? "ok" : "--", miss_delta, nack_delta,
+                 rtx_delta, retry_delta, give_delta,
+                 (double)rt.interval_max_interarrival_us / 1000.0,
+                 rt.work_queue_depth, sil_delta, late_delta,
+                 (double)stg_min_ahead / 1000.0,
+                 (double)stg_wait_max / 1000.0,
+                 now.playout_state == 1 ? "PRIME" : "STOP");
+      }
+
+      rt_prev = rt;
       stg_missing_prev = stg_missing;
       stg_recovered_prev = stg_recovered;
       stg_silence_prev = stg_silence;
       stg_late_prev = stg_late;
+#undef DELTA32
+    } else {
+      if (now.playout_state == 2 && now.output_sync_valid) {
+        ESP_LOGI(TAG,
+                 "AAC sync=%+.2fms ppm=%+d/%+d pcm=%dms fifo=%u/%uK",
+                 sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
+                 (unsigned)(transport.fifo_occupancy / 1024U),
+                 (unsigned)(fifo_capacity / 1024U));
+      } else {
+        ESP_LOGI(TAG,
+                 "AAC sync=-- pcm=%dms fifo=%u/%uK | %s",
+                 pcm_ahead_ms,
+                 (unsigned)(transport.fifo_occupancy / 1024U),
+                 (unsigned)(fifo_capacity / 1024U),
+                 now.playout_state == 1 ? "PRIME" : "STOP");
+      }
     }
     prev = now;
     pcm_prev = pcm;
@@ -2099,7 +2020,11 @@ static void stats_session_start(void) {
                               AP2_NETWORK_CORE) != pdPASS) {
     s.stats_task = NULL;
     __atomic_store_n(&s.stats_session_running, false, __ATOMIC_RELEASE);
-    ESP_LOGW(TAG, "stats session task create failed; audio continues");
+    ESP_LOGW(TAG,
+             "stats session task create failed; audio continues "
+             "internalFree=%u internalLargest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
   }
 }
 
