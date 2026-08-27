@@ -436,6 +436,21 @@ static const char *parse_raw_header(const uint8_t *raw, size_t raw_len,
   return NULL;
 }
 
+static bool parse_rtp_info_rtptime(const uint8_t *raw, size_t raw_len,
+                                    uint32_t *rtptime) {
+  if (!rtptime) return false;
+  const char *info = parse_raw_header(raw, raw_len, "RTP-Info:");
+  if (!info) return false;
+  const char *p = strcasestr(info, "rtptime=");
+  if (!p) return false;
+  p += 8;
+  char *end = NULL;
+  unsigned long value = strtoul(p, &end, 10);
+  if (end == p) return false;
+  *rtptime = (uint32_t)value;
+  return true;
+}
+
 static bool request_uses_rtsp(const rtsp_request_t *req) {
   return req && strncasecmp(req->protocol, "RTSP/", 5) == 0;
 }
@@ -1741,12 +1756,27 @@ static void handle_pause(int socket, rtsp_conn_t *conn,
 static void handle_flush(int socket, rtsp_conn_t *conn,
                          const rtsp_request_t *req, const uint8_t *raw,
                          size_t raw_len) {
-  (void)raw;
-  (void)raw_len;
-
-  // Plain AirPlay 1 FLUSH — always immediate.
   ESP_LOGI(TAG, "FLUSH received");
-  audio_receiver_seek_flush();
+  if (conn->stream_type == AUDIO_STREAM_REALTIME) {
+    uint32_t flush_rtp = 0;
+    if (parse_rtp_info_rtptime(raw, raw_len, &flush_rtp)) {
+      ESP_LOGI(TAG,
+               "FLUSH realtime RTP-Info rtptime=%" PRIu32
+               " — preserving D7/SETRATE timing",
+               flush_rtp);
+      audio_receiver_realtime_flush_to_rtp(flush_rtp);
+    } else {
+      /* No RTP boundary means we cannot know which buffered realtime samples
+       * remain valid. Invalidate the epoch and wait for the next REAL sender
+       * D7/SETRATE anchor. realtime_pcm_sink has no local-arrival fallback. */
+      ESP_LOGW(TAG,
+               "FLUSH realtime without RTP-Info — waiting for fresh sender anchor");
+      audio_receiver_realtime_flush_wait_sender_anchor();
+    }
+  } else {
+    // Buffered/legacy behaviour is unchanged.
+    audio_receiver_seek_flush();
+  }
   /* no PCM/output path in AP2 RAW RX build */
   rtsp_send_ok(socket, conn, req->cseq);
 }

@@ -887,17 +887,6 @@ static bool realtime_playout_deadline(uint32_t rtp,
   return true;
 }
 
-static void realtime_timeline_resync(void *ctx) {
-  (void)ctx;
-  /* ALAC transport continuity was lost beyond the bounded reorder window.
-   * Invalidate the common PCM/PTP epoch immediately. The first good ALAC
-   * packet after the receiver catches up will create a fresh local anchor. */
-  mark_timeline_discontinuity();
-  /* Stateful ALAC EQ is owned by the chronological staging task and resets
-   * there when the new generation is observed. */
-  ESP_LOGW(TAG, "REALTIME transport resync: old PCM/timing epoch invalidated");
-}
-
 static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
                               int channels, void *ctx) {
   (void)ctx;
@@ -915,43 +904,17 @@ static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
     return false;
   }
 
-  if (snap.timeline_reset_pending || !snap.anchor_valid) {
-    if (!ptp_clock_is_locked()) {
-      s.diag.realtime_sink_no_ptp++;
-      return false;
-    }
-
-    const uint64_t now_ptp_ns = ptp_clock_get_time_ns();
-    uint32_t gen = 0;
-    bool committed = false;
-    taskENTER_CRITICAL(&s.state_mux);
-    if (s.stream_type == AUDIO_STREAM_REALTIME &&
-        (s.timeline_reset_pending || !s.anchor_valid)) {
-      committed = s.timeline_reset_pending;
-      gen = commit_anchor_epoch_locked();
-      s.anchor_clock_id = 0;
-      s.anchor_ptp_ns = now_ptp_ns;
-      s.anchor_rtp = rtp;
-      s.anchor_valid = true;
-    } else {
-      gen = s.generation;
-    }
-    taskEXIT_CRITICAL(&s.state_mux);
-
-    if (committed) {
-      ESP_LOGI(TAG,
-               "REALTIME LOCAL ANCHOR ptp=%" PRIu64 " rtp=%" PRIu32
-               " gen=%" PRIu32 " latency=%" PRIu32 " samples",
-               now_ptp_ns, rtp, gen, s.playout_latency_samples);
-    }
-    snapshot_state(&snap);
-    if (!snap.anchor_valid || snap.timeline_reset_pending) {
-      s.diag.realtime_sink_no_ptp++;
-      return false;
-    }
+  /* Never invent RTP<->PTP from packet arrival time. Before the first real
+   * sender anchor, realtime PCM may be stored by RTP address in the prepared
+   * generation, but staging/playout remain stopped until D7/SETRATE makes
+   * anchor_valid true. After an unqualified FLUSH (timeline reset pending),
+   * reject provisional PCM until the sender supplies a fresh real anchor. */
+  if (snap.timeline_reset_pending) {
+    s.diag.realtime_sink_no_ptp++;
+    return false;
   }
 
-  if (frame_is_fully_stale(rtp, &snap, NULL)) {
+  if (snap.anchor_valid && frame_is_fully_stale(rtp, &snap, NULL)) {
     s.diag.realtime_sink_stale++;
     s.diag.stale_predecode++;
     s.public_stats.late_frames++;
@@ -2351,19 +2314,28 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
       return ESP_ERR_NOT_SUPPORTED;
     }
     realtime_stage_stop_and_wait();
+    uint32_t rt_gen = 0;
     taskENTER_CRITICAL(&s.state_mux);
+    /* A codec/session boundary already marked a discontinuity. Publish the
+     * fresh PCM generation now, before UDP starts, but deliberately leave the
+     * timing anchor invalid. This lets early ALAC packets be retained by RTP
+     * address while playout waits exclusively for a real D7/SETRATE anchor. */
+    rt_gen = commit_anchor_epoch_locked();
+    s.anchor_valid = false;
     s.realtime_stage_cursor_valid = false;
-    s.realtime_stage_generation = s.generation;
+    s.realtime_stage_generation = rt_gen;
     taskEXIT_CRITICAL(&s.state_mux);
     __atomic_store_n(&s.realtime_stage_running, true, __ATOMIC_RELEASE);
+    ESP_LOGI(TAG,
+             "REALTIME epoch prepared gen=%" PRIu32
+             " waiting for sender D7/SETRATE anchor (no arrival-time fallback)",
+             rt_gen);
 
     realtime_receiver_config_t cfg = {
         .format = fmt_snap.format,
         .encrypt = s.encrypt,
         .pcm_sink = realtime_pcm_sink,
         .pcm_sink_ctx = NULL,
-        .resync_cb = realtime_timeline_resync,
-        .resync_ctx = NULL,
         .deadline_cb = realtime_playout_deadline,
         .deadline_ctx = NULL,
     };
@@ -2458,6 +2430,70 @@ int32_t audio_receiver_get_volume_q15(void) {
 void audio_receiver_get_stats(audio_stats_t *out) { if (out) *out = s.public_stats; }
 void audio_receiver_flush(void) { mark_timeline_discontinuity(); }
 void audio_receiver_seek_flush(void) { mark_timeline_discontinuity(); }
+
+void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  if (snap.stream_type != AUDIO_STREAM_REALTIME) {
+    audio_receiver_seek_flush();
+    return;
+  }
+
+  /* RTP-Info names the first timestamp that may remain after FLUSH. Preserve
+   * the validated sender timing map and current generation, invalidate only
+   * older audio resident in the finite RTP-addressed stores, and move the
+   * chronological staging floor forward to the same RTP boundary. */
+  const uint32_t from_rtp = flush_rtp - PCM_RTP_RING_FRAMES;
+  if (s.realtime_stage_ring) {
+    pcm_rtp_ring_invalidate_range(s.realtime_stage_ring, from_rtp, flush_rtp,
+                                  snap.generation);
+  }
+  if (s.pcm_ring) {
+    pcm_rtp_ring_invalidate_range(s.pcm_ring, from_rtp, flush_rtp,
+                                  snap.generation);
+  }
+
+  uint32_t old_cursor = 0;
+  bool old_cursor_valid = false;
+  taskENTER_CRITICAL(&s.state_mux);
+  if (s.stream_type == AUDIO_STREAM_REALTIME &&
+      s.generation == snap.generation && !s.timeline_reset_pending) {
+    old_cursor_valid = s.realtime_stage_cursor_valid &&
+                       s.realtime_stage_generation == snap.generation;
+    if (old_cursor_valid) old_cursor = s.realtime_stage_cursor_rtp;
+    if (!old_cursor_valid || rtp_delta(flush_rtp, old_cursor) > 0) {
+      s.realtime_stage_cursor_rtp = flush_rtp;
+      s.realtime_stage_generation = snap.generation;
+      s.realtime_stage_cursor_valid = true;
+    }
+  }
+  taskEXIT_CRITICAL(&s.state_mux);
+
+  /* An explicit FLUSH may cancel already queued DMA, but it must not change
+   * RTP<->PTP. The normal playout task will re-prime against the same sender
+   * timeline and will naturally wait until desired_rtp reaches flush_rtp. */
+  s.i2s_flush_requested = true;
+  if (old_cursor_valid) {
+    ESP_LOGI(TAG,
+             "REALTIME FLUSH preserve timing rtp=%" PRIu32
+             " gen=%" PRIu32 " anchor=%d oldCursor=%" PRIu32,
+             flush_rtp, snap.generation, snap.anchor_valid ? 1 : 0, old_cursor);
+  } else {
+    ESP_LOGI(TAG,
+             "REALTIME FLUSH preserve timing rtp=%" PRIu32
+             " gen=%" PRIu32 " anchor=%d oldCursor=--",
+             flush_rtp, snap.generation, snap.anchor_valid ? 1 : 0);
+  }
+}
+
+void audio_receiver_realtime_flush_wait_sender_anchor(void) {
+  realtime_receiver_require_fresh_d7_anchor();
+  mark_timeline_discontinuity();
+  ESP_LOGI(TAG,
+           "REALTIME FLUSH no RTP boundary: local timing invalidated; "
+           "waiting for D7/SETRATE (no arrival-time fallback)");
+}
+
 void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
                                               uint32_t until_seq, uint32_t until_ts) {
   from_seq &= 0x007fffffU;

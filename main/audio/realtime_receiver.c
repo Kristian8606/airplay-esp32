@@ -189,6 +189,7 @@ typedef struct {
   uint64_t last_d7_ptp_ns;
   uint64_t last_d7_clock_id;
   bool initial_d7_anchor_committed;
+  volatile bool d7_anchor_refresh_requested;
   uint32_t initial_d7_anchor_commit_count;
   uint64_t initial_d7_timeline_ns;
 
@@ -612,13 +613,15 @@ static void reset_transport_tracking(void) {
   if (s_rt.missing) memset(s_rt.missing, 0, RT_MISSING_SLOTS * sizeof(*s_rt.missing));
 }
 
-/* Commit D7 into the existing audio timing API only once per realtime
- * receiver start. After that, master handovers are performed entirely inside
- * ptp_clock as epoch translations, so no handover can move the lower RTP
- * cursor, generation, PCM rings, EQ state, PID, DMA or I2S state. */
+/* Commit D7 into the existing audio timing API for the initial sender anchor,
+ * and again only after an explicit realtime FLUSH with no RTP boundary asks
+ * for a fresh media epoch. Normal GM handovers remain entirely inside
+ * ptp_clock, so D7 cannot move the lower RTP cursor during clock switch. */
 static void service_initial_d7_anchor(void) {
-  if (s_rt.initial_d7_anchor_committed || s_rt.last_d7_raw_ptp_ns == 0 ||
-      s_rt.last_d7_clock_id == 0) {
+  const bool refresh =
+      __atomic_load_n(&s_rt.d7_anchor_refresh_requested, __ATOMIC_ACQUIRE);
+  if ((s_rt.initial_d7_anchor_committed && !refresh) ||
+      s_rt.last_d7_raw_ptp_ns == 0 || s_rt.last_d7_clock_id == 0) {
     return;
   }
 
@@ -634,13 +637,14 @@ static void service_initial_d7_anchor(void) {
    * by ptp_clock_get_time_ns(). */
   audio_receiver_set_anchor_time(0, timeline_ptp_ns, s_rt.last_d7_frame1);
   s_rt.initial_d7_anchor_committed = true;
+  __atomic_store_n(&s_rt.d7_anchor_refresh_requested, false, __ATOMIC_RELEASE);
   s_rt.initial_d7_anchor_commit_count++;
   s_rt.initial_d7_timeline_ns = timeline_ptp_ns;
 
   ptp_realtime_snapshot_t ps = {0};
   ptp_clock_get_realtime_snapshot(&ps);
   ESP_LOGI(TAG,
-           "ALAC D7 INITIAL ANCHOR raw=%" PRIu64 " timeline=%" PRIu64
+           "ALAC D7 SENDER ANCHOR raw=%" PRIu64 " timeline=%" PRIu64
            " rtp=%" PRIu32 " clock=%016" PRIx64
            " gm=%016" PRIx64 " bias=%+" PRId64 "ns age=%lums samples=%lu",
            s_rt.last_d7_raw_ptp_ns, timeline_ptp_ns, s_rt.last_d7_frame1,
@@ -889,7 +893,7 @@ static void alac_worker_task(void *arg) {
            xPortGetCoreID(), RT_WORK_PRIORITY, dcfg.sample_rate, dcfg.channels,
            dcfg.frame_size);
   ESP_LOGI(TAG,
-           "build=FIX10_SHAIRPORT_SEAMLESS_ALAC_RX_SPLIT handover=400ms/5s startupHold=1s missing=%u dataPool=%u rtxPool=%u lower_audio=unchanged",
+           "build=FIX10_SHAIRPORT_ALAC_TRUE_ANCHOR_RX_SPLIT handover=400ms/5s startupHold=1s noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
            (unsigned)RT_MISSING_SLOTS, (unsigned)RT_DATA_POOL_SLOTS,
            (unsigned)RT_RTX_POOL_SLOTS);
 
@@ -990,7 +994,8 @@ static void resend_task(void *arg) {
         resend_process_event(&ev);
       }
     }
-    service_initial_d7_anchor();
+    /* D7 state and the one-shot initial anchor are owned by CTRL_RX. Keeping
+     * a single owner removes the former CTRL_RX/RESEND double-commit race. */
     resend_giveup_expired();
     resend_scan_due();
 
@@ -1157,6 +1162,7 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.last_d7_ptp_ns = 0;
   s_rt.last_d7_clock_id = 0;
   s_rt.initial_d7_anchor_committed = false;
+  __atomic_store_n(&s_rt.d7_anchor_refresh_requested, false, __ATOMIC_RELEASE);
   s_rt.initial_d7_anchor_commit_count = 0;
   s_rt.initial_d7_timeline_ns = 0;
   s_rt.unhandled_control_seen[0] = 0;
@@ -1263,6 +1269,11 @@ void realtime_receiver_stop(void) {
                                        (double)s_rt.rtx_latency_samples) / 1000.0 : 0.0,
            s_rt.rtx_latency_samples ? (double)s_rt.rtx_latency_max_us / 1000.0 : 0.0,
            s_rt.rtx_latency_samples);
+}
+
+void realtime_receiver_require_fresh_d7_anchor(void) {
+  __atomic_store_n(&s_rt.d7_anchor_refresh_requested, true, __ATOMIC_RELEASE);
+  ESP_LOGI(TAG, "next matching D7 armed as fresh sender anchor");
 }
 
 void realtime_receiver_set_client_control(uint32_t client_ip,

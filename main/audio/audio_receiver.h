@@ -74,6 +74,10 @@ int32_t audio_receiver_get_volume_q15(void);
 /* Timeline/generation control. These invalidate old PCM in O(1), no scan. */
 void audio_receiver_flush(void);
 void audio_receiver_seek_flush(void);
+/* AP2 realtime FLUSH with RTP-Info: discard audio older than the sender's
+ * RTP boundary while preserving the validated D7/SETRATE RTP<->PTP map. */
+void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp);
+void audio_receiver_realtime_flush_wait_sender_anchor(void);
 void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
                                               uint32_t until_seq, uint32_t until_ts);
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
