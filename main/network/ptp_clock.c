@@ -70,11 +70,20 @@ static const char *TAG = "ptp_clock";
 // window.  Below this threshold the drift is negligible (<0.25 ms at 5 s).
 #define PTP_LONG_PAUSE_THRESHOLD_MS 30000
 
-/* AirPlay 2 realtime handover policy, modelled after Shairport/NQPTP. */
+/* Shairport/NQPTP does not expose a newly elected GM immediately. Keep the
+ * estimator independent from audio and consider it usable only after a short
+ * continuous history. The realtime audio path keeps its previous LOCAL anchor
+ * while this new estimator is acquiring. */
 #define RT_MASTER_READY_AGE_MS 400U
-#define RT_HANDOVER_MAX_MS 5000U
 #define RT_MIN_MASTER_SAMPLES 4U
-#define PTP_TASK_PRIORITY_LEGACY 6U
+
+/* Realtime ALAC uses NQPTP only to establish PHASE between the current
+ * remote grandmaster and ESP monotonic time. Once a GM is ready, the running
+ * remote-PTP -> ESP-local map has a fixed 1:1 slope. This deliberately keeps
+ * movement of the asymmetric NQPTP offset estimator out of the media rate.
+ * Physical I2S rate remains controlled solely by the existing audio PID. */
+
+#define PTP_TASK_PRIORITY_LEGACY   6U
 #define PTP_TASK_PRIORITY_REALTIME 8U
 
 // PTP state
@@ -131,28 +140,16 @@ static struct {
   int64_t rt_last_followup_rx_ns;
   uint32_t rt_sample_count;
   bool rt_master_ready;
-
-  /* The audio engine keeps using ptp.filtered_offset_ns. During a GM change
-   * that exported offset is held constant, so lower RTP/cursor/PID code sees
-   * one continuous clock. Once the new master is trusted, domain_bias maps
-   * the new PTP epoch onto that existing timeline without a phase jump. */
-  bool rt_have_timeline;
-  bool rt_domain_bound;
-  bool rt_handover_active;
-  bool rt_handover_timeout_reported;
-  int64_t rt_handover_start_ns;
-  int64_t rt_hold_timeline_offset_ns;
-  int64_t rt_domain_bias_ns;
-  /* During a GM handover accepted before the nqptp-style 1 s startup phase
-   * has completed, keep the exported phase frozen. domain_bias follows the
-   * still-converging remote estimate instead of exposing its startup steps to
-   * the existing audio/PID path. */
-  int64_t rt_phase_hold_until_ns;
-  uint64_t rt_last_d7_clock_id;
+  uint64_t rt_last_d7_clock_id; /* observation only; never rewrites the PTP epoch */
   uint32_t rt_gm_changes;
-  uint32_t rt_handover_commits;
-  uint32_t rt_handover_fallbacks;
-  uint32_t rt_handover_timeouts;
+
+  /* Fixed-slope remote-PTP -> ESP-local map. Phase is captured from the
+   * NQPTP estimator when a GM becomes ready. The slope remains exactly 1:1
+   * for the lifetime of that mastership epoch; no PTP rate learner can steer
+   * the realtime audio timeline. */
+  bool rt_time_map_valid;
+  int64_t rt_time_ref_remote_ns;
+  int64_t rt_time_ref_local_ns;
 
   // Master clock filter / realtime anchor-clock hint (0 = unspecified).
   uint64_t expected_clock_id;
@@ -337,23 +334,27 @@ static bool realtime_source_matches_locked(uint32_t source_ip) {
   return false;
 }
 
-/* Reset only state that belongs to one remote grandmaster. The continuous
- * exported timeline is intentionally not reset when a working timeline exists. */
+/* Caller holds ptp_state_mux. Running realtime conversion intentionally
+ * uses a fixed 1:1 slope:
+ *   local = local_ref + (remote - remote_ref)
+ * NQPTP filtered-offset convergence is therefore phase diagnostic only and
+ * cannot impersonate a media clock-rate change. */
+static bool realtime_affine_to_local_locked(int64_t remote_ns,
+                                             int64_t *local_ns) {
+  if (!local_ns || !ptp.rt_time_map_valid) return false;
+  *local_ns = ptp.rt_time_ref_local_ns +
+              (remote_ns - ptp.rt_time_ref_remote_ns);
+  return true;
+}
+
+/* Reset only the estimator that belongs to one remote grandmaster. Audio
+ * continuity is intentionally NOT represented here. Realtime ALAC owns a
+ * separate RTP<->ESP-local presentation anchor and keeps using it while the
+ * new GM estimator acquires. */
 static void realtime_reset_master_estimator_locked(uint64_t new_gm,
                                                     uint64_t source_clock,
                                                     int64_t now_ns) {
-  const bool had_timeline = ptp.rt_have_timeline && ptp.locked;
-  if (had_timeline) {
-    ptp.rt_hold_timeline_offset_ns = ptp.filtered_offset_ns;
-    ptp.rt_handover_active = true;
-    ptp.rt_handover_start_ns = now_ns;
-  } else {
-    ptp.locked = false;
-    ptp.lock_start_ms = 0;
-    ptp.rt_handover_active = false;
-    ptp.rt_handover_start_ns = 0;
-  }
-
+  (void)now_ns;
   ptp.source_clock_id = source_clock;
   ptp.grandmaster_clock_id = new_gm;
   ptp.rt_master_offset_ns = 0;
@@ -363,13 +364,18 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.rt_last_followup_rx_ns = 0;
   ptp.rt_sample_count = 0;
   ptp.rt_master_ready = false;
-  ptp.rt_domain_bound = false;
-  ptp.rt_domain_bias_ns = 0;
-  ptp.rt_phase_hold_until_ns = 0;
-  /* A D7 from the previous grandmaster must never authorize the new epoch. */
-  ptp.rt_last_d7_clock_id = 0;
-  ptp.rt_handover_timeout_reported = false;
+  ptp.rt_last_d7_clock_id = 0; /* reject stale D7 from the previous GM */
+
+  ptp.rt_time_map_valid = false;
+  ptp.rt_time_ref_remote_ns = 0;
+  ptp.rt_time_ref_local_ns = 0;
+
+  /* Realtime PTP lock means "the current GM estimator is ready" only. It no
+   * longer means audio must stop: ALAC playout is in ESP-local time. */
+  ptp.locked = false;
+  ptp.lock_start_ms = 0;
   ptp.raw_offset_ns = 0;
+  ptp.filtered_offset_ns = 0;
   ptp.sample_count = 0;
   ptp.previous_offset = 0;
   ptp.previous_offset_time_ms = 0;
@@ -377,156 +383,17 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.last_sync_ms = 0;
 }
 
-typedef enum {
-  RT_BIND_NONE = 0,
-  RT_BIND_INITIAL,
-  RT_BIND_D7,
-  RT_BIND_FALLBACK,
-  RT_BIND_TIMEOUT,
-} rt_bind_event_t;
-
-/* Decide whether the new grandmaster may be attached to the existing exported
- * timeline. Binding is phase-continuous by construction: the bias is chosen
- * so local_now maps to exactly the same exported time before and after bind. */
-static rt_bind_event_t realtime_maybe_bind_locked(int64_t now_ns) {
-  if (!ptp.realtime_mode || ptp.grandmaster_clock_id == 0) return RT_BIND_NONE;
-
-  const uint32_t master_age_ms =
-      ptp.rt_mastership_start_ns > 0 && now_ns >= ptp.rt_mastership_start_ns
-          ? (uint32_t)((now_ns - ptp.rt_mastership_start_ns) / 1000000LL)
-          : 0U;
-  if (!ptp.rt_master_ready &&
-      ptp.rt_sample_count >= RT_MIN_MASTER_SAMPLES &&
-      master_age_ms >= RT_MASTER_READY_AGE_MS) {
-    ptp.rt_master_ready = true;
-  }
-
-  if (!ptp.rt_master_ready) {
-    if (ptp.rt_handover_active && ptp.rt_handover_start_ns > 0 &&
-        now_ns - ptp.rt_handover_start_ns >=
-            (int64_t)RT_HANDOVER_MAX_MS * 1000000LL) {
-      ptp.locked = false;
-      if (!ptp.rt_handover_timeout_reported) {
-        ptp.rt_handover_timeout_reported = true;
-        ptp.rt_handover_timeouts++;
-        return RT_BIND_TIMEOUT;
-      }
-    }
-    return RT_BIND_NONE;
-  }
-
-  if (!ptp.rt_have_timeline) {
-    /* PTP alone cannot place RTP on the AirPlay media timeline. Before the
-     * first realtime lock, require a sender media-clock hint (SETRATEANCHORTIME
-     * or D7) that names the same grandmaster reported by Announce. This keeps
-     * realtime_pcm_sink() from inventing a local-arrival anchor merely because
-     * PTP became ready a little before the media anchor arrived. */
-    const bool media_clock_confirmed =
-        ptp.expected_clock_id == ptp.grandmaster_clock_id ||
-        ptp.rt_last_d7_clock_id == ptp.grandmaster_clock_id;
-    if (!media_clock_confirmed) {
-      return RT_BIND_NONE;
-    }
-    ptp.rt_domain_bias_ns = 0;
-    ptp.filtered_offset_ns = ptp.rt_master_offset_ns;
-    ptp.rt_have_timeline = true;
-    ptp.rt_domain_bound = true;
-    ptp.rt_handover_active = false;
-    ptp.locked = true;
-    ptp.lock_start_ms = (uint32_t)(now_ns / 1000000LL);
-    return RT_BIND_INITIAL;
-  }
-
-  if (ptp.rt_handover_active) {
-    const uint32_t handover_age_ms =
-        now_ns >= ptp.rt_handover_start_ns
-            ? (uint32_t)((now_ns - ptp.rt_handover_start_ns) / 1000000LL)
-            : 0U;
-    const bool d7_matches =
-        ptp.rt_last_d7_clock_id != 0 &&
-        ptp.rt_last_d7_clock_id == ptp.grandmaster_clock_id;
-    if (d7_matches || handover_age_ms >= RT_HANDOVER_MAX_MS) {
-      ptp.rt_domain_bias_ns =
-          ptp.rt_hold_timeline_offset_ns - ptp.rt_master_offset_ns;
-      /* Exact continuity at the bind instant. If D7 authorizes an early bind
-       * while the new master is still in nqptp's aggressive first second,
-       * keep the exported phase frozen until that startup interval ends. The
-       * remote estimator may continue moving, but only domain_bias absorbs it. */
-      ptp.filtered_offset_ns = ptp.rt_hold_timeline_offset_ns;
-      ptp.rt_domain_bound = true;
-      ptp.rt_handover_active = false;
-      ptp.rt_handover_timeout_reported = false;
-      if (d7_matches && master_age_ms < STARTUP_DURATION_MS &&
-          ptp.rt_mastership_start_ns > 0) {
-        ptp.rt_phase_hold_until_ns =
-            ptp.rt_mastership_start_ns +
-            (int64_t)STARTUP_DURATION_MS * 1000000LL;
-      } else {
-        ptp.rt_phase_hold_until_ns = 0;
-      }
-      ptp.locked = true;
-      ptp.lock_start_ms = (uint32_t)(now_ns / 1000000LL);
-      ptp.rt_handover_commits++;
-      if (d7_matches) return RT_BIND_D7;
-      ptp.rt_handover_fallbacks++;
-      return RT_BIND_FALLBACK;
-    }
-    return RT_BIND_NONE;
-  }
-
-  if (ptp.rt_domain_bound) {
-    if (ptp.rt_phase_hold_until_ns > 0) {
-      /* Recompute the epoch bias on every startup sample so the lower clock
-       * remains exactly on the pre-handover phase while the new remote offset
-       * converges. At release, freeze the final bias; subsequent /16 and /256
-       * estimator motion then reaches the existing PID only in small steps. */
-      ptp.rt_domain_bias_ns =
-          ptp.rt_hold_timeline_offset_ns - ptp.rt_master_offset_ns;
-      ptp.filtered_offset_ns = ptp.rt_hold_timeline_offset_ns;
-      if (now_ns >= ptp.rt_phase_hold_until_ns) {
-        ptp.rt_phase_hold_until_ns = 0;
-      }
-    } else {
-      ptp.filtered_offset_ns = ptp.rt_master_offset_ns + ptp.rt_domain_bias_ns;
-    }
-    ptp.locked = true;
-  }
-  return RT_BIND_NONE;
-}
-
-static void log_realtime_bind_event(rt_bind_event_t ev, uint64_t gm,
-                                    uint64_t source, int64_t master_offset,
-                                    int64_t timeline_offset, int64_t bias,
-                                    uint32_t master_age_ms,
-                                    uint32_t handover_age_ms,
-                                    uint32_t samples) {
-  if (ev == RT_BIND_NONE) return;
-  if (ev == RT_BIND_TIMEOUT) {
-    ESP_LOGW(TAG,
-             "RT HANDOVER TIMEOUT gm=%016llx age=%lums samples=%lu; "
-             "old timeline no longer trusted until new master is ready",
-             (unsigned long long)gm, (unsigned long)handover_age_ms,
-             (unsigned long)samples);
-    return;
-  }
-  const char *reason = ev == RT_BIND_INITIAL ? "initial" :
-                       ev == RT_BIND_D7 ? "D7" : "5s-fallback";
-  ESP_LOGI(TAG,
-           "RT CLOCK BIND reason=%s gm=%016llx source=%016llx "
-           "masterOff=%+lldns timelineOff=%+lldns bias=%+lldns "
-           "masterAge=%lums handoverAge=%lums samples=%lu",
-           reason, (unsigned long long)gm, (unsigned long long)source,
-           (long long)master_offset, (long long)timeline_offset,
-           (long long)bias, (unsigned long)master_age_ms,
-           (unsigned long)handover_age_ms, (unsigned long)samples);
-}
-
-/* Realtime nqptp-style offset estimator. Follow-Up reception time, not Sync
- * reception time, is the local observation. Negative delay jitter is ignored
- * during the first second, then heavily damped; positive improvements are
- * accepted immediately during startup and at 1/16 thereafter. */
-static rt_bind_event_t realtime_update_offset_locked(int64_t raw_offset_ns,
-                                                      int64_t reception_ns) {
+/* Realtime estimator copied from nqptp semantics:
+ *   - first sample starts a fresh sequence;
+ *   - during the first second, positive offset changes are accepted fully and
+ *     negative changes are ignored;
+ *   - later, positive changes use 1/16 and negative changes use 1/256 after a
+ *     -2.5 ms innovation clamp.
+ * raw_offset_ns is preciseOriginTimestamp(+Follow_Up correction) minus the
+ * userspace Follow_Up reception timestamp, matching nqptp. */
+static bool realtime_update_offset_locked(int64_t raw_offset_ns,
+                                          int64_t reception_ns) {
+  const bool was_ready = ptp.rt_master_ready;
   ptp.raw_offset_ns = raw_offset_ns;
   ptp.rt_last_followup_rx_ns = reception_ns;
   ptp.last_sync_ms = (uint32_t)(reception_ns / 1000000LL);
@@ -556,12 +423,34 @@ static rt_bind_event_t realtime_update_offset_locked(int64_t raw_offset_ns,
   ptp.rt_previous_offset_ns = smoothed;
   ptp.rt_previous_offset_time_ns = reception_ns;
   ptp.rt_master_offset_ns = smoothed;
+
+
+  /* Keep the generic getters meaningful for diagnostics/upper layers, but
+   * realtime audio never uses this moving value as its presentation clock. */
+  ptp.filtered_offset_ns = smoothed;
   ptp.previous_offset = smoothed;
   ptp.previous_offset_time_ms = (uint32_t)(reception_ns / 1000000LL);
   ptp.mastership_start_ms =
       (uint32_t)(ptp.rt_mastership_start_ns / 1000000LL);
 
-  return realtime_maybe_bind_locked(reception_ns);
+  const uint32_t master_age_ms =
+      ptp.rt_mastership_start_ns > 0 && reception_ns >= ptp.rt_mastership_start_ns
+          ? (uint32_t)((reception_ns - ptp.rt_mastership_start_ns) / 1000000LL)
+          : 0U;
+  if (!ptp.rt_master_ready && ptp.rt_sample_count >= RT_MIN_MASTER_SAMPLES &&
+      master_age_ms >= RT_MASTER_READY_AGE_MS) {
+    ptp.rt_master_ready = true;
+    ptp.locked = true;
+    ptp.lock_start_ms = (uint32_t)(reception_ns / 1000000LL);
+
+    /* Freeze the PHASE estimate into a fixed-slope realtime clock map. From
+     * this point on NQPTP may keep converging for diagnostics/reacquisition,
+     * but its moving offset cannot alter the media phase or media rate. */
+    ptp.rt_time_ref_local_ns = reception_ns;
+    ptp.rt_time_ref_remote_ns = reception_ns + smoothed;
+    ptp.rt_time_map_valid = true;
+  }
+  return !was_ready && ptp.rt_master_ready;
 }
 
 // Master filter check. Caller must hold ptp_state_mux.
@@ -652,7 +541,6 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
   if (gm == 0) return;
 
   bool changed = false;
-  bool keep_timeline = false;
   uint64_t old_gm = 0;
   uint32_t peer_ip = 0;
 
@@ -662,8 +550,7 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
   if (ptp.realtime_mode && realtime_source_matches_locked(source_ip)) {
     old_gm = ptp.grandmaster_clock_id;
     if (old_gm != gm) {
-      keep_timeline = ptp.rt_have_timeline && ptp.locked;
-      ptp.rt_gm_changes += old_gm != 0 ? 1U : 0U;
+      if (old_gm != 0) ptp.rt_gm_changes++;
       realtime_reset_master_estimator_locked(gm, source_clock, reception_ns);
       changed = true;
     } else {
@@ -680,17 +567,20 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
     inet_ntop(AF_INET, &src, src_text, sizeof(src_text));
     if (peer_ip) inet_ntop(AF_INET, &peer, peer_text, sizeof(peer_text));
     ESP_LOGI(TAG,
-             "RT ANNOUNCE peer=%s wanted=%s source=%016llx gm=%016llx "
-             "oldGM=%016llx keepTimeline=%d",
+             "RT ANNOUNCE peer=%s wanted=%s source=%016llx gm=%016llx oldGM=%016llx",
              src_text, peer_ip ? peer_text : "any",
              (unsigned long long)source_clock, (unsigned long long)gm,
-             (unsigned long long)old_gm, keep_timeline ? 1 : 0);
+             (unsigned long long)old_gm);
   }
 }
 
 static void process_sync_realtime(const uint8_t *data, size_t len,
-                                  uint32_t source_ip) {
-  (void)len;
+                                  uint16_t seq, uint32_t source_ip,
+                                  int64_t reception_ns) {
+  (void)seq;
+  (void)reception_ns;
+  if (len < PTP_HEADER_SIZE) return;
+
   taskENTER_CRITICAL(&ptp_state_mux);
   if (ptp.realtime_mode && realtime_source_matches_locked(source_ip)) {
     ptp.sync_count++;
@@ -700,25 +590,26 @@ static void process_sync_realtime(const uint8_t *data, size_t len,
 }
 
 static void process_followup_realtime(const uint8_t *data, size_t len,
-                                      uint32_t source_ip,
+                                      uint16_t seq, uint32_t source_ip,
                                       int64_t reception_ns) {
+  (void)seq;
   if (len < PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) return;
 
-  uint64_t ptp_time_ns = parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
+  const uint64_t ptp_time_ns =
+      parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
+  int64_t followup_correction_ns = 0;
   if (len >= 16) {
-    int64_t correction_field =
+    followup_correction_ns =
         ((int64_t)data[8] << 56) | ((int64_t)data[9] << 48) |
         ((int64_t)data[10] << 40) | ((int64_t)data[11] << 32) |
         ((int64_t)data[12] << 24) | ((int64_t)data[13] << 16) |
         ((int64_t)data[14] << 8) | (int64_t)data[15];
-    correction_field /= 65536;
-    ptp_time_ns = (uint64_t)((int64_t)ptp_time_ns + correction_field);
+    followup_correction_ns /= 65536;
   }
 
-  rt_bind_event_t bind_ev = RT_BIND_NONE;
   uint64_t gm = 0, source = 0;
-  int64_t master_off = 0, timeline_off = 0, bias = 0;
-  uint32_t master_age = 0, handover_age = 0, samples = 0;
+  int64_t master_off = 0;
+  uint32_t master_age = 0, samples = 0;
   bool became_ready = false;
 
   taskENTER_CRITICAL(&ptp_state_mux);
@@ -727,33 +618,27 @@ static void process_followup_realtime(const uint8_t *data, size_t len,
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
+
   ptp.followup_count++;
-  const bool was_ready = ptp.rt_master_ready;
-  const int64_t raw_offset = (int64_t)ptp_time_ns - reception_ns;
-  bind_ev = realtime_update_offset_locked(raw_offset, reception_ns);
-  became_ready = !was_ready && ptp.rt_master_ready;
+  const int64_t raw_offset =
+      (int64_t)ptp_time_ns + followup_correction_ns - reception_ns;
+  became_ready = realtime_update_offset_locked(raw_offset, reception_ns);
   gm = ptp.grandmaster_clock_id;
   source = ptp.source_clock_id;
   master_off = ptp.rt_master_offset_ns;
-  timeline_off = ptp.filtered_offset_ns;
-  bias = ptp.rt_domain_bias_ns;
   samples = ptp.rt_sample_count;
-  if (ptp.rt_mastership_start_ns > 0)
+  if (ptp.rt_mastership_start_ns > 0 && reception_ns >= ptp.rt_mastership_start_ns)
     master_age = (uint32_t)((reception_ns - ptp.rt_mastership_start_ns) / 1000000LL);
-  if (ptp.rt_handover_start_ns > 0 && reception_ns >= ptp.rt_handover_start_ns)
-    handover_age = (uint32_t)((reception_ns - ptp.rt_handover_start_ns) / 1000000LL);
   taskEXIT_CRITICAL(&ptp_state_mux);
 
   if (became_ready) {
     ESP_LOGI(TAG,
              "RT MASTER READY gm=%016llx source=%016llx age=%lums samples=%lu "
-             "masterOff=%+lldns",
+             "masterOff=%+lldns mapRate=0ppm fixed",
              (unsigned long long)gm, (unsigned long long)source,
              (unsigned long)master_age, (unsigned long)samples,
              (long long)master_off);
   }
-  log_realtime_bind_event(bind_ev, gm, source, master_off, timeline_off, bias,
-                          master_age, handover_age, samples);
 }
 
 static void process_ptp_message(const uint8_t *data, size_t len,
@@ -789,11 +674,11 @@ static void process_ptp_message(const uint8_t *data, size_t len,
 
   switch (msg_type) {
   case PTP_MSG_SYNC:
-    if (is_event_port) process_sync_realtime(data, len, source_ip);
+    if (is_event_port) process_sync_realtime(data, len, seq, source_ip, reception_ns);
     break;
   case PTP_MSG_FOLLOW_UP:
     if (!is_event_port)
-      process_followup_realtime(data, len, source_ip, reception_ns);
+      process_followup_realtime(data, len, seq, source_ip, reception_ns);
     break;
   case PTP_MSG_ANNOUNCE:
     if (!is_event_port)
@@ -890,11 +775,15 @@ static void ptp_task(void *pvParameters) {
     if (ret == 0) {
       // Timeout - check if we lost lock due to no messages
     } else {
+      /* Match nqptp's userspace timestamp point: sample the local clock once
+       * immediately after select() reports readable PTP sockets, then use that
+       * reception timestamp for this ready batch. */
+      const int64_t reception_ns = get_local_time_ns();
+
       // Check event port (SYNC messages)
       if (ptp.event_socket >= 0 && FD_ISSET(ptp.event_socket, &read_fds)) {
         struct sockaddr_in src = {0};
         socklen_t src_len = sizeof(src);
-        const int64_t reception_ns = get_local_time_ns();
         ssize_t len = recvfrom(ptp.event_socket, buffer, sizeof(buffer), 0,
                                (struct sockaddr *)&src, &src_len);
         if (len > 0) {
@@ -907,7 +796,6 @@ static void ptp_task(void *pvParameters) {
       if (ptp.general_socket >= 0 && FD_ISSET(ptp.general_socket, &read_fds)) {
         struct sockaddr_in src = {0};
         socklen_t src_len = sizeof(src);
-        const int64_t reception_ns = get_local_time_ns();
         ssize_t len = recvfrom(ptp.general_socket, buffer, sizeof(buffer), 0,
                                (struct sockaddr *)&src, &src_len);
         if (len > 0) {
@@ -1018,8 +906,8 @@ void ptp_clock_clear(void) {
   ptp.followup_count = 0;
   ptp.expected_clock_id = 0;
 
-  /* Keep mode + timing peer across a stream-level clear, but drop every
-   * clock-domain estimate. The next Announce/Follow-Up sequence starts clean. */
+  /* Keep mode + timing peer across a stream-level clear, but drop the
+   * realtime GM estimator. No audio continuity state lives in ptp_clock. */
   ptp.source_clock_id = 0;
   ptp.grandmaster_clock_id = 0;
   ptp.rt_master_offset_ns = 0;
@@ -1029,15 +917,10 @@ void ptp_clock_clear(void) {
   ptp.rt_last_followup_rx_ns = 0;
   ptp.rt_sample_count = 0;
   ptp.rt_master_ready = false;
-  ptp.rt_have_timeline = false;
-  ptp.rt_domain_bound = false;
-  ptp.rt_handover_active = false;
-  ptp.rt_handover_timeout_reported = false;
-  ptp.rt_handover_start_ns = 0;
-  ptp.rt_hold_timeline_offset_ns = 0;
-  ptp.rt_domain_bias_ns = 0;
-  ptp.rt_phase_hold_until_ns = 0;
   ptp.rt_last_d7_clock_id = 0;
+  ptp.rt_time_map_valid = false;
+  ptp.rt_time_ref_remote_ns = 0;
+  ptp.rt_time_ref_local_ns = 0;
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
@@ -1046,13 +929,8 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
 
   taskENTER_CRITICAL(&ptp_state_mux);
   if (ptp.realtime_mode) {
-    /* Restart only the remote-master estimator. Keep the exported timeline so
-     * a long pause/resume cannot inject a clock-epoch jump into audio state. */
-    if (ptp.rt_have_timeline) {
-      ptp.rt_hold_timeline_offset_ns = ptp.filtered_offset_ns;
-      ptp.rt_handover_active = true;
-      ptp.rt_handover_start_ns = get_local_time_ns();
-    }
+    /* Only estimator history is stale after a long pause. The realtime audio
+     * presentation anchor remains in ESP-local time and is not touched. */
     ptp.rt_master_offset_ns = 0;
     ptp.rt_previous_offset_ns = 0;
     ptp.rt_previous_offset_time_ns = 0;
@@ -1060,9 +938,11 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
     ptp.rt_last_followup_rx_ns = 0;
     ptp.rt_sample_count = 0;
     ptp.rt_master_ready = false;
-    ptp.rt_domain_bound = false;
-    ptp.rt_phase_hold_until_ns = 0;
-    ptp.rt_handover_timeout_reported = false;
+    ptp.locked = false;
+    ptp.filtered_offset_ns = 0;
+    ptp.rt_time_map_valid = false;
+    ptp.rt_time_ref_remote_ns = 0;
+    ptp.rt_time_ref_local_ns = 0;
   } else {
     ptp.previous_offset_time_ms = 0;
     ptp.mastership_start_ms = 0;
@@ -1081,17 +961,10 @@ bool ptp_clock_is_locked(void) {
 
   taskENTER_CRITICAL(&ptp_state_mux);
   if (ptp.realtime_mode) {
-    /* During a normal GM handover the old continuous timeline remains usable
-     * for at most five seconds. Do not expose the new clock until it is ready. */
-    if (ptp.rt_handover_active && ptp.rt_handover_start_ns > 0 &&
-        now_ns - ptp.rt_handover_start_ns >=
-            (int64_t)RT_HANDOVER_MAX_MS * 1000000LL &&
-        !ptp.rt_domain_bound && !ptp.rt_master_ready) {
-      ptp.locked = false;
-    } else if (!ptp.rt_handover_active && ptp.rt_domain_bound &&
-               ptp.rt_last_followup_rx_ns > 0 &&
-               now_ns - ptp.rt_last_followup_rx_ns >
-                   (int64_t)LOCK_TIMEOUT_MS * 1000000LL) {
+    if (ptp.rt_master_ready && ptp.rt_last_followup_rx_ns > 0 &&
+        now_ns - ptp.rt_last_followup_rx_ns >
+            (int64_t)LOCK_TIMEOUT_MS * 1000000LL) {
+      ptp.rt_master_ready = false;
       ptp.locked = false;
     }
   } else if (ptp.locked && ptp.last_sync_ms > 0 &&
@@ -1132,8 +1005,8 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.realtime_mode = enabled;
     ptp.timing_peer_ip = enabled ? timing_peer_ip : 0;
 
-    /* Stream-mode transition is a valid upper-layer timing boundary. It does
-     * not touch PCM/cursor/PID/DMA/I2S; it only starts the PTP estimator fresh. */
+    /* Stream-mode transition starts the selected estimator fresh. This does
+     * not touch any PCM/ring/cursor/PID/DMA/I2S state. */
     ptp.locked = false;
     ptp.lock_start_ms = 0;
     ptp.lock_candidate_start_ms = 0;
@@ -1159,15 +1032,10 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.rt_last_followup_rx_ns = 0;
     ptp.rt_sample_count = 0;
     ptp.rt_master_ready = false;
-    ptp.rt_have_timeline = false;
-    ptp.rt_domain_bound = false;
-    ptp.rt_handover_active = false;
-    ptp.rt_handover_timeout_reported = false;
-    ptp.rt_handover_start_ns = 0;
-    ptp.rt_hold_timeline_offset_ns = 0;
-    ptp.rt_domain_bias_ns = 0;
-    ptp.rt_phase_hold_until_ns = 0;
     ptp.rt_last_d7_clock_id = 0;
+    ptp.rt_time_map_valid = false;
+    ptp.rt_time_ref_remote_ns = 0;
+    ptp.rt_time_ref_local_ns = 0;
   }
   task_handle = ptp.task_handle;
   taskEXIT_CRITICAL(&ptp_state_mux);
@@ -1188,53 +1056,29 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
 
 void ptp_clock_note_realtime_d7(uint64_t clock_id) {
   if (clock_id == 0) return;
-  const int64_t now_ns = get_local_time_ns();
-  rt_bind_event_t ev = RT_BIND_NONE;
-  uint64_t gm = 0, source = 0;
-  int64_t master_off = 0, timeline_off = 0, bias = 0;
-  uint32_t master_age = 0, handover_age = 0, samples = 0;
-
   taskENTER_CRITICAL(&ptp_state_mux);
   if (ptp.realtime_mode) {
     ptp.rt_last_d7_clock_id = clock_id;
-    /* D7 names the media anchor clock, but it never selects the PTP packet
-     * source. Keep it as a hint/confirmation only. */
-    ptp.expected_clock_id = clock_id;
-    ev = realtime_maybe_bind_locked(now_ns);
-    gm = ptp.grandmaster_clock_id;
-    source = ptp.source_clock_id;
-    master_off = ptp.rt_master_offset_ns;
-    timeline_off = ptp.filtered_offset_ns;
-    bias = ptp.rt_domain_bias_ns;
-    samples = ptp.rt_sample_count;
-    if (ptp.rt_mastership_start_ns > 0 && now_ns >= ptp.rt_mastership_start_ns)
-      master_age = (uint32_t)((now_ns - ptp.rt_mastership_start_ns) / 1000000LL);
-    if (ptp.rt_handover_start_ns > 0 && now_ns >= ptp.rt_handover_start_ns)
-      handover_age = (uint32_t)((now_ns - ptp.rt_handover_start_ns) / 1000000LL);
+    ptp.expected_clock_id = clock_id; /* anchor hint only; no realtime filtering */
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
-
-  log_realtime_bind_event(ev, gm, source, master_off, timeline_off, bias,
-                          master_age, handover_age, samples);
 }
 
-bool ptp_clock_translate_realtime_time(uint64_t clock_id,
-                                       uint64_t remote_ptp_ns,
-                                       uint64_t *timeline_ptp_ns) {
-  if (!timeline_ptp_ns || clock_id == 0) return false;
+bool ptp_clock_realtime_time_to_local(uint64_t clock_id,
+                                      uint64_t remote_ptp_ns,
+                                      uint64_t *local_ns) {
+  if (!local_ns || clock_id == 0) return false;
   bool ok = false;
-  int64_t bias = 0;
+  int64_t local = 0;
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (ptp.realtime_mode && ptp.rt_domain_bound && ptp.rt_master_ready &&
-      clock_id == ptp.grandmaster_clock_id) {
-    bias = ptp.rt_domain_bias_ns;
-    ok = true;
+  if (ptp.realtime_mode && ptp.rt_master_ready &&
+      clock_id == ptp.grandmaster_clock_id &&
+      ptp.rt_last_followup_rx_ns > 0 && ptp.rt_time_map_valid) {
+    ok = realtime_affine_to_local_locked((int64_t)remote_ptp_ns, &local);
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
-  if (!ok) return false;
-  const int64_t translated = (int64_t)remote_ptp_ns + bias;
-  if (translated < 0) return false;
-  *timeline_ptp_ns = (uint64_t)translated;
+  if (!ok || local < 0) return false;
+  *local_ns = (uint64_t)local;
   return true;
 }
 
@@ -1245,20 +1089,14 @@ void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
   taskENTER_CRITICAL(&ptp_state_mux);
   snapshot->realtime_mode = ptp.realtime_mode;
   snapshot->master_ready = ptp.rt_master_ready;
-  snapshot->handover_active = ptp.rt_handover_active;
-  snapshot->domain_bound = ptp.rt_domain_bound;
   snapshot->master_clock_id = ptp.grandmaster_clock_id;
   snapshot->source_clock_id = ptp.source_clock_id;
   snapshot->master_offset_ns = ptp.rt_master_offset_ns;
-  snapshot->timeline_offset_ns = ptp.filtered_offset_ns;
-  snapshot->domain_bias_ns = ptp.rt_domain_bias_ns;
   snapshot->sample_count = ptp.rt_sample_count;
+  snapshot->gm_change_count = ptp.rt_gm_changes;
   if (ptp.rt_mastership_start_ns > 0 && now_ns >= ptp.rt_mastership_start_ns)
     snapshot->mastership_age_ms =
         (uint32_t)((now_ns - ptp.rt_mastership_start_ns) / 1000000LL);
-  if (ptp.rt_handover_start_ns > 0 && now_ns >= ptp.rt_handover_start_ns)
-    snapshot->handover_age_ms =
-        (uint32_t)((now_ns - ptp.rt_handover_start_ns) / 1000000LL);
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
@@ -1314,6 +1152,8 @@ void ptp_clock_get_stats(ptp_stats_t *stats) {
   stats->followup_count = ptp.followup_count;
   stats->last_offset_ns = ptp.raw_offset_ns;
   stats->filtered_offset_ns = ptp.filtered_offset_ns;
+  /* ptpD is raw Follow_Up sample minus the smoothed estimator. */
+  stats->raw_filter_delta_ns = ptp.raw_offset_ns - ptp.filtered_offset_ns;
   stats->outlier_count = ptp.outlier_count;
   if (ptp.locked && ptp.lock_start_ms > 0) {
     stats->lock_time_ms = now_ms - ptp.lock_start_ms;

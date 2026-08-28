@@ -69,7 +69,8 @@ typedef struct {
   uint32_t sync_count;        // Number of SYNC messages received
   uint32_t followup_count;    // Number of FOLLOW_UP messages received
   int64_t last_offset_ns;     // Last RAW measured offset (pre-smoothing)
-  int64_t filtered_offset_ns; // Filtered/averaged offset (what timing uses)
+  int64_t filtered_offset_ns; // Exported filtered offset (what timing uses)
+  int64_t raw_filter_delta_ns; // RAW - filtered estimator delta
   uint32_t lock_time_ms;      // Time since lock achieved (0 if not locked)
   uint32_t outlier_count;     // Samples rejected as outliers since start
 } ptp_stats_t;
@@ -78,48 +79,46 @@ void ptp_clock_get_stats(ptp_stats_t *stats);
 
 
 /**
- * Enable the AirPlay 2 realtime clock-domain handover path.
+ * Enable the AirPlay 2 realtime NQPTP-style estimator path.
  *
  * In realtime mode the PTP source is selected by the RTSP client's IPv4
- * address, Announce supplies the actual grandmasterIdentity, and grandmaster
- * changes are bridged onto one continuous exported PTP timeline.  The audio
- * engine therefore never sees an epoch/phase jump merely because Apple elects
- * another PTP grandmaster.
+ * address and Announce supplies the actual grandmasterIdentity. Realtime PTP
+ * only estimates remote-GM -> ESP-local conversion; audio continuity is owned
+ * by the ALAC RTP<->local anchor, not by a synthetic/virtual PTP timeline.
  *
  * Buffered AAC leaves this mode disabled and keeps the existing PTP behaviour.
  */
 void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip);
 
 /**
- * Record the clockIdentity carried by the latest realtime D7 anchor.  A new
- * grandmaster is allowed to replace the old clock domain as soon as it has at
- * least 400 ms of nqptp-style Follow-Up history and D7 names that grandmaster.
- * Without matching D7, the old exported timeline is held for up to 5 seconds
- * and then rebased onto the new ready grandmaster without a timeline jump.
+ * Record the clockIdentity carried by the latest realtime D7 anchor. This is
+ * an observation/hint only; it never creates a virtual PTP domain or rewrites
+ * the realtime audio timeline.
  */
 void ptp_clock_note_realtime_d7(uint64_t clock_id);
 
 /**
- * Translate a raw PTP timestamp in the current realtime grandmaster domain to
- * the continuous timeline exported by ptp_clock_get_time_ns().
+ * Convert a remote timestamp from the current READY realtime grandmaster into
+ * ESP monotonic time. Returns false while a new GM is still acquiring or when
+ * the D7 clock_id does not match the current grandmaster.
  */
-bool ptp_clock_translate_realtime_time(uint64_t clock_id,
-                                       uint64_t remote_ptp_ns,
-                                       uint64_t *timeline_ptp_ns);
+bool ptp_clock_realtime_time_to_local(uint64_t clock_id,
+                                      uint64_t remote_ptp_ns,
+                                      uint64_t *local_ns);
 
 typedef struct {
   bool realtime_mode;
   bool master_ready;
-  bool handover_active;
-  bool domain_bound;
   uint64_t master_clock_id;
   uint64_t source_clock_id;
   int64_t master_offset_ns;
-  int64_t timeline_offset_ns;
-  int64_t domain_bias_ns;
   uint32_t mastership_age_ms;
-  uint32_t handover_age_ms;
   uint32_t sample_count;
+  /* Monotonic within one realtime PTP session. Incremented whenever Announce
+   * changes grandmasterIdentity after the first master has been observed.
+   * Audio uses this only to distinguish mastership epochs; it never feeds
+   * back into PTP selection/filtering. */
+  uint32_t gm_change_count;
 } ptp_realtime_snapshot_t;
 
 void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot);

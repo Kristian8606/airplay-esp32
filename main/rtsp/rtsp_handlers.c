@@ -1273,8 +1273,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   bool buffered = (stream_type == AUDIO_STREAM_BUFFERED);
 
-  /* Only AirPlay 2 realtime ALAC uses the seamless PTP-domain handover path.
-   * Buffered AAC deliberately stays on the existing timing implementation.
+  /* Only AirPlay 2 realtime ALAC uses the NQPTP-style GM estimator plus
+   * local presentation-anchor path. Buffered AAC deliberately stays on the
+   * existing timing implementation.
    * The RTSP peer IP, not D7 clockIdentity, selects the PTP packet source. */
   if (is_bplist) {
     ptp_clock_set_realtime_mode(!buffered,
@@ -1955,41 +1956,42 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
                (unsigned long long)network_time_ns,
                (unsigned long long)rtp_time);
 
-      /* Realtime ALAC exposes one continuous PTP timeline to the existing
-       * audio engine. SETRATEANCHORTIME is another raw remote-clock anchor,
-       * so it must pass through the same domain translation as D7. Never let
-       * a raw new-GM epoch overwrite the running lower anchor mid-handover. */
+      /* Realtime SETRATEANCHORTIME follows the same rule as D7: convert the
+       * sender's current GM timestamp once into ESP monotonic time. If the new
+       * GM is still acquiring, keep the already-running local ALAC map and
+       * defer this observation; never inject a raw PTP epoch into audio. */
       ptp_realtime_snapshot_t ps = {0};
       ptp_clock_get_realtime_snapshot(&ps);
       if (ps.realtime_mode) {
-        ptp_clock_set_master_clock_id(clock_id); /* hint only in RT mode */
-        uint64_t timeline_ptp_ns = 0;
-        if (ptp_clock_translate_realtime_time(clock_id, network_time_ns,
-                                               &timeline_ptp_ns)) {
+        ptp_clock_set_master_clock_id(clock_id); /* observation/hint only */
+        uint64_t local_ns = 0;
+        if (ptp_clock_realtime_time_to_local(clock_id, network_time_ns,
+                                              &local_ns)) {
           ESP_LOGI(TAG,
-                   "SETRATEANCHORTIME RT translated raw=%llu timeline=%llu "
-                   "gm=%016llx bias=%+lldns",
+                   "SETRATEANCHORTIME RT local raw=%llu local=%llu gm=%016llx age=%lums",
                    (unsigned long long)network_time_ns,
-                   (unsigned long long)timeline_ptp_ns,
+                   (unsigned long long)local_ns,
                    (unsigned long long)ps.master_clock_id,
-                   (long long)ps.domain_bias_ns);
-          audio_receiver_set_anchor_time(0, timeline_ptp_ns,
-                                         (uint32_t)rtp_time);
-        } else if (!ps.handover_active &&
-                   (ps.master_clock_id == 0 || ps.master_clock_id == clock_id)) {
-          /* Initial startup before the first 400 ms PTP bind: keep the stable
-           * baseline behaviour. The clock hint prevents an unrelated domain
-           * from being accepted, and playout still waits for PTP lock. */
-          audio_receiver_set_anchor_time(clock_id, network_time_ns,
-                                         (uint32_t)rtp_time);
+                   (unsigned long)ps.mastership_age_ms);
+          audio_realtime_anchor_result_t anchor_result = {0};
+          if (!audio_receiver_set_realtime_anchor_local(
+                  clock_id, ps.gm_change_count, ps.mastership_age_ms,
+                  network_time_ns, local_ns, (uint32_t)rtp_time,
+                  &anchor_result)) {
+            ESP_LOGI(TAG,
+                     "SETRATEANCHORTIME RT media rebase deferred clock=%016llx gm=%016llx epoch=%lu age=%lums",
+                     (unsigned long long)clock_id,
+                     (unsigned long long)ps.master_clock_id,
+                     (unsigned long)ps.gm_change_count,
+                     (unsigned long)ps.mastership_age_ms);
+          }
         } else {
           ESP_LOGI(TAG,
-                   "SETRATEANCHORTIME RT deferred clock=%016llx gm=%016llx "
-                   "ready=%d handover=%d age=%lums",
+                   "SETRATEANCHORTIME RT deferred clock=%016llx gm=%016llx ready=%d age=%lums",
                    (unsigned long long)clock_id,
                    (unsigned long long)ps.master_clock_id,
-                   ps.master_ready ? 1 : 0, ps.handover_active ? 1 : 0,
-                   (unsigned long)ps.handover_age_ms);
+                   ps.master_ready ? 1 : 0,
+                   (unsigned long)ps.mastership_age_ms);
         }
       } else {
         audio_receiver_set_anchor_time(clock_id, network_time_ns,
@@ -2030,13 +2032,10 @@ static void handle_setpeers(int socket, rtsp_conn_t *conn,
     ESP_LOGI(TAG, "SETPEERS: got bplist");
   }
 
-  // PTP peers changed — the PTP clock will re-lock to the new master on
-  // its own.  Do NOT reset the audio timing anchor here: the anchor's
-  // network_time_ns is in absolute PTP time, and compute_early_us
-  // auto-corrects via ptp_clock_get_offset_ns() as PTP re-locks.
-  // Resetting mid-stream orphans the pre-buffer (up to ~23 s of audio)
-  // with no valid anchor, causing consecutive-early detection to
-  // invalidate the anchor and break playback.
+  // PTP peers changed — let the selected estimator elect/re-lock naturally.
+  // Do NOT reset audio timing here. Buffered AAC keeps its existing PTP map;
+  // realtime ALAC keeps its already-valid RTP<->ESP-local map until a D7 from
+  // the ready new GM refreshes it. No ring/cursor/DMA reset belongs here.
   ESP_LOGI(TAG, "SETPEERS: PTP peers changed, clock will re-lock");
 
   rtsp_send_ok(socket, conn, req->cseq);

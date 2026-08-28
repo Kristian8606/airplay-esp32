@@ -76,6 +76,7 @@
 #define AP2_PCM_TARGET_MS           1000U
 #define AP2_PLAYOUT_PRIME_MS         500U
 #define AP2_REALTIME_PRIME_MS        100U
+#define AP2_RT_GM_REBASE_SETTLE_MS  1000U
 #define AP2_BUFFERED_FIFO_REQUEST_BYTES AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES
 #define AP2_BUFFERED_LEAD_MS       (AP2_PCM_TARGET_MS + 100U)
 #define AP2_MAX_DEFERRED_FLUSH     10U
@@ -104,6 +105,7 @@ typedef struct {
   bool anchor_valid;
   bool playing;
   uint64_t anchor_ptp_ns;
+  uint64_t anchor_local_ns; /* authoritative presentation anchor for realtime ALAC */
   uint32_t anchor_rtp;
   uint32_t generation;
   audio_format_t format;
@@ -212,7 +214,14 @@ typedef struct {
   bool anchor_valid;
   uint64_t anchor_clock_id;
   uint64_t anchor_ptp_ns;
+  uint64_t anchor_local_ns; /* ESP monotonic time corresponding to anchor_rtp */
   uint32_t anchor_rtp;
+  /* Realtime media-domain rebase. This is deliberately separate from PTP:
+   * it only maps a new GM epoch onto the already-running local media phase. */
+  bool rt_media_rebase_valid;
+  uint64_t rt_media_rebase_clock_id;
+  uint32_t rt_media_rebase_epoch;
+  int64_t rt_media_rebase_bias_ns;
   uint32_t generation;
   int64_t anchor_set_local_us;
   uint32_t anchor_set_generation;
@@ -270,6 +279,7 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->anchor_valid = s.anchor_valid;
   out->playing = s.playing;
   out->anchor_ptp_ns = s.anchor_ptp_ns;
+  out->anchor_local_ns = s.anchor_local_ns;
   out->anchor_rtp = s.anchor_rtp;
   out->generation = s.generation;
   out->format = s.format;
@@ -293,6 +303,10 @@ static void mark_timeline_discontinuity(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.anchor_valid = false;
   s.timeline_reset_pending = true;
+  s.rt_media_rebase_valid = false;
+  s.rt_media_rebase_clock_id = 0;
+  s.rt_media_rebase_epoch = 0;
+  s.rt_media_rebase_bias_ns = 0;
   taskEXIT_CRITICAL(&s.state_mux);
   s.diag.last_decoded_end_rtp = 0;
   s.i2s_flush_requested = true;
@@ -323,64 +337,83 @@ static inline int32_t rtp_delta(uint32_t a, uint32_t b) {
   return (int32_t)(a - b);
 }
 
+/* Presentation-clock boundary.
+ * Buffered AAC intentionally keeps the existing PTP-domain behaviour.
+ * Realtime ALAC is different: every validated D7 is converted once from the
+ * current GM's PTP domain into ESP monotonic time, and all lower audio timing
+ * (staging deadlines, startup phase, DMA completion error and PID input) then
+ * stays in that single local clock domain. A PTP estimator adjustment or GM
+ * epoch change therefore cannot masquerade as physical loudspeaker motion. */
+static bool timing_clock_ready(const timing_snapshot_t *snap) {
+  if (!snap || !snap->anchor_valid || snap->timeline_reset_pending) return false;
+  if (snap->stream_type == AUDIO_STREAM_REALTIME) return snap->anchor_local_ns != 0;
+  return ptp_clock_is_locked();
+}
+
+static uint64_t presentation_now_ns(const timing_snapshot_t *snap) {
+  if (snap && snap->stream_type == AUDIO_STREAM_REALTIME) {
+    return (uint64_t)esp_timer_get_time() * 1000ULL;
+  }
+  return ptp_clock_get_time_ns();
+}
+
+static uint64_t presentation_anchor_ns(const timing_snapshot_t *snap) {
+  return snap->stream_type == AUDIO_STREAM_REALTIME ? snap->anchor_local_ns
+                                                     : snap->anchor_ptp_ns;
+}
+
 static bool wanted_rtp_now(const timing_snapshot_t *snap, uint32_t *out) {
-  if (!snap || !out || !snap->playing || !snap->anchor_valid ||
-      snap->timeline_reset_pending || !ptp_clock_is_locked()) {
-    return false;
-  }
-  int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
-  int64_t now_ns = (int64_t)ptp_clock_get_time_ns();
-  int64_t dt_ns = now_ns - (int64_t)snap->anchor_ptp_ns;
+  if (!snap || !out || !snap->playing || !timing_clock_ready(snap)) return false;
+  const int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
+  const int64_t now_ns = (int64_t)presentation_now_ns(snap);
+  const int64_t dt_ns = now_ns - (int64_t)presentation_anchor_ns(snap);
   int64_t ds = (dt_ns * (int64_t)sr) / 1000000000LL;
   ds -= (int64_t)snap->playout_latency_samples;
   *out = snap->anchor_rtp + (uint32_t)ds;
   return true;
 }
 
-static bool wanted_rtp_at_ptp(const timing_snapshot_t *snap, uint64_t ptp_ns,
-                               uint32_t *out) {
-  if (!snap || !out || !snap->playing || !snap->anchor_valid ||
-      snap->timeline_reset_pending || !ptp_clock_is_locked()) {
-    return false;
-  }
-  int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
-  int64_t dt_ns = (int64_t)ptp_ns - (int64_t)snap->anchor_ptp_ns;
+static bool wanted_rtp_at_presentation_ns(const timing_snapshot_t *snap,
+                                           uint64_t time_ns, uint32_t *out) {
+  if (!snap || !out || !snap->playing || !timing_clock_ready(snap)) return false;
+  const int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
+  const int64_t dt_ns = (int64_t)time_ns - (int64_t)presentation_anchor_ns(snap);
   int64_t ds = (dt_ns * (int64_t)sr) / 1000000000LL;
   ds -= (int64_t)snap->playout_latency_samples;
   *out = snap->anchor_rtp + (uint32_t)ds;
   return true;
 }
 
-static bool rtp_to_ptp_ns(const timing_snapshot_t *snap, uint32_t rtp,
-                           uint64_t *out_ptp_ns) {
-  if (!snap || !out_ptp_ns || !snap->anchor_valid ||
-      snap->timeline_reset_pending) {
-    return false;
-  }
+static bool rtp_to_presentation_ns(const timing_snapshot_t *snap, uint32_t rtp,
+                                    uint64_t *out_time_ns) {
+  if (!snap || !out_time_ns || !timing_clock_ready(snap)) return false;
   const int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
   const int32_t ds = rtp_delta(rtp, snap->anchor_rtp);
   const int64_t dt_ns = ((int64_t)ds * 1000000000LL) / (int64_t)sr;
   const int64_t latency_ns =
       ((int64_t)snap->playout_latency_samples * 1000000000LL) / (int64_t)sr;
-  const int64_t ptp = (int64_t)snap->anchor_ptp_ns + dt_ns + latency_ns;
-  if (ptp < 0) {
-    return false;
-  }
-  *out_ptp_ns = (uint64_t)ptp;
+  const int64_t t = (int64_t)presentation_anchor_ns(snap) + dt_ns + latency_ns;
+  if (t < 0) return false;
+  *out_time_ns = (uint64_t)t;
   return true;
 }
 
-/* Pace DMA submission from the AirPlay PTP/RTP timeline instead of
- * letting an empty DMA ring decide how far the software cursor runs ahead.
- * Long waits yield to FreeRTOS; only the final sub-millisecond interval uses
- * short ROM delays. */
-static void wait_until_ptp_ns(uint64_t target_ptp_ns) {
+static int64_t completion_presentation_ns(const timing_snapshot_t *snap,
+                                          const audio_playout_completion_t *done) {
+  const int64_t local_ns = done->done_local_us * 1000LL;
+  if (snap->stream_type == AUDIO_STREAM_REALTIME) return local_ns;
+  return local_ns + ptp_clock_get_offset_ns();
+}
+
+/* Pace DMA submission in the stream's presentation clock. For AAC this is
+ * still PTP. For realtime ALAC it is ESP monotonic time after D7->local
+ * conversion. */
+static void wait_until_presentation_ns(const timing_snapshot_t *snap,
+                                       uint64_t target_ns) {
   while (s.engine_running) {
-    const uint64_t now = ptp_clock_get_time_ns();
-    if (now >= target_ptp_ns) {
-      return;
-    }
-    const uint64_t remain_us = (target_ptp_ns - now) / 1000ULL;
+    const uint64_t now = presentation_now_ns(snap);
+    if (now >= target_ns) return;
+    const uint64_t remain_us = (target_ns - now) / 1000ULL;
     if (remain_us > 2000ULL) {
       vTaskDelay(1);
     } else if (remain_us > 250ULL) {
@@ -866,9 +899,7 @@ static bool frame_is_fully_stale(uint32_t rtp, const timing_snapshot_t *snap,
 static bool realtime_playout_deadline(uint32_t rtp,
                                       int64_t *time_to_play_us, void *ctx) {
   (void)ctx;
-  if (!time_to_play_us || !ptp_clock_is_locked()) {
-    return false;
-  }
+  if (!time_to_play_us) return false;
 
   timing_snapshot_t snap;
   snapshot_state(&snap);
@@ -877,13 +908,11 @@ static bool realtime_playout_deadline(uint32_t rtp,
     return false;
   }
 
-  uint64_t target_ptp_ns = 0;
-  if (!rtp_to_ptp_ns(&snap, rtp, &target_ptp_ns)) {
-    return false;
-  }
+  uint64_t target_time_ns = 0;
+  if (!rtp_to_presentation_ns(&snap, rtp, &target_time_ns)) return false;
 
-  const int64_t now_ptp_ns = (int64_t)ptp_clock_get_time_ns();
-  *time_to_play_us = ((int64_t)target_ptp_ns - now_ptp_ns) / 1000LL;
+  const int64_t now_time_ns = (int64_t)presentation_now_ns(&snap);
+  *time_to_play_us = ((int64_t)target_time_ns - now_time_ns) / 1000LL;
   return true;
 }
 
@@ -1127,14 +1156,13 @@ static bool completion_sync_us(const timing_snapshot_t *snap,
     return false;
   }
 
-  uint64_t target_end_ptp = 0;
-  if (!rtp_to_ptp_ns(snap, done->rtp + done->frames, &target_end_ptp)) {
+  uint64_t target_end_ns = 0;
+  if (!rtp_to_presentation_ns(snap, done->rtp + done->frames, &target_end_ns)) {
     return false;
   }
 
-  const int64_t ptp_offset_ns = ptp_clock_get_offset_ns();
-  const int64_t done_ptp_ns = done->done_local_us * 1000LL + ptp_offset_ns;
-  *sync_us_out = (int32_t)(((int64_t)target_end_ptp - done_ptp_ns) / 1000LL);
+  const int64_t done_time_ns = completion_presentation_ns(snap, done);
+  *sync_us_out = (int32_t)(((int64_t)target_end_ns - done_time_ns) / 1000LL);
   return true;
 }
 
@@ -1318,7 +1346,7 @@ static void ap2_playout_task(void *arg) {
     uint32_t desired_rtp = 0;
     bool timeline_ok = false;
     if (snap.playing && snap.anchor_valid && !snap.timeline_reset_pending &&
-        ptp_clock_is_locked()) {
+        timing_clock_ready(&snap)) {
       timeline_ok = wanted_rtp_now(&snap, &desired_rtp);
     }
 
@@ -1382,8 +1410,8 @@ static void ap2_playout_task(void *arg) {
        * the first normal sync observation. */
       const uint32_t silence_rtp =
           desired_rtp + AP2_START_SILENCE_FUTURE_BLOCKS * AUDIO_PLAYOUT_FRAMES;
-      uint64_t silence_start_ptp = 0;
-      if (!rtp_to_ptp_ns(&snap, silence_rtp, &silence_start_ptp)) {
+      uint64_t silence_start_time_ns = 0;
+      if (!rtp_to_presentation_ns(&snap, silence_rtp, &silence_start_time_ns)) {
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
         continue;
@@ -1400,14 +1428,17 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      wait_until_ptp_ns(silence_start_ptp);
+      wait_until_presentation_ns(&snap, silence_start_time_ns);
 
       timing_snapshot_t after_wait;
       snapshot_state(&after_wait);
       if (!after_wait.playing || !after_wait.anchor_valid ||
           after_wait.timeline_reset_pending ||
           after_wait.generation != snap.generation || s.i2s_flush_requested ||
-          !ptp_clock_is_locked()) {
+          !timing_clock_ready(&after_wait) ||
+          (snap.stream_type == AUDIO_STREAM_REALTIME &&
+           (after_wait.anchor_local_ns != snap.anchor_local_ns ||
+            after_wait.anchor_rtp != snap.anchor_rtp))) {
         audio_playout_flush();
           state = PLAYOUT_STOPPED;
         s.diag.playout_state = state;
@@ -1447,35 +1478,33 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      /* Convert the measured EOF edge into PTP.  Descriptor #3 starts exactly
-       * one 256-frame interval after descriptor #1 EOF because descriptor #2
-       * is already in flight.  Over one block, even the maximum +/-160 ppm
-       * servo correction changes the estimate by <1 us. */
-      const int64_t ptp_offset_ns = ptp_clock_get_offset_ns();
-      const int64_t probe_done_ptp_ns =
-          probe_done.done_local_us * 1000LL + ptp_offset_ns;
+      /* Convert the measured EOF edge into the stream presentation clock.
+       * For realtime ALAC this stays as the ISR's ESP-local timestamp; AAC
+       * keeps the original local+PTP-offset conversion. Descriptor #3 starts
+       * one block after descriptor #1 EOF because descriptor #2 is in flight. */
+      const int64_t probe_done_time_ns = completion_presentation_ns(&snap, &probe_done);
       int64_t rate_scale_ppm = 1000000LL + (int64_t)servo_ppm;
       if (rate_scale_ppm < 900000LL) rate_scale_ppm = 900000LL;
       const uint64_t block_den = (uint64_t)sr * (uint64_t)rate_scale_ppm;
       const uint64_t block_ns =
           ((uint64_t)AUDIO_PLAYOUT_FRAMES * 1000000000ULL * 1000000ULL +
            block_den / 2ULL) / block_den;
-      uint64_t real_boundary_ptp =
-          probe_done_ptp_ns > 0 ? (uint64_t)probe_done_ptp_ns + block_ns
-                                : silence_start_ptp + 2ULL * block_ns;
+      uint64_t real_boundary_time_ns =
+          probe_done_time_ns > 0 ? (uint64_t)probe_done_time_ns + block_ns
+                                 : silence_start_time_ns + 2ULL * block_ns;
 
       /* Positive test offset means intentionally play content earlier.  At a
        * fixed physical boundary that is equivalent to selecting the RTP sample
        * whose nominal presentation time lies test_offset in the future. */
-      int64_t mapped_ptp = (int64_t)real_boundary_ptp +
+      int64_t mapped_time_ns = (int64_t)real_boundary_time_ns +
                            (int64_t)CONFIG_AP2_PLAYOUT_TEST_OFFSET_US * 1000LL;
-      if (mapped_ptp < 0) mapped_ptp = 0;
+      if (mapped_time_ns < 0) mapped_time_ns = 0;
 
       /* Round to the nearest RTP sample instead of truncating.  This makes the
        * startup alignment resolution one sample (22.68 us at 44.1 kHz). */
       const uint64_t half_sample_ns = 500000000ULL / (uint64_t)sr;
       uint32_t real_start_rtp = 0;
-      if (!wanted_rtp_at_ptp(&snap, (uint64_t)mapped_ptp + half_sample_ns,
+      if (!wanted_rtp_at_presentation_ns(&snap, (uint64_t)mapped_time_ns + half_sample_ns,
                              &real_start_rtp)) {
         audio_playout_flush();
         s.diag.playout_prime_waits++;
@@ -1489,7 +1518,10 @@ static void ap2_playout_task(void *arg) {
       if (!align_snap.playing || !align_snap.anchor_valid ||
           align_snap.timeline_reset_pending ||
           align_snap.generation != snap.generation || s.i2s_flush_requested ||
-          !ptp_clock_is_locked()) {
+          !timing_clock_ready(&align_snap) ||
+          (snap.stream_type == AUDIO_STREAM_REALTIME &&
+           (align_snap.anchor_local_ns != snap.anchor_local_ns ||
+            align_snap.anchor_rtp != snap.anchor_rtp))) {
         audio_playout_flush();
           state = PLAYOUT_STOPPED;
         s.diag.playout_state = state;
@@ -1519,12 +1551,12 @@ static void ap2_playout_task(void *arg) {
 
       /* Report the raw one-enable startup phase only as a diagnostic.  It is
        * It is not used as a second-enable compensation. */
-      uint64_t probe_target_end_ptp = 0;
+      uint64_t probe_target_end_ns = 0;
       int32_t probe_sync_us = 0;
-      if (rtp_to_ptp_ns(&snap, silence_rtp + AUDIO_PLAYOUT_FRAMES,
-                        &probe_target_end_ptp)) {
-        probe_sync_us = (int32_t)(((int64_t)probe_target_end_ptp -
-                                   probe_done_ptp_ns) / 1000LL);
+      if (rtp_to_presentation_ns(&snap, silence_rtp + AUDIO_PLAYOUT_FRAMES,
+                                 &probe_target_end_ns)) {
+        probe_sync_us = (int32_t)(((int64_t)probe_target_end_ns -
+                                   probe_done_time_ns) / 1000LL);
       }
       const int32_t align_samples =
           rtp_delta(real_start_rtp,
@@ -1549,10 +1581,10 @@ static void ap2_playout_task(void *arg) {
      * source of truth. */
     s.diag.desired_cursor_err_frames = rtp_delta(cursor_rtp, desired_rtp);
 
-    const uint64_t fetch_begin_ptp = ptp_clock_get_time_ns();
+    const uint64_t fetch_begin_ptp = presentation_now_ns(&snap);
     bool have_pcm = pcm_rtp_ring_read_256(
         s.pcm_ring, cursor_rtp, snap.generation, block);
-    const uint64_t fetch_end_ptp = ptp_clock_get_time_ns();
+    const uint64_t fetch_end_ptp = presentation_now_ns(&snap);
     if (!have_pcm) {
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
       s.diag.playout_underruns++;
@@ -1865,6 +1897,12 @@ static void ap2_stats_task(void *arg) {
     if (snap.stream_type == AUDIO_STREAM_REALTIME) {
       realtime_receiver_diag_t rt = {0};
       realtime_receiver_get_diag(&rt, true);
+      ptp_stats_t ptp_diag = {0};
+      ptp_clock_get_stats(&ptp_diag);
+      ptp_realtime_snapshot_t ptp_rt = {0};
+      ptp_clock_get_realtime_snapshot(&ptp_rt);
+      const double ptp_raw_filter_delta_ms =
+          (double)ptp_diag.raw_filter_delta_ns / 1000000.0;
 #define DELTA32(cur, old) ((cur) >= (old) ? (cur) - (old) : (cur))
       const uint32_t miss_delta = DELTA32(rt.missing_packets, rt_prev.missing_packets);
       const uint32_t nack_delta = DELTA32(rt.nack_requests, rt_prev.nack_requests);
@@ -1876,15 +1914,15 @@ static void ap2_stats_task(void *arg) {
 
       bool map_valid = false;
       double map_delta_ms = 0.0;
-      if (rt.last_d7_ptp_ns != 0U && snap.anchor_valid &&
-          !snap.timeline_reset_pending) {
+      if (rt.last_d7_local_ns != 0U && snap.anchor_valid &&
+          snap.anchor_local_ns != 0U && !snap.timeline_reset_pending) {
         const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
         const int32_t ds = rtp_delta(rt.last_d7_frame1, snap.anchor_rtp);
-        const int64_t local_source_ns =
-            (int64_t)snap.anchor_ptp_ns +
+        const int64_t mapped_local_ns =
+            (int64_t)snap.anchor_local_ns +
             ((int64_t)ds * 1000000000LL) / (int64_t)sr;
         map_delta_ms =
-            (double)(local_source_ns - (int64_t)rt.last_d7_ptp_ns) / 1000000.0;
+            (double)(mapped_local_ns - (int64_t)rt.last_d7_local_ns) / 1000000.0;
         map_valid = true;
       }
 
@@ -1925,26 +1963,26 @@ static void ap2_stats_task(void *arg) {
       if (now.playout_state == 2 && now.output_sync_valid) {
         if (map_valid) {
           ESP_LOGI(TAG,
-                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=%+.2fms"
+                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=%+.2fms ptpD=%+.2fms gmReady=%d gmAge=%lums"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
                    " stgMin=%.0fms wait=%.0fms",
                    sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
-                   map_delta_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   map_delta_ms, ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                    (double)rt.interval_max_interarrival_us / 1000.0,
                    rt.work_queue_depth, sil_delta, late_delta,
                    (double)stg_min_ahead / 1000.0,
                    (double)stg_wait_max / 1000.0);
         } else {
           ESP_LOGI(TAG,
-                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=--"
+                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=-- ptpD=%+.2fms gmReady=%d gmAge=%lums"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
                    " stgMin=%.0fms wait=%.0fms",
                    sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
-                   miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                    (double)rt.interval_max_interarrival_us / 1000.0,
                    rt.work_queue_depth, sil_delta, late_delta,
                    (double)stg_min_ahead / 1000.0,
@@ -1952,12 +1990,12 @@ static void ap2_stats_task(void *arg) {
         }
       } else {
         ESP_LOGI(TAG,
-                 "ALAC sync=-- pcm=%dms map=%s | miss=%" PRIu32
+                 "ALAC sync=-- pcm=%dms map=%s ptpD=%+.2fms gmReady=%d gmAge=%lums | miss=%" PRIu32
                  " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32 " give=%" PRIu32
                  " ia=%.0fms q=%" PRIu32 " | sil=%" PRIu32
                  " late=%" PRIu32 " stgMin=%.0fms wait=%.0fms | %s",
-                 pcm_ahead_ms, map_valid ? "ok" : "--", miss_delta, nack_delta,
-                 rtx_delta, retry_delta, give_delta,
+                 pcm_ahead_ms, map_valid ? "ok" : "--", ptp_raw_filter_delta_ms,
+                 ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                  (double)rt.interval_max_interarrival_us / 1000.0,
                  rt.work_queue_depth, sil_delta, late_delta,
                  (double)stg_min_ahead / 1000.0,
@@ -2247,6 +2285,10 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
      * address while playout waits exclusively for a real D7/SETRATE anchor. */
     rt_gen = commit_anchor_epoch_locked();
     s.anchor_valid = false;
+    s.rt_media_rebase_valid = false;
+    s.rt_media_rebase_clock_id = 0;
+    s.rt_media_rebase_epoch = 0;
+    s.rt_media_rebase_bias_ns = 0;
     s.realtime_stage_cursor_valid = false;
     s.realtime_stage_generation = rt_gen;
     taskEXIT_CRITICAL(&s.state_mux);
@@ -2395,8 +2437,9 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
   taskEXIT_CRITICAL(&s.state_mux);
 
   /* An explicit FLUSH may cancel already queued DMA, but it must not change
-   * RTP<->PTP. The normal playout task will re-prime against the same sender
-   * timeline and will naturally wait until desired_rtp reaches flush_rtp. */
+   * the validated RTP<->presentation map. The normal playout task re-primes
+   * against the same sender timeline and waits until desired_rtp reaches
+   * flush_rtp. */
   s.i2s_flush_requested = true;
   if (old_cursor_valid) {
     ESP_LOGI(TAG,
@@ -2412,7 +2455,6 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
 }
 
 void audio_receiver_realtime_flush_wait_sender_anchor(void) {
-  realtime_receiver_require_fresh_d7_anchor();
   mark_timeline_discontinuity();
   ESP_LOGI(TAG,
            "REALTIME FLUSH no RTP boundary: local timing invalidated; "
@@ -2552,7 +2594,12 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   gen = commit_anchor_epoch_locked();
   s.anchor_clock_id = clock_id;
   s.anchor_ptp_ns = ptp_ns;
+  s.anchor_local_ns = 0; /* buffered/AAC remains PTP-authoritative */
   s.anchor_rtp = rtp;
+  s.rt_media_rebase_valid = false;
+  s.rt_media_rebase_clock_id = 0;
+  s.rt_media_rebase_epoch = 0;
+  s.rt_media_rebase_bias_ns = 0;
   s.anchor_valid = true;
   s.anchor_set_local_us = esp_timer_get_time();
   s.anchor_set_generation = gen;
@@ -2563,4 +2610,126 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
            clock_id, ptp_ns, rtp, gen,
            committed ? " (new timeline committed; waiting for PTP lock if needed)"
                      : " (anchor update; waiting for PTP lock if needed)");
+}
+
+
+bool audio_receiver_set_realtime_anchor_local(
+    uint64_t clock_id, uint32_t gm_epoch, uint32_t mastership_age_ms,
+    uint64_t remote_ptp_ns, uint64_t candidate_local_ns, uint32_t rtp,
+    audio_realtime_anchor_result_t *result) {
+  audio_realtime_anchor_result_t local_result = {0};
+  if (!result) result = &local_result;
+  memset(result, 0, sizeof(*result));
+  if (candidate_local_ns == 0) return false;
+
+  uint32_t gen = 0;
+  bool committed = false;
+  bool accepted = false;
+  bool log_rebase = false;
+  uint64_t effective_local_ns = candidate_local_ns;
+  int64_t rebase_step_ns = 0;
+  int64_t rebase_bias_ns = 0;
+
+  taskENTER_CRITICAL(&s.state_mux);
+  if (s.stream_type == AUDIO_STREAM_REALTIME) {
+    const bool have_running_local_map =
+        s.anchor_valid && !s.timeline_reset_pending && s.anchor_local_ns != 0U;
+    const bool epoch_changed =
+        have_running_local_map &&
+        (!s.rt_media_rebase_valid || s.rt_media_rebase_epoch != gm_epoch ||
+         s.rt_media_rebase_clock_id != clock_id);
+
+    if (epoch_changed && mastership_age_ms < AP2_RT_GM_REBASE_SETTLE_MS) {
+      result->deferred = true;
+      taskEXIT_CRITICAL(&s.state_mux);
+      return false;
+    }
+
+    if (!have_running_local_map) {
+      /* Initial stream startup: no phase exists to preserve yet, so use the
+       * sender/GM conversion directly and establish this epoch with zero
+       * media bias. The existing ~400 ms PTP readiness remains unchanged. */
+      s.rt_media_rebase_valid = true;
+      s.rt_media_rebase_clock_id = clock_id;
+      s.rt_media_rebase_epoch = gm_epoch;
+      s.rt_media_rebase_bias_ns = 0;
+      effective_local_ns = candidate_local_ns;
+    } else if (epoch_changed) {
+      /* New GM/mastership epoch while audio is already running. Preserve the
+       * exact existing RTP<->local phase and calculate the one constant media
+       * bias needed to express the new GM's D7 observations in that same
+       * local timeline. This is a media rebase only: PTP and the PID are not
+       * modified. */
+      const int sr = s.format.sample_rate > 0 ? s.format.sample_rate : 44100;
+      const int32_t drtp = rtp_delta(rtp, s.anchor_rtp);
+      const int64_t predicted_local_ns =
+          (int64_t)s.anchor_local_ns +
+          ((int64_t)drtp * 1000000000LL) / (int64_t)sr;
+      rebase_step_ns = (int64_t)candidate_local_ns - predicted_local_ns;
+      rebase_bias_ns = -rebase_step_ns;
+      const int64_t rebased = (int64_t)candidate_local_ns + rebase_bias_ns;
+      if (rebased <= 0) {
+        taskEXIT_CRITICAL(&s.state_mux);
+        return false;
+      }
+      effective_local_ns = (uint64_t)rebased;
+      s.rt_media_rebase_valid = true;
+      s.rt_media_rebase_clock_id = clock_id;
+      s.rt_media_rebase_epoch = gm_epoch;
+      s.rt_media_rebase_bias_ns = rebase_bias_ns;
+      result->rebased = true;
+      log_rebase = true;
+    } else if (s.rt_media_rebase_valid &&
+               s.rt_media_rebase_epoch == gm_epoch &&
+               s.rt_media_rebase_clock_id == clock_id) {
+      /* Same stable GM epoch: retain the rebase offset but keep consuming
+       * every D7, so sender timing/rate changes remain visible without ever
+       * reintroducing the GM epoch phase step. */
+      rebase_bias_ns = s.rt_media_rebase_bias_ns;
+      const int64_t adjusted = (int64_t)candidate_local_ns + rebase_bias_ns;
+      if (adjusted <= 0) {
+        taskEXIT_CRITICAL(&s.state_mux);
+        return false;
+      }
+      effective_local_ns = (uint64_t)adjusted;
+    }
+
+    committed = s.timeline_reset_pending;
+    gen = commit_anchor_epoch_locked();
+    s.anchor_clock_id = clock_id;
+    s.anchor_ptp_ns = remote_ptp_ns; /* diagnostic/reference only for ALAC */
+    s.anchor_local_ns = effective_local_ns;
+    s.anchor_rtp = rtp;
+    s.anchor_valid = true;
+    s.anchor_set_local_us = esp_timer_get_time();
+    s.anchor_set_generation = gen;
+    accepted = true;
+
+    result->effective_local_ns = effective_local_ns;
+    result->rebase_step_ns = rebase_step_ns;
+    result->rebase_bias_ns = s.rt_media_rebase_bias_ns;
+  }
+  taskEXIT_CRITICAL(&s.state_mux);
+
+  if (log_rebase) {
+    ESP_LOGI(TAG,
+             "RT GM MEDIA REBASE clock=%016" PRIx64 " epoch=%" PRIu32
+             " age=%lums step=%+.3fms bias=%+.3fms rtp=%" PRIu32,
+             clock_id, gm_epoch, (unsigned long)mastership_age_ms,
+             (double)rebase_step_ns / 1000000.0,
+             (double)rebase_bias_ns / 1000000.0, rtp);
+  }
+
+  if (accepted) {
+    ESP_LOGI(TAG,
+             "RT ANCHOR clock=%016" PRIx64 " epoch=%" PRIu32
+             " remotePTP=%" PRIu64 " rawLocal=%" PRIu64
+             " local=%" PRIu64 " bias=%+.3fms rtp=%" PRIu32
+             " gen=%" PRIu32 "%s",
+             clock_id, gm_epoch, remote_ptp_ns, candidate_local_ns,
+             effective_local_ns,
+             (double)result->rebase_bias_ns / 1000000.0, rtp, gen,
+             committed ? " (new timeline committed)" : " (running map update)");
+  }
+  return accepted;
 }

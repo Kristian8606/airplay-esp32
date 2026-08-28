@@ -89,6 +89,31 @@ void audio_receiver_reset_timing(void);
 
 void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
                                     uint32_t rtp_time);
+typedef struct {
+  uint64_t effective_local_ns;
+  int64_t rebase_step_ns;
+  int64_t rebase_bias_ns;
+  bool rebased;
+  bool deferred;
+} audio_realtime_anchor_result_t;
+
+/* Realtime-only D7/SETRATE anchor already converted into ESP monotonic time.
+ *
+ * Initial startup accepts the current ready GM immediately. While audio is
+ * already running, a new PTP mastership epoch is intentionally kept out of
+ * the media phase until it has been stable for the handover settle period.
+ * The first accepted anchor from that epoch is then rebased onto the existing
+ * RTP<->ESP-local timeline, and the resulting constant media-domain bias is
+ * applied to later anchors from the same epoch. PTP itself is never biased or
+ * slewed, and buffered/AAC timing is untouched.
+ *
+ * Returns true when the anchor was published. False means it was deliberately
+ * deferred (typically because a new GM is still settling) or not applicable.
+ */
+bool audio_receiver_set_realtime_anchor_local(
+    uint64_t clock_id, uint32_t gm_epoch, uint32_t mastership_age_ms,
+    uint64_t remote_ptp_ns, uint64_t candidate_local_ns, uint32_t rtp_time,
+    audio_realtime_anchor_result_t *result);
 void audio_receiver_set_client_control(uint32_t client_ip,
                                        uint16_t client_control_port);
 

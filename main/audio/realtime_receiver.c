@@ -182,21 +182,20 @@ typedef struct {
   uint32_t last_sync_time_seconds;
   uint32_t last_sync_time_fraction;
 
-  /* AirPlay 2 realtime D7/PT=87 observation. The first validated D7 may
-   * establish the initial RTP/PTP map; later D7 packets only authorize PTP
-   * clock-domain handovers and never move the running RTP cursor. */
+  /* AirPlay 2 realtime D7/PT=87 observation. Every validated D7 from the
+   * ready current GM refreshes the running RTP<->ESP-local presentation map.
+   * A refresh updates timing only; it never resets the RTP cursor/rings. */
   uint32_t d7_packets;
   uint32_t d7_malformed;
   uint32_t last_d7_frame1;
   uint32_t last_d7_frame2;
   uint32_t last_d7_delta_frames;
   uint64_t last_d7_raw_ptp_ns;
-  uint64_t last_d7_ptp_ns;
+  uint64_t last_d7_local_ns;
   uint64_t last_d7_clock_id;
-  bool initial_d7_anchor_committed;
-  volatile bool d7_anchor_refresh_requested;
-  uint32_t initial_d7_anchor_commit_count;
-  uint64_t initial_d7_timeline_ns;
+  uint32_t d7_anchor_commit_count;
+  uint32_t d7_last_committed_packet;
+  uint32_t d7_defer_logged_epoch;
 
   uint64_t unhandled_control_seen[2];
 } realtime_state_t;
@@ -598,44 +597,69 @@ static void reset_transport_tracking(void) {
   if (s_rt.missing) memset(s_rt.missing, 0, RT_MISSING_SLOTS * sizeof(*s_rt.missing));
 }
 
-/* Commit D7 into the existing audio timing API for the initial sender anchor,
- * and again only after an explicit realtime FLUSH with no RTP boundary asks
- * for a fresh media epoch. Normal GM handovers remain entirely inside
- * ptp_clock, so D7 cannot move the lower RTP cursor during clock switch. */
-static void service_initial_d7_anchor(void) {
-  const bool refresh =
-      __atomic_load_n(&s_rt.d7_anchor_refresh_requested, __ATOMIC_ACQUIRE);
-  if ((s_rt.initial_d7_anchor_committed && !refresh) ||
-      s_rt.last_d7_raw_ptp_ns == 0 || s_rt.last_d7_clock_id == 0) {
+/* Convert the latest D7 exactly once from the current ready GM's remote PTP
+ * domain into ESP monotonic time and publish it as the realtime presentation
+ * anchor. This is deliberately NOT a one-shot startup operation: D7 is the
+ * sender's continuous RTP<->time observation, analogous to timing-anchor
+ * refreshes on the buffered path. A GM transition never invalidates the old
+ * local map; until the new GM is ready, conversion simply fails and playout
+ * continues on the previous local anchor. */
+static void service_d7_anchor(void) {
+  if (s_rt.last_d7_raw_ptp_ns == 0 || s_rt.last_d7_clock_id == 0 ||
+      s_rt.d7_packets == 0 || s_rt.d7_last_committed_packet == s_rt.d7_packets) {
     return;
   }
 
-  uint64_t timeline_ptp_ns = 0;
-  if (!ptp_clock_translate_realtime_time(s_rt.last_d7_clock_id,
-                                         s_rt.last_d7_raw_ptp_ns,
-                                         &timeline_ptp_ns)) {
+  uint64_t local_ns = 0;
+  if (!ptp_clock_realtime_time_to_local(s_rt.last_d7_clock_id,
+                                        s_rt.last_d7_raw_ptp_ns,
+                                        &local_ns)) {
     return;
   }
-
-  /* clock_id=0 is deliberate: D7 must not select/reset the PTP source. The
-   * translated timestamp is already in the continuous clock domain exported
-   * by ptp_clock_get_time_ns(). */
-  audio_receiver_set_anchor_time(0, timeline_ptp_ns, s_rt.last_d7_frame1);
-  s_rt.initial_d7_anchor_committed = true;
-  __atomic_store_n(&s_rt.d7_anchor_refresh_requested, false, __ATOMIC_RELEASE);
-  s_rt.initial_d7_anchor_commit_count++;
-  s_rt.initial_d7_timeline_ns = timeline_ptp_ns;
 
   ptp_realtime_snapshot_t ps = {0};
   ptp_clock_get_realtime_snapshot(&ps);
-  ESP_LOGI(TAG,
-           "ALAC D7 SENDER ANCHOR raw=%" PRIu64 " timeline=%" PRIu64
-           " rtp=%" PRIu32 " clock=%016" PRIx64
-           " gm=%016" PRIx64 " bias=%+" PRId64 "ns age=%lums samples=%lu",
-           s_rt.last_d7_raw_ptp_ns, timeline_ptp_ns, s_rt.last_d7_frame1,
-           s_rt.last_d7_clock_id, ps.master_clock_id, ps.domain_bias_ns,
-           (unsigned long)ps.mastership_age_ms,
-           (unsigned long)ps.sample_count);
+  audio_realtime_anchor_result_t anchor_result = {0};
+  if (!audio_receiver_set_realtime_anchor_local(
+          s_rt.last_d7_clock_id, ps.gm_change_count,
+          ps.mastership_age_ms, s_rt.last_d7_raw_ptp_ns, local_ns,
+          s_rt.last_d7_frame1, &anchor_result)) {
+    /* A new GM is usable for PTP after ~400 ms, but an already-running media
+     * phase is deliberately preserved for a longer settle window before the
+     * new epoch is rebased. Keep retrying the latest D7 from the control-loop
+     * timeout; no packet/ring/playout state is reset while waiting. */
+    if (anchor_result.deferred &&
+        s_rt.d7_defer_logged_epoch != ps.gm_change_count) {
+      s_rt.d7_defer_logged_epoch = ps.gm_change_count;
+      ESP_LOGI(TAG,
+               "ALAC GM MEDIA HOLD gm=%016" PRIx64 " epoch=%lu age=%lums "
+               "keeping current RTP<->local phase until 1000ms",
+               ps.master_clock_id, (unsigned long)ps.gm_change_count,
+               (unsigned long)ps.mastership_age_ms);
+    }
+    return;
+  }
+  s_rt.d7_anchor_commit_count++;
+  s_rt.d7_last_committed_packet = s_rt.d7_packets;
+  s_rt.last_d7_local_ns = anchor_result.effective_local_ns;
+
+  if (s_rt.d7_anchor_commit_count <= 3U ||
+      (s_rt.d7_anchor_commit_count % 64U) == 0U) {
+    ESP_LOGI(TAG,
+             "ALAC D7 LOCAL ANCHOR raw=%" PRIu64
+             " rawLocal=%" PRIu64 " local=%" PRIu64
+             " bias=%+.3fms"
+             " rtp=%" PRIu32 " clock=%016" PRIx64
+             " gm=%016" PRIx64 " epoch=%lu age=%lums samples=%lu",
+             s_rt.last_d7_raw_ptp_ns, local_ns,
+             anchor_result.effective_local_ns,
+             (double)anchor_result.rebase_bias_ns / 1000000.0,
+             s_rt.last_d7_frame1,
+             s_rt.last_d7_clock_id, ps.master_clock_id,
+             (unsigned long)ps.gm_change_count,
+             (unsigned long)ps.mastership_age_ms,
+             (unsigned long)ps.sample_count);
+  }
 }
 
 
@@ -686,17 +710,12 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
     s_rt.last_d7_frame2 = frame2;
     s_rt.last_d7_delta_frames = delta_frames;
     s_rt.last_d7_raw_ptp_ns = network_time_ns;
-    s_rt.last_d7_ptp_ns = network_time_ns;
+    s_rt.last_d7_local_ns = 0;
     s_rt.last_d7_clock_id = clock_id;
     s_rt.d7_packets++;
 
     ptp_clock_note_realtime_d7(clock_id);
-    uint64_t d7_timeline_ns = 0;
-    if (ptp_clock_translate_realtime_time(clock_id, network_time_ns,
-                                           &d7_timeline_ns)) {
-      s_rt.last_d7_ptp_ns = d7_timeline_ns;
-    }
-    service_initial_d7_anchor();
+    service_d7_anchor();
 
     if (s_rt.d7_packets <= 3U || (s_rt.d7_packets % 64U) == 0U) {
       const int sr = s_rt.cfg.format.sample_rate > 0
@@ -710,12 +729,12 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
                " frame2=%" PRIu32 " delta=%" PRIu32 "(%.2fms)"
                " rawPTP=%" PRIu64 " clock=%016" PRIx64
                " gm=%016" PRIx64 " src=%016" PRIx64
-               " ready=%d handover=%d age=%lums bias=%+" PRId64 "ns",
+               " ready=%d age=%lums samples=%lu local=%" PRIu64,
                s_rt.d7_packets, frame1, frame2, delta_frames, delta_ms,
                network_time_ns, clock_id, ps.master_clock_id,
                ps.source_clock_id, ps.master_ready ? 1 : 0,
-               ps.handover_active ? 1 : 0,
-               (unsigned long)ps.handover_age_ms, ps.domain_bias_ns);
+               (unsigned long)ps.mastership_age_ms,
+               (unsigned long)ps.sample_count, s_rt.last_d7_local_ns);
     }
     goto done;
   }
@@ -830,6 +849,11 @@ static void control_rx_task(void *arg) {
       if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
         s_rt.recv_errors++;
       }
+      /* A D7 can arrive just before the 400 ms GM-ready boundary. Retry the
+       * SAME observation on the 100 ms socket timeout so startup/handover does
+       * not wait for another D7 packet. The committed-packet guard above makes
+       * this idempotent. */
+      service_d7_anchor();
       continue;
     }
     process_control_packet(s_rt.control_packet, (size_t)n);
@@ -878,7 +902,7 @@ static void alac_worker_task(void *arg) {
            xPortGetCoreID(), RT_WORK_PRIORITY, dcfg.sample_rate, dcfg.channels,
            dcfg.frame_size);
   ESP_LOGI(TAG,
-           "build=FIX10_SHAIRPORT_ALAC_R23D_COMPACT_DIAG handover=400ms/5s startupHold=1s noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
+           "build=FIX13_SHAIRPORT_ALAC_R23N_FIXED_RATE0_FAST_REBASE localTimeline=1 continuousD7=1 nqptpPhase=1 fixedMapRate=0ppm gmRebaseSettle=1000ms phaseContinuous=1 noVirtualPTP=1 noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
            (unsigned)RT_MISSING_SLOTS, (unsigned)RT_DATA_POOL_SLOTS,
            (unsigned)RT_RTX_POOL_SLOTS);
 
@@ -978,7 +1002,7 @@ static void resend_task(void *arg) {
         resend_process_event(&ev);
       }
     }
-    /* D7 state and the one-shot initial anchor are owned by CTRL_RX. Keeping
+    /* D7 state and continuous sender-anchor refreshes are owned by CTRL_RX. Keeping
      * a single owner removes the former CTRL_RX/RESEND double-commit race. */
     resend_giveup_expired();
     resend_scan_due();
@@ -1127,12 +1151,11 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.last_d7_frame2 = 0;
   s_rt.last_d7_delta_frames = 0;
   s_rt.last_d7_raw_ptp_ns = 0;
-  s_rt.last_d7_ptp_ns = 0;
+  s_rt.last_d7_local_ns = 0;
   s_rt.last_d7_clock_id = 0;
-  s_rt.initial_d7_anchor_committed = false;
-  __atomic_store_n(&s_rt.d7_anchor_refresh_requested, false, __ATOMIC_RELEASE);
-  s_rt.initial_d7_anchor_commit_count = 0;
-  s_rt.initial_d7_timeline_ns = 0;
+  s_rt.d7_anchor_commit_count = 0;
+  s_rt.d7_last_committed_packet = 0;
+  s_rt.d7_defer_logged_epoch = UINT32_MAX;
   s_rt.unhandled_control_seen[0] = 0;
   s_rt.unhandled_control_seen[1] = 0;
 
@@ -1237,11 +1260,6 @@ void realtime_receiver_stop(void) {
            s_rt.rtx_latency_samples);
 }
 
-void realtime_receiver_require_fresh_d7_anchor(void) {
-  __atomic_store_n(&s_rt.d7_anchor_refresh_requested, true, __ATOMIC_RELEASE);
-  ESP_LOGI(TAG, "next matching D7 armed as fresh sender anchor");
-}
-
 void realtime_receiver_set_client_control(uint32_t client_ip,
                                           uint16_t client_control_port) {
   if (client_ip == 0 || client_control_port == 0) {
@@ -1309,7 +1327,7 @@ void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
   out->last_d7_frame1 = s_rt.last_d7_frame1;
   out->last_d7_frame2 = s_rt.last_d7_frame2;
   out->last_d7_delta_frames = s_rt.last_d7_delta_frames;
-  out->last_d7_ptp_ns = s_rt.last_d7_ptp_ns;
+  out->last_d7_local_ns = s_rt.last_d7_local_ns;
   out->last_d7_clock_id = s_rt.last_d7_clock_id;
 
   if (reset_interval_maxima) {

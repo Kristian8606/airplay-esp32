@@ -76,7 +76,7 @@ typedef struct {
   uint32_t last_d7_frame1;
   uint32_t last_d7_frame2;
   uint32_t last_d7_delta_frames;
-  uint64_t last_d7_ptp_ns;
+  uint64_t last_d7_local_ns;
   uint64_t last_d7_clock_id;
 } realtime_receiver_diag_t;
 
@@ -95,7 +95,3 @@ void realtime_receiver_stop(void);
 bool realtime_receiver_is_running(void);
 void realtime_receiver_get_diag(realtime_receiver_diag_t *out, bool reset_interval_maxima);
 void realtime_receiver_set_client_control(uint32_t client_ip, uint16_t client_control_port);
-/* Explicit realtime FLUSH without an RTP boundary: allow the next matching D7
- * to establish a fresh lower RTP<->PTP epoch. Normal GM handover never calls
- * this, so D7 cannot move a running cursor during clock switch. */
-void realtime_receiver_require_fresh_d7_anchor(void);
