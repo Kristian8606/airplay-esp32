@@ -274,6 +274,27 @@ static ap2_state_t s = {
     .realtime_stage_idle = true,
 };
 
+static inline void realtime_stage_kick(void) {
+  TaskHandle_t task = s.realtime_stage_task;
+  if (task) {
+    xTaskNotifyGive(task);
+  }
+}
+
+static TickType_t realtime_stage_wait_ticks(int64_t wait_us) {
+  if (wait_us <= 0) return 0;
+  const uint64_t tick_us = (uint64_t)portTICK_PERIOD_MS * 1000ULL;
+  if (tick_us == 0) return 1;
+
+  /* Floor to the previous RTOS tick so the notification timeout cannot move
+   * the existing final staging margin later. A sub-tick remainder simply
+   * wakes one tick early and re-evaluates the same deadline. */
+  uint64_t ticks64 = (uint64_t)wait_us / tick_us;
+  if (ticks64 == 0) ticks64 = 1;
+  if (ticks64 >= (uint64_t)portMAX_DELAY) ticks64 = (uint64_t)portMAX_DELAY - 1ULL;
+  return (TickType_t)ticks64;
+}
+
 static void snapshot_state(timing_snapshot_t *out) {
   taskENTER_CRITICAL(&s.state_mux);
   out->anchor_valid = s.anchor_valid;
@@ -308,6 +329,7 @@ static void mark_timeline_discontinuity(void) {
   s.rt_media_rebase_epoch = 0;
   s.rt_media_rebase_bias_ns = 0;
   taskEXIT_CRITICAL(&s.state_mux);
+  realtime_stage_kick();
   s.diag.last_decoded_end_rtp = 0;
   s.i2s_flush_requested = true;
 }
@@ -990,6 +1012,11 @@ static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
   }
   taskEXIT_CRITICAL(&s.state_mux);
 
+  /* Wake ordered staging only when new RAW PCM has actually been published.
+   * Counting task notifications coalesce bursts and cannot lose a wakeup if
+   * the write races with the task entering its blocked state. */
+  realtime_stage_kick();
+
   s.public_stats.packets_received++;
   s.public_stats.last_timestamp = rtp;
   return true;
@@ -1039,7 +1066,7 @@ static void realtime_stage_task(void *arg) {
   while (s.engine_running) {
     if (!__atomic_load_n(&s.realtime_stage_running, __ATOMIC_ACQUIRE)) {
       __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
-      vTaskDelay(1);
+      (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       continue;
     }
     __atomic_store_n(&s.realtime_stage_idle, false, __ATOMIC_RELEASE);
@@ -1049,7 +1076,7 @@ static void realtime_stage_task(void *arg) {
     if (snap.stream_type != AUDIO_STREAM_REALTIME || !snap.anchor_valid ||
         snap.timeline_reset_pending || snap.format.frame_size <= 0 ||
         snap.format.frame_size > (int)AP2_PCM_CAPACITY_FRAMES) {
-      vTaskDelay(1);
+      (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       continue;
     }
 
@@ -1063,7 +1090,7 @@ static void realtime_stage_task(void *arg) {
     }
     taskEXIT_CRITICAL(&s.state_mux);
     if (!cursor_valid) {
-      vTaskDelay(1);
+      (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
       continue;
     }
 
@@ -1090,7 +1117,16 @@ static void realtime_stage_task(void *arg) {
       }
 
       if (!have_deadline || time_to_play_us > AP2_RT_STAGE_COMMIT_MARGIN_US) {
-        vTaskDelay(1);
+        /* No polling: sleep until RAW PCM/RTX publication changes the ring,
+         * or until the exact remaining recovery window reaches the existing
+         * commit margin. If there is no valid deadline yet, a timing/state
+         * transition will explicitly notify this task. */
+        TickType_t wait_ticks = portMAX_DELAY;
+        if (have_deadline) {
+          wait_ticks = realtime_stage_wait_ticks(
+              time_to_play_us - AP2_RT_STAGE_COMMIT_MARGIN_US);
+        }
+        (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
         continue;
       }
 
@@ -1963,7 +1999,7 @@ static void ap2_stats_task(void *arg) {
       if (now.playout_state == 2 && now.output_sync_valid) {
         if (map_valid) {
           ESP_LOGI(TAG,
-                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=%+.2fms ptpD=%+.2fms gmReady=%d gmAge=%lums"
+                   "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=%+.2fms ptpD=%+.2fms gmReady=%d gmAge=%lums"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
@@ -1976,7 +2012,7 @@ static void ap2_stats_task(void *arg) {
                    (double)stg_wait_max / 1000.0);
         } else {
           ESP_LOGI(TAG,
-                   "ALAC sync=%+.2fms ppm=%+d/%+d pcm=%dms map=-- ptpD=%+.2fms gmReady=%d gmAge=%lums"
+                   "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=-- ptpD=%+.2fms gmReady=%d gmAge=%lums"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
@@ -2012,7 +2048,7 @@ static void ap2_stats_task(void *arg) {
     } else {
       if (now.playout_state == 2 && now.output_sync_valid) {
         ESP_LOGI(TAG,
-                 "AAC sync=%+.2fms ppm=%+d/%+d pcm=%dms fifo=%u/%uK",
+                 "AAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms fifo=%u/%uK",
                  sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
                  (unsigned)(transport.fifo_occupancy / 1024U),
                  (unsigned)(fifo_capacity / 1024U));
@@ -2159,6 +2195,7 @@ esp_err_t audio_receiver_init(void) {
 
 static void realtime_stage_stop_and_wait(void) {
   __atomic_store_n(&s.realtime_stage_running, false, __ATOMIC_RELEASE);
+  realtime_stage_kick();
 
   /* Session-bound handshake only. Never put a mutex around audio_eq_process():
    * the control path merely waits until the persistent staging task has
@@ -2293,6 +2330,7 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
     s.realtime_stage_generation = rt_gen;
     taskEXIT_CRITICAL(&s.state_mux);
     __atomic_store_n(&s.realtime_stage_running, true, __ATOMIC_RELEASE);
+    realtime_stage_kick();
     ESP_LOGI(TAG,
              "REALTIME epoch prepared gen=%" PRIu32
              " waiting for sender D7/SETRATE anchor (no arrival-time fallback)",
@@ -2309,6 +2347,7 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
     esp_err_t err = realtime_receiver_start(data_port, control_port, &cfg);
     if (err != ESP_OK) {
       __atomic_store_n(&s.realtime_stage_running, false, __ATOMIC_RELEASE);
+      realtime_stage_kick();
     } else {
       stats_session_start();
     }
@@ -2435,6 +2474,7 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
     }
   }
   taskEXIT_CRITICAL(&s.state_mux);
+  realtime_stage_kick();
 
   /* An explicit FLUSH may cancel already queued DMA, but it must not change
    * the validated RTP<->presentation map. The normal playout task re-primes
@@ -2604,6 +2644,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_set_local_us = esp_timer_get_time();
   s.anchor_set_generation = gen;
   taskEXIT_CRITICAL(&s.state_mux);
+  realtime_stage_kick();
 
   ESP_LOGI(TAG, "ANCHOR clock=%016" PRIx64 " ptp=%" PRIu64
                 " rtp=%" PRIu32 " gen=%" PRIu32 "%s",
@@ -2711,6 +2752,10 @@ bool audio_receiver_set_realtime_anchor_local(
   }
   taskEXIT_CRITICAL(&s.state_mux);
 
+  if (accepted) {
+    realtime_stage_kick();
+  }
+
   if (log_rebase) {
     ESP_LOGI(TAG,
              "RT GM MEDIA REBASE clock=%016" PRIx64 " epoch=%" PRIu32
@@ -2720,7 +2765,10 @@ bool audio_receiver_set_realtime_anchor_local(
              (double)rebase_bias_ns / 1000000.0, rtp);
   }
 
-  if (accepted) {
+  /* Continuous D7 refreshes are normal steady-state operation.  Keep INFO
+   * logging for phase-significant events only; the 2 s ALAC health line
+   * already reports map/sync state continuously. */
+  if (accepted && (committed || log_rebase)) {
     ESP_LOGI(TAG,
              "RT ANCHOR clock=%016" PRIx64 " epoch=%" PRIu32
              " remotePTP=%" PRIu64 " rawLocal=%" PRIu64
@@ -2729,7 +2777,7 @@ bool audio_receiver_set_realtime_anchor_local(
              clock_id, gm_epoch, remote_ptp_ns, candidate_local_ns,
              effective_local_ns,
              (double)result->rebase_bias_ns / 1000000.0, rtp, gen,
-             committed ? " (new timeline committed)" : " (running map update)");
+             committed ? " (new timeline committed)" : " (GM rebase)");
   }
   return accepted;
 }

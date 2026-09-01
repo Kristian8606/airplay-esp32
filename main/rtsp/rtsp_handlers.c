@@ -1523,28 +1523,24 @@ static void parse_dmap_metadata(const uint8_t *data, size_t len,
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->title, data + pos, copy_len);
       meta->title[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Title  = %s", meta->title);
     } else if (strcmp(tag, "asar") == 0 && item_len > 0) {
       size_t copy_len = item_len < METADATA_STRING_MAX - 1
                             ? item_len
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->artist, data + pos, copy_len);
       meta->artist[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Artist = %s", meta->artist);
     } else if (strcmp(tag, "asal") == 0 && item_len > 0) {
       size_t copy_len = item_len < METADATA_STRING_MAX - 1
                             ? item_len
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->album, data + pos, copy_len);
       meta->album[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Album  = %s", meta->album);
     } else if (strcmp(tag, "asgn") == 0 && item_len > 0) {
       size_t copy_len = item_len < METADATA_STRING_MAX - 1
                             ? item_len
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->genre, data + pos, copy_len);
       meta->genre[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Genre  = %s", meta->genre);
     } else if (strcmp(tag, "mlit") == 0 || strcmp(tag, "cmst") == 0 ||
                strcmp(tag, "mdst") == 0) {
       // Container tags - recurse into them
@@ -1553,6 +1549,61 @@ static void parse_dmap_metadata(const uint8_t *data, size_t len,
 
     pos += item_len;
   }
+}
+
+/* Logging-only metadata de-duplication.  RTSP_EVENT_METADATA delivery is not
+ * filtered: listeners still receive every metadata/progress event exactly as
+ * before.  We only suppress repeated INFO text from senders that publish the
+ * same DMAP/bplist several times in quick succession. */
+static rtsp_metadata_t s_last_logged_metadata;
+static bool s_last_logged_metadata_valid = false;
+static TickType_t s_last_metadata_log_tick = 0;
+
+static bool metadata_field_update(char *cached, const char *incoming) {
+  if (!incoming || incoming[0] == '\0') {
+    return false;
+  }
+  if (strcmp(cached, incoming) == 0) {
+    return false;
+  }
+  strlcpy(cached, incoming, METADATA_STRING_MAX);
+  return true;
+}
+
+static void log_metadata_if_useful(const rtsp_metadata_t *meta) {
+  if (!meta) return;
+
+  bool changed = !s_last_logged_metadata_valid;
+  changed |= metadata_field_update(s_last_logged_metadata.title, meta->title);
+  changed |= metadata_field_update(s_last_logged_metadata.artist, meta->artist);
+  changed |= metadata_field_update(s_last_logged_metadata.album, meta->album);
+  changed |= metadata_field_update(s_last_logged_metadata.genre, meta->genre);
+
+  const TickType_t now = xTaskGetTickCount();
+  const TickType_t repeat_after = pdMS_TO_TICKS(30000U);
+  const bool periodic_repeat =
+      s_last_logged_metadata_valid &&
+      (TickType_t)(now - s_last_metadata_log_tick) >= repeat_after;
+
+  if (!changed && !periodic_repeat) {
+    return;
+  }
+  if (meta->title[0] == '\0' && meta->artist[0] == '\0' &&
+      meta->album[0] == '\0' && meta->genre[0] == '\0') {
+    return;
+  }
+
+  ESP_LOGI(TAG, "Received metadata");
+  ESP_LOGI(TAG, "  Album  = %s",
+           s_last_logged_metadata.album[0] ? s_last_logged_metadata.album : "-");
+  ESP_LOGI(TAG, "  Artist = %s",
+           s_last_logged_metadata.artist[0] ? s_last_logged_metadata.artist : "-");
+  ESP_LOGI(TAG, "  Genre  = %s",
+           s_last_logged_metadata.genre[0] ? s_last_logged_metadata.genre : "-");
+  ESP_LOGI(TAG, "  Title  = %s",
+           s_last_logged_metadata.title[0] ? s_last_logged_metadata.title : "-");
+  s_last_logged_metadata_valid = true;
+  s_last_metadata_log_tick = now;
 }
 
 /**
@@ -1578,7 +1629,7 @@ static void parse_progress(const char *progress_str, uint32_t sample_rate,
     format_time_mmss(meta->position_secs, pos_str, sizeof(pos_str));
     format_time_mmss(meta->duration_secs, dur_str, sizeof(dur_str));
 
-    ESP_LOGI(TAG,
+    ESP_LOGD(TAG,
              "Progress: %s / %s (raw: %" PRIu64 "/%" PRIu64 "/%" PRIu64 ")",
              pos_str, dur_str, start, current, end);
   }
@@ -1640,7 +1691,7 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
   } else if (strstr(req->content_type, "application/x-dmap-tagged")) {
     // DMAP-tagged metadata (AirPlay 1)
     if (body && body_len > 0) {
-      ESP_LOGI(TAG, "Received DMAP metadata (%zu bytes)", body_len);
+      ESP_LOGD(TAG, "Received DMAP metadata (%zu bytes)", body_len);
       parse_dmap_metadata(body, body_len, &event_data.metadata, 0);
       has_metadata = true;
     }
@@ -1672,19 +1723,16 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
       char str_val[METADATA_STRING_MAX];
       if (bplist_find_string(body, body_len, "itemName", str_val,
                              sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Title = %s", str_val);
         strlcpy(event_data.metadata.title, str_val, METADATA_STRING_MAX);
         has_metadata = true;
       }
       if (bplist_find_string(body, body_len, "artistName", str_val,
                              sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Artist = %s", str_val);
         strlcpy(event_data.metadata.artist, str_val, METADATA_STRING_MAX);
         has_metadata = true;
       }
       if (bplist_find_string(body, body_len, "albumName", str_val,
                              sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Album = %s", str_val);
         strlcpy(event_data.metadata.album, str_val, METADATA_STRING_MAX);
         has_metadata = true;
       }
@@ -1700,15 +1748,16 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
           char duration_str[16];
           format_time_mmss((uint32_t)duration, duration_str,
                            sizeof(duration_str));
-          ESP_LOGI(TAG, "Progress: %s / %s", elapsed_str, duration_str);
+          ESP_LOGD(TAG, "Progress: %s / %s", elapsed_str, duration_str);
         } else {
-          ESP_LOGI(TAG, "Progress: %s", elapsed_str);
+          ESP_LOGD(TAG, "Progress: %s", elapsed_str);
         }
       }
     }
   }
 
   if (has_metadata) {
+    log_metadata_if_useful(&event_data.metadata);
     rtsp_events_emit(RTSP_EVENT_METADATA, &event_data);
   }
 

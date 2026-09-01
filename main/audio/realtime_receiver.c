@@ -93,6 +93,7 @@ typedef struct {
 typedef enum {
   RT_RESEND_EVENT_MISSING = 1,
   RT_RESEND_EVENT_RECEIVED = 2,
+  RT_RESEND_EVENT_WAKE = 3,
 } rt_resend_event_kind_t;
 
 typedef struct {
@@ -126,6 +127,7 @@ typedef struct {
   int16_t *pcm;
   seen_slot_t *seen;
   missing_slot_t *missing;
+  uint16_t active_missing_count;
 
   uint32_t newest_ext_seq;
   bool newest_ext_valid;
@@ -422,6 +424,9 @@ static missing_slot_t *missing_slot_for(uint32_t ext_seq) {
 static void missing_clear_slot(missing_slot_t *slot) {
   if (!slot || !slot->active) return;
   memset(slot, 0, sizeof(*slot));
+  if (s_rt.active_missing_count != 0U) {
+    s_rt.active_missing_count--;
+  }
 }
 
 static bool missing_find_min(uint32_t *min_ext) {
@@ -472,6 +477,9 @@ static void missing_add_range(uint32_t first_ext, uint16_t count,
       slot->ext_seq = ext;
       slot->missing_rtp = first_rtp + (uint32_t)i * frame_samples;
       slot->missing_since = now;
+      if (s_rt.active_missing_count != UINT16_MAX) {
+        s_rt.active_missing_count++;
+      }
       tracked++;
     }
   }
@@ -643,8 +651,7 @@ static void service_d7_anchor(void) {
   s_rt.d7_last_committed_packet = s_rt.d7_packets;
   s_rt.last_d7_local_ns = anchor_result.effective_local_ns;
 
-  if (s_rt.d7_anchor_commit_count <= 3U ||
-      (s_rt.d7_anchor_commit_count % 64U) == 0U) {
+  if (s_rt.d7_anchor_commit_count == 1U) {
     ESP_LOGI(TAG,
              "ALAC D7 LOCAL ANCHOR raw=%" PRIu64
              " rawLocal=%" PRIu64 " local=%" PRIu64
@@ -717,7 +724,7 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
     ptp_clock_note_realtime_d7(clock_id);
     service_d7_anchor();
 
-    if (s_rt.d7_packets <= 3U || (s_rt.d7_packets % 64U) == 0U) {
+    if (s_rt.d7_packets == 1U) {
       const int sr = s_rt.cfg.format.sample_rate > 0
                          ? s_rt.cfg.format.sample_rate
                          : 44100;
@@ -902,7 +909,7 @@ static void alac_worker_task(void *arg) {
            xPortGetCoreID(), RT_WORK_PRIORITY, dcfg.sample_rate, dcfg.channels,
            dcfg.frame_size);
   ESP_LOGI(TAG,
-           "build=FIX13_SHAIRPORT_ALAC_R23N_FIXED_RATE0_FAST_REBASE localTimeline=1 continuousD7=1 nqptpPhase=1 fixedMapRate=0ppm gmRebaseSettle=1000ms phaseContinuous=1 noVirtualPTP=1 noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
+           "build=FIX13_SHAIRPORT_ALAC_R23P_LOG_CLEANUP localTimeline=1 continuousD7=1 nqptpPhase=1 fixedMapRate=0ppm gmRebaseSettle=1000ms phaseContinuous=1 noVirtualPTP=1 noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
            (unsigned)RT_MISSING_SLOTS, (unsigned)RT_DATA_POOL_SLOTS,
            (unsigned)RT_RTX_POOL_SLOTS);
 
@@ -988,24 +995,39 @@ static void alac_worker_task(void *arg) {
 
 static void resend_task(void *arg) {
   (void)arg;
-  ESP_LOGI(TAG, "RESEND started core=%d prio=%d scan=%ums first=%ums retry=%ums lastReq=%ums finalLoss=%ums",
+  ESP_LOGI(TAG,
+           "RESEND event-driven core=%d prio=%d activeScan=%ums first=%ums "
+           "retry=%ums lastReq=%ums finalLoss=%ums",
            xPortGetCoreID(), RT_RESEND_PRIORITY, (unsigned)RT_RESEND_SCAN_MS,
            (unsigned)RT_RESEND_FIRST_MS, (unsigned)RT_RESEND_RETRY_MS,
            (unsigned)RT_RESEND_LAST_REQUEST_MS,
            (unsigned)RT_FINAL_LOSS_MARGIN_MS);
   while (s_rt.running) {
     rt_resend_event_t ev = {0};
-    if (xQueueReceive(s_rt.resend_event_q, &ev,
-                      pdMS_TO_TICKS(RT_RESEND_SCAN_MS)) == pdTRUE) {
+    const TickType_t wait_ticks =
+        s_rt.active_missing_count == 0U
+            ? portMAX_DELAY
+            : pdMS_TO_TICKS(RT_RESEND_SCAN_MS);
+
+    if (xQueueReceive(s_rt.resend_event_q, &ev, wait_ticks) == pdTRUE) {
       resend_process_event(&ev);
       while (xQueueReceive(s_rt.resend_event_q, &ev, 0) == pdTRUE) {
         resend_process_event(&ev);
       }
     }
+    if (!s_rt.running) break;
+
+    /* With no unresolved holes there is nothing to age, request or expire.
+     * Stay blocked on the event queue instead of scanning 512 slots every
+     * RT_RESEND_SCAN_MS. A MISSING event wakes this task immediately. */
+    if (s_rt.active_missing_count == 0U) continue;
+
     /* D7 state and continuous sender-anchor refreshes are owned by CTRL_RX. Keeping
      * a single owner removes the former CTRL_RX/RESEND double-commit race. */
     resend_giveup_expired();
-    resend_scan_due();
+    if (s_rt.active_missing_count != 0U) {
+      resend_scan_due();
+    }
 
   }
 
@@ -1113,6 +1135,7 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.reorder_overwrite = 0;
   s_rt.gap_skips = 0;
   s_rt.resend_scans = 0;
+  s_rt.active_missing_count = 0;
   s_rt.resend_retries = 0;
   s_rt.resend_giveups = 0;
   s_rt.hard_resyncs = 0;
@@ -1226,6 +1249,12 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
 
 void realtime_receiver_stop(void) {
   s_rt.running = false;
+  /* resend_task may be blocked indefinitely while there are no missing
+   * packets. Wake its queue so it can observe running=false and exit. */
+  if (s_rt.resend_event_q && s_rt.resend_task) {
+    const rt_resend_event_t wake = {.kind = RT_RESEND_EVENT_WAKE};
+    (void)xQueueSendToFront(s_rt.resend_event_q, &wake, 0);
+  }
   if (s_rt.data_sock >= 0) {
     shutdown(s_rt.data_sock, SHUT_RDWR);
     close(s_rt.data_sock);
