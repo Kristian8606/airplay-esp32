@@ -36,6 +36,8 @@ typedef struct {
   biquad_coeff_t coeff_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   biquad_state_t state_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   biquad_state_t state_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  uint8_t active_l;
+  uint8_t active_r;
   int sample_rate;
   float preamp_gain;
   bool ready;
@@ -252,23 +254,23 @@ void audio_eq_reset_state(void) {
 }
 
 static bool prepare_output(const audio_eq_output_config_t *cfg,
-                           biquad_coeff_t *coeff, int sample_rate,
-                           const char *name) {
+                           biquad_coeff_t *coeff, uint8_t *active_count,
+                           int sample_rate, const char *name) {
+  uint8_t active = 0;
   for (uint8_t i = 0; i < cfg->filter_count; ++i) {
     const audio_eq_filter_config_t *f = &cfg->filters[i];
-    if (!f->enabled) {
-      memset(&coeff[i], 0, sizeof(coeff[i]));
-      coeff[i].b0 = 1.0f;
-      continue;
-    }
+    if (!f->enabled) continue;
+
     if (f->frequency_hz >= ((float)sample_rate * 0.5f) ||
         !calc_biquad((audio_eq_filter_type_t)f->type, f->frequency_hz,
-                     f->gain_db, f->q, sample_rate, &coeff[i])) {
+                     f->gain_db, f->q, sample_rate, &coeff[active])) {
       ESP_LOGE(TAG, "Invalid %s filter %u for %d Hz stream", name,
                (unsigned)(i + 1), sample_rate);
       return false;
     }
+    ++active;
   }
+  *active_count = active;
   return true;
 }
 
@@ -276,8 +278,10 @@ static bool prepare_for_rate(int sample_rate) {
   if (sample_rate <= 0) return false;
   if (s_eq.ready && s_eq.sample_rate == sample_rate) return true;
 
-  if (!prepare_output(&s_eq.config.left, s_eq.coeff_l, sample_rate, "left") ||
-      !prepare_output(&s_eq.config.right, s_eq.coeff_r, sample_rate, "right")) {
+  if (!prepare_output(&s_eq.config.left, s_eq.coeff_l, &s_eq.active_l,
+                      sample_rate, "left") ||
+      !prepare_output(&s_eq.config.right, s_eq.coeff_r, &s_eq.active_r,
+                      sample_rate, "right")) {
     s_eq.ready = false;
     return false;
   }
@@ -287,11 +291,13 @@ static bool prepare_for_rate(int sample_rate) {
   s_eq.ready = true;
   audio_eq_reset_state();
   ESP_LOGI(TAG,
-           "Ready: enabled=%u mode=%s left=%u right=%u preamp=%.2fdB sr=%d",
+           "Ready: enabled=%u mode=%s left=%u/%u right=%u/%u preamp=%.2fdB sr=%d",
            (unsigned)s_eq.config.enabled,
            audio_eq_channel_mode_name(
                (audio_eq_channel_mode_t)s_eq.config.channel_mode),
+           (unsigned)s_eq.active_l,
            (unsigned)s_eq.config.left.filter_count,
+           (unsigned)s_eq.active_r,
            (unsigned)s_eq.config.right.filter_count, s_eq.config.preamp_db,
            sample_rate);
   return true;
@@ -324,15 +330,12 @@ static inline float biquad_process(float x, const biquad_coeff_t *c,
   return y;
 }
 
-static inline float process_chain(float x, const audio_eq_output_config_t *cfg,
-                                  const biquad_coeff_t *coeff,
-                                  biquad_state_t *states) {
-  if (!s_eq.config.enabled) return x;
+static inline float process_chain_hot(float x, const biquad_coeff_t *coeff,
+                                      biquad_state_t *states,
+                                      uint8_t active_count) {
   x *= s_eq.preamp_gain;
-  for (uint8_t i = 0; i < cfg->filter_count; ++i) {
-    if (cfg->filters[i].enabled) {
-      x = biquad_process(x, &coeff[i], &states[i]);
-    }
+  for (uint8_t i = 0; i < active_count; ++i) {
+    x = biquad_process(x, &coeff[i], &states[i]);
   }
   return x;
 }
@@ -349,6 +352,83 @@ static inline int16_t saturate_s16(float sample) {
   return (int16_t)lrintf(sample);
 }
 
+static inline void process_stereo_eq(int16_t *pcm, size_t frames) {
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t p = i * 2;
+    const float out_l =
+        process_chain_hot((float)pcm[p], s_eq.coeff_l, s_eq.state_l,
+                          s_eq.active_l);
+    const float out_r =
+        process_chain_hot((float)pcm[p + 1], s_eq.coeff_r, s_eq.state_r,
+                          s_eq.active_r);
+    pcm[p] = saturate_s16(out_l);
+    pcm[p + 1] = saturate_s16(out_r);
+  }
+}
+
+static inline void process_mono_eq(int16_t *pcm, size_t frames) {
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t p = i * 2;
+    const float source = 0.5f * ((float)pcm[p] + (float)pcm[p + 1]);
+    const float out_l =
+        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l);
+    const float out_r =
+        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r);
+    pcm[p] = saturate_s16(out_l);
+    pcm[p + 1] = saturate_s16(out_r);
+  }
+}
+
+static inline void process_left_eq(int16_t *pcm, size_t frames) {
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t p = i * 2;
+    const float source = (float)pcm[p];
+    const float out_l =
+        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l);
+    const float out_r =
+        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r);
+    pcm[p] = saturate_s16(out_l);
+    pcm[p + 1] = saturate_s16(out_r);
+  }
+}
+
+static inline void process_right_eq(int16_t *pcm, size_t frames) {
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t p = i * 2;
+    const float source = (float)pcm[p + 1];
+    const float out_l =
+        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l);
+    const float out_r =
+        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r);
+    pcm[p] = saturate_s16(out_l);
+    pcm[p + 1] = saturate_s16(out_r);
+  }
+}
+
+static inline void process_mono_bypass(int16_t *pcm, size_t frames) {
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t p = i * 2;
+    const int16_t out =
+        (int16_t)lrintf(0.5f * ((float)pcm[p] + (float)pcm[p + 1]));
+    pcm[p] = out;
+    pcm[p + 1] = out;
+  }
+}
+
+static inline void process_left_bypass(int16_t *pcm, size_t frames) {
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t p = i * 2;
+    pcm[p + 1] = pcm[p];
+  }
+}
+
+static inline void process_right_bypass(int16_t *pcm, size_t frames) {
+  for (size_t i = 0; i < frames; ++i) {
+    const size_t p = i * 2;
+    pcm[p] = pcm[p + 1];
+  }
+}
+
 void audio_eq_process(int16_t *pcm, size_t frames, int channels,
                       int sample_rate) {
   if (!pcm || frames == 0 || channels != 2 || !prepare_for_rate(sample_rate)) {
@@ -358,42 +438,37 @@ void audio_eq_process(int16_t *pcm, size_t frames, int channels,
   const audio_eq_channel_mode_t mode =
       (audio_eq_channel_mode_t)s_eq.config.channel_mode;
 
-  if (!s_eq.config.enabled && mode == AUDIO_EQ_CHANNEL_STEREO) return;
-
-  for (size_t i = 0; i < frames; ++i) {
-    const float in_l = (float)pcm[i * 2];
-    const float in_r = (float)pcm[i * 2 + 1];
-    float source_l;
-    float source_r;
-
+  if (!s_eq.config.enabled) {
     switch (mode) {
-      case AUDIO_EQ_CHANNEL_MONO: {
-        const float mono = 0.5f * (in_l + in_r);
-        source_l = mono;
-        source_r = mono;
-        break;
-      }
+      case AUDIO_EQ_CHANNEL_MONO:
+        process_mono_bypass(pcm, frames);
+        return;
       case AUDIO_EQ_CHANNEL_LEFT:
-        source_l = in_l;
-        source_r = in_l;
-        break;
+        process_left_bypass(pcm, frames);
+        return;
       case AUDIO_EQ_CHANNEL_RIGHT:
-        source_l = in_r;
-        source_r = in_r;
-        break;
+        process_right_bypass(pcm, frames);
+        return;
       case AUDIO_EQ_CHANNEL_STEREO:
       default:
-        source_l = in_l;
-        source_r = in_r;
-        break;
+        return;
     }
+  }
 
-    const float out_l =
-        process_chain(source_l, &s_eq.config.left, s_eq.coeff_l, s_eq.state_l);
-    const float out_r = process_chain(source_r, &s_eq.config.right,
-                                      s_eq.coeff_r, s_eq.state_r);
-    pcm[i * 2] = saturate_s16(out_l);
-    pcm[i * 2 + 1] = saturate_s16(out_r);
+  switch (mode) {
+    case AUDIO_EQ_CHANNEL_MONO:
+      process_mono_eq(pcm, frames);
+      return;
+    case AUDIO_EQ_CHANNEL_LEFT:
+      process_left_eq(pcm, frames);
+      return;
+    case AUDIO_EQ_CHANNEL_RIGHT:
+      process_right_eq(pcm, frames);
+      return;
+    case AUDIO_EQ_CHANNEL_STEREO:
+    default:
+      process_stereo_eq(pcm, frames);
+      return;
   }
 }
 
