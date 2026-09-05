@@ -2539,6 +2539,16 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
   until_seq &= 0x007fffffU;
   int32_t distance = (has_endpoint && current_seq_valid && rx_count != 0)
       ? seq23_delta(until_seq, current_seq) : 0;
+  bool endpoint_already_reached =
+      has_endpoint && current_seq_valid && rx_count != 0 && distance <= 0;
+  if (endpoint_already_reached) {
+    ESP_LOGI(TAG,
+             "FLUSH endpoint already reached current_seq=%" PRIu32
+             " until=%" PRIu32 " until_rtp=%" PRIu32
+             " seqdist=%" PRId32 "; clearing old raw FIFO",
+             current_seq, until_seq, until_ts, distance);
+    has_endpoint = false;
+  }
   int64_t start_us = esp_timer_get_time();
 
   taskENTER_CRITICAL(&s.state_mux);
@@ -2568,8 +2578,9 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
   if (has_endpoint) {
     ESP_LOGI(TAG,
              "FLUSH armed current_seq=%" PRIu32 " until=%" PRIu32
-             " seqdist=%" PRId32 " fifo=%u/%uKiB",
-             current_seq, until_seq, distance,
+             " until_rtp=%" PRIu32 " seqdist=%" PRId32
+             " fifo=%u/%uKiB",
+             current_seq, until_seq, until_ts, distance,
              (unsigned)(ts.fifo_occupancy / 1024U),
              (unsigned)(ts.fifo_high_water / 1024U));
   } else {

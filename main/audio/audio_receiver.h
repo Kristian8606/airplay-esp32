@@ -8,7 +8,7 @@
 
 /* Raw AirPlay 2 buffered-audio FIFO. SETUP advertises the actual allocated
  * capacity, so sender buffering follows the receiver capacity. */
-#define AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES (1U * 1024U * 1024U)
+#define AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES (4U * 1024U * 1024U)
 
 /* AirPlay 2 audio receiver: buffered AAC plus realtime ALAC. */
 typedef struct {

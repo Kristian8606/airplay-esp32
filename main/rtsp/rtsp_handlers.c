@@ -1826,9 +1826,11 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
                                               (uint32_t)flush_until_ts);
     } else {
       ESP_LOGI(TAG, "FLUSHBUFFERED immediate");
+      bool has_endpoint = got_until_seq && got_until_ts &&
+                          (flush_until_seq != 0 || flush_until_ts != 0);
       audio_receiver_set_immediate_flush((uint32_t)flush_until_seq,
                                          (uint32_t)flush_until_ts,
-                                         got_until_seq && got_until_ts);
+                                         has_endpoint);
     }
   }
 
