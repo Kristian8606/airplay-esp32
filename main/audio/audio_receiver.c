@@ -99,6 +99,14 @@ typedef struct {
   uint32_t from_rtp;
   uint32_t until_seq;
   uint32_t until_rtp;
+  /* Diagnostic-only counters for one deferred request. They never influence
+   * FLUSH decisions; they let a hardware log prove exactly what transport
+   * blocks were discarded between the sender's advertised endpoints. */
+  uint32_t diag_drop_count;
+  uint32_t diag_first_drop_seq;
+  uint32_t diag_first_drop_rtp;
+  uint32_t diag_last_drop_seq;
+  uint32_t diag_last_drop_rtp;
 } ap2_flush_request_t;
 
 typedef struct {
@@ -461,24 +469,146 @@ static inline int32_t seq23_delta(uint32_t a, uint32_t b) {
   return (int32_t)d;
 }
 
-static bool deferred_flush_should_drop(uint32_t seq) {
+static bool deferred_flush_should_drop(uint32_t seq, uint32_t rtp) {
   bool drop = false;
+  struct {
+    uint32_t index;
+    uint32_t event; /* 1=activate, 2=until, 3=overshoot */
+    uint32_t from_seq;
+    uint32_t from_rtp;
+    uint32_t until_seq;
+    uint32_t until_rtp;
+    uint32_t drops;
+    uint32_t first_drop_seq;
+    uint32_t first_drop_rtp;
+    uint32_t last_drop_seq;
+    uint32_t last_drop_rtp;
+  } events[AP2_MAX_DEFERRED_FLUSH];
+  uint32_t event_count = 0;
+
   taskENTER_CRITICAL(&s.state_mux);
   for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
     ap2_flush_request_t *r = &s.deferred_flush[i];
     if (!r->in_use) continue;
+
     if (!r->active && seq == r->from_seq && seq != r->until_seq) {
       r->active = true;
+      if (event_count < AP2_MAX_DEFERRED_FLUSH) {
+        events[event_count].index = i;
+        events[event_count].event = 1U;
+        events[event_count].from_seq = r->from_seq;
+        events[event_count].from_rtp = r->from_rtp;
+        events[event_count].until_seq = r->until_seq;
+        events[event_count].until_rtp = r->until_rtp;
+        event_count++;
+      }
     }
+
     if (seq == r->until_seq || seq23_delta(seq, r->until_seq) > 0) {
+      const uint32_t event = seq == r->until_seq ? 2U : 3U;
+      if (event_count < AP2_MAX_DEFERRED_FLUSH) {
+        events[event_count].index = i;
+        events[event_count].event = event;
+        events[event_count].from_seq = r->from_seq;
+        events[event_count].from_rtp = r->from_rtp;
+        events[event_count].until_seq = r->until_seq;
+        events[event_count].until_rtp = r->until_rtp;
+        events[event_count].drops = r->diag_drop_count;
+        events[event_count].first_drop_seq = r->diag_first_drop_seq;
+        events[event_count].first_drop_rtp = r->diag_first_drop_rtp;
+        events[event_count].last_drop_seq = r->diag_last_drop_seq;
+        events[event_count].last_drop_rtp = r->diag_last_drop_rtp;
+        event_count++;
+      }
       r->active = false;
       r->in_use = false;
       continue;
     }
-    if (r->active) drop = true;
+
+    if (r->active) {
+      if (r->diag_drop_count == 0) {
+        r->diag_first_drop_seq = seq;
+        r->diag_first_drop_rtp = rtp;
+      }
+      r->diag_drop_count++;
+      r->diag_last_drop_seq = seq;
+      r->diag_last_drop_rtp = rtp;
+      drop = true;
+    }
   }
   taskEXIT_CRITICAL(&s.state_mux);
+
+  for (uint32_t i = 0; i < event_count; ++i) {
+    if (events[i].event == 1U) {
+      ESP_LOGI(TAG,
+               "DFLUSH activate idx=%" PRIu32 " seq=%" PRIu32
+               " rtp=%" PRIu32 " req_seq=%" PRIu32 "..%" PRIu32
+               " req_rtp=%" PRIu32 "..%" PRIu32,
+               events[i].index, seq, rtp, events[i].from_seq,
+               events[i].until_seq, events[i].from_rtp, events[i].until_rtp);
+    } else {
+      ESP_LOGI(TAG,
+               "DFLUSH %s idx=%" PRIu32 " seq=%" PRIu32 " rtp=%" PRIu32
+               " req_seq=%" PRIu32 "..%" PRIu32
+               " req_rtp=%" PRIu32 "..%" PRIu32
+               " dropped=%" PRIu32
+               " first=%" PRIu32 "/%" PRIu32
+               " last=%" PRIu32 "/%" PRIu32,
+               events[i].event == 2U ? "until" : "overshoot",
+               events[i].index, seq, rtp, events[i].from_seq,
+               events[i].until_seq, events[i].from_rtp, events[i].until_rtp,
+               events[i].drops, events[i].first_drop_seq,
+               events[i].first_drop_rtp, events[i].last_drop_seq,
+               events[i].last_drop_rtp);
+    }
+  }
   return drop;
+}
+
+/* Diagnostic only: when a deferred FLUSH is pending, report any transport
+ * sequence/RTP discontinuity before FLUSH state is applied. This proves
+ * whether fromSeq was actually delivered by the sender or skipped in the
+ * compressed TCP stream. */
+static void deferred_flush_diag_transport(uint32_t seq, uint32_t rtp,
+                                          uint32_t prev_seq, uint32_t prev_rtp,
+                                          bool have_prev,
+                                          uint32_t frame_samples) {
+  if (!have_prev) return;
+
+  const uint32_t expected_seq = (prev_seq + 1U) & 0x007fffffU;
+  const uint32_t expected_rtp = prev_rtp + frame_samples;
+  const int32_t seq_gap = seq23_delta(seq, expected_seq);
+  const int32_t rtp_gap = rtp_delta(rtp, expected_rtp);
+  if (seq_gap == 0 && rtp_gap == 0) return;
+
+  ap2_flush_request_t pending[AP2_MAX_DEFERRED_FLUSH];
+  uint32_t pending_index[AP2_MAX_DEFERRED_FLUSH];
+  uint32_t count = 0;
+  taskENTER_CRITICAL(&s.state_mux);
+  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
+    if (!s.deferred_flush[i].in_use) continue;
+    if (count < AP2_MAX_DEFERRED_FLUSH) {
+      pending[count] = s.deferred_flush[i];
+      pending_index[count] = i;
+      count++;
+    }
+  }
+  taskEXIT_CRITICAL(&s.state_mux);
+
+  for (uint32_t i = 0; i < count; ++i) {
+    ESP_LOGW(TAG,
+             "DFLUSH transport gap idx=%" PRIu32
+             " prev=%" PRIu32 "/%" PRIu32
+             " expected=%" PRIu32 "/%" PRIu32
+             " current=%" PRIu32 "/%" PRIu32
+             " seq_gap=%" PRId32 " rtp_gap=%" PRId32
+             " req_seq=%" PRIu32 "..%" PRIu32
+             " req_rtp=%" PRIu32 "..%" PRIu32 " active=%u",
+             pending_index[i], prev_seq, prev_rtp, expected_seq, expected_rtp,
+             seq, rtp, seq_gap, rtp_gap, pending[i].from_seq,
+             pending[i].until_seq, pending[i].from_rtp, pending[i].until_rtp,
+             pending[i].active ? 1U : 0U);
+  }
 }
 
 static bool immediate_flush_should_drop(uint32_t seq) {
@@ -546,14 +676,99 @@ static bool immediate_flush_should_drop(uint32_t seq) {
   return drop;
 }
 
-static bool buffered_flush_should_drop(uint32_t seq) {
+static bool buffered_flush_should_drop(uint32_t seq, uint32_t rtp) {
   /* Do not use short-circuit `immediate || deferred` here. Shairport Sync
    * deliberately services deferred flush state even while an immediate flush
    * is actively dropping the same block. This keeps deferred activation and
    * termination semantics in transport order. */
   bool immediate_drop = immediate_flush_should_drop(seq);
-  bool deferred_drop = deferred_flush_should_drop(seq);
+  bool deferred_drop = deferred_flush_should_drop(seq, rtp);
   return immediate_drop || deferred_drop;
+}
+
+/* Diagnostic only: preserve the transport predecessor for the decoded block
+ * and emit a richer snapshot only for discontinuities of at least four AAC
+ * frames. This catches the rare multi-second positive hole without adding
+ * per-packet logging or changing any transport/playout decision. */
+static void diag_large_aac_timestamp_gap(
+    uint32_t seq, uint32_t rtp, uint32_t decoded_expected,
+    int32_t timestamp_gap, uint32_t transport_prev_seq,
+    uint32_t transport_prev_rtp, bool have_transport_prev,
+    uint32_t frame_samples, uint32_t wanted, int sample_rate,
+    uint32_t generation) {
+  const int64_t abs_gap = timestamp_gap < 0 ? -(int64_t)timestamp_gap
+                                             : (int64_t)timestamp_gap;
+  const int64_t threshold = (int64_t)frame_samples * 4LL;
+  if (abs_gap < threshold) return;
+
+  uint32_t expected_seq = 0;
+  uint32_t expected_rtp = 0;
+  int32_t seq_gap = 0;
+  int32_t rtp_gap = 0;
+  if (have_transport_prev) {
+    expected_seq = (transport_prev_seq + 1U) & 0x007fffffU;
+    expected_rtp = transport_prev_rtp + frame_samples;
+    seq_gap = seq23_delta(seq, expected_seq);
+    rtp_gap = rtp_delta(rtp, expected_rtp);
+  }
+
+  ap2_flush_request_t pending[AP2_MAX_DEFERRED_FLUSH];
+  uint32_t pending_index[AP2_MAX_DEFERRED_FLUSH];
+  uint32_t pending_count = 0;
+  uint32_t active_count = 0;
+  bool immediate_requested = false;
+  bool immediate_has_endpoint = false;
+  taskENTER_CRITICAL(&s.state_mux);
+  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
+    if (!s.deferred_flush[i].in_use) continue;
+    if (pending_count < AP2_MAX_DEFERRED_FLUSH) {
+      pending[pending_count] = s.deferred_flush[i];
+      pending_index[pending_count] = i;
+      pending_count++;
+    }
+    if (s.deferred_flush[i].active) active_count++;
+  }
+  immediate_requested = s.immediate_flush_requested;
+  immediate_has_endpoint = s.immediate_flush_has_endpoint;
+  taskEXIT_CRITICAL(&s.state_mux);
+
+  ap2_buffered_transport_stats_t ts = {0};
+  if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
+  const size_t fifo_capacity =
+      s.transport ? ap2_buffered_transport_capacity(s.transport) : 0U;
+  const int sr = sample_rate > 0 ? sample_rate : 44100;
+  const int32_t decoded_ahead_ms =
+      (int32_t)(((int64_t)rtp_delta(decoded_expected, wanted) * 1000LL) / sr);
+  const int32_t incoming_lead_ms =
+      (int32_t)(((int64_t)rtp_delta(rtp, wanted) * 1000LL) / sr);
+
+  ESP_LOGW(TAG,
+           "AAC GAPDIAG seq=%" PRIu32 " rtp=%" PRIu32
+           " dec_expected=%" PRIu32 " gap=%" PRId32
+           " tprev_valid=%u tprev=%" PRIu32 "/%" PRIu32
+           " texpected=%" PRIu32 "/%" PRIu32
+           " seq_gap=%" PRId32 " rtp_gap=%" PRId32
+           " wanted=%" PRIu32 " dec_ahead=%" PRId32 "ms"
+           " incoming_lead=%" PRId32 "ms dflush=%" PRIu32 "/%" PRIu32
+           " iflush=%u/%u fifo=%u/%uK gen=%" PRIu32,
+           seq, rtp, decoded_expected, timestamp_gap,
+           have_transport_prev ? 1U : 0U, transport_prev_seq,
+           transport_prev_rtp, expected_seq, expected_rtp, seq_gap, rtp_gap,
+           wanted, decoded_ahead_ms, incoming_lead_ms, pending_count,
+           active_count, immediate_requested ? 1U : 0U,
+           immediate_has_endpoint ? 1U : 0U,
+           (unsigned)(ts.fifo_occupancy / 1024U),
+           (unsigned)(fifo_capacity / 1024U), generation);
+
+  for (uint32_t i = 0; i < pending_count; ++i) {
+    ESP_LOGW(TAG,
+             "AAC GAPDIAG flush idx=%" PRIu32
+             " req_seq=%" PRIu32 "..%" PRIu32
+             " req_rtp=%" PRIu32 "..%" PRIu32 " active=%u",
+             pending_index[i], pending[i].from_seq, pending[i].until_seq,
+             pending[i].from_rtp, pending[i].until_rtp,
+             pending[i].active ? 1U : 0U);
+  }
 }
 
 static void update_transport_continuity(uint32_t seq, uint32_t rtp,
@@ -632,6 +847,9 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t current_seq = 0;
   uint32_t current_rtp = 0;
   uint32_t current_ssrc = 0;
+  uint32_t current_transport_prev_seq = 0;
+  uint32_t current_transport_prev_rtp = 0;
+  bool current_have_transport_prev = false;
   uint64_t packets_played_in_sequence = 0;
   uint32_t observed_generation = 0;
 
@@ -712,6 +930,12 @@ static void ap2_buffered_processor_task(void *arg) {
       snapshot_state(&state_snap);
       uint32_t frame_samples = state_snap.format.frame_size > 0 ?
           (uint32_t)state_snap.format.frame_size : 1024U;
+      current_transport_prev_seq = previous_seq;
+      current_transport_prev_rtp = previous_rtp;
+      current_have_transport_prev = have_previous_transport;
+      deferred_flush_diag_transport(current_seq, current_rtp, previous_seq,
+                                    previous_rtp, have_previous_transport,
+                                    frame_samples);
       update_transport_continuity(current_seq, current_rtp, &previous_seq,
                                   &previous_rtp, &have_previous_transport,
                                   frame_samples);
@@ -720,7 +944,7 @@ static void ap2_buffered_processor_task(void *arg) {
     /* FLUSH is transport-order state. Service it even while playback is
      * stopped or an anchor is not yet usable. A dropped current block is then
      * replaced by the next transport block. */
-    if (buffered_flush_should_drop(current_seq)) {
+    if (buffered_flush_should_drop(current_seq, current_rtp)) {
       s.diag.timeline_drop++;
       current_block_valid = false;
       need_new_block = true;
@@ -823,6 +1047,11 @@ static void ap2_buffered_processor_task(void *arg) {
                  "AAC timestamp discontinuity seq=%" PRIu32 " rtp=%" PRIu32
                  " expected=%" PRIu32 " gap=%" PRId32,
                  current_seq, current_rtp, expected_timestamp, timestamp_gap);
+        diag_large_aac_timestamp_gap(
+            current_seq, current_rtp, expected_timestamp, timestamp_gap,
+            current_transport_prev_seq, current_transport_prev_rtp,
+            current_have_transport_prev, frame_samples, wanted, sr,
+            snap.generation);
       }
     }
 
