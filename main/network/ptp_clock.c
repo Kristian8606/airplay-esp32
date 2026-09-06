@@ -13,6 +13,7 @@
 
 #include "ptp_clock.h"
 #include "spiram_task.h"
+#include "stack_diag.h"
 
 static const char *TAG = "ptp_clock";
 
@@ -735,8 +736,13 @@ static int create_ptp_socket(uint16_t port) {
 // PTP task - listens for messages on both ports
 static void ptp_task(void *pvParameters) {
   uint8_t buffer[256];
+  uint32_t stack_diag_loops = 0;
+  stack_diag_sample(STACK_DIAG_PTP_CLOCK);
 
   while (ptp.running) {
+    if ((++stack_diag_loops & 0x1fU) == 0U) {
+      stack_diag_sample(STACK_DIAG_PTP_CLOCK);
+    }
     fd_set read_fds;
     FD_ZERO(&read_fds);
 
@@ -816,6 +822,7 @@ static void ptp_task(void *pvParameters) {
     ptp.general_socket = -1;
   }
 
+  stack_diag_sample(STACK_DIAG_PTP_CLOCK);
   ptp.task_handle = NULL;
   vTaskDelete(NULL);
 }

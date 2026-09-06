@@ -4,14 +4,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "network/socket_utils.h"
+#include "stack_diag.h"
 
 #define AP2_TCP_READ_CHUNK 4096U
 
@@ -82,6 +85,7 @@ static bool fifo_write_all(ap2_buffered_transport_t *t, const uint8_t *src,
 
 static void tcp_reader_task(void *arg) {
   ap2_buffered_transport_t *t = (ap2_buffered_transport_t *)arg;
+  uint32_t stack_diag_loops = 0;
   uint8_t *scratch = heap_caps_malloc(AP2_TCP_READ_CHUNK,
                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!scratch) scratch = malloc(AP2_TCP_READ_CHUNK);
@@ -110,9 +114,30 @@ static void tcp_reader_task(void *arg) {
 
     fifo_reset(t);
     t->client_sock = c;
-    ESP_LOGI(TAG, "buffered TCP connected");
+
+    // Match the accepted socket receive buffer to lwIP's configured TCP RX
+    // window, as upstream does. This avoids a second oversized hidden queue
+    // behind our explicit 4 MiB AirPlay FIFO.
+    int rcvbuf = CONFIG_LWIP_TCP_WND_DEFAULT;
+    if (setsockopt(c, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+      ESP_LOGW(TAG, "SO_RCVBUF failed errno=%d", errno);
+    }
+
+    // Upstream uses a 30 s receive timeout to detect a dead buffered socket.
+    // Our 4 MiB Automix FIFO can legitimately cover sender-silent periods
+    // longer than that, so timeout is only a wake-up here: it never tears down
+    // an otherwise healthy connection.
+    struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
+    if (setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+      ESP_LOGW(TAG, "SO_RCVTIMEO failed errno=%d", errno);
+    }
+
+    ESP_LOGI(TAG, "buffered TCP connected rcvbuf=%d", rcvbuf);
 
     while (t->running) {
+      if ((++stack_diag_loops & 0x7fU) == 0U) {
+        stack_diag_sample(STACK_DIAG_AP2_TCP_READER);
+      }
       /* Do not read from TCP while our bounded FIFO is full. This is the
        * AirPlay-2 backpressure point: the sender is throttled by the TCP
        * receive window instead of dropping future audio. */
@@ -128,6 +153,10 @@ static void tcp_reader_task(void *arg) {
       if (n > 0) {
         t->socket_bytes += (uint64_t)n;
         if (!fifo_write_all(t, scratch, (size_t)n)) break;
+      } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        // Receive timeout is intentionally non-fatal. Apple can legitimately
+        // stop sending while our advertised 4 MiB Automix reserve is consumed.
+        continue;
       } else {
         xSemaphoreTake(t->mutex, portMAX_DELAY);
         if (n == 0) t->peer_closed = true;
@@ -144,6 +173,7 @@ static void tcp_reader_task(void *arg) {
     ESP_LOGI(TAG, "buffered TCP disconnected");
   }
 
+  stack_diag_sample(STACK_DIAG_AP2_TCP_READER);
   free(scratch);
   t->reader_task = NULL;
   vTaskDelete(NULL);

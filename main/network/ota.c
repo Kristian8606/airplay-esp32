@@ -4,25 +4,35 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
-#include "mbedtls/sha256.h"
 #include <string.h>
 #include <sys/param.h>
 
 static const char *TAG = "ota";
 
-/**
- * Validate an in-memory firmware image before writing to flash.
- * Checks: minimum size, magic byte, segment count, and SHA-256 digest
- * (when the image indicates a hash is appended).
- */
-static esp_err_t ota_validate_image(const uint8_t *image, size_t len) {
-  if (len < sizeof(esp_image_header_t)) {
-    ESP_LOGE(TAG, "Image too small (%zu bytes)", len);
+#define OTA_STREAM_BUF_BYTES 4096U
+#define OTA_STREAM_FALLBACK_BUF_BYTES 1024U
+#define OTA_PROGRESS_STEP_BYTES (256U * 1024U)
+
+static void ota_log_memory(const char *where) {
+  ESP_LOGI(TAG,
+           "MEM %s internalFree=%u KiB internalLargest=%u KiB internalMin=%u KiB "
+           "psramFree=%u KiB psramLargest=%u KiB psramMin=%u KiB",
+           where,
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
+           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024U));
+}
+
+static esp_err_t ota_validate_header(const uint8_t *image, size_t len) {
+  if (!image || len < sizeof(esp_image_header_t)) {
+    ESP_LOGE(TAG, "Image header too small (%zu bytes)", len);
     return ESP_ERR_INVALID_SIZE;
   }
 
   const esp_image_header_t *header = (const esp_image_header_t *)image;
-
   if (header->magic != ESP_IMAGE_HEADER_MAGIC) {
     ESP_LOGE(TAG, "Bad image magic: 0x%02x (expected 0x%02x)", header->magic,
              ESP_IMAGE_HEADER_MAGIC);
@@ -35,172 +45,146 @@ static esp_err_t ota_validate_image(const uint8_t *image, size_t len) {
     return ESP_ERR_INVALID_STATE;
   }
 
-  if (header->hash_appended) {
-    if (len < 32) {
-      ESP_LOGE(TAG, "Image claims hash but is too small");
-      return ESP_ERR_INVALID_SIZE;
-    }
-    // SHA-256 digest covers everything except the last 32 bytes
-    size_t data_len = len - 32;
-    const uint8_t *expected_hash = image + data_len;
-
-    uint8_t computed_hash[32];
-    mbedtls_sha256(image, data_len, computed_hash, 0);
-
-    if (memcmp(computed_hash, expected_hash, 32) != 0) {
-      ESP_LOGE(TAG, "SHA-256 mismatch — firmware is corrupt");
-      return ESP_ERR_INVALID_STATE;
-    }
-    ESP_LOGI(TAG, "SHA-256 verified OK");
-  }
-
   return ESP_OK;
 }
 
-/**
- * Receive firmware into a PSRAM buffer, validate, then write to flash.
- * Returns ESP_ERR_NO_MEM if PSRAM allocation fails (caller can fall back).
- */
-static esp_err_t ota_buffered(httpd_req_t *req) {
-  size_t fw_size = req->content_len;
+static uint8_t *ota_alloc_stream_buffer(size_t *out_size) {
+  if (!out_size) return NULL;
 
-  uint8_t *fw_buf = heap_caps_malloc(fw_size, MALLOC_CAP_SPIRAM);
-  if (!fw_buf) {
-    ESP_LOGW(TAG, "Cannot allocate %zu bytes in PSRAM", fw_size);
-    return ESP_ERR_NO_MEM;
+  uint8_t *buf = heap_caps_malloc(
+      OTA_STREAM_BUF_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (buf) {
+    *out_size = OTA_STREAM_BUF_BYTES;
+    return buf;
   }
 
-  // Receive entire firmware into RAM
-  ESP_LOGI(TAG, "Receiving firmware into PSRAM (%zu bytes)...", fw_size);
-  size_t received = 0;
-  while (received < fw_size) {
-    int recv_len =
-        httpd_req_recv(req, (char *)fw_buf + received, fw_size - received);
-    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
-      continue;
-    } else if (recv_len <= 0) {
-      ESP_LOGE(TAG, "Receive error: %d", recv_len);
-      heap_caps_free(fw_buf);
-      return ESP_FAIL;
-    }
-    received += recv_len;
-  }
-
-  // Validate before touching flash
-  esp_err_t err = ota_validate_image(fw_buf, fw_size);
-  if (err != ESP_OK) {
-    heap_caps_free(fw_buf);
-    return err;
-  }
-
-  // Write validated image to flash
-  const esp_partition_t *ota_partition =
-      esp_ota_get_next_update_partition(NULL);
-  if (!ota_partition) {
-    ESP_LOGE(TAG, "No OTA partition found");
-    heap_caps_free(fw_buf);
-    return ESP_ERR_NOT_FOUND;
-  }
-
-  esp_ota_handle_t ota_handle;
-  err = esp_ota_begin(ota_partition, fw_size, &ota_handle);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
-    heap_caps_free(fw_buf);
-    return err;
-  }
-
-  // Write in 4 KB chunks to avoid watchdog triggers on large images
-  size_t offset = 0;
-  while (offset < fw_size) {
-    size_t chunk = MIN(fw_size - offset, 4096);
-    if (esp_ota_write(ota_handle, fw_buf + offset, chunk) != ESP_OK) {
-      ESP_LOGE(TAG, "Flash write failed at offset %zu", offset);
-      esp_ota_abort(ota_handle);
-      heap_caps_free(fw_buf);
-      return ESP_FAIL;
-    }
-    offset += chunk;
-  }
-  heap_caps_free(fw_buf);
-
-  if (esp_ota_end(ota_handle) != ESP_OK) {
-    ESP_LOGE(TAG, "Image validation failed (esp_ota_end)");
-    return ESP_FAIL;
-  }
-
-  if (esp_ota_set_boot_partition(ota_partition) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to set boot partition");
-    return ESP_FAIL;
-  }
-
-  ESP_LOGI(TAG, "OTA update successful (buffered)");
-  return ESP_OK;
-}
-
-/**
- * Stream firmware directly to flash (original approach, used as fallback).
- */
-static esp_err_t ota_streaming(httpd_req_t *req) {
-  const esp_partition_t *ota_partition =
-      esp_ota_get_next_update_partition(NULL);
-  if (!ota_partition) {
-    ESP_LOGE(TAG, "No OTA partition found");
-    return ESP_ERR_NOT_FOUND;
-  }
-
-  esp_ota_handle_t ota_handle;
-  esp_err_t err = esp_ota_begin(ota_partition, OTA_SIZE_UNKNOWN, &ota_handle);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
-    return err;
-  }
-
-  char buf[1024];
-  size_t remaining = req->content_len;
-  ESP_LOGI(TAG, "Receiving firmware via streaming (%zu bytes)...", remaining);
-
-  while (remaining > 0) {
-    int recv_len = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)));
-
-    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
-      continue;
-    } else if (recv_len <= 0) {
-      ESP_LOGE(TAG, "Receive error: %d", recv_len);
-      esp_ota_abort(ota_handle);
-      return ESP_FAIL;
-    }
-
-    if (esp_ota_write(ota_handle, buf, recv_len) != ESP_OK) {
-      ESP_LOGE(TAG, "Flash write failed");
-      esp_ota_abort(ota_handle);
-      return ESP_FAIL;
-    }
-
-    remaining -= recv_len;
-  }
-
-  if (esp_ota_end(ota_handle) != ESP_OK) {
-    ESP_LOGE(TAG, "Image validation failed");
-    return ESP_FAIL;
-  }
-
-  if (esp_ota_set_boot_partition(ota_partition) != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to set boot partition");
-    return ESP_FAIL;
-  }
-
-  ESP_LOGI(TAG, "OTA update successful (streaming)");
-  return ESP_OK;
+  ESP_LOGW(TAG, "Cannot allocate %u-byte internal OTA buffer; trying %u bytes",
+           (unsigned)OTA_STREAM_BUF_BYTES,
+           (unsigned)OTA_STREAM_FALLBACK_BUF_BYTES);
+  buf = heap_caps_malloc(OTA_STREAM_FALLBACK_BUF_BYTES, MALLOC_CAP_8BIT);
+  if (buf) *out_size = OTA_STREAM_FALLBACK_BUF_BYTES;
+  return buf;
 }
 
 esp_err_t ota_start_from_http(httpd_req_t *req) {
-  // Try RAM-buffered OTA first (validates image before writing to flash).
-  // Falls back to streaming if PSRAM is not available or too small.
-  esp_err_t err = ota_buffered(req);
-  if (err == ESP_ERR_NO_MEM) {
-    ESP_LOGW(TAG, "Falling back to streaming OTA (no PSRAM available)");
-    err = ota_streaming(req);
+  if (!req || req->content_len <= 0) return ESP_ERR_INVALID_ARG;
+
+  const size_t fw_size = (size_t)req->content_len;
+  const esp_partition_t *ota_partition =
+      esp_ota_get_next_update_partition(NULL);
+  if (!ota_partition) {
+    ESP_LOGE(TAG, "No OTA partition found");
+    return ESP_ERR_NOT_FOUND;
   }
-  return err;
+
+  if (fw_size > ota_partition->size) {
+    ESP_LOGE(TAG, "Firmware too large: %zu bytes, OTA partition is %zu bytes",
+             fw_size, ota_partition->size);
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  ota_log_memory("before-stream");
+
+  size_t buf_size = 0;
+  uint8_t *buf = ota_alloc_stream_buffer(&buf_size);
+  if (!buf) {
+    ESP_LOGE(TAG, "Cannot allocate OTA stream buffer");
+    return ESP_ERR_NO_MEM;
+  }
+
+  /* Read enough bytes to validate the ESP image header before touching flash. */
+  size_t first_len = 0;
+  size_t remaining = fw_size;
+  while (first_len < sizeof(esp_image_header_t) && remaining > 0) {
+    size_t want = MIN(remaining, buf_size - first_len);
+    int recv_len = httpd_req_recv(req, (char *)buf + first_len, want);
+    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (recv_len <= 0) {
+      ESP_LOGE(TAG, "Receive error before image header: %d", recv_len);
+      heap_caps_free(buf);
+      return ESP_FAIL;
+    }
+    first_len += (size_t)recv_len;
+    remaining -= (size_t)recv_len;
+  }
+
+  esp_err_t err = ota_validate_header(buf, first_len);
+  if (err != ESP_OK) {
+    heap_caps_free(buf);
+    return err;
+  }
+
+  esp_ota_handle_t ota_handle;
+  err = esp_ota_begin(ota_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+    heap_caps_free(buf);
+    return err;
+  }
+
+  ESP_LOGI(TAG,
+           "Receiving firmware via sequential streaming (%zu bytes, buffer=%zu bytes)...",
+           fw_size, buf_size);
+
+  size_t written = 0;
+  if (first_len > 0) {
+    err = esp_ota_write(ota_handle, buf, first_len);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Flash write failed at offset 0: %s", esp_err_to_name(err));
+      esp_ota_abort(ota_handle);
+      heap_caps_free(buf);
+      return err;
+    }
+    written = first_len;
+  }
+
+  size_t next_progress = OTA_PROGRESS_STEP_BYTES;
+  while (remaining > 0) {
+    size_t want = MIN(remaining, buf_size);
+    int recv_len = httpd_req_recv(req, (char *)buf, want);
+
+    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (recv_len <= 0) {
+      ESP_LOGE(TAG, "Receive error: %d after %zu/%zu bytes", recv_len,
+               written, fw_size);
+      esp_ota_abort(ota_handle);
+      heap_caps_free(buf);
+      return ESP_FAIL;
+    }
+
+    err = esp_ota_write(ota_handle, buf, (size_t)recv_len);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "Flash write failed at offset %zu: %s", written,
+               esp_err_to_name(err));
+      esp_ota_abort(ota_handle);
+      heap_caps_free(buf);
+      return err;
+    }
+
+    written += (size_t)recv_len;
+    remaining -= (size_t)recv_len;
+
+    if (written >= next_progress) {
+      ESP_LOGI(TAG, "OTA progress: %zu/%zu bytes", written, fw_size);
+      while (next_progress <= written) next_progress += OTA_PROGRESS_STEP_BYTES;
+    }
+  }
+
+  heap_caps_free(buf);
+
+  err = esp_ota_end(ota_handle);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Image validation failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = esp_ota_set_boot_partition(ota_partition);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set boot partition: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  ota_log_memory("after-stream");
+  ESP_LOGI(TAG, "OTA update successful (sequential streaming)");
+  return ESP_OK;
 }

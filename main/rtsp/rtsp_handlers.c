@@ -28,8 +28,65 @@
 #include "tlv8.h"
 
 #include "rtsp_events.h"
+#include "stack_diag.h"
 
 static const char *TAG = "rtsp_handlers";
+
+/* Logging-only de-duplication. This does not suppress parsing or metadata
+ * events; it only avoids repeatedly formatting/streaming identical metadata.
+ * Keep the state tiny: one 32-bit fingerprint plus progress log timing. */
+#define PROGRESS_LOG_INTERVAL_MS 5000U
+static uint32_t s_last_dmap_log_hash;
+static bool s_dmap_log_hash_valid;
+static TickType_t s_last_progress_log_tick;
+static uint32_t s_last_progress_duration_secs;
+static bool s_progress_log_valid;
+
+static uint32_t metadata_log_hash(const rtsp_metadata_t *meta) {
+  uint32_t hash = 2166136261U; /* FNV-1a */
+  const char *fields[] = {meta->title, meta->artist, meta->album, meta->genre};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    const unsigned char *p = (const unsigned char *)fields[i];
+    while (*p) {
+      hash ^= (uint32_t)*p++;
+      hash *= 16777619U;
+    }
+    /* Field separator so {"ab","c"} != {"a","bc"}. */
+    hash ^= 0xffU;
+    hash *= 16777619U;
+  }
+  return hash;
+}
+
+static bool should_log_dmap_metadata(const rtsp_metadata_t *meta) {
+  const uint32_t hash = metadata_log_hash(meta);
+  if (s_dmap_log_hash_valid && hash == s_last_dmap_log_hash) return false;
+  s_last_dmap_log_hash = hash;
+  s_dmap_log_hash_valid = true;
+  return true;
+}
+
+static bool should_log_progress(uint32_t duration_secs) {
+  const TickType_t now = xTaskGetTickCount();
+  const TickType_t interval = pdMS_TO_TICKS(PROGRESS_LOG_INTERVAL_MS);
+  const bool duration_changed =
+      !s_progress_log_valid || duration_secs != s_last_progress_duration_secs;
+  const bool interval_elapsed =
+      !s_progress_log_valid ||
+      (TickType_t)(now - s_last_progress_log_tick) >= interval;
+
+  if (!duration_changed && !interval_elapsed) return false;
+
+  s_last_progress_log_tick = now;
+  s_last_progress_duration_secs = duration_secs;
+  s_progress_log_valid = true;
+  return true;
+}
+
+static void reset_metadata_log_dedup(void) {
+  s_dmap_log_hash_valid = false;
+  s_progress_log_valid = false;
+}
 
 // ============================================================================
 // Codec Registry
@@ -182,9 +239,14 @@ static bool start_audio_receiver_or_fail(int socket, rtsp_conn_t *conn,
 // Event port task - handles AirPlay 2 session persistence
 static void event_port_task(void *pvParameters) {
   int listen_socket = (int)(intptr_t)pvParameters;
+  uint32_t stack_diag_loops = 0;
   event_listen_socket = listen_socket;
 
+  stack_diag_sample(STACK_DIAG_EVENT_PORT);
   while (!event_task_should_stop && listen_socket >= 0) {
+    if ((++stack_diag_loops % 5U) == 0U) {
+      stack_diag_sample(STACK_DIAG_EVENT_PORT);
+    }
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(listen_socket, &read_fds);
@@ -233,6 +295,9 @@ static void event_port_task(void *pvParameters) {
 
       // Monitor connection for disconnection
       while (event_client_socket >= 0 && !event_task_should_stop) {
+        if ((++stack_diag_loops % 5U) == 0U) {
+          stack_diag_sample(STACK_DIAG_EVENT_PORT);
+        }
         fd_set cfds;
         FD_ZERO(&cfds);
         FD_SET(event_client_socket, &cfds);
@@ -263,6 +328,7 @@ static void event_port_task(void *pvParameters) {
     close(event_client_socket);
     event_client_socket = -1;
   }
+  stack_diag_sample(STACK_DIAG_EVENT_PORT);
   event_listen_socket = -1;
   event_task_handle = NULL;
   vTaskDelete(NULL);
@@ -1241,6 +1307,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       return;
     }
 
+    reset_metadata_log_dedup();
     ESP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
 
     if (is_bplist) {
@@ -1523,28 +1590,24 @@ static void parse_dmap_metadata(const uint8_t *data, size_t len,
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->title, data + pos, copy_len);
       meta->title[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Title  = %s", meta->title);
     } else if (strcmp(tag, "asar") == 0 && item_len > 0) {
       size_t copy_len = item_len < METADATA_STRING_MAX - 1
                             ? item_len
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->artist, data + pos, copy_len);
       meta->artist[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Artist = %s", meta->artist);
     } else if (strcmp(tag, "asal") == 0 && item_len > 0) {
       size_t copy_len = item_len < METADATA_STRING_MAX - 1
                             ? item_len
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->album, data + pos, copy_len);
       meta->album[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Album  = %s", meta->album);
     } else if (strcmp(tag, "asgn") == 0 && item_len > 0) {
       size_t copy_len = item_len < METADATA_STRING_MAX - 1
                             ? item_len
                             : METADATA_STRING_MAX - 1;
       memcpy(meta->genre, data + pos, copy_len);
       meta->genre[copy_len] = '\0';
-      ESP_LOGI(TAG, "  Genre  = %s", meta->genre);
     } else if (strcmp(tag, "mlit") == 0 || strcmp(tag, "cmst") == 0 ||
                strcmp(tag, "mdst") == 0) {
       // Container tags - recurse into them
@@ -1578,9 +1641,11 @@ static void parse_progress(const char *progress_str, uint32_t sample_rate,
     format_time_mmss(meta->position_secs, pos_str, sizeof(pos_str));
     format_time_mmss(meta->duration_secs, dur_str, sizeof(dur_str));
 
-    ESP_LOGI(TAG,
-             "Progress: %s / %s (raw: %" PRIu64 "/%" PRIu64 "/%" PRIu64 ")",
-             pos_str, dur_str, start, current, end);
+    if (should_log_progress(meta->duration_secs)) {
+      ESP_LOGI(TAG,
+               "Progress: %s / %s (raw: %" PRIu64 "/%" PRIu64 "/%" PRIu64 ")",
+               pos_str, dur_str, start, current, end);
+    }
   }
 }
 
@@ -1640,8 +1705,18 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
   } else if (strstr(req->content_type, "application/x-dmap-tagged")) {
     // DMAP-tagged metadata (AirPlay 1)
     if (body && body_len > 0) {
-      ESP_LOGI(TAG, "Received DMAP metadata (%zu bytes)", body_len);
       parse_dmap_metadata(body, body_len, &event_data.metadata, 0);
+      if (should_log_dmap_metadata(&event_data.metadata)) {
+        ESP_LOGI(TAG, "Received DMAP metadata (%zu bytes)", body_len);
+        if (event_data.metadata.album[0])
+          ESP_LOGI(TAG, "  Album  = %s", event_data.metadata.album);
+        if (event_data.metadata.artist[0])
+          ESP_LOGI(TAG, "  Artist = %s", event_data.metadata.artist);
+        if (event_data.metadata.genre[0])
+          ESP_LOGI(TAG, "  Genre  = %s", event_data.metadata.genre);
+        if (event_data.metadata.title[0])
+          ESP_LOGI(TAG, "  Title  = %s", event_data.metadata.title);
+      }
       has_metadata = true;
     }
   } else if (strstr(req->content_type, "image/jpeg") ||
@@ -1700,8 +1775,10 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
           char duration_str[16];
           format_time_mmss((uint32_t)duration, duration_str,
                            sizeof(duration_str));
-          ESP_LOGI(TAG, "Progress: %s / %s", elapsed_str, duration_str);
-        } else {
+          if (should_log_progress(event_data.metadata.duration_secs)) {
+            ESP_LOGI(TAG, "Progress: %s / %s", elapsed_str, duration_str);
+          }
+        } else if (should_log_progress(0)) {
           ESP_LOGI(TAG, "Progress: %s", elapsed_str);
         }
       }

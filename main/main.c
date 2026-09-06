@@ -14,11 +14,25 @@
 #include "wifi.h"
 #include "esp_app_desc.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "main";
 #define AP_IP_ADDR 0x0104A8C0
+
+static void log_memory_state(const char *where) {
+  ESP_LOGI(TAG,
+           "MEM %s internalFree=%u KiB internalLargest=%u KiB internalMin=%u KiB "
+           "psramFree=%u KiB psramLargest=%u KiB psramMin=%u KiB",
+           where,
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
+           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024U));
+}
 #define FW_NAME "airplay-esp32_V22_ALAC_R23P_LOG_CLEANUP"
 
 static void print_firmware_banner(void) {
@@ -34,6 +48,7 @@ static void print_firmware_banner(void) {
 
 void app_main(void) {
   print_firmware_banner();
+  log_memory_state("boot");
 
   esp_err_t e = nvs_flash_init();
   if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -56,10 +71,12 @@ void app_main(void) {
   } else {
     ESP_LOGI(TAG, "WiFi connected");
   }
+  log_memory_state("post-wifi");
 
   ESP_ERROR_CHECK(ptp_clock_init());
   ESP_ERROR_CHECK(hap_init());
   ESP_ERROR_CHECK(audio_receiver_init());
+  log_memory_state("post-audio-init");
   led_init();
   mdns_airplay_init();
   ESP_ERROR_CHECK(rtsp_server_start());

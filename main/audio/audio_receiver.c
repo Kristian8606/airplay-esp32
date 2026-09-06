@@ -21,13 +21,15 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "network/ptp_clock.h"
 #include "network/socket_utils.h"
+#include "stack_diag.h"
 
 #define AP2_PACKET_MAX             8192U
-#define AP2_RX_STACK               6144U
-#define AP2_PROCESS_STACK          8192U
+#define AP2_RX_STACK               4096U
+#define AP2_PROCESS_STACK          6144U
 #define AP2_STATS_STACK            8192U
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
@@ -852,11 +854,15 @@ static void ap2_buffered_processor_task(void *arg) {
   bool current_have_transport_prev = false;
   uint64_t packets_played_in_sequence = 0;
   uint32_t observed_generation = 0;
+  uint32_t stack_diag_loops = 0;
 
   ESP_LOGI(TAG, "Shairport-style buffered processor core=%d prio=%u",
            xPortGetCoreID(), (unsigned)AP2_DECODE_PRIORITY);
 
   while (s.rx_running) {
+    if ((++stack_diag_loops & 0xffU) == 0U) {
+      stack_diag_sample(STACK_DIAG_AP2_BUF_PROC);
+    }
     timing_snapshot_t state_snap;
     snapshot_state(&state_snap);
     bool control_play_enabled =
@@ -1124,6 +1130,7 @@ static void ap2_buffered_processor_task(void *arg) {
     need_new_block = true;
   }
 
+  stack_diag_sample(STACK_DIAG_AP2_BUF_PROC);
   if (decoder) aac_decoder_destroy(decoder);
   s.processor_task = NULL;
   vTaskDelete(NULL);
@@ -1286,13 +1293,18 @@ static void realtime_stage_task(void *arg) {
   ESP_LOGI(TAG,
            "ALAC staging: raw RTP PCM -> ordered EQ -> final PCM ring, core=%d prio=%u",
            xPortGetCoreID(), (unsigned)AP2_RT_STAGE_PRIORITY);
+  stack_diag_sample(STACK_DIAG_ALAC_STAGE);
 
   uint32_t local_generation = 0;
   uint32_t missing_cursor = 0;
   int64_t missing_since_us = 0;
+  uint32_t stack_diag_loops = 0;
   __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
 
   while (s.engine_running) {
+    if ((++stack_diag_loops & 0xffU) == 0U) {
+      stack_diag_sample(STACK_DIAG_ALAC_STAGE);
+    }
     if (!__atomic_load_n(&s.realtime_stage_running, __ATOMIC_ACQUIRE)) {
       __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
       (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -1406,6 +1418,7 @@ static void realtime_stage_task(void *arg) {
     taskEXIT_CRITICAL(&s.state_mux);
   }
 
+  stack_diag_sample(STACK_DIAG_ALAC_STAGE);
   __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
   free(pcm);
   s.realtime_stage_task = NULL;
@@ -1538,7 +1551,6 @@ static void ap2_playout_task(void *arg) {
 
   uint32_t cursor_rtp = 0; /* next block to submit after two preloaded blocks */
   uint32_t cursor_generation = 0;
-  uint32_t log_underrun_div = 0;
   int32_t volume_current_q15 = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
   playout_state_t state = PLAYOUT_STOPPED;
   int32_t servo_ppm = 0;
@@ -1550,14 +1562,16 @@ static void ap2_playout_task(void *arg) {
   double pid_prev_error_ms = 0.0;
   double pid_d_filtered_ms_s = 0.0;
   bool pid_prev_valid = false;
+  uint32_t stack_diag_loops = 0;
   s.diag.playout_state = PLAYOUT_STOPPED;
 
-  ESP_LOGI(TAG,
-           "PTP/RTP playout task started core=%d prio=%u block=%u prime=%ums",
-           xPortGetCoreID(), (unsigned)AP2_PLAYOUT_PRIORITY,
-           (unsigned)AUDIO_PLAYOUT_FRAMES, (unsigned)AP2_PLAYOUT_PRIME_MS);
+  /* Keep normal logging out of this high-priority realtime task. */
+  stack_diag_sample(STACK_DIAG_AP2_PLAYOUT);
 
   while (s.engine_running) {
+    if ((++stack_diag_loops & 0x1ffU) == 0U) {
+      stack_diag_sample(STACK_DIAG_AP2_PLAYOUT);
+    }
     if (__atomic_exchange_n(&s.playout_servo_reset_requested, false,
                             __ATOMIC_ACQ_REL)) {
       /* A codec/session boundary is stronger than a normal timeline change.
@@ -1588,9 +1602,8 @@ static void ap2_playout_task(void *arg) {
       s.diag.playout_servo_session_resets++;
       if (re != ESP_OK) {
         s.diag.playout_servo_reset_errors++;
+        /* Keep only the exceptional failure in the realtime task. */
         ESP_LOGW(TAG, "PLAYOUT SERVO RESET failed: %s", esp_err_to_name(re));
-      } else {
-        ESP_LOGI(TAG, "PLAYOUT SERVO RESET session boundary: ppm=0");
       }
     }
 
@@ -1853,10 +1866,7 @@ static void ap2_playout_task(void *arg) {
     if (!have_pcm) {
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
       s.diag.playout_underruns++;
-      if ((++log_underrun_div & 0x7fU) == 1U) {
-        ESP_LOGW(TAG, "PCM underrun rtp=%" PRIu32 " gen=%" PRIu32,
-                 cursor_rtp, snap.generation);
-      }
+      /* ap2_stats_task reports the same condition as AUDIO err U=... */
     }
     s.diag.tx_fetch_us =
         (uint32_t)((fetch_end_ptp - fetch_begin_ptp) / 1000ULL);
@@ -2002,6 +2012,7 @@ static void ap2_playout_task(void *arg) {
     }
   }
 
+  stack_diag_sample(STACK_DIAG_AP2_PLAYOUT);
   audio_playout_flush();
   free(block);
   s.playout_task = NULL;
@@ -2019,6 +2030,7 @@ static void ap2_stats_task(void *arg) {
   uint32_t stg_silence_prev = 0;
   uint32_t stg_late_prev = 0;
   unsigned idle_periods = 0;
+  unsigned stack_diag_periods = 0;
   __atomic_store_n(&s.realtime_stage_min_ahead_us, INT32_MAX, __ATOMIC_RELAXED);
   __atomic_store_n(&s.realtime_stage_wait_max_us, 0U, __ATOMIC_RELAXED);
   prev = s.diag;
@@ -2030,11 +2042,17 @@ static void ap2_stats_task(void *arg) {
   stg_silence_prev = __atomic_load_n(&s.realtime_stage_silence, __ATOMIC_RELAXED);
   stg_late_prev = __atomic_load_n(&s.realtime_stage_late_fill, __ATOMIC_RELAXED);
   ESP_LOGI(TAG, "stats session started on core %d", xPortGetCoreID());
+  stack_diag_sample(STACK_DIAG_AP2_STATS);
 
   while (s.engine_running &&
          __atomic_load_n(&s.stats_session_running, __ATOMIC_ACQUIRE)) {
     (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(AP2_STATS_PERIOD_MS));
     if (!__atomic_load_n(&s.stats_session_running, __ATOMIC_ACQUIRE)) break;
+    if (++stack_diag_periods >= 5U) {
+      stack_diag_sample(STACK_DIAG_AP2_STATS);
+      stack_diag_log();
+      stack_diag_periods = 0;
+    }
     timing_snapshot_t snap;
     snapshot_state(&snap);
     diag_stats_t now = s.diag;
@@ -2295,9 +2313,10 @@ static void ap2_stats_task(void *arg) {
     pdiag_prev = pdiag;
   }
 
+  stack_diag_sample(STACK_DIAG_AP2_STATS);
   s.stats_task = NULL;
   ESP_LOGI(TAG, "stats session stopped");
-  vTaskDelete(NULL);
+  vTaskDeleteWithCaps(NULL);
 }
 
 static void stats_session_stop(void) {
@@ -2318,9 +2337,10 @@ static void stats_session_start(void) {
     if (s.stats_task) return;
   }
   __atomic_store_n(&s.stats_session_running, true, __ATOMIC_RELEASE);
-  if (xTaskCreatePinnedToCore(ap2_stats_task, "ap2_stats", AP2_STATS_STACK,
-                              NULL, AP2_STATS_PRIORITY, &s.stats_task,
-                              AP2_NETWORK_CORE) != pdPASS) {
+  if (xTaskCreatePinnedToCoreWithCaps(
+          ap2_stats_task, "ap2_stats", AP2_STATS_STACK, NULL,
+          AP2_STATS_PRIORITY, &s.stats_task, AP2_NETWORK_CORE,
+          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
     s.stats_task = NULL;
     __atomic_store_n(&s.stats_session_running, false, __ATOMIC_RELEASE);
     ESP_LOGW(TAG,
@@ -2404,6 +2424,10 @@ esp_err_t audio_receiver_init(void) {
                               &s.playout_task, AP2_DECODE_CORE) != pdPASS) {
     return ESP_FAIL;
   }
+  ESP_LOGI(TAG,
+           "PTP/RTP playout task started core=%d prio=%u block=%u prime=%ums",
+           AP2_DECODE_CORE, (unsigned)AP2_PLAYOUT_PRIORITY,
+           (unsigned)AUDIO_PLAYOUT_FRAMES, (unsigned)AP2_PLAYOUT_PRIME_MS);
   if (xTaskCreatePinnedToCore(realtime_stage_task, "alac_stage",
                               AP2_RT_STAGE_STACK, NULL, AP2_RT_STAGE_PRIORITY,
                               &s.realtime_stage_task, AP2_DECODE_CORE) != pdPASS) {

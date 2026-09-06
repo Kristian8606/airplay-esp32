@@ -8,6 +8,7 @@
 
 #include "log_stream.h"
 #include "spiram_task.h"
+#include "stack_diag.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -73,8 +74,12 @@ static size_t ring_read(char *buf, size_t max) {
 /* ------------------------------------------------------------------ */
 
 static int log_vprintf_hook(const char *fmt, va_list args) {
-  /* Always print to UART first. */
-  int ret = s_orig_vprintf(fmt, args);
+  /* A va_list may be consumed by vprintf. Give UART its own copy so the
+   * original list remains valid for the WebSocket copy below. */
+  va_list uart_args;
+  va_copy(uart_args, args);
+  int ret = s_orig_vprintf(fmt, uart_args);
+  va_end(uart_args);
 
   /* Format into a stack buffer and push to ring. */
   char buf[256];
@@ -137,9 +142,14 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
 static void broadcast_task(void *arg) {
   (void)arg;
   char buf[MAX_SEND_CHUNK];
+  uint32_t stack_diag_loops = 0;
+  stack_diag_sample(STACK_DIAG_LOG_WS);
 
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(BROADCAST_INTERVAL_MS));
+    if ((++stack_diag_loops % 50U) == 0U) {
+      stack_diag_sample(STACK_DIAG_LOG_WS);
+    }
 
     /* Discover active WebSocket sessions fresh each tick.  No connect-time
      * registration (see ws_log_handler) and no stale-fd list: a client

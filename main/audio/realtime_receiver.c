@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "network/socket_utils.h"
 #include "network/ptp_clock.h"
+#include "stack_diag.h"
 
 #define RT_PACKET_MAX             8192U
 #define RT_PCM_CAPACITY_FRAMES    4096U
@@ -27,8 +28,8 @@
  * receives D7/PT84 and forwards RTX into the same worker queue. ALAC_WORK is
  * the sole owner of decrypt + ALAC decoder state. RESEND owns missing state. */
 #define RT_DATA_RX_STACK          4096U
-#define RT_CTRL_RX_STACK          6144U
-#define RT_WORK_STACK             8192U
+#define RT_CTRL_RX_STACK          4096U
+#define RT_WORK_STACK             6144U
 #define RT_RESEND_STACK           4096U
 #define RT_DATA_RX_PRIORITY       7
 #define RT_CTRL_RX_PRIORITY       6
@@ -793,10 +794,14 @@ done:
 
 static void data_rx_task(void *arg) {
   (void)arg;
+  uint32_t stack_diag_loops = 0;
   ESP_LOGI(TAG, "DATA_RX started core=%d prio=%d pool=%u",
            xPortGetCoreID(), RT_DATA_RX_PRIORITY, (unsigned)RT_DATA_POOL_SLOTS);
 
   while (s_rt.running) {
+    if ((++stack_diag_loops & 0x1ffU) == 0U) {
+      stack_diag_sample(STACK_DIAG_ALAC_DATA);
+    }
     rt_packet_slot_t *slot = NULL;
     if (xQueueReceive(s_rt.data_free_q, &slot, pdMS_TO_TICKS(20)) != pdTRUE ||
         !slot) {
@@ -841,15 +846,20 @@ static void data_rx_task(void *arg) {
     }
   }
 
+  stack_diag_sample(STACK_DIAG_ALAC_DATA);
   s_rt.data_task = NULL;
   vTaskDelete(NULL);
 }
 
 static void control_rx_task(void *arg) {
   (void)arg;
+  uint32_t stack_diag_loops = 0;
   ESP_LOGI(TAG, "CTRL_RX started core=%d prio=%d rtx_pool=%u",
            xPortGetCoreID(), RT_CTRL_RX_PRIORITY, (unsigned)RT_RTX_POOL_SLOTS);
   while (s_rt.running && s_rt.control_sock >= 0) {
+    if ((++stack_diag_loops & 0x3fU) == 0U) {
+      stack_diag_sample(STACK_DIAG_ALAC_CTRL);
+    }
     const ssize_t n = recv(s_rt.control_sock, s_rt.control_packet, RT_PACKET_MAX, 0);
     if (n <= 0) {
       if (!s_rt.running) break;
@@ -865,6 +875,7 @@ static void control_rx_task(void *arg) {
     }
     process_control_packet(s_rt.control_packet, (size_t)n);
   }
+  stack_diag_sample(STACK_DIAG_ALAC_CTRL);
   s_rt.control_task = NULL;
   vTaskDelete(NULL);
 }
@@ -888,6 +899,7 @@ static void worker_note_gap(uint32_t previous_ext, uint32_t current_ext,
 
 static void alac_worker_task(void *arg) {
   (void)arg;
+  uint32_t stack_diag_loops = 0;
   alac_decoder_config_t dcfg = {
       .sample_rate = s_rt.cfg.format.sample_rate,
       .channels = s_rt.cfg.format.channels,
@@ -914,6 +926,9 @@ static void alac_worker_task(void *arg) {
            (unsigned)RT_RTX_POOL_SLOTS);
 
   while (s_rt.running || (s_rt.work_q && uxQueueMessagesWaiting(s_rt.work_q) != 0U)) {
+    if ((++stack_diag_loops & 0x1ffU) == 0U) {
+      stack_diag_sample(STACK_DIAG_ALAC_WORK);
+    }
     rt_packet_slot_t *slot = NULL;
     if (xQueueReceive(s_rt.work_q, &slot, pdMS_TO_TICKS(20)) != pdTRUE || !slot) {
       continue;
@@ -988,6 +1003,7 @@ static void alac_worker_task(void *arg) {
     release_packet_slot(slot);
   }
 
+  stack_diag_sample(STACK_DIAG_ALAC_WORK);
   alac_decoder_destroy(decoder);
   s_rt.worker_task = NULL;
   vTaskDelete(NULL);
@@ -1002,6 +1018,7 @@ static void resend_task(void *arg) {
            (unsigned)RT_RESEND_FIRST_MS, (unsigned)RT_RESEND_RETRY_MS,
            (unsigned)RT_RESEND_LAST_REQUEST_MS,
            (unsigned)RT_FINAL_LOSS_MARGIN_MS);
+  stack_diag_sample(STACK_DIAG_ALAC_RESEND);
   while (s_rt.running) {
     rt_resend_event_t ev = {0};
     const TickType_t wait_ticks =
@@ -1028,9 +1045,11 @@ static void resend_task(void *arg) {
     if (s_rt.active_missing_count != 0U) {
       resend_scan_due();
     }
+    stack_diag_sample(STACK_DIAG_ALAC_RESEND);
 
   }
 
+  stack_diag_sample(STACK_DIAG_ALAC_RESEND);
   s_rt.resend_task = NULL;
   vTaskDelete(NULL);
 }
