@@ -474,7 +474,7 @@ static bool deferred_flush_should_drop(uint32_t seq, uint32_t rtp) {
   bool drop = false;
   struct {
     uint32_t index;
-    uint32_t event; /* 1=activate, 2=until, 3=overshoot */
+    uint32_t event; /* 1=activate, 2=until, 3=overshoot, 4=skipped-range */
     uint32_t from_seq;
     uint32_t from_rtp;
     uint32_t until_seq;
@@ -492,7 +492,15 @@ static bool deferred_flush_should_drop(uint32_t seq, uint32_t rtp) {
     ap2_flush_request_t *r = &s.deferred_flush[i];
     if (!r->in_use) continue;
 
-    if (!r->active && seq == r->from_seq && seq != r->until_seq) {
+    const int32_t from_delta = seq23_delta(seq, r->from_seq);
+    const int32_t until_delta = seq23_delta(seq, r->until_seq);
+
+    /* A delayed FLUSH is a transport range, not an equality rendezvous.
+     * Normally the sender delivers from_seq exactly. If Automix jumps over
+     * that value but lands inside the advertised range, start dropping from
+     * the first block we actually received instead of leaving the request
+     * permanently inactive. */
+    if (!r->active && from_delta >= 0 && until_delta < 0) {
       r->active = true;
       if (event_count < AP2_MAX_DEFERRED_FLUSH) {
         events[event_count].index = i;
@@ -505,8 +513,16 @@ static bool deferred_flush_should_drop(uint32_t seq, uint32_t rtp) {
       }
     }
 
-    if (seq == r->until_seq || seq23_delta(seq, r->until_seq) > 0) {
-      const uint32_t event = seq == r->until_seq ? 2U : 3U;
+    if (until_delta >= 0) {
+      /* If from_seq was never observed and transport jumped straight to (or
+       * beyond) until_seq, the boundary block is exactly the block that used
+       * to pin the AAC processor as a multi-second future current_block.
+       * Consume that one anomalous boundary block as part of recovery so the
+       * processor can immediately inspect the following transport block.
+       * Normal FLUSH endpoints are unchanged. */
+      const bool skipped_range = !r->active && from_delta > 0;
+      const uint32_t event =
+          skipped_range ? 4U : (until_delta == 0 ? 2U : 3U);
       if (event_count < AP2_MAX_DEFERRED_FLUSH) {
         events[event_count].index = i;
         events[event_count].event = event;
@@ -520,6 +536,9 @@ static bool deferred_flush_should_drop(uint32_t seq, uint32_t rtp) {
         events[event_count].last_drop_seq = r->diag_last_drop_seq;
         events[event_count].last_drop_rtp = r->diag_last_drop_rtp;
         event_count++;
+      }
+      if (skipped_range) {
+        drop = true;
       }
       r->active = false;
       r->in_use = false;
@@ -545,6 +564,15 @@ static bool deferred_flush_should_drop(uint32_t seq, uint32_t rtp) {
                "DFLUSH activate idx=%" PRIu32 " seq=%" PRIu32
                " rtp=%" PRIu32 " req_seq=%" PRIu32 "..%" PRIu32
                " req_rtp=%" PRIu32 "..%" PRIu32,
+               events[i].index, seq, rtp, events[i].from_seq,
+               events[i].until_seq, events[i].from_rtp, events[i].until_rtp);
+    } else if (events[i].event == 4U) {
+      ESP_LOGW(TAG,
+               "DFLUSH skipped-range idx=%" PRIu32
+               " seq=%" PRIu32 " rtp=%" PRIu32
+               " req_seq=%" PRIu32 "..%" PRIu32
+               " req_rtp=%" PRIu32 "..%" PRIu32
+               " boundary_drop=1",
                events[i].index, seq, rtp, events[i].from_seq,
                events[i].until_seq, events[i].from_rtp, events[i].until_rtp);
     } else {
