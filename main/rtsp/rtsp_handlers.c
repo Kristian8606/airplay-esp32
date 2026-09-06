@@ -28,7 +28,6 @@
 #include "tlv8.h"
 
 #include "rtsp_events.h"
-#include "stack_diag.h"
 
 static const char *TAG = "rtsp_handlers";
 
@@ -239,14 +238,9 @@ static bool start_audio_receiver_or_fail(int socket, rtsp_conn_t *conn,
 // Event port task - handles AirPlay 2 session persistence
 static void event_port_task(void *pvParameters) {
   int listen_socket = (int)(intptr_t)pvParameters;
-  uint32_t stack_diag_loops = 0;
   event_listen_socket = listen_socket;
 
-  stack_diag_sample(STACK_DIAG_EVENT_PORT);
   while (!event_task_should_stop && listen_socket >= 0) {
-    if ((++stack_diag_loops % 5U) == 0U) {
-      stack_diag_sample(STACK_DIAG_EVENT_PORT);
-    }
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(listen_socket, &read_fds);
@@ -295,9 +289,6 @@ static void event_port_task(void *pvParameters) {
 
       // Monitor connection for disconnection
       while (event_client_socket >= 0 && !event_task_should_stop) {
-        if ((++stack_diag_loops % 5U) == 0U) {
-          stack_diag_sample(STACK_DIAG_EVENT_PORT);
-        }
         fd_set cfds;
         FD_ZERO(&cfds);
         FD_SET(event_client_socket, &cfds);
@@ -328,7 +319,6 @@ static void event_port_task(void *pvParameters) {
     close(event_client_socket);
     event_client_socket = -1;
   }
-  stack_diag_sample(STACK_DIAG_EVENT_PORT);
   event_listen_socket = -1;
   event_task_handle = NULL;
   vTaskDelete(NULL);

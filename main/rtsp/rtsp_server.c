@@ -21,7 +21,6 @@
 
 #include "ptp_clock.h"
 #include "rtsp_events.h"
-#include "stack_diag.h"
 
 static const char *TAG = "rtsp_server";
 
@@ -187,7 +186,6 @@ static void client_task(void *pvParameters) {
   }
 
   size_t buf_len = 0;
-  uint32_t stack_diag_messages = 0;
 
   // Socket timeout for stop signal responsiveness
   struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
@@ -229,9 +227,6 @@ static void client_task(void *pvParameters) {
 
         buf_len += (size_t)block_len;
         process_rtsp_buffer(slot, buffer, &buf_len);
-        if ((++stack_diag_messages & 0x0fU) == 0U) {
-          stack_diag_sample(STACK_DIAG_RTSP_CLIENT);
-        }
       }
       goto cleanup;
     }
@@ -261,13 +256,9 @@ static void client_task(void *pvParameters) {
     }
     buf_len += (size_t)recv_len;
     process_rtsp_buffer(slot, buffer, &buf_len);
-    if ((++stack_diag_messages & 0x0fU) == 0U) {
-      stack_diag_sample(STACK_DIAG_RTSP_CLIENT);
-    }
   }
 
 cleanup:
-  stack_diag_sample(STACK_DIAG_RTSP_CLIENT);
   ESP_LOGI(TAG, "Client slot %d disconnected", slot_idx);
   free(buffer);
   close(slot->socket);
@@ -358,7 +349,6 @@ static void server_task(void *pvParameters) {
 
   ESP_LOGI(TAG, "RTSP server listening on port %d", RTSP_PORT);
   server_running = true;
-  stack_diag_sample(STACK_DIAG_RTSP_SERVER);
 
   while (server_running) {
     int new_socket = accept(server_socket, (struct sockaddr *)&client_addr,
@@ -414,7 +404,6 @@ static void server_task(void *pvParameters) {
     } else {
       current_slot = new_slot;
     }
-    stack_diag_sample(STACK_DIAG_RTSP_SERVER);
   }
 
   // Stop all clients
@@ -434,7 +423,6 @@ static void server_task(void *pvParameters) {
     server_socket = -1;
   }
 
-  stack_diag_sample(STACK_DIAG_RTSP_SERVER);
   server_task_handle = NULL;
   vTaskDelete(NULL);
 }

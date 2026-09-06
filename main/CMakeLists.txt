@@ -1,7 +1,6 @@
 set(SRC_FILES
     "main.c"
     "settings.c"
-    "stack_diag.c"
     "led.c"
     "audio/audio_receiver.c"
     "audio/ap2_buffered_transport.c"

@@ -14,7 +14,6 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "network/socket_utils.h"
-#include "stack_diag.h"
 
 #define AP2_TCP_READ_CHUNK 4096U
 
@@ -85,7 +84,6 @@ static bool fifo_write_all(ap2_buffered_transport_t *t, const uint8_t *src,
 
 static void tcp_reader_task(void *arg) {
   ap2_buffered_transport_t *t = (ap2_buffered_transport_t *)arg;
-  uint32_t stack_diag_loops = 0;
   uint8_t *scratch = heap_caps_malloc(AP2_TCP_READ_CHUNK,
                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!scratch) scratch = malloc(AP2_TCP_READ_CHUNK);
@@ -135,9 +133,6 @@ static void tcp_reader_task(void *arg) {
     ESP_LOGI(TAG, "buffered TCP connected rcvbuf=%d", rcvbuf);
 
     while (t->running) {
-      if ((++stack_diag_loops & 0x7fU) == 0U) {
-        stack_diag_sample(STACK_DIAG_AP2_TCP_READER);
-      }
       /* Do not read from TCP while our bounded FIFO is full. This is the
        * AirPlay-2 backpressure point: the sender is throttled by the TCP
        * receive window instead of dropping future audio. */
@@ -173,7 +168,6 @@ static void tcp_reader_task(void *arg) {
     ESP_LOGI(TAG, "buffered TCP disconnected");
   }
 
-  stack_diag_sample(STACK_DIAG_AP2_TCP_READER);
   free(scratch);
   t->reader_task = NULL;
   vTaskDelete(NULL);

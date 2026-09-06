@@ -8,7 +8,6 @@
 
 #include "log_stream.h"
 #include "spiram_task.h"
-#include "stack_diag.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -142,14 +141,9 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
 static void broadcast_task(void *arg) {
   (void)arg;
   char buf[MAX_SEND_CHUNK];
-  uint32_t stack_diag_loops = 0;
-  stack_diag_sample(STACK_DIAG_LOG_WS);
 
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(BROADCAST_INTERVAL_MS));
-    if ((++stack_diag_loops % 50U) == 0U) {
-      stack_diag_sample(STACK_DIAG_LOG_WS);
-    }
 
     /* Discover active WebSocket sessions fresh each tick.  No connect-time
      * registration (see ws_log_handler) and no stale-fd list: a client
