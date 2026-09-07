@@ -79,10 +79,14 @@ void rtsp_server_request_resume(void) {
 static uint8_t *grow_buffer(uint8_t *old_buf, size_t old_size, size_t new_size,
                             size_t data_len) {
   (void)old_size;
+  /* Keep one guard byte beyond the logical receive capacity.
+   * process_rtsp_buffer() temporarily writes buffer[total_len] = '\0'; when
+   * a request exactly fills the logical buffer this sentinel must still be
+   * inside the allocation. */
   uint8_t *new_buf =
-      heap_caps_malloc(new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      heap_caps_malloc(new_size + 1U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!new_buf) {
-    new_buf = malloc(new_size);
+    new_buf = malloc(new_size + 1U);
   }
   if (!new_buf) {
     return NULL;
@@ -127,7 +131,8 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     }
 
     // Null-terminate so strcasestr in parse_raw_header won't read past
-    // the message boundary (buffer capacity > total_len).
+    // the message boundary. The allocation always has one guard byte beyond
+    // the logical receive capacity, including the exact-capacity case.
     uint8_t saved = buffer[total_len];
     buffer[total_len] = '\0';
     rtsp_dispatch(slot->socket, slot->conn, buffer, total_len);
@@ -173,7 +178,8 @@ static void client_task(void *pvParameters) {
 
   // Allocate buffer
   size_t buf_capacity = RTSP_BUFFER_INITIAL;
-  uint8_t *buffer = malloc(buf_capacity);
+  /* +1 guard byte for the temporary RTSP message terminator. */
+  uint8_t *buffer = malloc(buf_capacity + 1U);
   if (!buffer) {
     ESP_LOGE(TAG, "Failed to allocate buffer");
     rtsp_conn_free(conn);

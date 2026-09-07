@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -325,7 +326,7 @@ static void mark_timeline_discontinuity(void) {
   s.rt_media_rebase_bias_ns = 0;
   taskEXIT_CRITICAL(&s.state_mux);
   realtime_stage_kick();
-  s.i2s_flush_requested = true;
+  __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
 }
 
 static uint32_t commit_anchor_epoch_locked(void) {
@@ -503,6 +504,67 @@ static void diag_large_media_gap(
            ts.invalidation_rules, generation);
 }
 
+static void diag_media_cursor_snapshot(
+    const char *reason, uint32_t wanted, uint32_t expected_rtp,
+    uint32_t expected_seq, bool expected_valid, uint32_t frame_samples,
+    int32_t max_lead_samples, int sample_rate, uint32_t generation) {
+  if (!s.transport) return;
+
+  ap2_buffered_transport_media_diag_t d = {0};
+  ap2_buffered_transport_get_media_diag(
+      s.transport, wanted, expected_rtp, expected_seq, expected_valid,
+      frame_samples, max_lead_samples, &d);
+
+  const int sr = sample_rate > 0 ? sample_rate : 44100;
+  const int32_t prev_ms =
+      d.nearest_before_valid
+          ? (int32_t)(((int64_t)d.nearest_before_delta * 1000LL) / sr)
+          : INT32_MIN;
+  const int32_t next_ms =
+      d.nearest_after_valid
+          ? (int32_t)(((int64_t)d.nearest_after_delta * 1000LL) / sr)
+          : INT32_MAX;
+  ESP_LOGW(TAG,
+           "CSTORE DIAG %s gen=%" PRIu32 " wanted=%" PRIu32
+           " expected=%" PRIu32 "/%" PRIu32
+           " ready=%" PRIu32 " stale=%" PRIu32 " overlap=%" PRIu32
+           " fwd=%" PRIu32 " future=%" PRIu32
+           " X=%" PRIu32 " I=%" PRIu32 " W=%" PRIu32
+           " exact=%" PRIu32 "/%" PRIu32 "/%" PRIu32
+           " rule=%u",
+           reason, generation, wanted, expected_seq, expected_rtp,
+           d.ready_total, d.ready_stale, d.ready_overlap,
+           d.ready_forward_window, d.ready_future, d.decoding_total,
+           d.invalid_total, d.writing_total,
+           expected_valid ? d.exact_expected_rtp_ready : 0U,
+           expected_valid ? d.exact_expected_rtp_decoding : 0U,
+           expected_valid ? d.exact_expected_rtp_invalid : 0U,
+           expected_valid && d.expected_seq_invalid_by_rule ? 1U : 0U);
+
+  /* Keep the rare deep diagnostic to one additional UART line. Logging is
+   * synchronous on the target, so the previous six-line dump could itself
+   * consume tens of milliseconds on the realtime decode task. */
+  ESP_LOGW(TAG,
+           "CSTORE DIAG near prev=%" PRIu32 "/%" PRIu32 "/%" PRId32
+           "ms next=%" PRIu32 "/%" PRIu32 "/%" PRId32
+           "ms tcp=%" PRIu32 "/%" PRIu32
+           " rules=%" PRIu32 "/%" PRIu32 " free=%" PRIu32 "/%" PRIu32,
+           d.nearest_before_valid ? d.nearest_before_seq : 0U,
+           d.nearest_before_valid ? d.nearest_before_rtp : 0U, prev_ms,
+           d.nearest_after_valid ? d.nearest_after_seq : 0U,
+           d.nearest_after_valid ? d.nearest_after_rtp : 0U, next_ms,
+           d.transport_last_valid ? d.transport_last_seq : 0U,
+           d.transport_last_valid ? d.transport_last_rtp : 0U,
+           d.invalidation_rules, d.invalidation_rule_capacity,
+           d.free_packet_slots, d.free_pages);
+
+  if (expected_valid && d.expected_rule_is_range) {
+    ESP_LOGW(TAG,
+             "CSTORE DIAG expected FLUSH=[%" PRIu32 ",%" PRIu32 ")",
+             d.expected_rule_from_seq, d.expected_rule_until_seq);
+  }
+}
+
 static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
                                   int sample_rate) {
   /* This is the codec boundary: AAC and ALAC are fully independent up to
@@ -551,6 +613,7 @@ static void ap2_buffered_processor_task(void *arg) {
   bool play_enabled = false;
   uint64_t packets_published_total = 0;
   uint32_t cursor_log_generation = 0;
+  int64_t last_media_miss_diag_us = 0;
 
   /* EQ/AAC history belongs to media chronology, not to the PTP presentation
    * epoch.  Start a fresh codec-session history once here; later resets happen
@@ -637,6 +700,12 @@ static void ap2_buffered_processor_task(void *arg) {
                    " gen=%" PRIu32,
                    expected_timestamp, wanted, expected_from_wanted,
                    snap.generation);
+          /* Do not run the full descriptor-pool diagnostic snapshot here.
+           * This task owns the AAC decode path on CPU0; synchronous UART logs
+           * plus the full scan can advance the live playhead by multiple AAC
+           * frames and turn one legitimate cursor correction into a reset
+           * storm. The compact MEDIA_CURSOR line above is enough on this hot
+           * path. Deep diagnostics remain available for a real acquire miss. */
           if (decoder && !aac_decoder_reset(decoder)) {
             aac_decoder_destroy(decoder);
             decoder = NULL;
@@ -653,6 +722,24 @@ static void ap2_buffered_processor_task(void *arg) {
       if (!ap2_buffered_transport_acquire_media_next(
               s.transport, wanted, expected_timestamp, have_decoded_sequence,
               frame_samples, max_lead, &pkt)) {
+        /* An exact continuation just beyond max_lead is normal pacing, not a
+         * media hole. The transport now detects that case in O(1) average and
+         * returns without a fallback scan. Suppress the heavyweight snapshot
+         * until the expected position is actually inside the active window;
+         * otherwise the diagnostic itself becomes periodic realtime load. */
+        const int32_t expected_lead =
+            have_decoded_sequence ? rtp_delta(expected_timestamp, wanted) : 0;
+        const bool normal_early_wait =
+            have_decoded_sequence && expected_lead > max_lead;
+        const int64_t now_us = esp_timer_get_time();
+        if (!normal_early_wait &&
+            now_us - last_media_miss_diag_us >= 5000000LL) {
+          last_media_miss_diag_us = now_us;
+          diag_media_cursor_snapshot(
+              "acquire-miss", wanted, expected_timestamp, expected_seq,
+              have_decoded_sequence, frame_samples, max_lead, sr,
+              snap.generation);
+        }
         break;
       }
       made_progress = true;
@@ -838,6 +925,17 @@ static void ap2_buffered_processor_task(void *arg) {
 
       if (pcm_store_with_backpressure(pkt.rtp, s.decode_pcm, (size_t)frames,
                                       info.channels, snap.pcm_generation)) {
+        /* A FLUSH may invalidate the DECODING packet after the pre-publication
+         * check but before PCM becomes visible. Re-check after publication; if
+         * control won that race, remove exactly the block we just published. */
+        if (ap2_buffered_transport_ref_is_invalid(s.transport, &pkt)) {
+          pcm_rtp_ring_invalidate_range(s.pcm_ring, pkt.rtp,
+                                        pkt.rtp + (uint32_t)frames,
+                                        snap.pcm_generation);
+          s.diag.timeline_drop++;
+          ap2_buffered_transport_release(s.transport, &pkt);
+          continue;
+        }
         s.diag.decoded++;
         s.public_stats.packets_decoded++;
         packets_published_total++;
@@ -1320,8 +1418,7 @@ static void ap2_playout_task(void *arg) {
       }
     }
 
-    if (s.i2s_flush_requested) {
-      s.i2s_flush_requested = false;
+    if (__atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL)) {
       audio_playout_flush();
       s.diag.dma_pipeline_blocks = 0;
       s.diag.output_sync_valid = false;
@@ -1429,7 +1526,8 @@ static void ap2_playout_task(void *arg) {
       snapshot_state(&after_wait);
       if (!after_wait.playing || !after_wait.anchor_valid ||
           after_wait.timeline_reset_pending ||
-          after_wait.generation != snap.generation || s.i2s_flush_requested ||
+          after_wait.generation != snap.generation ||
+          __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
           !timing_clock_ready(&after_wait) ||
           (snap.stream_type == AUDIO_STREAM_REALTIME &&
            (after_wait.anchor_local_ns != snap.anchor_local_ns ||
@@ -1512,7 +1610,8 @@ static void ap2_playout_task(void *arg) {
       snapshot_state(&align_snap);
       if (!align_snap.playing || !align_snap.anchor_valid ||
           align_snap.timeline_reset_pending ||
-          align_snap.generation != snap.generation || s.i2s_flush_requested ||
+          align_snap.generation != snap.generation ||
+          __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
           !timing_clock_ready(&align_snap) ||
           (snap.stream_type == AUDIO_STREAM_REALTIME &&
            (align_snap.anchor_local_ns != snap.anchor_local_ns ||
@@ -2004,20 +2103,24 @@ static void ap2_stats_task(void *arg) {
       if (now.playout_state == 2 && now.output_sync_valid) {
         ESP_LOGI(TAG,
                  "AAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32
-                 " pcm=%dms cstore=%u/%uK R=%" PRIu32
-                 " I=%" PRIu32,
+                 " pcm=%dms cstore=%u/%uK P=%uK R=%" PRIu32
+                 " I=%" PRIu32 " G=%" PRIu64,
                  sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
                  (unsigned)(transport.store_allocated_bytes / 1024U),
-                 (unsigned)(store_capacity / 1024U), transport.packets_ready,
-                 transport.packets_invalid);
+                 (unsigned)(store_capacity / 1024U),
+                 (unsigned)(transport.store_payload_bytes / 1024U),
+                 transport.packets_ready, transport.packets_invalid,
+                 transport.stale_ready_reaped);
       } else {
         ESP_LOGI(TAG,
-                 "AAC sync=-- pcm=%dms cstore=%u/%uK R=%" PRIu32
-                 " I=%" PRIu32 " | %s",
+                 "AAC sync=-- pcm=%dms cstore=%u/%uK P=%uK R=%" PRIu32
+                 " I=%" PRIu32 " G=%" PRIu64 " | %s",
                  pcm_ahead_ms,
                  (unsigned)(transport.store_allocated_bytes / 1024U),
-                 (unsigned)(store_capacity / 1024U), transport.packets_ready,
-                 transport.packets_invalid,
+                 (unsigned)(store_capacity / 1024U),
+                 (unsigned)(transport.store_payload_bytes / 1024U),
+                 transport.packets_ready, transport.packets_invalid,
+                 transport.stale_ready_reaped,
                  now.playout_state == 1 ? "PRIME" : "STOP");
       }
     }
@@ -2228,6 +2331,11 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
   realtime_stage_stop_and_wait();
   if (!s.transport) return ESP_ERR_INVALID_STATE;
   if (s.rx_running) return ESP_OK;
+  if (s.processor_task) {
+    ESP_LOGE(TAG,
+             "buffered processor from previous session is still active; refusing duplicate task");
+    return ESP_ERR_INVALID_STATE;
+  }
 
   /* New buffered codec session: both compressed and decoded media storage are
    * hard-reset. This is deliberately stronger than a seek/anchor change. */
@@ -2350,6 +2458,10 @@ void audio_receiver_stop(void) {
   for (int i = 0; s.processor_task && i < 100; ++i) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
+  if (s.processor_task) {
+    ESP_LOGE(TAG,
+             "buffered processor did not stop within shutdown window; next buffered start will be rejected");
+  }
 
   if (s.transport) {
     ap2_buffered_transport_clear(s.transport);
@@ -2429,7 +2541,7 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
    * the validated RTP<->presentation map. The normal playout task re-primes
    * against the same sender timeline and waits until desired_rtp reaches
    * flush_rtp. */
-  s.i2s_flush_requested = true;
+  __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
   if (old_cursor_valid) {
     ESP_LOGI(TAG,
              "REALTIME FLUSH preserve timing rtp=%" PRIu32
@@ -2475,9 +2587,12 @@ void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts
   ESP_LOGI(TAG,
            "CSTORE FLUSH_RANGE seq=[%" PRIu32 ",%" PRIu32 ")"
            " rtp=[%" PRIu32 ",%" PRIu32 ") invalid_now=%" PRIu32
-           " rules=%" PRIu32,
+           " rules=%" PRIu32 "/%" PRIu32 " retired=%" PRIu64
+           " grows=%" PRIu64 " allocfail=%" PRIu64,
            from_seq, until_seq, from_ts, until_ts, compressed_invalidated,
-           ts.invalidation_rules);
+           ts.invalidation_rules, ts.invalidation_rule_capacity,
+           ts.invalidation_rules_retired, ts.invalidation_rule_grows,
+           ts.invalidation_rule_alloc_failures);
 }
 
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
@@ -2596,6 +2711,12 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_set_local_us = esp_timer_get_time();
   s.anchor_set_generation = gen;
   taskEXIT_CRITICAL(&s.state_mux);
+  if (s.transport) {
+    /* The writer-side stale READY GC hint belongs to the previous playhead.
+     * Drop it at every anchor update; the buffered processor installs the
+     * current wanted RTP on its next acquire attempt. */
+    ap2_buffered_transport_reset_media_floor(s.transport);
+  }
   if (committed && s.transport) {
     /* Rules describe the previous control timeline. Matching packets already
      * marked INVALID stay invalid; only the rule table is retired so new
