@@ -36,12 +36,43 @@ static esp_timer_handle_t s_retry_timer = NULL;
 
 // Saved AP config from init, used to re-enable AP without duplication
 static wifi_config_t s_ap_config;
+/* DHCP option 114 points clients directly at the setup portal. The DHCP
+ * server keeps this pointer, so the URI must live for the lifetime of AP. */
+static char s_captive_portal_uri[32];
 
 static bool wifi_select_best_saved_network(void);
 static void scan_and_connect_task(void *arg);
 static esp_err_t wifi_collect_scan_results(bool show_hidden,
                                            wifi_ap_record_t **ap_list,
                                            uint16_t *ap_count);
+
+static void configure_ap_captive_portal(void) {
+  if (!s_ap_netif) return;
+
+  esp_netif_ip_info_t ip_info = {0};
+  esp_err_t err = esp_netif_get_ip_info(s_ap_netif, &ip_info);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to get setup AP IP: %s", esp_err_to_name(err));
+    return;
+  }
+
+  snprintf(s_captive_portal_uri, sizeof(s_captive_portal_uri),
+           "http://" IPSTR "/", IP2STR(&ip_info.ip));
+
+  /* Configure before Wi-Fi/AP start while DHCPS is stopped. This is the
+   * standards-based captive portal advertisement (DHCP option 114); the
+   * existing wildcard DNS redirect remains as a compatibility fallback. */
+  err = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                               ESP_NETIF_CAPTIVEPORTAL_URI,
+                               s_captive_portal_uri,
+                               strlen(s_captive_portal_uri));
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to set DHCP captive portal URI: %s",
+             esp_err_to_name(err));
+  } else {
+    ESP_LOGI(TAG, "DHCP captive portal URI: %s", s_captive_portal_uri);
+  }
+}
 
 static void sanitize_hostname(const char *name, char *out, size_t out_len) {
   size_t j = 0;
@@ -110,6 +141,7 @@ static void enable_ap_mode(void) {
     if (!s_ap_netif) {
       s_ap_netif = esp_netif_create_default_wifi_ap();
     }
+    configure_ap_captive_portal();
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &s_ap_config);
   }
@@ -369,6 +401,7 @@ void wifi_init_apsta(const char *ap_ssid, const char *ap_password) {
   if (!s_ap_netif) {
     s_ap_netif = esp_netif_create_default_wifi_ap();
   }
+  configure_ap_captive_portal();
 
   // Configure AP and save for later re-enable. STA credentials are selected
   // only after the boot scan has compared all saved networks.

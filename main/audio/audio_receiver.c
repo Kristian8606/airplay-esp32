@@ -42,7 +42,6 @@
 #define AP2_RT_STAGE_PRIORITY      7
 #define AP2_PCM_CAPACITY_FRAMES    4096U
 #define AP2_STATS_PERIOD_MS        2000U
-#define AP2_FIRST_DECODE_LOGS      3U
 
 #define AP2_PID_CALC_PERIOD_US    1000000LL  /* PID math at 1 Hz */
 #define AP2_PID_TUNE_PERIOD_US    5000000LL  /* physical I2S retune <= 0.2 Hz */
@@ -75,13 +74,13 @@
 #define AP2_PID_D_ALPHA                  0.20
 #define AP2_PID_I_TERM_LIMIT_PPM       110.0
 #define AP2_PCM_TARGET_MS           1000U
-#define AP2_PLAYOUT_PRIME_MS         500U
 #define AP2_REALTIME_PRIME_MS        100U
 #define AP2_RT_GM_REBASE_SETTLE_MS  1000U
-#define AP2_BUFFERED_FIFO_REQUEST_BYTES AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES
+#define AP2_BUFFERED_STORE_REQUEST_BYTES AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES
 #define AP2_BUFFERED_LEAD_MS       (AP2_PCM_TARGET_MS + 100U)
-#define AP2_MAX_DEFERRED_FLUSH     10U
-#define AP2_DECODE_IDLE_TICKS       1U
+#define AP2_CSTORE_DECODE_BURST          8U
+#define AP2_CSTORE_REORDER_GUARD_MS    300U
+#define AP2_DECODE_IDLE_TICKS            1U
 
 /* ALAC reorder release point. Missing PCM stays absent in the raw RTP ring
  * while retransmission runs independently. Only when the physical PTP
@@ -94,37 +93,16 @@ static const char *TAG = "audio_shairport";
 static volatile int32_t s_volume_target_q15 = 32768;
 
 typedef struct {
-  bool in_use;
-  bool active;
-  uint32_t from_seq;
-  uint32_t from_rtp;
-  uint32_t until_seq;
-  uint32_t until_rtp;
-  /* Diagnostic-only counters for one deferred request. They never influence
-   * FLUSH decisions; they let a hardware log prove exactly what transport
-   * blocks were discarded between the sender's advertised endpoints. */
-  uint32_t diag_drop_count;
-  uint32_t diag_first_drop_seq;
-  uint32_t diag_first_drop_rtp;
-  uint32_t diag_last_drop_seq;
-  uint32_t diag_last_drop_rtp;
-} ap2_flush_request_t;
-
-typedef struct {
   bool anchor_valid;
   bool playing;
   uint64_t anchor_ptp_ns;
   uint64_t anchor_local_ns; /* authoritative presentation anchor for realtime ALAC */
   uint32_t anchor_rtp;
-  uint32_t generation;
+  uint32_t generation;          /* timing/playout epoch */
+  uint32_t pcm_generation;      /* buffered media-store epoch; realtime == generation */
   audio_format_t format;
   uint32_t format_generation;
   bool timeline_reset_pending;
-  bool immediate_flush_requested;
-  bool immediate_flush_has_endpoint;
-  uint32_t immediate_flush_until_seq;
-  uint32_t immediate_flush_until_rtp;
-  ap2_flush_request_t deferred_flush[AP2_MAX_DEFERRED_FLUSH];
   audio_stream_type_t stream_type;
   uint32_t playout_latency_samples;
 } timing_snapshot_t;
@@ -149,7 +127,6 @@ typedef struct {
   uint64_t rtp_gap;
   uint32_t last_seq;
   uint32_t last_rtp;
-  uint32_t last_decoded_end_rtp;
   uint64_t playout_blocks;
   uint64_t playout_underruns;
   uint64_t playout_resyncs;
@@ -231,23 +208,12 @@ typedef struct {
   uint64_t rt_media_rebase_clock_id;
   uint32_t rt_media_rebase_epoch;
   int64_t rt_media_rebase_bias_ns;
-  uint32_t generation;
+  uint32_t generation;          /* timing/playout epoch */
+  uint32_t buffered_pcm_generation; /* survives buffered seek/anchor changes */
   int64_t anchor_set_local_us;
   uint32_t anchor_set_generation;
   uint32_t format_generation;
   bool timeline_reset_pending;
-  bool immediate_flush_requested;
-  bool immediate_flush_has_endpoint;
-  uint32_t immediate_flush_until_seq;
-  uint32_t immediate_flush_until_rtp;
-  bool immediate_flush_diag_active;
-  int64_t immediate_flush_start_us;
-  uint32_t immediate_flush_start_seq;
-  uint64_t immediate_flush_start_drop;
-  size_t immediate_flush_start_fifo;
-  uint64_t immediate_flush_start_socket_bytes;
-  uint64_t immediate_flush_start_fifo_read;
-  ap2_flush_request_t deferred_flush[AP2_MAX_DEFERRED_FLUSH];
   uint32_t playout_latency_samples;
   uint32_t realtime_eq_generation;
   volatile bool realtime_stage_running;
@@ -265,9 +231,6 @@ typedef struct {
   /* Buffered transport control state belongs to one codec/session only.
    * Diagnostics remain cumulative, but FLUSH decisions must never reuse a
    * sequence number from an older AAC session after ALAC was active. */
-  uint32_t buffered_session_seq;
-  uint64_t buffered_session_rx;
-  bool buffered_session_seq_valid;
   volatile bool i2s_flush_requested;
   volatile bool playout_servo_reset_requested;
 
@@ -277,6 +240,7 @@ typedef struct {
 static ap2_state_t s = {
     .stream_type = AUDIO_STREAM_NONE,
     .generation = 1,
+    .buffered_pcm_generation = 1,
     .format_generation = 1,
     .timeline_reset_pending = true,
     .state_mux = portMUX_INITIALIZER_UNLOCKED,
@@ -312,6 +276,9 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->anchor_local_ns = s.anchor_local_ns;
   out->anchor_rtp = s.anchor_rtp;
   out->generation = s.generation;
+  out->pcm_generation =
+      s.stream_type == AUDIO_STREAM_BUFFERED ? s.buffered_pcm_generation
+                                             : s.generation;
   out->format = s.format;
   out->format_generation = s.format_generation;
   out->timeline_reset_pending = s.timeline_reset_pending;
@@ -325,10 +292,29 @@ static uint32_t next_generation(uint32_t generation) {
   return generation ? generation : 1U;
 }
 
-/* Immediate FLUSH/pause ends the current timeline now, but the processor deliberately
- * does not publish a new generation yet. TCP may keep arriving while the
- * anchor is invalid; those packets are provisional and will be made
- * unreachable atomically when the next valid anchor commits a new epoch. */
+/* Hard reset for buffered media storage only. Ordinary pause/seek/anchor
+ * changes must not call this: they change the timing epoch, not the identity
+ * of already received RTP-addressed PCM. */
+static uint32_t reset_buffered_pcm_store(void) {
+  uint32_t new_gen;
+  taskENTER_CRITICAL(&s.state_mux);
+  new_gen = next_generation(s.buffered_pcm_generation);
+  taskEXIT_CRITICAL(&s.state_mux);
+
+  if (s.pcm_ring) {
+    pcm_rtp_ring_set_generation(s.pcm_ring, new_gen);
+  }
+
+  taskENTER_CRITICAL(&s.state_mux);
+  s.buffered_pcm_generation = new_gen;
+  taskEXIT_CRITICAL(&s.state_mux);
+  return new_gen;
+}
+
+/* Pause/immediate FLUSH ends the current presentation timeline now, but it does
+ * not by itself destroy buffered AAC media. TCP keeps arriving while the
+ * anchor is invalid; FLUSH rules decide media validity and the next anchor only
+ * commits a fresh timing/playout epoch. */
 static void mark_timeline_discontinuity(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.anchor_valid = false;
@@ -339,7 +325,6 @@ static void mark_timeline_discontinuity(void) {
   s.rt_media_rebase_bias_ns = 0;
   taskEXIT_CRITICAL(&s.state_mux);
   realtime_stage_kick();
-  s.diag.last_decoded_end_rtp = 0;
   s.i2s_flush_requested = true;
 }
 
@@ -347,19 +332,23 @@ static uint32_t commit_anchor_epoch_locked(void) {
   uint32_t gen = s.generation;
   if (s.timeline_reset_pending) {
     gen = next_generation(gen);
-    /* Publish the backing stores first. Any task holding the previous state
-     * snapshot can only fail a generation check during this tiny window. */
-    if (s.pcm_ring) {
-      pcm_rtp_ring_set_generation(s.pcm_ring, gen);
+    /* Timing/playout epoch changes are not automatically media-store resets.
+     * Buffered AAC keeps RTP-addressed PCM across pause/seek/anchor changes so
+     * a backward seek can reuse samples we already decoded. Realtime ALAC still
+     * owns generation-scoped raw/final rings because its recovery/EQ chronology
+     * is tied to one continuous realtime epoch. */
+    if (s.stream_type == AUDIO_STREAM_REALTIME) {
+      if (s.pcm_ring) {
+        pcm_rtp_ring_set_generation(s.pcm_ring, gen);
+      }
+      if (s.realtime_stage_ring) {
+        pcm_rtp_ring_set_generation(s.realtime_stage_ring, gen);
+      }
+      s.realtime_stage_cursor_valid = false;
+      s.realtime_stage_generation = gen;
     }
-    if (s.realtime_stage_ring) {
-      pcm_rtp_ring_set_generation(s.realtime_stage_ring, gen);
-    }
-    s.realtime_stage_cursor_valid = false;
-    s.realtime_stage_generation = gen;
     s.generation = gen;
     s.timeline_reset_pending = false;
-    s.diag.last_decoded_end_rtp = 0;
   }
   return gen;
 }
@@ -457,241 +446,19 @@ static void wait_until_presentation_ns(const timing_snapshot_t *snap,
   }
 }
 
-/* Buffered AirPlay 2 follows the Shairport Sync model: transport ordering,
- * timeline validity and decoded-player buffering are separate concerns. */
-static inline uint32_t be32(const uint8_t *p) {
-  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
-}
-
+/* Buffered AirPlay 2 addressable model: transport arrival, media validity,
+ * decoder chronology and presentation timing are separate concerns. */
 static inline int32_t seq23_delta(uint32_t a, uint32_t b) {
   uint32_t d = (a - b) & 0x007fffffU;
   if (d & 0x00400000U) d |= 0xff800000U;
   return (int32_t)d;
 }
 
-static bool deferred_flush_should_drop(uint32_t seq, uint32_t rtp) {
-  bool drop = false;
-  struct {
-    uint32_t index;
-    uint32_t event; /* 1=activate, 2=until, 3=overshoot */
-    uint32_t from_seq;
-    uint32_t from_rtp;
-    uint32_t until_seq;
-    uint32_t until_rtp;
-    uint32_t drops;
-    uint32_t first_drop_seq;
-    uint32_t first_drop_rtp;
-    uint32_t last_drop_seq;
-    uint32_t last_drop_rtp;
-  } events[AP2_MAX_DEFERRED_FLUSH];
-  uint32_t event_count = 0;
-
-  taskENTER_CRITICAL(&s.state_mux);
-  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-    ap2_flush_request_t *r = &s.deferred_flush[i];
-    if (!r->in_use) continue;
-
-    if (!r->active && seq == r->from_seq && seq != r->until_seq) {
-      r->active = true;
-      if (event_count < AP2_MAX_DEFERRED_FLUSH) {
-        events[event_count].index = i;
-        events[event_count].event = 1U;
-        events[event_count].from_seq = r->from_seq;
-        events[event_count].from_rtp = r->from_rtp;
-        events[event_count].until_seq = r->until_seq;
-        events[event_count].until_rtp = r->until_rtp;
-        event_count++;
-      }
-    }
-
-    if (seq == r->until_seq || seq23_delta(seq, r->until_seq) > 0) {
-      const uint32_t event = seq == r->until_seq ? 2U : 3U;
-      if (event_count < AP2_MAX_DEFERRED_FLUSH) {
-        events[event_count].index = i;
-        events[event_count].event = event;
-        events[event_count].from_seq = r->from_seq;
-        events[event_count].from_rtp = r->from_rtp;
-        events[event_count].until_seq = r->until_seq;
-        events[event_count].until_rtp = r->until_rtp;
-        events[event_count].drops = r->diag_drop_count;
-        events[event_count].first_drop_seq = r->diag_first_drop_seq;
-        events[event_count].first_drop_rtp = r->diag_first_drop_rtp;
-        events[event_count].last_drop_seq = r->diag_last_drop_seq;
-        events[event_count].last_drop_rtp = r->diag_last_drop_rtp;
-        event_count++;
-      }
-      r->active = false;
-      r->in_use = false;
-      continue;
-    }
-
-    if (r->active) {
-      if (r->diag_drop_count == 0) {
-        r->diag_first_drop_seq = seq;
-        r->diag_first_drop_rtp = rtp;
-      }
-      r->diag_drop_count++;
-      r->diag_last_drop_seq = seq;
-      r->diag_last_drop_rtp = rtp;
-      drop = true;
-    }
-  }
-  taskEXIT_CRITICAL(&s.state_mux);
-
-  for (uint32_t i = 0; i < event_count; ++i) {
-    if (events[i].event == 1U) {
-      ESP_LOGI(TAG,
-               "DFLUSH activate idx=%" PRIu32 " seq=%" PRIu32
-               " rtp=%" PRIu32 " req_seq=%" PRIu32 "..%" PRIu32
-               " req_rtp=%" PRIu32 "..%" PRIu32,
-               events[i].index, seq, rtp, events[i].from_seq,
-               events[i].until_seq, events[i].from_rtp, events[i].until_rtp);
-    } else {
-      ESP_LOGI(TAG,
-               "DFLUSH %s idx=%" PRIu32 " seq=%" PRIu32 " rtp=%" PRIu32
-               " req_seq=%" PRIu32 "..%" PRIu32
-               " req_rtp=%" PRIu32 "..%" PRIu32
-               " dropped=%" PRIu32
-               " first=%" PRIu32 "/%" PRIu32
-               " last=%" PRIu32 "/%" PRIu32,
-               events[i].event == 2U ? "until" : "overshoot",
-               events[i].index, seq, rtp, events[i].from_seq,
-               events[i].until_seq, events[i].from_rtp, events[i].until_rtp,
-               events[i].drops, events[i].first_drop_seq,
-               events[i].first_drop_rtp, events[i].last_drop_seq,
-               events[i].last_drop_rtp);
-    }
-  }
-  return drop;
-}
-
-/* Diagnostic only: when a deferred FLUSH is pending, report any transport
- * sequence/RTP discontinuity before FLUSH state is applied. This proves
- * whether fromSeq was actually delivered by the sender or skipped in the
- * compressed TCP stream. */
-static void deferred_flush_diag_transport(uint32_t seq, uint32_t rtp,
-                                          uint32_t prev_seq, uint32_t prev_rtp,
-                                          bool have_prev,
-                                          uint32_t frame_samples) {
-  if (!have_prev) return;
-
-  const uint32_t expected_seq = (prev_seq + 1U) & 0x007fffffU;
-  const uint32_t expected_rtp = prev_rtp + frame_samples;
-  const int32_t seq_gap = seq23_delta(seq, expected_seq);
-  const int32_t rtp_gap = rtp_delta(rtp, expected_rtp);
-  if (seq_gap == 0 && rtp_gap == 0) return;
-
-  ap2_flush_request_t pending[AP2_MAX_DEFERRED_FLUSH];
-  uint32_t pending_index[AP2_MAX_DEFERRED_FLUSH];
-  uint32_t count = 0;
-  taskENTER_CRITICAL(&s.state_mux);
-  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-    if (!s.deferred_flush[i].in_use) continue;
-    if (count < AP2_MAX_DEFERRED_FLUSH) {
-      pending[count] = s.deferred_flush[i];
-      pending_index[count] = i;
-      count++;
-    }
-  }
-  taskEXIT_CRITICAL(&s.state_mux);
-
-  for (uint32_t i = 0; i < count; ++i) {
-    ESP_LOGW(TAG,
-             "DFLUSH transport gap idx=%" PRIu32
-             " prev=%" PRIu32 "/%" PRIu32
-             " expected=%" PRIu32 "/%" PRIu32
-             " current=%" PRIu32 "/%" PRIu32
-             " seq_gap=%" PRId32 " rtp_gap=%" PRId32
-             " req_seq=%" PRIu32 "..%" PRIu32
-             " req_rtp=%" PRIu32 "..%" PRIu32 " active=%u",
-             pending_index[i], prev_seq, prev_rtp, expected_seq, expected_rtp,
-             seq, rtp, seq_gap, rtp_gap, pending[i].from_seq,
-             pending[i].until_seq, pending[i].from_rtp, pending[i].until_rtp,
-             pending[i].active ? 1U : 0U);
-  }
-}
-
-static bool immediate_flush_should_drop(uint32_t seq) {
-  bool drop = false;
-  bool completed = false;
-  uint32_t until_seq = 0;
-  uint32_t start_seq = 0;
-  int64_t start_us = 0;
-  uint64_t start_drop = 0;
-  size_t start_fifo = 0;
-  uint64_t start_socket = 0;
-  uint64_t start_read = 0;
-
-  taskENTER_CRITICAL(&s.state_mux);
-  if (s.immediate_flush_requested) {
-    if (!s.immediate_flush_has_endpoint) {
-      s.immediate_flush_requested = false;
-      s.immediate_flush_diag_active = false;
-    } else if (seq23_delta(seq, s.immediate_flush_until_seq) >= 0) {
-      until_seq = s.immediate_flush_until_seq;
-      start_seq = s.immediate_flush_start_seq;
-      start_us = s.immediate_flush_start_us;
-      start_drop = s.immediate_flush_start_drop;
-      start_fifo = s.immediate_flush_start_fifo;
-      start_socket = s.immediate_flush_start_socket_bytes;
-      start_read = s.immediate_flush_start_fifo_read;
-      completed = s.immediate_flush_diag_active;
-      s.immediate_flush_requested = false;
-      s.immediate_flush_has_endpoint = false;
-      s.immediate_flush_diag_active = false;
-
-      /* Shairport Sync parity: deferred requests remain live while an
-       * endpoint-bounded immediate flush is in progress, because their ranges
-       * may be consumed by the same purged transport blocks. Only when the
-       * immediate endpoint is reached are any remaining deferred requests
-       * cancelled. */
-      for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-        s.deferred_flush[i].in_use = false;
-        s.deferred_flush[i].active = false;
-      }
-    } else {
-      drop = true;
-    }
-  }
-  taskEXIT_CRITICAL(&s.state_mux);
-
-  if (completed) {
-    ap2_buffered_transport_stats_t ts = {0};
-    if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
-    int64_t elapsed_us = esp_timer_get_time() - start_us;
-    uint64_t dropped = s.diag.timeline_drop - start_drop;
-    uint64_t drained = ts.fifo_bytes_read - start_read;
-    uint64_t received = ts.socket_bytes - start_socket;
-    ESP_LOGI(TAG,
-             "FLUSH complete seq=%" PRIu32 " until=%" PRIu32
-             " elapsed=%.1fms dropped=%" PRIu64
-             " fifo=%u/%uKiB start=%uKiB drained=%" PRIu64
-             "KiB recv=%" PRIu64 "KiB",
-             seq, until_seq, (double)elapsed_us / 1000.0, dropped,
-             (unsigned)(ts.fifo_occupancy / 1024U),
-             (unsigned)(ts.fifo_high_water / 1024U),
-             (unsigned)(start_fifo / 1024U), drained / 1024U,
-             received / 1024U);
-  }
-  return drop;
-}
-
-static bool buffered_flush_should_drop(uint32_t seq, uint32_t rtp) {
-  /* Do not use short-circuit `immediate || deferred` here. Shairport Sync
-   * deliberately services deferred flush state even while an immediate flush
-   * is actively dropping the same block. This keeps deferred activation and
-   * termination semantics in transport order. */
-  bool immediate_drop = immediate_flush_should_drop(seq);
-  bool deferred_drop = deferred_flush_should_drop(seq, rtp);
-  return immediate_drop || deferred_drop;
-}
-
-/* Diagnostic only: preserve the transport predecessor for the decoded block
- * and emit a richer snapshot only for discontinuities of at least four AAC
- * frames. This catches the rare multi-second positive hole without adding
- * per-packet logging or changing any transport/playout decision. */
-static void diag_large_aac_timestamp_gap(
+/* Media-order diagnostic only. Transport arrival order is intentionally not
+ * the decode order in the addressable design. A large gap here therefore
+ * describes the media cursor itself, while the stored transport predecessor is
+ * included only as evidence about what Apple placed on the TCP stream. */
+static void diag_large_media_gap(
     uint32_t seq, uint32_t rtp, uint32_t decoded_expected,
     int32_t timestamp_gap, uint32_t transport_prev_seq,
     uint32_t transport_prev_rtp, bool have_transport_prev,
@@ -699,8 +466,7 @@ static void diag_large_aac_timestamp_gap(
     uint32_t generation) {
   const int64_t abs_gap = timestamp_gap < 0 ? -(int64_t)timestamp_gap
                                              : (int64_t)timestamp_gap;
-  const int64_t threshold = (int64_t)frame_samples * 4LL;
-  if (abs_gap < threshold) return;
+  if (abs_gap < (int64_t)frame_samples * 4LL) return;
 
   uint32_t expected_seq = 0;
   uint32_t expected_rtp = 0;
@@ -713,30 +479,8 @@ static void diag_large_aac_timestamp_gap(
     rtp_gap = rtp_delta(rtp, expected_rtp);
   }
 
-  ap2_flush_request_t pending[AP2_MAX_DEFERRED_FLUSH];
-  uint32_t pending_index[AP2_MAX_DEFERRED_FLUSH];
-  uint32_t pending_count = 0;
-  uint32_t active_count = 0;
-  bool immediate_requested = false;
-  bool immediate_has_endpoint = false;
-  taskENTER_CRITICAL(&s.state_mux);
-  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-    if (!s.deferred_flush[i].in_use) continue;
-    if (pending_count < AP2_MAX_DEFERRED_FLUSH) {
-      pending[pending_count] = s.deferred_flush[i];
-      pending_index[pending_count] = i;
-      pending_count++;
-    }
-    if (s.deferred_flush[i].active) active_count++;
-  }
-  immediate_requested = s.immediate_flush_requested;
-  immediate_has_endpoint = s.immediate_flush_has_endpoint;
-  taskEXIT_CRITICAL(&s.state_mux);
-
   ap2_buffered_transport_stats_t ts = {0};
   if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
-  const size_t fifo_capacity =
-      s.transport ? ap2_buffered_transport_capacity(s.transport) : 0U;
   const int sr = sample_rate > 0 ? sample_rate : 44100;
   const int32_t decoded_ahead_ms =
       (int32_t)(((int64_t)rtp_delta(decoded_expected, wanted) * 1000LL) / sr);
@@ -744,48 +488,19 @@ static void diag_large_aac_timestamp_gap(
       (int32_t)(((int64_t)rtp_delta(rtp, wanted) * 1000LL) / sr);
 
   ESP_LOGW(TAG,
-           "AAC GAPDIAG seq=%" PRIu32 " rtp=%" PRIu32
-           " dec_expected=%" PRIu32 " gap=%" PRId32
-           " tprev_valid=%u tprev=%" PRIu32 "/%" PRIu32
+           "CSTORE MEDIA_GAP seq=%" PRIu32 " rtp=%" PRIu32
+           " expected=%" PRIu32 " gap=%" PRId32
+           " tprev=%s%" PRIu32 "/%" PRIu32
            " texpected=%" PRIu32 "/%" PRIu32
-           " seq_gap=%" PRId32 " rtp_gap=%" PRId32
+           " tseq_gap=%" PRId32 " trtp_gap=%" PRId32
            " wanted=%" PRIu32 " dec_ahead=%" PRId32 "ms"
-           " incoming_lead=%" PRId32 "ms dflush=%" PRIu32 "/%" PRIu32
-           " iflush=%u/%u fifo=%u/%uK gen=%" PRIu32,
+           " incoming_lead=%" PRId32 "ms ready=%" PRIu32
+           " rules=%" PRIu32 " gen=%" PRIu32,
            seq, rtp, decoded_expected, timestamp_gap,
-           have_transport_prev ? 1U : 0U, transport_prev_seq,
+           have_transport_prev ? "" : "--", transport_prev_seq,
            transport_prev_rtp, expected_seq, expected_rtp, seq_gap, rtp_gap,
-           wanted, decoded_ahead_ms, incoming_lead_ms, pending_count,
-           active_count, immediate_requested ? 1U : 0U,
-           immediate_has_endpoint ? 1U : 0U,
-           (unsigned)(ts.fifo_occupancy / 1024U),
-           (unsigned)(fifo_capacity / 1024U), generation);
-
-  for (uint32_t i = 0; i < pending_count; ++i) {
-    ESP_LOGW(TAG,
-             "AAC GAPDIAG flush idx=%" PRIu32
-             " req_seq=%" PRIu32 "..%" PRIu32
-             " req_rtp=%" PRIu32 "..%" PRIu32 " active=%u",
-             pending_index[i], pending[i].from_seq, pending[i].until_seq,
-             pending[i].from_rtp, pending[i].until_rtp,
-             pending[i].active ? 1U : 0U);
-  }
-}
-
-static void update_transport_continuity(uint32_t seq, uint32_t rtp,
-                                        uint32_t *prev_seq,
-                                        uint32_t *prev_rtp,
-                                        bool *have_prev,
-                                        uint32_t frame_samples) {
-  if (*have_prev) {
-    if (seq != ((*prev_seq + 1U) & 0x007fffffU)) s.diag.seq_gap++;
-    if ((uint32_t)(rtp - *prev_rtp) != frame_samples) s.diag.rtp_gap++;
-  }
-  *prev_seq = seq;
-  *prev_rtp = rtp;
-  *have_prev = true;
-  s.diag.last_seq = seq;
-  s.diag.last_rtp = rtp;
+           wanted, decoded_ahead_ms, incoming_lead_ms, ts.packets_ready,
+           ts.invalidation_rules, generation);
 }
 
 static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
@@ -797,11 +512,12 @@ static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
 
 static bool pcm_store_with_backpressure(uint32_t rtp, const int16_t *pcm,
                                         size_t frames, int channels,
-                                        uint32_t generation) {
+                                        uint32_t pcm_generation) {
   while (s.rx_running) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
-    if (snap.generation != generation || snap.stream_type != AUDIO_STREAM_BUFFERED)
+    if (snap.pcm_generation != pcm_generation ||
+        snap.stream_type != AUDIO_STREAM_BUFFERED)
       return false;
     uint32_t wanted = 0;
     bool wanted_valid = wanted_rtp_now(&snap, &wanted);
@@ -810,11 +526,11 @@ static bool pcm_store_with_backpressure(uint32_t rtp, const int16_t *pcm,
       s.public_stats.late_frames++;
       return false;
     }
-    if (pcm_rtp_ring_write(s.pcm_ring, rtp, pcm, frames, channels, generation,
+    if (pcm_rtp_ring_write(s.pcm_ring, rtp, pcm, frames, channels, pcm_generation,
                            wanted, wanted_valid)) return true;
-    /* Decoded player buffer full/colliding: stop consuming the TCP FIFO. The
-     * reader will eventually fill its bounded FIFO and TCP will throttle the
-     * sender. No audio is deliberately dropped for transient pressure. */
+    /* Decoded timeline is temporarily full/colliding. Leave compressed
+     * packets addressable; when the compressed store itself fills, the TCP
+     * reader naturally stops recv() and applies sender backpressure. */
     vTaskDelay(1);
   }
   return false;
@@ -829,300 +545,316 @@ static void ap2_buffered_processor_task(void *arg) {
   (void)arg;
   aac_decoder_t *decoder = NULL;
   uint32_t decoder_format_generation = 0;
-  uint32_t previous_seq = 0, previous_rtp = 0;
   uint32_t expected_timestamp = 0;
-  bool have_previous_transport = false;
+  uint32_t expected_seq = 0;
   bool have_decoded_sequence = false;
-  bool mute_next_aac = true;
-  uint32_t decode_generation = 0;
-
-  /* Shairport-style processor ownership state. A block stays current until it
-   * is explicitly dropped by FLUSH/staleness or successfully handed to the
-   * decoded-player path. We never fetch the next TCP block merely because
-   * playback timing is temporarily unavailable. */
   bool play_enabled = false;
-  bool current_block_valid = false;
-  bool need_new_block = true;
-  uint16_t current_data_len = 0;
-  size_t current_packet_len = 0;
-  uint32_t current_seq = 0;
-  uint32_t current_rtp = 0;
-  uint32_t current_ssrc = 0;
-  uint32_t current_transport_prev_seq = 0;
-  uint32_t current_transport_prev_rtp = 0;
-  bool current_have_transport_prev = false;
-  uint64_t packets_played_in_sequence = 0;
-  uint32_t observed_generation = 0;
+  uint64_t packets_published_total = 0;
+  uint32_t cursor_log_generation = 0;
 
-  ESP_LOGI(TAG, "Shairport-style buffered processor core=%d prio=%u",
+  /* EQ/AAC history belongs to media chronology, not to the PTP presentation
+   * epoch.  Start a fresh codec-session history once here; later resets happen
+   * only when the media cursor itself becomes discontinuous. */
+  audio_eq_reset_state();
+
+  ESP_LOGI(TAG,
+           "addressable buffered processor core=%d prio=%u media_order=1 exact_hash=1",
            xPortGetCoreID(), (unsigned)AP2_DECODE_PRIORITY);
 
   while (s.rx_running) {
+    bool made_progress = false;
     timing_snapshot_t state_snap;
     snapshot_state(&state_snap);
-    bool control_play_enabled =
+    const bool control_play_enabled =
         state_snap.stream_type == AUDIO_STREAM_BUFFERED && state_snap.playing;
 
     if (control_play_enabled != play_enabled) {
+      ap2_buffered_transport_stats_t ts = {0};
+      if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
       ESP_LOGI(TAG,
-               "BSTATE play %u->%u gen=%" PRIu32
-               " current=%u need_new=%u played=%" PRIu64,
+               "CSTORE play %u->%u gen=%" PRIu32 " pcm_gen=%" PRIu32
+               " ready=%" PRIu32 " invalid=%" PRIu32
+               " rx_total=%" PRIu64 " decoded=%" PRIu64,
                play_enabled ? 1U : 0U, control_play_enabled ? 1U : 0U,
-               state_snap.generation, current_block_valid ? 1U : 0U,
-               need_new_block ? 1U : 0U, packets_played_in_sequence);
-      if (!play_enabled && control_play_enabled) {
-        /* Shairport Sync sets new_audio_block_needed=1 on every play start.
-         * Do the same: a block held while stopped belongs to the old stopped
-         * sequence and must not become the first block of the resumed one. */
-        current_block_valid = false;
-        need_new_block = true;
-        packets_played_in_sequence = 0;
-      } else if (play_enabled && !control_play_enabled) {
-        packets_played_in_sequence = 0;
-      }
+               state_snap.generation, state_snap.pcm_generation,
+               ts.packets_ready, ts.packets_invalid,
+               ts.packets_received_total, packets_published_total);
       play_enabled = control_play_enabled;
     }
 
-    if (observed_generation != state_snap.generation) {
-      observed_generation = state_snap.generation;
-      packets_played_in_sequence = 0;
-    }
-
-    if (need_new_block || !current_block_valid) {
-      uint8_t lb[2];
-      ssize_t n = ap2_buffered_transport_read_exact(s.transport, lb, sizeof(lb));
-      if (n != 2) {
-        if (s.rx_running) vTaskDelay(delay_ticks_at_least_one(5));
-        continue;
-      }
-      current_data_len = ((uint16_t)lb[0] << 8) | lb[1];
-      if (current_data_len < 14U || current_data_len > AP2_PACKET_MAX + 2U) {
-        ESP_LOGW(TAG, "invalid buffered block length=%u", (unsigned)current_data_len);
-        need_new_block = true;
-        current_block_valid = false;
-        continue;
-      }
-      current_packet_len = (size_t)current_data_len - 2U;
-      if (ap2_buffered_transport_read_exact(s.transport, s.packet,
-                                             current_packet_len) !=
-          (ssize_t)current_packet_len) {
-        need_new_block = true;
-        current_block_valid = false;
-        continue;
-      }
-
-      current_seq = be32(s.packet) & 0x007fffffU;
-      current_rtp = be32(s.packet + 4);
-      current_ssrc = be32(s.packet + 8);
-      (void)current_ssrc;
-      current_block_valid = true;
-      need_new_block = false;
-
-      s.diag.rx++;
-      taskENTER_CRITICAL(&s.state_mux);
-      s.buffered_session_seq = current_seq;
-      s.buffered_session_rx++;
-      s.buffered_session_seq_valid = true;
-      taskEXIT_CRITICAL(&s.state_mux);
-      s.public_stats.packets_received++;
-      s.public_stats.last_seq = (uint16_t)(current_seq & 0xffffU);
-      s.public_stats.last_timestamp = current_rtp;
-
-      snapshot_state(&state_snap);
-      uint32_t frame_samples = state_snap.format.frame_size > 0 ?
-          (uint32_t)state_snap.format.frame_size : 1024U;
-      current_transport_prev_seq = previous_seq;
-      current_transport_prev_rtp = previous_rtp;
-      current_have_transport_prev = have_previous_transport;
-      deferred_flush_diag_transport(current_seq, current_rtp, previous_seq,
-                                    previous_rtp, have_previous_transport,
-                                    frame_samples);
-      update_transport_continuity(current_seq, current_rtp, &previous_seq,
-                                  &previous_rtp, &have_previous_transport,
-                                  frame_samples);
-    }
-
-    /* FLUSH is transport-order state. Service it even while playback is
-     * stopped or an anchor is not yet usable. A dropped current block is then
-     * replaced by the next transport block. */
-    if (buffered_flush_should_drop(current_seq, current_rtp)) {
-      s.diag.timeline_drop++;
-      current_block_valid = false;
-      need_new_block = true;
-      continue;
-    }
-
-    /* Shairport keeps the current block while play/timing is unavailable.
-     * This is the key ownership invariant: do not read ahead in the processor;
-     * let the bounded raw FIFO/TCP backpressure absorb the transition. */
+    /* TCP publishes directly into the addressable READY index. There is no
+     * metadata FIFO and no transport-order ownership phase here. */
     snapshot_state(&state_snap);
     if (!play_enabled || state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
         !state_snap.playing || !state_snap.anchor_valid ||
         state_snap.timeline_reset_pending || !ptp_clock_is_locked()) {
-      vTaskDelay(delay_ticks_at_least_one(20));
+      if (!made_progress) vTaskDelay(delay_ticks_at_least_one(5));
       continue;
     }
 
-    uint32_t frame_samples = state_snap.format.frame_size > 0 ?
-        (uint32_t)state_snap.format.frame_size : 1024U;
-    uint32_t wanted = 0;
-    if (!wanted_rtp_now(&state_snap, &wanted)) {
-      vTaskDelay(delay_ticks_at_least_one(20));
-      continue;
-    }
+    /* Decode a bounded media-order burst. TCP publication is independent and
+     * direct, so decoder work can never gate network ingestion except through
+     * the intentional full-store backpressure point. */
+    for (uint32_t decoded_now = 0; decoded_now < AP2_CSTORE_DECODE_BURST;
+         ++decoded_now) {
+      snapshot_state(&state_snap);
+      if (!play_enabled || state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
+          !state_snap.playing || !state_snap.anchor_valid ||
+          state_snap.timeline_reset_pending || !ptp_clock_is_locked()) {
+        break;
+      }
 
-    int sr = state_snap.format.sample_rate > 0 ? state_snap.format.sample_rate : 44100;
-    int32_t lead = rtp_delta(current_rtp, wanted);
-    int32_t max_lead =
-        (int32_t)(((int64_t)sr * AP2_BUFFERED_LEAD_MS) / 1000LL);
-    if (lead > max_lead) {
-      vTaskDelay(delay_ticks_at_least_one(5));
-      continue;
-    }
-    if (lead + (int32_t)frame_samples <= 0) {
-      s.diag.stale_predecrypt++;
-      s.public_stats.late_frames++;
-      current_block_valid = false;
-      need_new_block = true;
-      continue;
-    }
+      const uint32_t frame_samples = state_snap.format.frame_size > 0
+                                         ? (uint32_t)state_snap.format.frame_size
+                                         : 1024U;
+      uint32_t wanted = 0;
+      if (!wanted_rtp_now(&state_snap, &wanted)) break;
 
-    timing_snapshot_t snap = state_snap;
-    if (decode_generation != snap.generation) {
-      decode_generation = snap.generation;
-      decoder_format_generation = 0;
-      have_decoded_sequence = false;
-      mute_next_aac = true;
-      expected_timestamp = 0;
-      packets_played_in_sequence = 0;
-      audio_eq_reset_state();
-    }
+      const int sr = state_snap.format.sample_rate > 0
+                         ? state_snap.format.sample_rate
+                         : 44100;
+      const int32_t max_lead =
+          (int32_t)(((int64_t)sr * AP2_BUFFERED_LEAD_MS) / 1000LL);
 
-    int dec_len = audio_crypto_decrypt_buffered(&s.encrypt, s.packet,
-                                                 current_packet_len,
-                                                 s.decrypt_buf, AP2_PACKET_MAX);
-    if (dec_len < 0) {
-      s.diag.decrypt_error++;
-      s.public_stats.decrypt_errors++;
-      current_block_valid = false;
-      need_new_block = true;
-      continue;
-    }
-    if (dec_len == 0) {
-      s.diag.empty_payload++;
-      current_block_valid = false;
-      need_new_block = true;
-      continue;
-    }
+      timing_snapshot_t snap = state_snap;
 
-    if (!decoder || decoder_format_generation != snap.format_generation) {
-      if (decoder) aac_decoder_destroy(decoder);
-      decoder = NULL;
-      aac_decoder_config_t cfg = {
-          .sample_rate = snap.format.sample_rate,
-          .channels = snap.format.channels,
-          .bits_per_sample = snap.format.bits_per_sample,
-      };
-      decoder = aac_decoder_create(&cfg);
-      if (!decoder) {
+      /* Presentation anchors are cursor moves, not decoder resets.  Keep AAC
+       * and EQ chronology while the decoder's expected RTP is still inside the
+       * active addressable window.  A seek/track/scrub that moves the playhead
+       * outside that window breaks media continuity exactly once, independent
+       * of how many PAUSE/FLUSH/SETRATE timing generations were involved. */
+      if (have_decoded_sequence) {
+        const int32_t expected_from_wanted =
+            rtp_delta(expected_timestamp, wanted);
+        const bool cursor_moved_past_decoder =
+            expected_from_wanted + (int32_t)frame_samples <= 0;
+        const bool decoder_is_other_neighbourhood =
+            expected_from_wanted > max_lead + (int32_t)frame_samples;
+        if (cursor_moved_past_decoder || decoder_is_other_neighbourhood) {
+          ESP_LOGI(TAG,
+                   "CSTORE MEDIA_CURSOR reset expected=%" PRIu32
+                   " wanted=%" PRIu32 " delta=%" PRId32
+                   " gen=%" PRIu32,
+                   expected_timestamp, wanted, expected_from_wanted,
+                   snap.generation);
+          if (decoder && !aac_decoder_reset(decoder)) {
+            aac_decoder_destroy(decoder);
+            decoder = NULL;
+            decoder_format_generation = 0;
+          }
+          audio_eq_reset_state();
+          expected_timestamp = 0;
+          expected_seq = 0;
+          have_decoded_sequence = false;
+        }
+      }
+
+      ap2_buffered_packet_ref_t pkt = {0};
+      if (!ap2_buffered_transport_acquire_media_next(
+              s.transport, wanted, expected_timestamp, have_decoded_sequence,
+              frame_samples, max_lead, &pkt)) {
+        break;
+      }
+      made_progress = true;
+
+      if (ap2_buffered_transport_ref_is_invalid(s.transport, &pkt)) {
+        s.diag.timeline_drop++;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
+      }
+
+      const int32_t lead = rtp_delta(pkt.rtp, wanted);
+      if (lead + (int32_t)frame_samples <= 0) {
+        s.diag.stale_predecrypt++;
+        s.public_stats.late_frames++;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
+      }
+
+      /* If the exact decoder continuation is missing but the PCM timeline still
+       * has comfortable lead, do not immediately jump the AAC decoder forward.
+       * Return the candidate to READY and give Apple time to publish a missing
+       * replacement media block. Once the expected position is
+       * within the guard of the playhead, progress wins over waiting. */
+      if (have_decoded_sequence) {
+        const int32_t media_gap = rtp_delta(pkt.rtp, expected_timestamp);
+        const int32_t expected_lead = rtp_delta(expected_timestamp, wanted);
+        const int32_t reorder_guard =
+            (int32_t)(((int64_t)sr * AP2_CSTORE_REORDER_GUARD_MS) / 1000LL);
+        if (media_gap > 0 && expected_lead > reorder_guard) {
+          if (!ap2_buffered_transport_defer_decode(s.transport, &pkt)) {
+            /* A FLUSH may have invalidated the DECODING packet while the
+             * reorder decision was being made. In that race, release its
+             * ownership instead of leaving an invalid packet pinned. */
+            ap2_buffered_transport_release(s.transport, &pkt);
+          }
+          vTaskDelay(1);
+          break;
+        }
+      }
+
+      if (pkt.packet_len > AP2_PACKET_MAX ||
+          ap2_buffered_transport_copy_packet(s.transport, &pkt, s.packet,
+                                             AP2_PACKET_MAX) !=
+              (ssize_t)pkt.packet_len) {
+        s.diag.empty_payload++;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
+      }
+
+      int dec_len = audio_crypto_decrypt_buffered(&s.encrypt, s.packet,
+                                                   pkt.packet_len,
+                                                   s.decrypt_buf,
+                                                   AP2_PACKET_MAX);
+      if (dec_len < 0) {
+        s.diag.decrypt_error++;
+        s.public_stats.decrypt_errors++;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
+      }
+      if (dec_len == 0) {
+        s.diag.empty_payload++;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
+      }
+
+      if (!decoder || decoder_format_generation != snap.format_generation) {
+        if (decoder) aac_decoder_destroy(decoder);
+        decoder = NULL;
+        aac_decoder_config_t cfg = {
+            .sample_rate = snap.format.sample_rate,
+            .channels = snap.format.channels,
+            .bits_per_sample = snap.format.bits_per_sample,
+        };
+        decoder = aac_decoder_create(&cfg);
+        if (!decoder) {
+          s.diag.decode_error++;
+          s.public_stats.packets_dropped++;
+          ap2_buffered_transport_release(s.transport, &pkt);
+          vTaskDelay(1);
+          continue;
+        }
+        decoder_format_generation = snap.format_generation;
+        have_decoded_sequence = false;
+        expected_timestamp = 0;
+        expected_seq = 0;
+        audio_eq_reset_state();
+        ESP_LOGI(TAG, "AAC decoder ready %dHz %dch", snap.format.sample_rate,
+                 snap.format.channels);
+      }
+
+      int32_t timestamp_gap = 0;
+      int32_t sequence_gap = 0;
+      if (have_decoded_sequence) {
+        timestamp_gap = rtp_delta(pkt.rtp, expected_timestamp);
+        sequence_gap = seq23_delta(pkt.seq, expected_seq);
+        if (timestamp_gap != 0 || sequence_gap != 0) {
+          diag_large_media_gap(
+              pkt.seq, pkt.rtp, expected_timestamp, timestamp_gap,
+              pkt.transport_prev_seq, pkt.transport_prev_rtp,
+              pkt.have_transport_prev, frame_samples, wanted, sr,
+              snap.generation);
+
+          ESP_LOGI(TAG,
+                   "CSTORE MEDIA_BOUNDARY seq=%" PRIu32
+                   " expected_seq=%" PRIu32 " seq_gap=%" PRId32
+                   " rtp=%" PRIu32 " expected_rtp=%" PRIu32
+                   " rtp_gap=%" PRId32 " gen=%" PRIu32,
+                   pkt.seq, expected_seq, sequence_gap, pkt.rtp,
+                   expected_timestamp, timestamp_gap, snap.generation);
+
+          /* This is the actual media boundary.  Reset AAC overlap/history and
+           * EQ delay state here, not on SETRATEANCHORTIME.  The current packet
+           * becomes the first block of the newly selected addressable segment. */
+          if (decoder && !aac_decoder_reset(decoder)) {
+            s.diag.decode_error++;
+            s.public_stats.packets_dropped++;
+            aac_decoder_destroy(decoder);
+            decoder = NULL;
+            decoder_format_generation = 0;
+            expected_timestamp = 0;
+            expected_seq = 0;
+            have_decoded_sequence = false;
+            ap2_buffered_transport_release(s.transport, &pkt);
+            continue;
+          }
+          audio_eq_reset_state();
+          expected_timestamp = 0;
+          expected_seq = 0;
+          have_decoded_sequence = false;
+        }
+      }
+
+      aac_decode_info_t info = {0};
+      int frames = aac_decoder_decode(decoder, s.decrypt_buf, (size_t)dec_len,
+                                      s.decode_pcm, AP2_PCM_CAPACITY_FRAMES,
+                                      &info);
+      if (frames < 0) {
         s.diag.decode_error++;
         s.public_stats.packets_dropped++;
-        current_block_valid = false;
-        need_new_block = true;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
+      }
+      if (frames == 0) {
+        ap2_buffered_transport_release(s.transport, &pkt);
         vTaskDelay(1);
         continue;
       }
-      decoder_format_generation = snap.format_generation;
-      have_decoded_sequence = false;
-      mute_next_aac = true;
-      ESP_LOGI(TAG, "AAC decoder ready %dHz %dch", snap.format.sample_rate,
-               snap.format.channels);
-    }
 
-    int32_t timestamp_gap = 0;
-    if (have_decoded_sequence) {
-      timestamp_gap = rtp_delta(current_rtp, expected_timestamp);
-      if (timestamp_gap != 0) {
-        mute_next_aac = true;
-        ESP_LOGI(TAG,
-                 "AAC timestamp discontinuity seq=%" PRIu32 " rtp=%" PRIu32
-                 " expected=%" PRIu32 " gap=%" PRId32,
-                 current_seq, current_rtp, expected_timestamp, timestamp_gap);
-        diag_large_aac_timestamp_gap(
-            current_seq, current_rtp, expected_timestamp, timestamp_gap,
-            current_transport_prev_seq, current_transport_prev_rtp,
-            current_have_transport_prev, frame_samples, wanted, sr,
-            snap.generation);
+      expected_timestamp = pkt.rtp + (uint32_t)frames;
+      expected_seq = (pkt.seq + 1U) & 0x007fffffU;
+      have_decoded_sequence = true;
+
+      if (cursor_log_generation != snap.generation) {
+        int64_t anchor_us = 0;
+        uint32_t anchor_gen = 0;
+        taskENTER_CRITICAL(&s.state_mux);
+        anchor_us = s.anchor_set_local_us;
+        anchor_gen = s.anchor_set_generation;
+        taskEXIT_CRITICAL(&s.state_mux);
+        cursor_log_generation = snap.generation;
+        if (anchor_gen == snap.generation && anchor_us > 0) {
+          int32_t ms = (int32_t)((esp_timer_get_time() - anchor_us) / 1000LL);
+          s.diag.first_decode_from_anchor_ms = ms;
+          s.diag.first_decode_generation = snap.generation;
+          ESP_LOGI(TAG,
+                   "CSTORE CURSOR gen=%" PRIu32
+                   " anchor_to_decode=%" PRId32 "ms seq=%" PRIu32
+                   " rtp=%" PRIu32,
+                   snap.generation, ms, pkt.seq, pkt.rtp);
+        }
       }
-    }
 
-    aac_decode_info_t info = {0};
-    int frames = aac_decoder_decode(decoder, s.decrypt_buf, (size_t)dec_len,
-                                    s.decode_pcm, AP2_PCM_CAPACITY_FRAMES, &info);
-    if (frames < 0) {
-      s.diag.decode_error++;
-      s.public_stats.packets_dropped++;
-      current_block_valid = false;
-      need_new_block = true;
-      continue;
-    }
-    if (frames == 0) {
-      current_block_valid = false;
-      need_new_block = true;
-      vTaskDelay(1);
-      continue;
-    }
+      pcm_process_common_eq(s.decode_pcm, (size_t)frames, info.channels,
+                            snap.format.sample_rate);
 
-    if (!have_decoded_sequence || mute_next_aac) {
-      memset(s.decode_pcm, 0,
-             (size_t)frames * (size_t)info.channels * sizeof(int16_t));
-      ESP_LOGI(TAG,
-               "AAC block muted seq=%" PRIu32 " rtp=%" PRIu32 " reason=%s",
-               current_seq, current_rtp,
-               !have_decoded_sequence ? "sequence-start" : "discontinuity");
-      mute_next_aac = false;
-    }
-
-    expected_timestamp = current_rtp + (uint32_t)frames;
-    have_decoded_sequence = true;
-
-    if (packets_played_in_sequence == 0) {
-      int64_t anchor_us = 0;
-      uint32_t anchor_gen = 0;
-      taskENTER_CRITICAL(&s.state_mux);
-      anchor_us = s.anchor_set_local_us;
-      anchor_gen = s.anchor_set_generation;
-      taskEXIT_CRITICAL(&s.state_mux);
-      if (anchor_gen == snap.generation && anchor_us > 0) {
-        int32_t ms = (int32_t)((esp_timer_get_time() - anchor_us) / 1000LL);
-        s.diag.first_decode_from_anchor_ms = ms;
-        s.diag.first_decode_generation = snap.generation;
-        ESP_LOGI(TAG,
-                 "BSTATE FIRST_DECODE gen=%" PRIu32
-                 " anchor_to_decode=%" PRId32 "ms seq=%" PRIu32
-                 " rtp=%" PRIu32,
-                 snap.generation, ms, current_seq, current_rtp);
+      /* Declarative invalidation can race an in-flight decode. It never steals
+       * DECODING pages, so re-check validity exactly at PCM publication. */
+      if (ap2_buffered_transport_ref_is_invalid(s.transport, &pkt)) {
+        s.diag.timeline_drop++;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
       }
+
+      if (pcm_store_with_backpressure(pkt.rtp, s.decode_pcm, (size_t)frames,
+                                      info.channels, snap.pcm_generation)) {
+        s.diag.decoded++;
+        s.public_stats.packets_decoded++;
+        packets_published_total++;
+        ap2_buffered_transport_release(s.transport, &pkt);
+        continue;
+      }
+
+      /* The PCM media epoch changed or this decoded block became stale while
+       * waiting for a reusable address.  Compressed ownership is complete
+       * regardless of whether publication survived. */
+      ap2_buffered_transport_release(s.transport, &pkt);
     }
 
-    pcm_process_common_eq(s.decode_pcm, (size_t)frames, info.channels,
-                          snap.format.sample_rate);
-    if (pcm_store_with_backpressure(current_rtp, s.decode_pcm, (size_t)frames,
-                                    info.channels, snap.generation)) {
-      s.diag.decoded++;
-      s.public_stats.packets_decoded++;
-      s.diag.last_decoded_end_rtp = current_rtp + (uint32_t)frames;
-      packets_played_in_sequence++;
-      current_block_valid = false;
-      need_new_block = true;
-      vTaskDelay(1);
-      continue;
-    }
-
-    /* Generation/timeline changed while the decoded PCM was waiting for room.
-     * The decoded block no longer belongs to the active player sequence. */
-    current_block_valid = false;
-    need_new_block = true;
+    /* CPU0 also hosts network/PTP/control work. Even with infinite READY
+     * backlog this worker must yield after every bounded decode burst. */
+    vTaskDelay(made_progress ? AP2_DECODE_IDLE_TICKS
+                             : delay_ticks_at_least_one(5));
   }
 
   if (decoder) aac_decoder_destroy(decoder);
@@ -1395,7 +1127,6 @@ static void realtime_stage_task(void *arg) {
     }
 
     s.diag.decoded++;
-    s.diag.last_decoded_end_rtp = cursor + frames;
     s.public_stats.packets_decoded++;
 
     taskENTER_CRITICAL(&s.state_mux);
@@ -1557,8 +1288,9 @@ static void ap2_playout_task(void *arg) {
                             __ATOMIC_ACQ_REL)) {
       /* A codec/session boundary is stronger than a normal timeline change.
        * Do not inherit the previous stream's learned crystal correction.
-       * Keep ordinary AAC track/seek generations untouched so the mature
-       * buffered path retains its current behavior. */
+       * Ordinary buffered cursor/anchor changes deliberately keep the learned
+       * physical clock correction; presentation changes are not new hardware
+       * clock sessions. */
       audio_playout_flush();
       esp_err_t re = audio_playout_reset_tune();
 
@@ -1640,21 +1372,25 @@ static void ap2_playout_task(void *arg) {
 
     if (state == PLAYOUT_PRIMING) {
       const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
-      const uint32_t prime_ms =
-          snap.stream_type == AUDIO_STREAM_REALTIME ? AP2_REALTIME_PRIME_MS
-                                                    : AP2_PLAYOUT_PRIME_MS;
-      const uint32_t prime_frames =
-          (uint32_t)(((uint64_t)sr * prime_ms) / 1000ULL);
 
-      /* Wait until enough real PCM exists before starting the silent phase
-       * probe.  Once I2S is enabled we intentionally never stop it between
-       * measurement and the first real block, so the real block must already
-       * be available for an immediate queue operation. */
+      /* The old FIFO decoder required a long fully-contiguous PCM run before
+       * startup. In the addressable model that condition is too strong: a
+       * single intentionally skipped/revised AAC AU can leave a sparse hole
+       * while plenty of valid PCM already surrounds the playhead. Buffered AAC
+       * therefore requires only the short deterministic I2S start guard; once
+       * running, the existing exact-RTP playout handles any truly missing block
+       * at its physical deadline instead of remaining in PRIME forever.
+       * Realtime ALAC keeps its existing recovery prime because its raw reorder
+       * path has different deadline semantics. */
       const uint32_t guard_start = desired_rtp;
-      const uint32_t guard_frames =
-          prime_frames + AP2_START_PRIME_GUARD_BLOCKS * AUDIO_PLAYOUT_FRAMES;
+      uint32_t guard_frames =
+          AP2_START_PRIME_GUARD_BLOCKS * AUDIO_PLAYOUT_FRAMES;
+      if (snap.stream_type == AUDIO_STREAM_REALTIME) {
+        guard_frames += (uint32_t)(((uint64_t)sr * AP2_REALTIME_PRIME_MS) /
+                                   1000ULL);
+      }
       if (!pcm_rtp_ring_has_range(s.pcm_ring, guard_start, guard_frames,
-                                  snap.generation)) {
+                                  snap.pcm_generation)) {
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
         continue;
@@ -1788,7 +1524,7 @@ static void ap2_playout_task(void *arg) {
       }
 
       bool ok = pcm_rtp_ring_read_256(s.pcm_ring, real_start_rtp,
-                                      snap.generation, block);
+                                      snap.pcm_generation, block);
       if (!ok) {
         /* Do not allow the already-running silent probe to leak into audible
          * timing indefinitely. A miss restarts the one-enable alignment epoch
@@ -1842,7 +1578,7 @@ static void ap2_playout_task(void *arg) {
 
     const uint64_t fetch_begin_ptp = presentation_now_ns(&snap);
     bool have_pcm = pcm_rtp_ring_read_256(
-        s.pcm_ring, cursor_rtp, snap.generation, block);
+        s.pcm_ring, cursor_rtp, snap.pcm_generation, block);
     const uint64_t fetch_end_ptp = presentation_now_ns(&snap);
     if (!have_pcm) {
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
@@ -2084,19 +1820,18 @@ static void ap2_stats_task(void *arg) {
     uint32_t wanted = 0;
     if (wanted_rtp_now(&snap, &wanted)) {
       int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
-      if (now.last_decoded_end_rtp != 0) {
-        pcm_ahead_ms = (int)(((int64_t)rtp_delta(
-            now.last_decoded_end_rtp, wanted) * 1000LL) / sr);
-      }
+      const uint32_t contiguous = pcm_rtp_ring_contiguous_frames(
+          s.pcm_ring, wanted, PCM_RTP_RING_FRAMES, snap.pcm_generation);
+      pcm_ahead_ms = (int)(((uint64_t)contiguous * 1000ULL) / (uint64_t)sr);
     }
     audio_playout_diag_t pdiag = {0};
     audio_playout_get_diag(&pdiag);
     ap2_buffered_transport_stats_t transport = {0};
     if (s.transport) ap2_buffered_transport_get_stats(s.transport, &transport);
-    const size_t fifo_capacity =
+    const size_t store_capacity =
         s.transport ? ap2_buffered_transport_capacity(s.transport) : 0U;
-    /* The old compressed AAC RTP ring no longer exists. Raw compressed audio is
-     * represented by FIFO=... below, so do not print a fake millisecond value. */
+    /* Compressed AAC is now an addressable packet store. Occupancy is allocated
+     * page bytes, while R/X/I expose READY/RECEIVED/INVALID packet state. */
 
     /* Compact runtime log. SYNC comes from the EOF ISR for an RTP-tagged
      * DMA block, not from a guessed queue depth. Keep only timing/buffer/error
@@ -2268,16 +2003,21 @@ static void ap2_stats_task(void *arg) {
     } else {
       if (now.playout_state == 2 && now.output_sync_valid) {
         ESP_LOGI(TAG,
-                 "AAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms fifo=%u/%uK",
+                 "AAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32
+                 " pcm=%dms cstore=%u/%uK R=%" PRIu32
+                 " I=%" PRIu32,
                  sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
-                 (unsigned)(transport.fifo_occupancy / 1024U),
-                 (unsigned)(fifo_capacity / 1024U));
+                 (unsigned)(transport.store_allocated_bytes / 1024U),
+                 (unsigned)(store_capacity / 1024U), transport.packets_ready,
+                 transport.packets_invalid);
       } else {
         ESP_LOGI(TAG,
-                 "AAC sync=-- pcm=%dms fifo=%u/%uK | %s",
+                 "AAC sync=-- pcm=%dms cstore=%u/%uK R=%" PRIu32
+                 " I=%" PRIu32 " | %s",
                  pcm_ahead_ms,
-                 (unsigned)(transport.fifo_occupancy / 1024U),
-                 (unsigned)(fifo_capacity / 1024U),
+                 (unsigned)(transport.store_allocated_bytes / 1024U),
+                 (unsigned)(store_capacity / 1024U), transport.packets_ready,
+                 transport.packets_invalid,
                  now.playout_state == 1 ? "PRIME" : "STOP");
       }
     }
@@ -2364,7 +2104,7 @@ esp_err_t audio_receiver_init(void) {
     return ESP_ERR_NO_MEM;
   }
 
-  pcm_rtp_ring_set_generation(s.pcm_ring, s.generation);
+  pcm_rtp_ring_set_generation(s.pcm_ring, s.buffered_pcm_generation);
   pcm_rtp_ring_set_generation(s.realtime_stage_ring, s.generation);
   __atomic_store_n(&s.realtime_stage_min_ahead_us, INT32_MAX, __ATOMIC_RELAXED);
   ESP_LOGI(TAG,
@@ -2374,7 +2114,7 @@ esp_err_t audio_receiver_init(void) {
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
   if (!s.transport) {
     ap2_buffered_transport_config_t tcfg = {
-        .fifo_bytes = AP2_BUFFERED_FIFO_REQUEST_BYTES,
+        .store_bytes = AP2_BUFFERED_STORE_REQUEST_BYTES,
         .task_core = AP2_NETWORK_CORE,
         .task_priority = AP2_RX_PRIORITY,
         .task_stack = AP2_RX_STACK,
@@ -2383,7 +2123,7 @@ esp_err_t audio_receiver_init(void) {
                         TAG, "buffered transport create failed");
   }
   ESP_LOGI(TAG,
-           "PSRAM after raw FIFO: total=%u KiB free=%u KiB largest=%u KiB fifo=%u KiB",
+           "PSRAM after compressed store: total=%u KiB free=%u KiB largest=%u KiB store=%u KiB",
            (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
@@ -2397,22 +2137,25 @@ esp_err_t audio_receiver_init(void) {
     return ESP_FAIL;
   }
   ESP_LOGI(TAG,
-           "PTP/RTP playout task started core=%d prio=%u block=%u prime=%ums",
+           "PTP/RTP playout task started core=%d prio=%u block=%u buffered_guard=%ums realtime_prime=%ums",
            AP2_DECODE_CORE, (unsigned)AP2_PLAYOUT_PRIORITY,
-           (unsigned)AUDIO_PLAYOUT_FRAMES, (unsigned)AP2_PLAYOUT_PRIME_MS);
+           (unsigned)AUDIO_PLAYOUT_FRAMES,
+           (unsigned)((AP2_START_PRIME_GUARD_BLOCKS * AUDIO_PLAYOUT_FRAMES *
+                       1000U) / 44100U),
+           (unsigned)AP2_REALTIME_PRIME_MS);
   if (xTaskCreatePinnedToCore(realtime_stage_task, "alac_stage",
                               AP2_RT_STAGE_STACK, NULL, AP2_RT_STAGE_PRIORITY,
                               &s.realtime_stage_task, AP2_DECODE_CORE) != pdPASS) {
     return ESP_FAIL;
   }
 
-  ESP_LOGI(TAG, "AP2 buffered: Shairport-style TCP FIFO -> state/flush/timing processor -> AAC decode -> PCM RTP ring");
-  ESP_LOGI(TAG, "AP2 buffered: no compressed AAC RTP ring, no +45s admission gate, no normal-path REACQUIRE");
-  ESP_LOGI(TAG, "AP2 buffered: raw FIFO=%u KiB (requested=%u KiB), decoded target=%u ms",
+  ESP_LOGI(TAG, "AP2 buffered: TCP -> addressable compressed store -> media-order AAC scheduler -> PCM RTP ring");
+  ESP_LOGI(TAG, "AP2 buffered: TCP payload recv writes directly into page-backed packet storage");
+  ESP_LOGI(TAG, "AP2 buffered: compressed store=%u KiB (requested=%u KiB), decoded target=%u ms",
            (unsigned)(ap2_buffered_transport_capacity(s.transport) / 1024U),
-           (unsigned)(AP2_BUFFERED_FIFO_REQUEST_BYTES / 1024U),
+           (unsigned)(AP2_BUFFERED_STORE_REQUEST_BYTES / 1024U),
            (unsigned)AP2_PCM_TARGET_MS);
-  ESP_LOGI(TAG, "AP2 buffered: future audio is held/backpressured, FLUSH uses 23-bit sender sequence ranges");
+  ESP_LOGI(TAG, "AP2 buffered: future packets remain addressable; only full store applies TCP backpressure");
   ESP_LOGI(TAG, "AP2 output: existing exact PTP/RTP PCM playout and I2S PID preserved");
   ESP_LOGI(TAG, "ALAC: immediate decode -> raw RTP PCM ring -> ordered EQ -> final PCM ring");
   return ESP_OK;
@@ -2486,21 +2229,12 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
   if (!s.transport) return ESP_ERR_INVALID_STATE;
   if (s.rx_running) return ESP_OK;
 
-  /* New buffered codec session: compressed FIFO/control sequence state must
-   * never inherit anything from a previous AAC -> ALAC -> AAC transition. */
+  /* New buffered codec session: both compressed and decoded media storage are
+   * hard-reset. This is deliberately stronger than a seek/anchor change. */
   ap2_buffered_transport_clear(s.transport);
-  taskENTER_CRITICAL(&s.state_mux);
-  s.buffered_session_seq = 0;
-  s.buffered_session_rx = 0;
-  s.buffered_session_seq_valid = false;
-  s.immediate_flush_requested = false;
-  s.immediate_flush_has_endpoint = false;
-  s.immediate_flush_diag_active = false;
-  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-    s.deferred_flush[i].in_use = false;
-    s.deferred_flush[i].active = false;
-  }
-  taskEXIT_CRITICAL(&s.state_mux);
+  const uint32_t pcm_gen = reset_buffered_pcm_store();
+  ESP_LOGI(TAG, "CSTORE MEDIA_RESET pcm_gen=%" PRIu32 " reason=session-start",
+           pcm_gen);
 
   uint16_t bound = port;
   ESP_RETURN_ON_ERROR(ap2_buffered_transport_start(s.transport, port, &bound),
@@ -2622,16 +2356,6 @@ void audio_receiver_stop(void) {
   }
 
   taskENTER_CRITICAL(&s.state_mux);
-  s.buffered_session_seq = 0;
-  s.buffered_session_rx = 0;
-  s.buffered_session_seq_valid = false;
-  s.immediate_flush_requested = false;
-  s.immediate_flush_has_endpoint = false;
-  s.immediate_flush_diag_active = false;
-  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-    s.deferred_flush[i].in_use = false;
-    s.deferred_flush[i].active = false;
-  }
   taskEXIT_CRITICAL(&s.state_mux);
 
   /* Do not reset the stateful EQ asynchronously from the control core. AAC
@@ -2730,92 +2454,84 @@ void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts
                                               uint32_t until_seq, uint32_t until_ts) {
   from_seq &= 0x007fffffU;
   until_seq &= 0x007fffffU;
-  taskENTER_CRITICAL(&s.state_mux);
-  for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-    if (!s.deferred_flush[i].in_use) {
-      s.deferred_flush[i] = (ap2_flush_request_t){
-          .in_use = true, .active = false, .from_seq = from_seq,
-          .from_rtp = from_ts, .until_seq = until_seq, .until_rtp = until_ts};
-      taskEXIT_CRITICAL(&s.state_mux);
-      /* Remove already-decoded PCM in the replaced range; rare O(N) control path. */
-      pcm_rtp_ring_invalidate_range(s.pcm_ring, from_ts, until_ts, s.generation);
-      ESP_LOGI(TAG, "deferred flush queued seq=%" PRIu32 "..%" PRIu32
-                    " rtp=%" PRIu32 "..%" PRIu32,
-               from_seq, until_seq, from_ts, until_ts);
-      return;
-    }
-  }
-  taskEXIT_CRITICAL(&s.state_mux);
-  ESP_LOGW(TAG, "deferred flush queue full");
+
+  /* In the addressable model FLUSHBUFFERED is declarative invalidation, not a
+   * packet-order state machine. Install [fromSeq, untilSeq) in the compressed
+   * store so it applies retroactively and to later arrivals, and invalidate the
+   * same sender-described media interval in decoded PCM. untilSeq itself is
+   * deliberately preserved: our Automix logs show it can be the first packet
+   * of replacement material, often restarting at flushFromTS. */
+  uint32_t compressed_invalidated = s.transport
+      ? ap2_buffered_transport_add_invalid_seq_range(
+            s.transport, from_seq, until_seq)
+      : 0U;
+  timing_snapshot_t flush_snap;
+  snapshot_state(&flush_snap);
+  pcm_rtp_ring_invalidate_range(s.pcm_ring, from_ts, until_ts,
+                                flush_snap.pcm_generation);
+
+  ap2_buffered_transport_stats_t ts = {0};
+  if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
+  ESP_LOGI(TAG,
+           "CSTORE FLUSH_RANGE seq=[%" PRIu32 ",%" PRIu32 ")"
+           " rtp=[%" PRIu32 ",%" PRIu32 ") invalid_now=%" PRIu32
+           " rules=%" PRIu32,
+           from_seq, until_seq, from_ts, until_ts, compressed_invalidated,
+           ts.invalidation_rules);
 }
 
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
                                         bool has_endpoint) {
-  ap2_buffered_transport_stats_t ts = {0};
-  if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
-  uint32_t current_seq = 0;
-  uint64_t rx_count = 0;
-  bool current_seq_valid = false;
-  taskENTER_CRITICAL(&s.state_mux);
-  current_seq = s.buffered_session_seq & 0x007fffffU;
-  rx_count = s.buffered_session_rx;
-  current_seq_valid = s.buffered_session_seq_valid;
-  taskEXIT_CRITICAL(&s.state_mux);
   until_seq &= 0x007fffffU;
-  int32_t distance = (has_endpoint && current_seq_valid && rx_count != 0)
-      ? seq23_delta(until_seq, current_seq) : 0;
-  bool endpoint_already_reached =
-      has_endpoint && current_seq_valid && rx_count != 0 && distance <= 0;
-  if (endpoint_already_reached) {
-    ESP_LOGI(TAG,
-             "FLUSH endpoint already reached current_seq=%" PRIu32
-             " until=%" PRIu32 " until_rtp=%" PRIu32
-             " seqdist=%" PRId32 "; clearing old raw FIFO",
-             current_seq, until_seq, until_ts, distance);
-    has_endpoint = false;
-  }
-  int64_t start_us = esp_timer_get_time();
 
-  taskENTER_CRITICAL(&s.state_mux);
-  s.immediate_flush_requested = true;
-  s.immediate_flush_has_endpoint = has_endpoint;
-  s.immediate_flush_until_seq = until_seq;
-  s.immediate_flush_until_rtp = until_ts;
-  s.immediate_flush_diag_active = has_endpoint;
-  s.immediate_flush_start_us = start_us;
-  s.immediate_flush_start_seq = current_seq;
-  s.immediate_flush_start_drop = s.diag.timeline_drop;
-  s.immediate_flush_start_fifo = ts.fifo_occupancy;
-  s.immediate_flush_start_socket_bytes = ts.socket_bytes;
-  s.immediate_flush_start_fifo_read = ts.fifo_bytes_read;
-  /* Endpoint-bounded immediate FLUSH follows Shairport Sync: keep deferred
-   * requests alive until the immediate endpoint is actually reached. A
-   * no-endpoint flush is a full local reset, so preserving deferred ranges
-   * would leave stale control state behind. */
-  if (!has_endpoint) {
-    for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
-      s.deferred_flush[i].in_use = false;
-      s.deferred_flush[i].active = false;
+  /* Stop presentation immediately. This changes only the timing epoch; media
+   * invalidation below is independent and never stops TCP ingestion. */
+  mark_timeline_discontinuity();
+
+  ap2_buffered_transport_stats_t before = {0};
+  if (s.transport) ap2_buffered_transport_get_stats(s.transport, &before);
+
+  uint32_t invalidated = 0;
+  if (s.transport) {
+    if (has_endpoint) {
+      /* Declarative endpoint: everything before untilSeq belongs to the old
+       * timeline. The rule remains active for future TCP arrivals until the
+       * next anchor commits; untilSeq itself is preserved. */
+      invalidated = ap2_buffered_transport_invalidate_before_seq(
+          s.transport, until_seq);
+    } else {
+      /* No endpoint means all currently buffered/provisional material belongs
+       * to the old timeline. Keep receiving TCP, but catalog new packets as
+       * INVALID until the next anchor retires this rule. */
+      invalidated = ap2_buffered_transport_invalidate_all(s.transport);
     }
   }
-  taskEXIT_CRITICAL(&s.state_mux);
 
+  timing_snapshot_t flush_snap;
+  snapshot_state(&flush_snap);
   if (has_endpoint) {
+    /* The protocol says immediate FLUSH discards buffered media up to the
+     * supplied endpoint. Preserve later and historical PCM outside that
+     * boundary; a backward anchor can therefore reuse still-valid samples. */
+    pcm_rtp_ring_invalidate_before(s.pcm_ring, until_ts,
+                                   flush_snap.pcm_generation);
     ESP_LOGI(TAG,
-             "FLUSH armed current_seq=%" PRIu32 " until=%" PRIu32
-             " until_rtp=%" PRIu32 " seqdist=%" PRId32
-             " fifo=%u/%uKiB",
-             current_seq, until_seq, until_ts, distance,
-             (unsigned)(ts.fifo_occupancy / 1024U),
-             (unsigned)(ts.fifo_high_water / 1024U));
+             "CSTORE FLUSH_BEFORE seq<%" PRIu32 " until_rtp=%" PRIu32
+             " invalid_now=%" PRIu32 " occupancy=%uKiB pcm_gen=%" PRIu32,
+             until_seq, until_ts, invalidated,
+             (unsigned)(before.store_allocated_bytes / 1024U),
+             flush_snap.pcm_generation);
   } else {
+    /* No endpoint is an explicit full media flush. This is one of the few
+     * buffered control operations allowed to invalidate the entire PCM store. */
+    const uint32_t new_pcm_gen = reset_buffered_pcm_store();
     ESP_LOGI(TAG,
-             "FLUSH immediate no endpoint: clearing raw FIFO occupancy=%uKiB",
-             (unsigned)(ts.fifo_occupancy / 1024U));
+             "CSTORE FLUSH_ALL until_rtp=%" PRIu32
+             " invalid_now=%" PRIu32 " occupancy=%uKiB pcm_gen=%" PRIu32,
+             until_ts, invalidated,
+             (unsigned)(before.store_allocated_bytes / 1024U), new_pcm_gen);
   }
 
-  mark_timeline_discontinuity();
-  if (!has_endpoint && s.transport) ap2_buffered_transport_clear(s.transport);
 }
 
 void audio_receiver_pause(void) {
@@ -2880,11 +2596,19 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_set_local_us = esp_timer_get_time();
   s.anchor_set_generation = gen;
   taskEXIT_CRITICAL(&s.state_mux);
+  if (committed && s.transport) {
+    /* Rules describe the previous control timeline. Matching packets already
+     * marked INVALID stay invalid; only the rule table is retired so new
+     * timeline traffic is not judged by an old FLUSHBUFFERED range. */
+    ap2_buffered_transport_clear_invalidation_rules(s.transport);
+  }
   realtime_stage_kick();
 
+  timing_snapshot_t anchor_snap;
+  snapshot_state(&anchor_snap);
   ESP_LOGI(TAG, "ANCHOR clock=%016" PRIx64 " ptp=%" PRIu64
-                " rtp=%" PRIu32 " gen=%" PRIu32 "%s",
-           clock_id, ptp_ns, rtp, gen,
+                " rtp=%" PRIu32 " gen=%" PRIu32 " pcm_gen=%" PRIu32 "%s",
+           clock_id, ptp_ns, rtp, gen, anchor_snap.pcm_generation,
            committed ? " (new timeline committed; waiting for PTP lock if needed)"
                      : " (anchor update; waiting for PTP lock if needed)");
 }

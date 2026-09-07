@@ -103,6 +103,10 @@ void aac_decoder_destroy(aac_decoder_t *d) {
   free(d);
 }
 
+bool aac_decoder_reset(aac_decoder_t *d) {
+  return d && open_decoder(d);
+}
+
 int aac_decoder_decode(aac_decoder_t *d, const uint8_t *input,
                        size_t input_len, int16_t *output,
                        size_t output_capacity_frames,

@@ -1860,14 +1860,14 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
 
   // AirPlay 2 FLUSHBUFFERED carries an optional bplist with:
   //   flushFromSeq / flushFromTS  — first sequence/timestamp to discard
-  //   flushUntilSeq / flushUntilTS — last sequence/timestamp to discard
+  //   flushUntilSeq / flushUntilTS — exclusive end boundary
   //
-  // If flushFromSeq is absent → immediate flush (stop and discard everything).
-  // If flushFromSeq is present → deferred flush: keep playing existing buffered
-  //   content until flushUntilTS is reached, then discard and start fresh.
-  //   The phone simultaneously starts streaming the new track, which fills the
-  //   buffer beyond flushUntilTS; audio_timing_read detects the boundary and
-  //   triggers the bulk-flush at the right moment.
+  // Addressable buffered semantics:
+  // - no flushFromSeq: immediate presentation discontinuity; invalidate media
+  //   before flushUntilSeq/TS (or all media when no endpoint is supplied).
+  // - flushFromSeq present: declaratively invalidate [from, until). Existing
+  //   and future TCP packets are classified by the store; no decoder rendezvous
+  //   waits for fromSeq/untilSeq and TCP ingestion never stops for FLUSH.
   bool has_deferred = false;
   if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
     int64_t flush_from_seq = 0, flush_from_ts = 0;

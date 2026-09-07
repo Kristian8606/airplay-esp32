@@ -77,7 +77,9 @@ bool audio_eq_validate_config(const audio_eq_config_t *config);
 void audio_eq_process(int16_t *pcm, size_t frames, int channels,
                       int sample_rate);
 
-/* Clear biquad delay state at AirPlay timeline generation boundaries. */
+/* Clear biquad delay state at a real decoded-media continuity boundary
+ * (codec/session change or RTP/sequence discontinuity). Presentation-clock
+ * anchor changes alone must not reset the filter history. */
 void audio_eq_reset_state(void);
 
 const char *audio_eq_filter_type_name(audio_eq_filter_type_t type);

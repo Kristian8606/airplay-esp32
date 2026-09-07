@@ -88,6 +88,52 @@ static void validity_clear_range(uint32_t valid[VALID_WORDS], uint32_t off,
   }
 }
 
+static bool validity_any(const uint32_t valid[VALID_WORDS]) {
+  for (uint32_t i = 0; i < VALID_WORDS; ++i) {
+    if (valid[i] != 0U) return true;
+  }
+  return false;
+}
+
+static bool validity_any_range(const uint32_t valid[VALID_WORDS], uint32_t off,
+                               uint32_t count) {
+  while (count) {
+    uint32_t word = off >> 5;
+    uint32_t bit = off & 31U;
+    uint32_t n = 32U - bit;
+    if (n > count) n = count;
+    uint32_t mask =
+        (n == 32U) ? 0xFFFFFFFFU : (((1U << n) - 1U) << bit);
+    if (valid[word] & mask) return true;
+    off += n;
+    count -= n;
+  }
+  return false;
+}
+
+static uint32_t validity_contiguous_range(const uint32_t valid[VALID_WORDS],
+                                          uint32_t off, uint32_t count) {
+  uint32_t total = 0U;
+  while (count) {
+    const uint32_t word = off >> 5;
+    const uint32_t bit = off & 31U;
+    uint32_t n = 32U - bit;
+    if (n > count) n = count;
+
+    const uint32_t low_mask =
+        n == 32U ? 0xFFFFFFFFU : ((1U << n) - 1U);
+    const uint32_t bits = (valid[word] >> bit) & low_mask;
+    if (bits != low_mask) {
+      const uint32_t first_zero = (uint32_t)__builtin_ctz((~bits) & low_mask);
+      return total + first_zero;
+    }
+    total += n;
+    off += n;
+    count -= n;
+  }
+  return total;
+}
+
 static bool validity_has_range(const uint32_t valid[VALID_WORDS], uint32_t off,
                                uint32_t count) {
   while (count) {
@@ -158,9 +204,33 @@ void pcm_rtp_ring_set_generation(pcm_rtp_ring_t *r, uint32_t generation) {
   r->tagged_slots = 0;
 }
 
-static bool old_page_is_future(const pcm_slot_tag_t *tag, uint32_t wanted_rtp) {
-  uint32_t end_rtp = tag->page_rtp + PCM_RTP_SLOT_FRAMES;
-  return rtp_delta(end_rtp, wanted_rtp) > 0;
+/* A direct-mapped cache may retain tags from an older RTP neighbourhood even
+ * after a seek/track switch.  Only valid samples inside the finite addressable
+ * future window of the *current* playhead are protected from replacement.
+ * Anything empty, behind the cursor, or more than one ring-span ahead is cache
+ * history and may be evicted immediately.  This prevents an unrelated RTP
+ * universe from looking "future forever" merely because signed 32-bit RTP
+ * ordering happens to put its page above wanted_rtp. */
+static bool page_has_protected_future(const pcm_slot_tag_t *tag,
+                                      uint32_t wanted_rtp) {
+  if (!validity_any(tag->valid)) return false;
+
+  const int32_t start_delta = rtp_delta(tag->page_rtp, wanted_rtp);
+  const int64_t end_delta =
+      (int64_t)start_delta + (int64_t)PCM_RTP_SLOT_FRAMES;
+  if (end_delta <= 0) return false;
+  if ((int64_t)start_delta >= (int64_t)PCM_RTP_RING_FRAMES) return false;
+
+  uint32_t off = 0U;
+  if (start_delta < 0) off = (uint32_t)(-start_delta);
+
+  uint32_t end_off = PCM_RTP_SLOT_FRAMES;
+  const int64_t horizon_left =
+      (int64_t)PCM_RTP_RING_FRAMES - (int64_t)start_delta;
+  if (horizon_left <= 0) return false;
+  if (horizon_left < (int64_t)end_off) end_off = (uint32_t)horizon_left;
+  if (off >= end_off) return false;
+  return validity_any_range(tag->valid, off, end_off - off);
 }
 
 /* Acquire a slot writer token with CAS. Readers only trust even sequence
@@ -270,7 +340,12 @@ bool pcm_rtp_ring_write(pcm_rtp_ring_t *r, uint32_t first_rtp,
   for (unsigned i = 0; i < chunk_count; ++i) {
     pcm_slot_tag_t *tag = chunks[i].tag;
     if (tag->generation == generation && tag->page_rtp != chunks[i].base) {
-      if (wanted_valid && old_page_is_future(tag, wanted_rtp)) {
+      /* Empty tags are not occupied.  More importantly, a valid old page only
+       * blocks this write when it still contains samples in the current
+       * playhead's finite future cache window.  FLUSH can therefore make a
+       * physical slot reusable immediately without changing the PCM session
+       * generation, and unrelated RTP address spaces cannot pin the ring. */
+      if (wanted_valid && page_has_protected_future(tag, wanted_rtp)) {
         r->future_collisions++;
         for (unsigned j = 0; j < chunk_count; ++j) {
           __atomic_store_n(&chunks[j].tag->seq, chunks[j].seq_even + 2U,
@@ -397,6 +472,49 @@ bool pcm_rtp_ring_has_range(const pcm_rtp_ring_t *r, uint32_t first_rtp,
   return true;
 }
 
+uint32_t pcm_rtp_ring_contiguous_frames(const pcm_rtp_ring_t *r,
+                                        uint32_t first_rtp,
+                                        uint32_t max_frames,
+                                        uint32_t generation) {
+  if (!r || max_frames == 0U ||
+      generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
+    return 0U;
+  }
+
+  uint32_t cur = first_rtp;
+  uint32_t total = 0U;
+  while (total < max_frames) {
+    const uint32_t base = page_base(cur);
+    const uint32_t off = cur - base;
+    uint32_t chunk = PCM_RTP_SLOT_FRAMES - off;
+    if (chunk > max_frames - total) chunk = max_frames - total;
+
+    const uint32_t slot = slot_for_page(base);
+    const pcm_slot_tag_t *tag = &r->tags[slot];
+    bool stable = false;
+    uint32_t valid_copy[VALID_WORDS];
+    for (int retry = 0; retry < 2; ++retry) {
+      const uint32_t seq1 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
+      if (seq1 & 1U) continue;
+      if (tag->generation != generation || tag->page_rtp != base) return total;
+      memcpy(valid_copy, tag->valid, sizeof(valid_copy));
+      const uint32_t seq2 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
+      if (seq1 == seq2 && !(seq2 & 1U)) {
+        stable = true;
+        break;
+      }
+    }
+    if (!stable) return total;
+
+    const uint32_t contiguous =
+        validity_contiguous_range(valid_copy, off, chunk);
+    total += contiguous;
+    if (contiguous != chunk) return total;
+    cur += chunk;
+  }
+  return total;
+}
+
 bool pcm_rtp_ring_read(const pcm_rtp_ring_t *r, uint32_t first_rtp,
                        uint32_t frames, uint32_t generation, int16_t *out) {
   if (!r || !out || frames == 0 || generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
@@ -453,12 +571,47 @@ void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *r, uint32_t from_rtp,
                                       false, __ATOMIC_ACQ_REL,
                                       __ATOMIC_ACQUIRE)) {
         validity_clear_range(tag->valid, off, chunk);
+        if (!validity_any(tag->valid)) {
+          tag->page_rtp = 0U;
+          tag->generation = 0U;
+        }
         __atomic_store_n(&tag->seq, seq0 + 2U, __ATOMIC_RELEASE);
       }
     }
 
     cur += chunk;
     remaining -= chunk;
+  }
+}
+
+void pcm_rtp_ring_invalidate_before(pcm_rtp_ring_t *r, uint32_t until_rtp,
+                                    uint32_t generation) {
+  if (!r || generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
+    return;
+  }
+
+  for (uint32_t i = 0; i < PCM_RTP_SLOT_COUNT; ++i) {
+    pcm_slot_tag_t *tag = &r->tags[i];
+    uint32_t seq0 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
+    if (seq0 & 1U) continue;
+    if (tag->generation != generation) continue;
+
+    const int32_t frames_before = rtp_delta(until_rtp, tag->page_rtp);
+    if (frames_before <= 0) continue;
+
+    uint32_t count = frames_before >= (int32_t)PCM_RTP_SLOT_FRAMES
+                         ? PCM_RTP_SLOT_FRAMES
+                         : (uint32_t)frames_before;
+    uint32_t expected = seq0;
+    if (__atomic_compare_exchange_n(&tag->seq, &expected, seq0 + 1U, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      validity_clear_range(tag->valid, 0U, count);
+      if (!validity_any(tag->valid)) {
+        tag->page_rtp = 0U;
+        tag->generation = 0U;
+      }
+      __atomic_store_n(&tag->seq, seq0 + 2U, __ATOMIC_RELEASE);
+    }
   }
 }
 

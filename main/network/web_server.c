@@ -40,6 +40,15 @@ static esp_err_t speedtest_handler(httpd_req_t *req){ return serve_file(req,"/sp
 static esp_err_t eq_page_handler(httpd_req_t *req){ return serve_file(req,"/spiffs/www/eq.html","text/html"); }
 static esp_err_t favicon_handler(httpd_req_t *req){ httpd_resp_set_status(req,"204 No Content"); return httpd_resp_send(req,NULL,0); }
 static esp_err_t captive_redirect(httpd_req_t *req){ httpd_resp_set_status(req,"302 Found"); httpd_resp_set_hdr(req,"Location","http://192.168.4.1/"); return httpd_resp_send(req,NULL,0); }
+static esp_err_t captive_404_handler(httpd_req_t *req, httpd_err_code_t error){
+  (void)error;
+  /* Unknown probe URLs should enter the setup page only while STA is not
+   * connected. In normal STA mode keep ordinary 404 behavior. */
+  if (!wifi_is_connected()) return captive_redirect(req);
+  httpd_resp_set_status(req,"404 Not Found");
+  httpd_resp_set_type(req,"text/plain");
+  return httpd_resp_sendstr(req,"Not Found");
+}
 
 static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   wifi_ap_record_t *ap_list = NULL;
@@ -255,6 +264,7 @@ static esp_err_t speed_upload(httpd_req_t *req){size_t got=0,total=req->content_
 esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=24;c.stack_size=8192;c.lru_purge_enable=true;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
 #define REG(U,M,H) do{httpd_uri_t x={.uri=U,.method=M,.handler=H};ESP_ERROR_CHECK(httpd_register_uri_handler(s_server,&x));}while(0)
   REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);
+  ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
 #undef REG
   e=log_stream_register(s_server);if(e!=ESP_OK)ESP_LOGW(TAG,"log stream register failed: %s",esp_err_to_name(e));ESP_LOGI(TAG,"Web UI started on port %u",port);return ESP_OK; }
 void web_server_stop(void){if(s_server){httpd_stop(s_server);s_server=NULL;}}
