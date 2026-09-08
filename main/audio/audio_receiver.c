@@ -611,7 +611,6 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t expected_seq = 0;
   bool have_decoded_sequence = false;
   bool play_enabled = false;
-  uint64_t packets_published_total = 0;
   uint32_t cursor_log_generation = 0;
   int64_t last_media_miss_diag_us = 0;
 
@@ -632,16 +631,6 @@ static void ap2_buffered_processor_task(void *arg) {
         state_snap.stream_type == AUDIO_STREAM_BUFFERED && state_snap.playing;
 
     if (control_play_enabled != play_enabled) {
-      ap2_buffered_transport_stats_t ts = {0};
-      if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
-      ESP_LOGI(TAG,
-               "CSTORE play %u->%u gen=%" PRIu32 " pcm_gen=%" PRIu32
-               " ready=%" PRIu32 " invalid=%" PRIu32
-               " rx_total=%" PRIu64 " decoded=%" PRIu64,
-               play_enabled ? 1U : 0U, control_play_enabled ? 1U : 0U,
-               state_snap.generation, state_snap.pcm_generation,
-               ts.packets_ready, ts.packets_invalid,
-               ts.packets_received_total, packets_published_total);
       play_enabled = control_play_enabled;
     }
 
@@ -694,18 +683,11 @@ static void ap2_buffered_processor_task(void *arg) {
         const bool decoder_is_other_neighbourhood =
             expected_from_wanted > max_lead + (int32_t)frame_samples;
         if (cursor_moved_past_decoder || decoder_is_other_neighbourhood) {
-          ESP_LOGI(TAG,
-                   "CSTORE MEDIA_CURSOR reset expected=%" PRIu32
-                   " wanted=%" PRIu32 " delta=%" PRId32
-                   " gen=%" PRIu32,
-                   expected_timestamp, wanted, expected_from_wanted,
-                   snap.generation);
           /* Do not run the full descriptor-pool diagnostic snapshot here.
            * This task owns the AAC decode path on CPU0; synchronous UART logs
            * plus the full scan can advance the live playhead by multiple AAC
            * frames and turn one legitimate cursor correction into a reset
-           * storm. The compact MEDIA_CURSOR line above is enough on this hot
-           * path. Deep diagnostics remain available for a real acquire miss. */
+           * storm. Deep diagnostics remain available for a real acquire miss. */
           if (decoder && !aac_decoder_reset(decoder)) {
             aac_decoder_destroy(decoder);
             decoder = NULL;
@@ -842,14 +824,6 @@ static void ap2_buffered_processor_task(void *arg) {
               pkt.have_transport_prev, frame_samples, wanted, sr,
               snap.generation);
 
-          ESP_LOGI(TAG,
-                   "CSTORE MEDIA_BOUNDARY seq=%" PRIu32
-                   " expected_seq=%" PRIu32 " seq_gap=%" PRId32
-                   " rtp=%" PRIu32 " expected_rtp=%" PRIu32
-                   " rtp_gap=%" PRId32 " gen=%" PRIu32,
-                   pkt.seq, expected_seq, sequence_gap, pkt.rtp,
-                   expected_timestamp, timestamp_gap, snap.generation);
-
           /* This is the actual media boundary.  Reset AAC overlap/history and
            * EQ delay state here, not on SETRATEANCHORTIME.  The current packet
            * becomes the first block of the newly selected addressable segment. */
@@ -904,11 +878,6 @@ static void ap2_buffered_processor_task(void *arg) {
           int32_t ms = (int32_t)((esp_timer_get_time() - anchor_us) / 1000LL);
           s.diag.first_decode_from_anchor_ms = ms;
           s.diag.first_decode_generation = snap.generation;
-          ESP_LOGI(TAG,
-                   "CSTORE CURSOR gen=%" PRIu32
-                   " anchor_to_decode=%" PRId32 "ms seq=%" PRIu32
-                   " rtp=%" PRIu32,
-                   snap.generation, ms, pkt.seq, pkt.rtp);
         }
       }
 
@@ -938,7 +907,6 @@ static void ap2_buffered_processor_task(void *arg) {
         }
         s.diag.decoded++;
         s.public_stats.packets_decoded++;
-        packets_published_total++;
         ap2_buffered_transport_release(s.transport, &pkt);
         continue;
       }
@@ -2340,9 +2308,7 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
   /* New buffered codec session: both compressed and decoded media storage are
    * hard-reset. This is deliberately stronger than a seek/anchor change. */
   ap2_buffered_transport_clear(s.transport);
-  const uint32_t pcm_gen = reset_buffered_pcm_store();
-  ESP_LOGI(TAG, "CSTORE MEDIA_RESET pcm_gen=%" PRIu32 " reason=session-start",
-           pcm_gen);
+  reset_buffered_pcm_store();
 
   uint16_t bound = port;
   ESP_RETURN_ON_ERROR(ap2_buffered_transport_start(s.transport, port, &bound),
@@ -2573,26 +2539,15 @@ void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts
    * same sender-described media interval in decoded PCM. untilSeq itself is
    * deliberately preserved: our Automix logs show it can be the first packet
    * of replacement material, often restarting at flushFromTS. */
-  uint32_t compressed_invalidated = s.transport
-      ? ap2_buffered_transport_add_invalid_seq_range(
-            s.transport, from_seq, until_seq)
-      : 0U;
+  if (s.transport) {
+    (void)ap2_buffered_transport_add_invalid_seq_range(
+        s.transport, from_seq, until_seq);
+  }
   timing_snapshot_t flush_snap;
   snapshot_state(&flush_snap);
   pcm_rtp_ring_invalidate_range(s.pcm_ring, from_ts, until_ts,
                                 flush_snap.pcm_generation);
 
-  ap2_buffered_transport_stats_t ts = {0};
-  if (s.transport) ap2_buffered_transport_get_stats(s.transport, &ts);
-  ESP_LOGI(TAG,
-           "CSTORE FLUSH_RANGE seq=[%" PRIu32 ",%" PRIu32 ")"
-           " rtp=[%" PRIu32 ",%" PRIu32 ") invalid_now=%" PRIu32
-           " rules=%" PRIu32 "/%" PRIu32 " retired=%" PRIu64
-           " grows=%" PRIu64 " allocfail=%" PRIu64,
-           from_seq, until_seq, from_ts, until_ts, compressed_invalidated,
-           ts.invalidation_rules, ts.invalidation_rule_capacity,
-           ts.invalidation_rules_retired, ts.invalidation_rule_grows,
-           ts.invalidation_rule_alloc_failures);
 }
 
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
@@ -2603,22 +2558,18 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
    * invalidation below is independent and never stops TCP ingestion. */
   mark_timeline_discontinuity();
 
-  ap2_buffered_transport_stats_t before = {0};
-  if (s.transport) ap2_buffered_transport_get_stats(s.transport, &before);
-
-  uint32_t invalidated = 0;
   if (s.transport) {
     if (has_endpoint) {
       /* Declarative endpoint: everything before untilSeq belongs to the old
        * timeline. The rule remains active for future TCP arrivals until the
        * next anchor commits; untilSeq itself is preserved. */
-      invalidated = ap2_buffered_transport_invalidate_before_seq(
+      (void)ap2_buffered_transport_invalidate_before_seq(
           s.transport, until_seq);
     } else {
       /* No endpoint means all currently buffered/provisional material belongs
        * to the old timeline. Keep receiving TCP, but catalog new packets as
        * INVALID until the next anchor retires this rule. */
-      invalidated = ap2_buffered_transport_invalidate_all(s.transport);
+      (void)ap2_buffered_transport_invalidate_all(s.transport);
     }
   }
 
@@ -2630,21 +2581,10 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
      * boundary; a backward anchor can therefore reuse still-valid samples. */
     pcm_rtp_ring_invalidate_before(s.pcm_ring, until_ts,
                                    flush_snap.pcm_generation);
-    ESP_LOGI(TAG,
-             "CSTORE FLUSH_BEFORE seq<%" PRIu32 " until_rtp=%" PRIu32
-             " invalid_now=%" PRIu32 " occupancy=%uKiB pcm_gen=%" PRIu32,
-             until_seq, until_ts, invalidated,
-             (unsigned)(before.store_allocated_bytes / 1024U),
-             flush_snap.pcm_generation);
   } else {
     /* No endpoint is an explicit full media flush. This is one of the few
      * buffered control operations allowed to invalidate the entire PCM store. */
-    const uint32_t new_pcm_gen = reset_buffered_pcm_store();
-    ESP_LOGI(TAG,
-             "CSTORE FLUSH_ALL until_rtp=%" PRIu32
-             " invalid_now=%" PRIu32 " occupancy=%uKiB pcm_gen=%" PRIu32,
-             until_ts, invalidated,
-             (unsigned)(before.store_allocated_bytes / 1024U), new_pcm_gen);
+    reset_buffered_pcm_store();
   }
 
 }

@@ -543,11 +543,7 @@ static void publish_written_packet(ap2_buffered_transport_t *t, uint16_t slot) {
 
   /* untilSeq is exclusive: retire completed deferred rules before judging
    * this packet so untilSeq itself remains valid replacement media. */
-  const uint32_t retired_rules =
-      retire_completed_invalid_ranges_locked(t, d->seq);
-  const uint32_t active_rules_after_retire = t->invalid_range_count;
-  const uint32_t published_seq = d->seq;
-  const uint32_t published_rtp = d->rtp;
+  (void)retire_completed_invalid_ranges_locked(t, d->seq);
 
   /* Control rules are declarative. TCP ingestion never waits for a FLUSH
    * sequence rendezvous: the packet is catalogued immediately as READY or
@@ -563,13 +559,6 @@ static void publish_written_packet(ap2_buffered_transport_t *t, uint16_t slot) {
   }
   xSemaphoreGive(t->mutex);
 
-  if (retired_rules) {
-    ESP_LOGI(TAG,
-             "FLUSH rule retire count=%" PRIu32 " at seq=%" PRIu32
-             " rtp=%" PRIu32 " active=%" PRIu32,
-             retired_rules, published_seq, published_rtp,
-             active_rules_after_retire);
-  }
 }
 
 static void store_clear_epoch(ap2_buffered_transport_t *t) {

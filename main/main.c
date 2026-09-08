@@ -33,12 +33,11 @@ static void log_memory_state(const char *where) {
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024U));
 }
-#define FW_NAME "airplay-esp32_V22_ALAC_R23P_LOG_CLEANUP"
-
 static void print_firmware_banner(void) {
   const esp_app_desc_t *app = esp_app_get_description();
   ESP_LOGI(TAG, "============================================================");
-  ESP_LOGI(TAG, "FIRMWARE: %s", FW_NAME);
+  ESP_LOGI(TAG, "FIRMWARE: %s", app ? app->project_name : "airplay-esp32");
+  ESP_LOGI(TAG, "VERSION: %s", app ? app->version : "unknown");
   ESP_LOGI(TAG, "BUILD: %s %s", __DATE__, __TIME__);
   ESP_LOGI(TAG, "IDF: %s", app ? app->idf_ver : "unknown");
   ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP + AAC TCP/decode/EQ + ALAC UDP/decrypt/decode");
@@ -81,12 +80,14 @@ void app_main(void) {
   mdns_airplay_init();
   ESP_ERROR_CHECK(rtsp_server_start());
 
+  const esp_app_desc_t *app = esp_app_get_description();
+  const char *fw_name = app ? app->project_name : "airplay-esp32";
   char ip[32] = {0};
   if (wifi_get_ip_str(ip, sizeof(ip)) == ESP_OK) {
     ESP_LOGI(TAG, "%s ready; Web UI / WiFi scan / logs / OTA: http://%s/",
-             FW_NAME, ip);
+             fw_name, ip);
   } else {
-    ESP_LOGI(TAG, "%s ready; setup UI: http://192.168.4.1/", FW_NAME);
+    ESP_LOGI(TAG, "%s ready; setup UI: http://192.168.4.1/", fw_name);
   }
 
   while (1) {
