@@ -1201,7 +1201,8 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     } else if (ekey_len > 16 && conn->hap_session &&
                conn->hap_session->session_established) {
       uint8_t nonce[12] = {0};
-      uint8_t decrypted_key[32];
+      /* AEAD may output every ciphertext byte except the authentication tag. */
+      uint8_t decrypted_key[sizeof(ekey_encrypted)];
       unsigned long long decrypted_len;
 
       if (crypto_aead_chacha20poly1305_ietf_decrypt(
@@ -1887,10 +1888,14 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
                "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
                " untilSeq=%" PRId64 " untilTS=%" PRId64,
                flush_from_seq, flush_from_ts, flush_until_seq, flush_until_ts);
-      audio_receiver_set_deferred_flush_range((uint32_t)flush_from_seq,
-                                              (uint32_t)flush_from_ts,
-                                              (uint32_t)flush_until_seq,
-                                              (uint32_t)flush_until_ts);
+      esp_err_t flush_err = audio_receiver_set_deferred_flush_range(
+          (uint32_t)flush_from_seq, (uint32_t)flush_from_ts,
+          (uint32_t)flush_until_seq, (uint32_t)flush_until_ts);
+      if (flush_err != ESP_OK) {
+        rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq,
+                           NULL, NULL, 0);
+        return;
+      }
     } else {
       ESP_LOGI(TAG, "FLUSHBUFFERED immediate");
       bool has_endpoint = got_until_seq && got_until_ts &&

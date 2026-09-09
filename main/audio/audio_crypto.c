@@ -77,6 +77,8 @@ int audio_crypto_decrypt_rtp(const audio_encrypt_t *encrypt,
     size_t aad_len = 8;
 
     size_t ciphertext_len = input_len - 8;
+    if (ciphertext_len - crypto_aead_chacha20poly1305_ietf_ABYTES >
+        output_capacity) return -1;
 
     unsigned long long decrypted_len = 0;
     int ret = crypto_aead_chacha20poly1305_ietf_decrypt(
@@ -126,8 +128,8 @@ int audio_crypto_decrypt_buffered(const audio_encrypt_t *encrypt,
   const uint8_t *ciphertext = packet + 12;
   size_t ciphertext_len = packet_len - 12 - 8;
 
-  if (ciphertext_len >
-      output_capacity + crypto_aead_chacha20poly1305_ietf_ABYTES) {
+  if (ciphertext_len - crypto_aead_chacha20poly1305_ietf_ABYTES >
+      output_capacity) {
     return -1;
   }
 

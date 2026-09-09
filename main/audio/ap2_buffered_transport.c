@@ -88,8 +88,11 @@ struct ap2_buffered_transport {
 
   /* Last live media floor observed by the AAC processor. This is only used
    * by writer-side GC when the page store is under pressure; it never gates
-   * decode. Reset on a hard store clear/new anchor boundary. */
+   * decode. The generation tags prevent a decoder snapshot from the previous
+   * anchor from reinstalling a stale pressure-GC floor after a seek. */
+  uint32_t media_generation;
   bool media_floor_valid;
+  uint32_t media_floor_generation;
   uint32_t media_floor_rtp;
   uint32_t media_floor_frame_samples;
   uint64_t stale_ready_reaped;
@@ -282,7 +285,7 @@ static uint16_t ready_index_find_exact_locked(
        * READY match is sufficient to prove that we only need to wait. */
       if (playhead_delta > max_lead_samples) {
         if (ready_exact_too_early) *ready_exact_too_early = true;
-      } else if (playhead_delta + (int32_t)frame_samples > 0 &&
+      } else if ((int64_t)playhead_delta + (int64_t)frame_samples > 0 &&
                  (best == AP2_STORE_INVALID_INDEX ||
                   d->arrival_id > newest)) {
         best = cur;
@@ -381,7 +384,7 @@ static uint32_t reap_stale_ready_locked(ap2_buffered_transport_t *t,
       continue;
     }
     const int32_t delta = (int32_t)(d->rtp - wanted_rtp);
-    if (delta + (int32_t)frame_samples <= 0) {
+    if ((int64_t)delta + (int64_t)frame_samples <= 0) {
       packet_make_free_locked(t, i);
       reaped++;
     }
@@ -398,8 +401,11 @@ static bool reserve_packet_locked(ap2_buffered_transport_t *t, size_t packet_len
 
   if (t->free_packet_top == 0 || t->free_pages < needed_pages) {
     (void)reap_invalid_locked(t, 0);
+    const uint32_t media_generation =
+        __atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE);
     if ((t->free_packet_top == 0 || t->free_pages < needed_pages) &&
-        t->media_floor_valid) {
+        t->media_floor_valid &&
+        t->media_floor_generation == media_generation) {
       (void)reap_stale_ready_locked(t, t->media_floor_rtp,
                                     t->media_floor_frame_samples, 0);
     }
@@ -569,6 +575,8 @@ static void store_clear_epoch(ap2_buffered_transport_t *t) {
   t->peer_error = 0;
   t->transport_prev_valid = false;
   t->media_floor_valid = false;
+  t->media_floor_generation =
+      __atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE);
   t->media_floor_rtp = 0;
   t->media_floor_frame_samples = 0;
   if (t->invalid_ranges && t->invalid_range_capacity) {
@@ -879,8 +887,12 @@ bool ap2_buffered_transport_mark_invalid(ap2_buffered_transport_t *t,
 bool ap2_buffered_transport_acquire_media_next(
     ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
     bool expected_valid, uint32_t frame_samples, int32_t max_lead_samples,
-    ap2_buffered_packet_ref_t *out) {
+    uint32_t media_generation, ap2_buffered_packet_ref_t *out) {
   if (!t || !out || frame_samples == 0) return false;
+  if (__atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE) !=
+      media_generation) {
+    return false;
+  }
 
   uint16_t best_slot = AP2_STORE_INVALID_INDEX;
   int best_class = INT_MAX;
@@ -889,7 +901,16 @@ bool ap2_buffered_transport_acquire_media_next(
 
   xSemaphoreTake(t->mutex, portMAX_DELAY);
 
+  /* The anchor may have changed while this task was waiting for the transport
+   * lock. Never let a stale decoder snapshot select media or update GC state. */
+  if (__atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE) !=
+      media_generation) {
+    xSemaphoreGive(t->mutex);
+    return false;
+  }
+
   t->media_floor_valid = true;
+  t->media_floor_generation = media_generation;
   t->media_floor_rtp = wanted_rtp;
   t->media_floor_frame_samples = frame_samples;
 
@@ -921,7 +942,7 @@ bool ap2_buffered_transport_acquire_media_next(
 
       const int32_t playhead_delta = (int32_t)(d->rtp - wanted_rtp);
       if (playhead_delta > max_lead_samples) continue;
-      if (playhead_delta + (int32_t)frame_samples <= 0) continue;
+      if ((int64_t)playhead_delta + (int64_t)frame_samples <= 0) continue;
 
       int klass;
       int32_t distance;
@@ -933,7 +954,7 @@ bool ap2_buffered_transport_acquire_media_next(
         } else if (d_expected > 0) {
           klass = 1;
           distance = d_expected;
-        } else if (d_expected + (int32_t)frame_samples > 0) {
+        } else if ((int64_t)d_expected + (int64_t)frame_samples > 0) {
           klass = 2;
           distance = -d_expected;
         } else {
@@ -941,7 +962,7 @@ bool ap2_buffered_transport_acquire_media_next(
         }
       } else {
         if (playhead_delta <= 0 &&
-            playhead_delta + (int32_t)frame_samples > 0) {
+            (int64_t)playhead_delta + (int64_t)frame_samples > 0) {
           klass = 0;
           distance = -playhead_delta;
         } else if (playhead_delta > 0) {
@@ -962,6 +983,15 @@ bool ap2_buffered_transport_acquire_media_next(
         best_arrival = d->arrival_id;
       }
     }
+  }
+
+  /* A genuine acquire miss can require a full descriptor scan. Control may
+   * commit another anchor during that search, so re-check before consuming the
+   * chosen READY packet. */
+  if (__atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE) !=
+      media_generation) {
+    xSemaphoreGive(t->mutex);
+    return false;
   }
 
   if (best_slot != AP2_STORE_INVALID_INDEX) {
@@ -1057,9 +1087,9 @@ uint32_t ap2_buffered_transport_reap_invalid(ap2_buffered_transport_t *t,
   return n;
 }
 
-uint32_t ap2_buffered_transport_add_invalid_seq_range(
+esp_err_t ap2_buffered_transport_add_invalid_seq_range(
     ap2_buffered_transport_t *t, uint32_t from_seq, uint32_t until_seq) {
-  if (!t) return 0;
+  if (!t) return ESP_ERR_INVALID_ARG;
   from_seq &= 0x007fffffU;
   until_seq &= 0x007fffffU;
   uint32_t marked = 0;
@@ -1084,9 +1114,12 @@ uint32_t ap2_buffered_transport_add_invalid_seq_range(
     rule_installed = true;
   }
 
-  /* Retroactive invalidation is independent of rule allocation. If memory is
-   * exhausted, already-stored data is still invalidated, but the caller gets a
-   * loud diagnostic because future matching arrivals cannot be protected. */
+  /* Failure must leave both current packets and future rules unchanged. */
+  if (!rule_installed) {
+    xSemaphoreGive(t->mutex);
+    ESP_LOGE(TAG, "FLUSH rule allocation failed");
+    return ESP_ERR_NO_MEM;
+  }
   for (uint16_t i = 0; i < t->packet_count; ++i) {
     packet_desc_t *d = &t->packets[i];
     if (d->store_epoch != t->store_epoch || d->arrival_id == 0) continue;
@@ -1107,18 +1140,9 @@ uint32_t ap2_buffered_transport_add_invalid_seq_range(
       }
     }
   }
-  const uint32_t rule_count = t->invalid_range_count;
-  const uint32_t rule_capacity = t->invalid_range_capacity;
   xSemaphoreGive(t->mutex);
-
-  if (!rule_installed) {
-    ESP_LOGE(TAG,
-             "FLUSH rule allocation failed seq=[%" PRIu32 ",%" PRIu32
-             ") active=%" PRIu32 " cap=%" PRIu32,
-             from_seq, until_seq, rule_count, rule_capacity);
-  }
   if (marked) signal_space(t);
-  return marked;
+  return ESP_OK;
 }
 
 void ap2_buffered_transport_clear_invalidation_rules(
@@ -1193,10 +1217,18 @@ uint32_t ap2_buffered_transport_invalidate_all(ap2_buffered_transport_t *t) {
   return marked;
 }
 
+void ap2_buffered_transport_set_media_generation(
+    ap2_buffered_transport_t *t, uint32_t generation) {
+  if (!t) return;
+  __atomic_store_n(&t->media_generation, generation, __ATOMIC_RELEASE);
+}
+
 void ap2_buffered_transport_reset_media_floor(ap2_buffered_transport_t *t) {
   if (!t) return;
   xSemaphoreTake(t->mutex, portMAX_DELAY);
   t->media_floor_valid = false;
+  t->media_floor_generation =
+      __atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE);
   t->media_floor_rtp = 0;
   t->media_floor_frame_samples = 0;
   xSemaphoreGive(t->mutex);
@@ -1314,7 +1346,7 @@ void ap2_buffered_transport_get_media_diag(
 
     out->ready_total++;
     const int32_t delta = (int32_t)(d->rtp - wanted_rtp);
-    if (delta + (int32_t)frame_samples <= 0)
+    if ((int64_t)delta + (int64_t)frame_samples <= 0)
       out->ready_stale++;
     else if (delta > max_lead_samples)
       out->ready_future++;

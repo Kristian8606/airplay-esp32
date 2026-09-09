@@ -151,7 +151,7 @@ bool ap2_buffered_transport_mark_invalid(ap2_buffered_transport_t *t,
 bool ap2_buffered_transport_acquire_media_next(
     ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
     bool expected_valid, uint32_t frame_samples, int32_t max_lead_samples,
-    ap2_buffered_packet_ref_t *out);
+    uint32_t media_generation, ap2_buffered_packet_ref_t *out);
 
 /* DECODING -> READY. Used by the reorder guard when a forward media jump is
  * visible but there is still enough decoded PCM time to wait for a missing
@@ -188,13 +188,19 @@ uint32_t ap2_buffered_transport_reap_invalid(ap2_buffered_transport_t *t,
  * buffered packets until the next anchor commits. These rules apply both
  * retroactively and to future arrivals. clear_invalidation_rules() retires the
  * control rules at the new anchor; packets already marked INVALID stay invalid. */
-uint32_t ap2_buffered_transport_add_invalid_seq_range(
+/* Returns ESP_OK only when the future rule is installed; failure is atomic. */
+esp_err_t ap2_buffered_transport_add_invalid_seq_range(
     ap2_buffered_transport_t *t, uint32_t from_seq, uint32_t until_seq);
 uint32_t ap2_buffered_transport_invalidate_before_seq(
     ap2_buffered_transport_t *t, uint32_t until_seq);
 uint32_t ap2_buffered_transport_invalidate_all(ap2_buffered_transport_t *t);
 void ap2_buffered_transport_clear_invalidation_rules(
     ap2_buffered_transport_t *t);
+
+/* Publish the timing generation without taking the transport mutex. Safe to
+ * call while the receiver state critical section is held. */
+void ap2_buffered_transport_set_media_generation(
+    ap2_buffered_transport_t *t, uint32_t generation);
 
 /* Forget the writer-side stale-GC playhead hint at a new timeline anchor. */
 void ap2_buffered_transport_reset_media_floor(ap2_buffered_transport_t *t);

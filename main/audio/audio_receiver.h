@@ -78,8 +78,8 @@ void audio_receiver_seek_flush(void);
  * RTP boundary while preserving the validated D7/SETRATE RTP<->PTP map. */
 void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp);
 void audio_receiver_realtime_flush_wait_sender_anchor(void);
-void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
-                                              uint32_t until_seq, uint32_t until_ts);
+esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
+                                                   uint32_t until_seq, uint32_t until_ts);
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
                                         bool has_endpoint);
 void audio_receiver_pause(void);

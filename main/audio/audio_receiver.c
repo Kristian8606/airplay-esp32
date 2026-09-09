@@ -36,7 +36,7 @@
 #define AP2_NETWORK_CORE           0
 #define AP2_DECODE_CORE            1
 #define AP2_BUFFERED_PROCESSOR_CORE 0
-#define AP2_RX_PRIORITY            7
+#define AP2_RX_PRIORITY            5
 #define AP2_DECODE_PRIORITY        6
 #define AP2_PLAYOUT_PRIORITY       8
 #define AP2_STATS_PRIORITY         2
@@ -703,7 +703,7 @@ static void ap2_buffered_processor_task(void *arg) {
       ap2_buffered_packet_ref_t pkt = {0};
       if (!ap2_buffered_transport_acquire_media_next(
               s.transport, wanted, expected_timestamp, have_decoded_sequence,
-              frame_samples, max_lead, &pkt)) {
+              frame_samples, max_lead, snap.generation, &pkt)) {
         /* An exact continuation just beyond max_lead is normal pacing, not a
          * media hole. The transport now detects that case in O(1) average and
          * returns without a fallback scan. Suppress the heavyweight snapshot
@@ -733,7 +733,7 @@ static void ap2_buffered_processor_task(void *arg) {
       }
 
       const int32_t lead = rtp_delta(pkt.rtp, wanted);
-      if (lead + (int32_t)frame_samples <= 0) {
+      if ((int64_t)lead + (int64_t)frame_samples <= 0) {
         s.diag.stale_predecrypt++;
         s.public_stats.late_frames++;
         ap2_buffered_transport_release(s.transport, &pkt);
@@ -1290,8 +1290,14 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
       if (ai > peak_in) peak_in = ai;
       if (in == INT16_MAX || in == INT16_MIN) rail_in++;
       int64_t y = (int64_t)in * (int64_t)gain;
-      y += y >= 0 ? 16384 : -16384;
-      y >>= 15;
+      /* Symmetric Q15 rounding without 64-bit division on the audio hot path.
+       * This keeps unity gain bit-exact while retaining the cheap shift-based
+       * implementation needed by the 44.1 kHz stereo playout task. */
+      if (y >= 0) {
+        y = (y + 16384) >> 15;
+      } else {
+        y = -(((-y) + 16384) >> 15);
+      }
       if (y > INT16_MAX) { y = INT16_MAX; clip_out++; }
       else if (y < INT16_MIN) { y = INT16_MIN; clip_out++; }
       pcm[i] = (int16_t)y;
@@ -2528,8 +2534,8 @@ void audio_receiver_realtime_flush_wait_sender_anchor(void) {
            "waiting for D7/SETRATE (no arrival-time fallback)");
 }
 
-void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
-                                              uint32_t until_seq, uint32_t until_ts) {
+esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
+                                                   uint32_t until_seq, uint32_t until_ts) {
   from_seq &= 0x007fffffU;
   until_seq &= 0x007fffffU;
 
@@ -2540,14 +2546,16 @@ void audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts
    * deliberately preserved: our Automix logs show it can be the first packet
    * of replacement material, often restarting at flushFromTS. */
   if (s.transport) {
-    (void)ap2_buffered_transport_add_invalid_seq_range(
+    esp_err_t err = ap2_buffered_transport_add_invalid_seq_range(
         s.transport, from_seq, until_seq);
+    if (err != ESP_OK) return err;
   }
   timing_snapshot_t flush_snap;
   snapshot_state(&flush_snap);
   pcm_rtp_ring_invalidate_range(s.pcm_ring, from_ts, until_ts,
                                 flush_snap.pcm_generation);
 
+  return ESP_OK;
 }
 
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
@@ -2650,6 +2658,11 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_valid = true;
   s.anchor_set_local_us = esp_timer_get_time();
   s.anchor_set_generation = gen;
+  /* Publish the timing generation before stale decoder snapshots can update
+   * transport GC state after this anchor. */
+  if (s.transport) {
+    ap2_buffered_transport_set_media_generation(s.transport, gen);
+  }
   taskEXIT_CRITICAL(&s.state_mux);
   if (s.transport) {
     /* The writer-side stale READY GC hint belongs to the previous playhead.
