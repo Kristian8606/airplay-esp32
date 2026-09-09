@@ -95,3 +95,6 @@ void realtime_receiver_stop(void);
 bool realtime_receiver_is_running(void);
 void realtime_receiver_get_diag(realtime_receiver_diag_t *out, bool reset_interval_maxima);
 void realtime_receiver_set_client_control(uint32_t client_ip, uint16_t client_control_port);
+
+/* True only after every old producer has exited. */
+bool realtime_receiver_is_idle(void);

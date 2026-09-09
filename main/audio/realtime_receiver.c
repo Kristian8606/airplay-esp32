@@ -1368,3 +1368,7 @@ void realtime_receiver_get_diag(realtime_receiver_diag_t *out,
 }
 
 bool realtime_receiver_is_running(void) { return s_rt.running; }
+
+bool realtime_receiver_is_idle(void) {
+  return !s_rt.running && all_tasks_stopped();
+}

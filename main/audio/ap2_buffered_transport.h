@@ -117,6 +117,8 @@ typedef struct {
 
 esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
                                         const ap2_buffered_transport_config_t *cfg);
+/* Call only with the consumer stopped. If shutdown times out or DECODING
+ * ownership remains, destruction is deferred; retain the pointer and retry. */
 void ap2_buffered_transport_destroy(ap2_buffered_transport_t *t);
 esp_err_t ap2_buffered_transport_start(ap2_buffered_transport_t *t,
                                        uint16_t requested_port,
@@ -139,19 +141,29 @@ bool ap2_buffered_transport_mark_invalid(ap2_buffered_transport_t *t,
 /* Select the best READY packet for the media timeline.
  *
  * - wanted_rtp is the sample position required by the active PTP playhead.
- * - expected_rtp is the decoder's next contiguous media position when valid.
- * - frame_samples defines stale/overlap bounds.
- * - max_lead_samples keeps decode bounded around the active playhead.
+ * - expected_rtp/expected_seq identify the decoder's next contiguous media
+ *   position when expected_valid is true.
+ * - allow_recovery_scan is false during normal playback while the missing
+ *   continuation is still outside the reorder guard. In that hot path an
+ *   absent exact RTP returns immediately after the O(1) hash lookup.
+ * - a FLUSH notification for expected_seq survives rule retirement, overrides
+ *   that wait and
+ *   permits recovery immediately, because that exact continuation can no
+ *   longer become valid.
+ * - media_generation is the receiver anchor revision, not its playout epoch.
+ * - frame_samples defines stale/overlap bounds and max_lead_samples keeps
+ *   decode bounded around the active playhead.
  *
- * Exact expected RTP uses the READY hash index (O(1) average). Only when that
- * media position is absent do we perform a bounded full-store fallback search
- * for the nearest forward/overlap candidate. At equal RTP the newest arrival
- * wins so replacement data supersedes an older duplicate. Transport arrival
- * order never determines decode order. */
+ * Full descriptor scans are therefore recovery-only: startup/seek/new media
+ * neighbourhood, FLUSH-invalid continuity, or the reorder deadline. At equal
+ * RTP the newest arrival wins so replacement data supersedes an older
+ * duplicate. Transport arrival order never determines decode order. */
 bool ap2_buffered_transport_acquire_media_next(
     ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
-    bool expected_valid, uint32_t frame_samples, int32_t max_lead_samples,
-    uint32_t media_generation, ap2_buffered_packet_ref_t *out);
+    uint32_t expected_seq, bool expected_valid, bool allow_recovery_scan,
+    uint32_t frame_samples, int32_t max_lead_samples,
+    uint32_t media_generation, bool *out_forced_recovery,
+    ap2_buffered_packet_ref_t *out);
 
 /* DECODING -> READY. Used by the reorder guard when a forward media jump is
  * visible but there is still enough decoded PCM time to wait for a missing
@@ -197,8 +209,14 @@ uint32_t ap2_buffered_transport_invalidate_all(ap2_buffered_transport_t *t);
 void ap2_buffered_transport_clear_invalidation_rules(
     ap2_buffered_transport_t *t);
 
-/* Publish the timing generation without taking the transport mutex. Safe to
- * call while the receiver state critical section is held. */
+/* Anchor revision, distinct from the playout generation. Increment on EVERY
+ * buffered anchor update. begin/end serialize anchor commit with pressure GC.
+ * Acquire before entering receiver state_mux; end after leaving it. Never wait
+ * for a transport mutex from inside a critical section. */
+void ap2_buffered_transport_begin_media_update(ap2_buffered_transport_t *t);
+void ap2_buffered_transport_end_media_update(ap2_buffered_transport_t *t,
+                                             uint32_t revision);
+/* Standalone update (takes the transport mutex). */
 void ap2_buffered_transport_set_media_generation(
     ap2_buffered_transport_t *t, uint32_t generation);
 

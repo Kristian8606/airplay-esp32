@@ -91,6 +91,9 @@ struct ap2_buffered_transport {
    * decode. The generation tags prevent a decoder snapshot from the previous
    * anchor from reinstalling a stale pressure-GC floor after a seek. */
   uint32_t media_generation;
+  bool cursor_seq_valid;
+  uint32_t cursor_seq; /* current next decode sequence, including in-flight AU */
+  bool cursor_flush_pending; /* survives rule retirement until cursor advances */
   bool media_floor_valid;
   uint32_t media_floor_generation;
   uint32_t media_floor_rtp;
@@ -354,6 +357,7 @@ static void packet_make_free_locked(ap2_buffered_transport_t *t, uint16_t slot) 
 
 static uint32_t reap_invalid_locked(ap2_buffered_transport_t *t,
                                     uint32_t max_packets) {
+  if (t->count_invalid == 0) return 0;
   uint32_t reaped = 0;
   for (uint16_t i = 0; i < t->packet_count; ++i) {
     if (max_packets != 0 && reaped >= max_packets) break;
@@ -374,7 +378,7 @@ static uint32_t reap_stale_ready_locked(ap2_buffered_transport_t *t,
                                         uint32_t wanted_rtp,
                                         uint32_t frame_samples,
                                         uint32_t max_packets) {
-  if (frame_samples == 0) return 0;
+  if (frame_samples == 0 || t->count_ready == 0) return 0;
   uint32_t reaped = 0;
   for (uint16_t i = 0; i < t->packet_count; ++i) {
     if (max_packets != 0 && reaped >= max_packets) break;
@@ -574,6 +578,8 @@ static void store_clear_epoch(ap2_buffered_transport_t *t) {
   t->peer_closed = false;
   t->peer_error = 0;
   t->transport_prev_valid = false;
+  t->cursor_seq_valid = false;
+  t->cursor_flush_pending = false;
   t->media_floor_valid = false;
   t->media_floor_generation =
       __atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE);
@@ -679,7 +685,7 @@ static void tcp_reader_task(void *arg) {
     ESP_LOGI(TAG, "buffered TCP disconnected");
   }
 
-  t->reader_task = NULL;
+  __atomic_store_n(&t->reader_task, NULL, __ATOMIC_RELEASE);
   vTaskDelete(NULL);
 }
 
@@ -779,6 +785,14 @@ esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
 void ap2_buffered_transport_destroy(ap2_buffered_transport_t *t) {
   if (!t) return;
   ap2_buffered_transport_stop(t);
+  if (__atomic_load_n(&t->reader_task, __ATOMIC_ACQUIRE)) {
+    ESP_LOGE(TAG, "destroy deferred: TCP reader still owns transport");
+    return;
+  }
+  if (t->count_decoding) {
+    ESP_LOGE(TAG, "destroy deferred: decoder still owns transport");
+    return;
+  }
   if (t->mutex) vSemaphoreDelete(t->mutex);
   if (t->space_ready) vSemaphoreDelete(t->space_ready);
   free(t->invalid_ranges);
@@ -799,6 +813,8 @@ esp_err_t ap2_buffered_transport_start(ap2_buffered_transport_t *t,
     return ESP_OK;
   }
 
+  if (__atomic_load_n(&t->reader_task, __ATOMIC_ACQUIRE))
+    return ESP_ERR_INVALID_STATE;
   uint16_t bound = requested_port;
   t->listen_sock = socket_utils_bind_tcp_listener(requested_port, 1, true, &bound);
   if (t->listen_sock < 0) return ESP_FAIL;
@@ -832,7 +848,7 @@ void ap2_buffered_transport_stop(ap2_buffered_transport_t *t) {
     t->listen_sock = -1;
   }
   signal_space(t);
-  for (int i = 0; t->reader_task && i < 100; ++i) {
+  for (int i = 0; __atomic_load_n(&t->reader_task, __ATOMIC_ACQUIRE) && i < 100; ++i) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
   t->port = 0;
@@ -886,8 +902,11 @@ bool ap2_buffered_transport_mark_invalid(ap2_buffered_transport_t *t,
 
 bool ap2_buffered_transport_acquire_media_next(
     ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
-    bool expected_valid, uint32_t frame_samples, int32_t max_lead_samples,
-    uint32_t media_generation, ap2_buffered_packet_ref_t *out) {
+    uint32_t expected_seq, bool expected_valid, bool allow_recovery_scan,
+    uint32_t frame_samples, int32_t max_lead_samples,
+    uint32_t media_generation, bool *out_forced_recovery,
+    ap2_buffered_packet_ref_t *out) {
+  if (out_forced_recovery) *out_forced_recovery = false;
   if (!t || !out || frame_samples == 0) return false;
   if (__atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE) !=
       media_generation) {
@@ -914,11 +933,21 @@ bool ap2_buffered_transport_acquire_media_next(
   t->media_floor_rtp = wanted_rtp;
   t->media_floor_frame_samples = frame_samples;
 
-  /* Steady state: exact decoder continuation is the overwhelmingly common
-   * case, so use the RTP hash instead of rescanning the descriptor pool.
-   * Distinguish "exact packet is present but still beyond the decode window"
-   * from "exact packet is absent". Only the latter is a real reason to do the
-   * full-store replacement/hole search. */
+  expected_seq &= 0x007fffffU;
+  if (!expected_valid || !t->cursor_seq_valid || t->cursor_seq != expected_seq) {
+    t->cursor_flush_pending = false;
+  }
+  t->cursor_seq_valid = expected_valid;
+  t->cursor_seq = expected_seq;
+
+  /* Normal playback is exact-addressed only. The overwhelmingly common case
+   * is an O(1) READY-hash hit for the next decoder RTP. A missing exact packet
+   * above the reorder guard is not recovery: release the transport mutex and
+   * let the receiver sleep/retry while TCP is free to publish it.
+   *
+   * FLUSH is the exception. If control has explicitly invalidated expected_seq,
+   * waiting for that exact continuation can never succeed, so recovery is
+   * allowed immediately even before the time guard. */
   bool exact_ready_too_early = false;
   if (expected_valid) {
     best_slot = ready_index_find_exact_locked(
@@ -928,11 +957,20 @@ bool ap2_buffered_transport_acquire_media_next(
       xSemaphoreGive(t->mutex);
       return false;
     }
+    if (best_slot == AP2_STORE_INVALID_INDEX && !allow_recovery_scan) {
+      if (!t->cursor_flush_pending &&
+          !packet_is_invalid_by_rule_locked(t, expected_seq)) {
+        xSemaphoreGive(t->mutex);
+        return false;
+      }
+      if (out_forced_recovery) *out_forced_recovery = true;
+    }
   }
 
-  /* Startup or a genuine media hole/replacement: only then pay for a full
-   * descriptor scan to find the nearest legal candidate. */
-  if (best_slot == AP2_STORE_INVALID_INDEX) {
+  /* Recovery-only path. Pay for the full descriptor scan only when there is
+   * no contiguous decoder cursor (startup/seek/new neighbourhood), FLUSH has
+   * made that cursor impossible, or the reorder deadline has been reached. */
+  if (best_slot == AP2_STORE_INVALID_INDEX && t->count_ready != 0) {
     for (uint16_t i = 0; i < t->packet_count; ++i) {
       packet_desc_t *d = &t->packets[i];
       if (d->state != AP2_BUFFERED_PACKET_READY || !d->ready_indexed ||
@@ -1001,6 +1039,11 @@ bool ap2_buffered_transport_acquire_media_next(
     t->count_decoding++;
     d->state = AP2_BUFFERED_PACKET_DECODING;
     fill_ref_locked(t, best_slot, out);
+    /* FLUSH can arrive while this AU is being decoded. Track its continuation
+     * now, before TCP can retire the rule at untilSeq. */
+    t->cursor_seq = (d->seq + 1U) & 0x007fffffU;
+    t->cursor_seq_valid = true;
+    t->cursor_flush_pending = packet_is_invalid_by_rule_locked(t, t->cursor_seq);
   }
   xSemaphoreGive(t->mutex);
   return best_slot != AP2_STORE_INVALID_INDEX;
@@ -1120,6 +1163,11 @@ esp_err_t ap2_buffered_transport_add_invalid_seq_range(
     ESP_LOGE(TAG, "FLUSH rule allocation failed");
     return ESP_ERR_NO_MEM;
   }
+  if (t->cursor_seq_valid &&
+      seq23_delta_local(t->cursor_seq, from_seq) >= 0 &&
+      seq23_delta_local(t->cursor_seq, until_seq) < 0) {
+    t->cursor_flush_pending = true;
+  }
   for (uint16_t i = 0; i < t->packet_count; ++i) {
     packet_desc_t *d = &t->packets[i];
     if (d->store_epoch != t->store_epoch || d->arrival_id == 0) continue;
@@ -1168,6 +1216,8 @@ uint32_t ap2_buffered_transport_invalidate_before_seq(
   xSemaphoreTake(t->mutex, portMAX_DELAY);
   t->invalid_before_active = true;
   t->invalid_before_seq = until_seq;
+  if (t->cursor_seq_valid && seq23_delta_local(t->cursor_seq, until_seq) < 0)
+    t->cursor_flush_pending = true;
   for (uint16_t i = 0; i < t->packet_count; ++i) {
     packet_desc_t *d = &t->packets[i];
     if (d->store_epoch != t->store_epoch || d->arrival_id == 0) continue;
@@ -1196,6 +1246,7 @@ uint32_t ap2_buffered_transport_invalidate_all(ap2_buffered_transport_t *t) {
   uint32_t marked = 0;
   xSemaphoreTake(t->mutex, portMAX_DELAY);
   t->invalidate_all_active = true;
+  if (t->cursor_seq_valid) t->cursor_flush_pending = true;
   for (uint16_t i = 0; i < t->packet_count; ++i) {
     packet_desc_t *d = &t->packets[i];
     if (d->store_epoch != t->store_epoch || d->arrival_id == 0) continue;
@@ -1217,10 +1268,22 @@ uint32_t ap2_buffered_transport_invalidate_all(ap2_buffered_transport_t *t) {
   return marked;
 }
 
-void ap2_buffered_transport_set_media_generation(
-    ap2_buffered_transport_t *t, uint32_t generation) {
+void ap2_buffered_transport_begin_media_update(ap2_buffered_transport_t *t) {
+  if (t) xSemaphoreTake(t->mutex, portMAX_DELAY);
+}
+
+void ap2_buffered_transport_end_media_update(ap2_buffered_transport_t *t,
+                                             uint32_t revision) {
   if (!t) return;
-  __atomic_store_n(&t->media_generation, generation, __ATOMIC_RELEASE);
+  t->media_floor_valid = false;
+  __atomic_store_n(&t->media_generation, revision, __ATOMIC_RELEASE);
+  xSemaphoreGive(t->mutex);
+}
+
+void ap2_buffered_transport_set_media_generation(
+    ap2_buffered_transport_t *t, uint32_t revision) {
+  ap2_buffered_transport_begin_media_update(t);
+  ap2_buffered_transport_end_media_update(t, revision);
 }
 
 void ap2_buffered_transport_reset_media_floor(ap2_buffered_transport_t *t) {

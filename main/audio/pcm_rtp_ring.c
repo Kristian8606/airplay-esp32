@@ -5,6 +5,8 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define PCM_SLOT_SAMPLES (PCM_RTP_SLOT_FRAMES * PCM_RTP_CHANNELS)
 #define PCM_RING_MASK    (PCM_RTP_SLOT_COUNT - 1U)
@@ -26,6 +28,7 @@ typedef struct {
 } pcm_slot_tag_t;
 
 struct pcm_rtp_ring {
+  SemaphoreHandle_t writer_mutex; /* writers/control only; I2S reads never lock */
   int16_t *pcm;
   pcm_slot_tag_t *tags;
   uint32_t generation;
@@ -173,7 +176,8 @@ esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out) {
   if (!r->tags) {
     r->tags = calloc(PCM_RTP_SLOT_COUNT, sizeof(pcm_slot_tag_t));
   }
-  if (!r->pcm || !r->tags) {
+  r->writer_mutex = xSemaphoreCreateMutex();
+  if (!r->pcm || !r->tags || !r->writer_mutex) {
     pcm_rtp_ring_destroy(r);
     return ESP_ERR_NO_MEM;
   }
@@ -191,6 +195,7 @@ void pcm_rtp_ring_destroy(pcm_rtp_ring_t *r) {
   if (!r) {
     return;
   }
+  if (r->writer_mutex) vSemaphoreDelete(r->writer_mutex);
   free(r->pcm);
   free(r->tags);
   free(r);
@@ -264,7 +269,7 @@ typedef struct {
   bool locked;
 } pcm_write_chunk_t;
 
-bool pcm_rtp_ring_write(pcm_rtp_ring_t *r, uint32_t first_rtp,
+static bool pcm_rtp_ring_write_locked(pcm_rtp_ring_t *r, uint32_t first_rtp,
                         const int16_t *pcm, size_t frames, int channels,
                         uint32_t generation, uint32_t wanted_rtp,
                         bool wanted_valid) {
@@ -387,6 +392,20 @@ bool pcm_rtp_ring_write(pcm_rtp_ring_t *r, uint32_t first_rtp,
                      __ATOMIC_RELEASE);
   }
   return true;
+}
+
+/* Serialize all tag writers so FLUSH cannot silently skip an owned slot.
+ * Generation changes remain O(1), nonblocking, and safe under state_mux. */
+bool pcm_rtp_ring_write(pcm_rtp_ring_t *r, uint32_t first_rtp,
+                        const int16_t *pcm, size_t frames, int channels,
+                        uint32_t generation, uint32_t wanted_rtp,
+                        bool wanted_valid) {
+  if (!r) return false;
+  xSemaphoreTake(r->writer_mutex, portMAX_DELAY);
+  bool ok = pcm_rtp_ring_write_locked(r, first_rtp, pcm, frames, channels,
+                                     generation, wanted_rtp, wanted_valid);
+  xSemaphoreGive(r->writer_mutex);
+  return ok;
 }
 
 static bool read_page_range(const pcm_rtp_ring_t *r, uint32_t rtp,
@@ -549,70 +568,57 @@ bool pcm_rtp_ring_read_256(const pcm_rtp_ring_t *r, uint32_t first_rtp,
 
 void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *r, uint32_t from_rtp,
                                    uint32_t until_rtp, uint32_t generation) {
-  if (!r || (int32_t)(until_rtp - from_rtp) <= 0) {
-    return;
-  }
+  const int32_t length = (int32_t)(until_rtp - from_rtp);
+  if (!r || length <= 0) return;
 
-  uint32_t cur = from_rtp;
-  uint32_t remaining = until_rtp - from_rtp;
-  while (remaining) {
-    uint32_t base = page_base(cur);
-    uint32_t off = cur - base;
-    uint32_t chunk = PCM_RTP_SLOT_FRAMES - off;
-    if (chunk > remaining) {
-      chunk = remaining;
+  xSemaphoreTake(r->writer_mutex, portMAX_DELAY);
+  /* Visit physical tags once, even if the sender names hours of RTP time. */
+  for (uint32_t i = 0; i < PCM_RTP_SLOT_COUNT; ++i) {
+    pcm_slot_tag_t *tag = &r->tags[i];
+    if (tag->generation != generation) continue;
+    const int64_t start = (int32_t)(tag->page_rtp - from_rtp);
+    const int64_t end = start + PCM_RTP_SLOT_FRAMES;
+    if (end <= 0 || start >= length) continue;
+    const uint32_t off = start < 0 ? (uint32_t)(-start) : 0U;
+    const uint32_t stop = end > length ? (uint32_t)(length - start)
+                                      : PCM_RTP_SLOT_FRAMES;
+    const uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
+    (void)__atomic_exchange_n(&tag->seq, seq + 1U, __ATOMIC_ACQ_REL);
+    validity_clear_range(tag->valid, off, stop - off);
+    if (!validity_any(tag->valid)) {
+      tag->page_rtp = 0U;
+      tag->generation = 0U;
     }
-
-    pcm_slot_tag_t *tag = &r->tags[slot_for_page(base)];
-    uint32_t seq0 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
-    if (!(seq0 & 1U) && tag->generation == generation && tag->page_rtp == base) {
-      uint32_t expected = seq0;
-      if (__atomic_compare_exchange_n(&tag->seq, &expected, seq0 + 1U,
-                                      false, __ATOMIC_ACQ_REL,
-                                      __ATOMIC_ACQUIRE)) {
-        validity_clear_range(tag->valid, off, chunk);
-        if (!validity_any(tag->valid)) {
-          tag->page_rtp = 0U;
-          tag->generation = 0U;
-        }
-        __atomic_store_n(&tag->seq, seq0 + 2U, __ATOMIC_RELEASE);
-      }
-    }
-
-    cur += chunk;
-    remaining -= chunk;
+    __atomic_store_n(&tag->seq, seq + 2U, __ATOMIC_RELEASE);
   }
+  xSemaphoreGive(r->writer_mutex);
 }
 
 void pcm_rtp_ring_invalidate_before(pcm_rtp_ring_t *r, uint32_t until_rtp,
                                     uint32_t generation) {
-  if (!r || generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
+  if (!r) return;
+  xSemaphoreTake(r->writer_mutex, portMAX_DELAY);
+  if (generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
+    xSemaphoreGive(r->writer_mutex);
     return;
   }
-
   for (uint32_t i = 0; i < PCM_RTP_SLOT_COUNT; ++i) {
     pcm_slot_tag_t *tag = &r->tags[i];
-    uint32_t seq0 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
-    if (seq0 & 1U) continue;
     if (tag->generation != generation) continue;
-
-    const int32_t frames_before = rtp_delta(until_rtp, tag->page_rtp);
-    if (frames_before <= 0) continue;
-
-    uint32_t count = frames_before >= (int32_t)PCM_RTP_SLOT_FRAMES
-                         ? PCM_RTP_SLOT_FRAMES
-                         : (uint32_t)frames_before;
-    uint32_t expected = seq0;
-    if (__atomic_compare_exchange_n(&tag->seq, &expected, seq0 + 1U, false,
-                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-      validity_clear_range(tag->valid, 0U, count);
-      if (!validity_any(tag->valid)) {
-        tag->page_rtp = 0U;
-        tag->generation = 0U;
-      }
-      __atomic_store_n(&tag->seq, seq0 + 2U, __ATOMIC_RELEASE);
+    const int32_t before = rtp_delta(until_rtp, tag->page_rtp);
+    if (before <= 0) continue;
+    const uint32_t count = before >= (int32_t)PCM_RTP_SLOT_FRAMES
+                              ? PCM_RTP_SLOT_FRAMES : (uint32_t)before;
+    const uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
+    (void)__atomic_exchange_n(&tag->seq, seq + 1U, __ATOMIC_ACQ_REL);
+    validity_clear_range(tag->valid, 0U, count);
+    if (!validity_any(tag->valid)) {
+      tag->page_rtp = 0U;
+      tag->generation = 0U;
     }
+    __atomic_store_n(&tag->seq, seq + 2U, __ATOMIC_RELEASE);
   }
+  xSemaphoreGive(r->writer_mutex);
 }
 
 void pcm_rtp_ring_get_stats(const pcm_rtp_ring_t *r,
