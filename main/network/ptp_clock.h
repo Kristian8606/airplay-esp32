@@ -115,6 +115,12 @@ typedef struct {
   uint32_t mastership_age_ms;
   uint32_t sample_count;
   uint32_t sample_age_ms; /* UINT32_MAX when no Follow_Up is available. */
+  /* Realtime two-step PTP diagnostics. pair_count is the number of accepted
+   * Sync/Follow_Up pairs (one-step Sync samples are counted too). */
+  uint32_t pair_count;
+  uint32_t orphan_followup_count;
+  uint32_t pair_mismatch_count;
+  uint32_t sync_followup_gap_us;
   /* Monotonic within one realtime PTP session. Incremented whenever Announce
    * changes grandmasterIdentity after the first master has been observed.
    * Audio uses this only to distinguish mastership epochs; it never feeds

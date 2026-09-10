@@ -2208,12 +2208,17 @@ static void ap2_stats_task(void *arg) {
         if (map_valid) {
           ESP_LOGI(TAG,
                    "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=%+.2fms ptpD=%+.2fms gmReady=%d gmAge=%lums ptpAge=%lums"
+                   " pair=%" PRIu32 " o=%" PRIu32 " m=%" PRIu32 " gap=%.2fms"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
                    " stgMin=%.0fms wait=%.0fms",
                    sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
-                   map_delta_ms, ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   map_delta_ms, ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms,
+                   ptp_rt.pair_count, ptp_rt.orphan_followup_count,
+                   ptp_rt.pair_mismatch_count,
+                   (double)ptp_rt.sync_followup_gap_us / 1000.0,
+                   miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                    (double)rt.interval_max_interarrival_us / 1000.0,
                    rt.work_queue_depth, sil_delta, late_delta,
                    (double)stg_min_ahead / 1000.0,
@@ -2221,12 +2226,17 @@ static void ap2_stats_task(void *arg) {
         } else {
           ESP_LOGI(TAG,
                    "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=-- ptpD=%+.2fms gmReady=%d gmAge=%lums ptpAge=%lums"
+                   " pair=%" PRIu32 " o=%" PRIu32 " m=%" PRIu32 " gap=%.2fms"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
                    " stgMin=%.0fms wait=%.0fms",
                    sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
-                   ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms,
+                   ptp_rt.pair_count, ptp_rt.orphan_followup_count,
+                   ptp_rt.pair_mismatch_count,
+                   (double)ptp_rt.sync_followup_gap_us / 1000.0,
+                   miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                    (double)rt.interval_max_interarrival_us / 1000.0,
                    rt.work_queue_depth, sil_delta, late_delta,
                    (double)stg_min_ahead / 1000.0,
@@ -2234,12 +2244,17 @@ static void ap2_stats_task(void *arg) {
         }
       } else {
         ESP_LOGI(TAG,
-                 "ALAC sync=-- pcm=%dms map=%s ptpD=%+.2fms gmReady=%d gmAge=%lums ptpAge=%lums | miss=%" PRIu32
+                 "ALAC sync=-- pcm=%dms map=%s ptpD=%+.2fms gmReady=%d gmAge=%lums ptpAge=%lums"
+                 " pair=%" PRIu32 " o=%" PRIu32 " m=%" PRIu32 " gap=%.2fms | miss=%" PRIu32
                  " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32 " give=%" PRIu32
                  " ia=%.0fms q=%" PRIu32 " | sil=%" PRIu32
                  " late=%" PRIu32 " stgMin=%.0fms wait=%.0fms | %s",
                  pcm_ahead_ms, map_valid ? "ok" : "--", ptp_raw_filter_delta_ms,
-                 ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                 ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms,
+                 ptp_rt.pair_count, ptp_rt.orphan_followup_count,
+                 ptp_rt.pair_mismatch_count,
+                 (double)ptp_rt.sync_followup_gap_us / 1000.0,
+                 miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                  (double)rt.interval_max_interarrival_us / 1000.0,
                  rt.work_queue_depth, sil_delta, late_delta,
                  (double)stg_min_ahead / 1000.0,

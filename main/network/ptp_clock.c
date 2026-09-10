@@ -140,6 +140,26 @@ static struct {
   uint64_t rt_last_d7_clock_id; /* observation only; never rewrites the PTP epoch */
   uint32_t rt_gm_changes;
 
+  /* Realtime two-step PTP pairing. A Follow_Up carries the precise origin
+   * timestamp of the corresponding Sync, but the local receive timestamp that
+   * belongs in the offset calculation is the Sync receive time, not the
+   * Follow_Up receive time. Keep exactly one outstanding Sync, matching the
+   * cadence used by AirPlay/NQPTP and by the legacy path above. */
+  uint16_t rt_sync_seq;
+  int64_t rt_sync_local_ns;
+  int64_t rt_sync_correction_ns;
+  uint64_t rt_sync_source_clock_id;
+  uint32_t rt_sync_source_ip;
+  bool rt_awaiting_followup;
+
+  /* Diagnostic counters for validating Sync <-> Follow_Up pairing in real
+   * listening tests. These are session counters and intentionally survive GM
+   * estimator resets; only a stream-mode reset/clear zeros them. */
+  uint32_t rt_pair_count;
+  uint32_t rt_orphan_followup_count;
+  uint32_t rt_pair_mismatch_count;
+  int64_t rt_last_sync_followup_gap_ns;
+
   // Master clock filter / realtime anchor-clock hint (0 = unspecified).
   uint64_t expected_clock_id;
 } ptp = {0};
@@ -187,6 +207,16 @@ static uint64_t parse_ptp_timestamp_ns(const uint8_t *data) {
 // Get local time in nanoseconds (from esp_timer)
 static inline int64_t get_local_time_ns(void) {
   return (int64_t)esp_timer_get_time() * 1000LL;
+}
+
+/* PTP correctionField is a signed 64-bit fixed-point value with 16 fractional
+ * bits. Return whole nanoseconds, matching the existing legacy behaviour. */
+static int64_t parse_ptp_correction_ns(const uint8_t *data, size_t len) {
+  if (!data || len < 16U) return 0;
+
+  uint64_t raw = 0;
+  for (size_t i = 8U; i < 16U; ++i) raw = (raw << 8) | data[i];
+  return ((int64_t)raw) / 65536LL;
 }
 
 // Update offset with new sample using asymmetric smoothing (nqptp-style).
@@ -341,6 +371,13 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.rt_sample_count = 0;
   ptp.rt_master_ready = false;
   ptp.rt_last_d7_clock_id = 0; /* reject stale D7 from the previous GM */
+  ptp.rt_sync_seq = 0;
+  ptp.rt_sync_local_ns = 0;
+  ptp.rt_sync_correction_ns = 0;
+  ptp.rt_sync_source_clock_id = 0;
+  ptp.rt_sync_source_ip = 0;
+  ptp.rt_awaiting_followup = false;
+  ptp.rt_last_sync_followup_gap_ns = 0;
 
   /* Realtime PTP lock means "the current GM estimator is ready" only. It no
    * longer means audio must stop: ALAC playout is in ESP-local time. */
@@ -361,8 +398,9 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
  *     negative changes are ignored;
  *   - later, positive changes use 1/16 and negative changes use 1/256 after a
  *     -2.5 ms innovation clamp.
- * raw_offset_ns is preciseOriginTimestamp(+Follow_Up correction) minus the
- * userspace Follow_Up reception timestamp, matching nqptp. */
+ * raw_offset_ns is the precise Sync origin timestamp (+ Sync/Follow_Up
+ * correction fields) minus the userspace reception timestamp of that same
+ * Sync packet. */
 static bool realtime_update_offset_locked(int64_t raw_offset_ns,
                                           int64_t reception_ns) {
   const bool was_ready = ptp.rt_master_ready;
@@ -541,39 +579,48 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
 static void process_sync_realtime(const uint8_t *data, size_t len,
                                   uint16_t seq, uint32_t source_ip,
                                   int64_t reception_ns) {
-  (void)seq;
-  (void)reception_ns;
   if (len < PTP_HEADER_SIZE) return;
 
+  const uint64_t source_clock = parse_ptp_clock_id(data);
+  const int64_t sync_correction_ns = parse_ptp_correction_ns(data, len);
+
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (ptp.realtime_mode && realtime_source_matches_locked(source_ip)) {
-    ptp.sync_count++;
-    if (ptp.source_clock_id == 0) ptp.source_clock_id = parse_ptp_clock_id(data);
+  if (!ptp.realtime_mode || !realtime_source_matches_locked(source_ip)) {
+    taskEXIT_CRITICAL(&ptp_state_mux);
+    return;
   }
+
+  ptp.sync_count++;
+  if (ptp.source_clock_id == 0) ptp.source_clock_id = source_clock;
+
+  /* A new Sync before the previous pair completed means the old pair can no
+   * longer be used safely. Count it and replace it with the newest Sync. */
+  if (ptp.rt_awaiting_followup) ptp.rt_pair_mismatch_count++;
+  ptp.rt_sync_seq = seq;
+  ptp.rt_sync_local_ns = reception_ns;
+  ptp.rt_sync_correction_ns = sync_correction_ns;
+  ptp.rt_sync_source_clock_id = source_clock;
+  ptp.rt_sync_source_ip = source_ip;
+  ptp.rt_awaiting_followup = true;
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
 static void process_followup_realtime(const uint8_t *data, size_t len,
                                       uint16_t seq, uint32_t source_ip,
                                       int64_t reception_ns) {
-  (void)seq;
   if (len < PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) return;
 
   const uint64_t ptp_time_ns =
       parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
-  int64_t followup_correction_ns = 0;
-  if (len >= 16) {
-    followup_correction_ns =
-        ((int64_t)data[8] << 56) | ((int64_t)data[9] << 48) |
-        ((int64_t)data[10] << 40) | ((int64_t)data[11] << 32) |
-        ((int64_t)data[12] << 24) | ((int64_t)data[13] << 16) |
-        ((int64_t)data[14] << 8) | (int64_t)data[15];
-    followup_correction_ns /= 65536;
-  }
+  if (ptp_time_ns > INT64_MAX) return;
+  const int64_t followup_correction_ns = parse_ptp_correction_ns(data, len);
+  const uint64_t followup_source_clock = parse_ptp_clock_id(data);
 
   uint64_t gm = 0, source = 0;
   int64_t master_off = 0;
+  int64_t sync_fu_gap_ns = 0;
   uint32_t master_age = 0, samples = 0;
+  uint32_t pairs = 0, orphans = 0, mismatches = 0;
   bool became_ready = false;
 
   taskENTER_CRITICAL(&ptp_state_mux);
@@ -584,13 +631,42 @@ static void process_followup_realtime(const uint8_t *data, size_t len,
   }
 
   ptp.followup_count++;
+
+  if (!ptp.rt_awaiting_followup) {
+    ptp.rt_orphan_followup_count++;
+    taskEXIT_CRITICAL(&ptp_state_mux);
+    return;
+  }
+
+  if (seq != ptp.rt_sync_seq || source_ip != ptp.rt_sync_source_ip ||
+      followup_source_clock != ptp.rt_sync_source_clock_id) {
+    /* Keep the current pending Sync: an out-of-order/old Follow_Up must not
+     * destroy the chance to receive the correct Follow_Up for it. */
+    ptp.rt_pair_mismatch_count++;
+    taskEXIT_CRITICAL(&ptp_state_mux);
+    return;
+  }
+
+  const int64_t sync_local_ns = ptp.rt_sync_local_ns;
+  const int64_t sync_correction_ns = ptp.rt_sync_correction_ns;
+  ptp.rt_awaiting_followup = false;
+  sync_fu_gap_ns = reception_ns >= sync_local_ns
+                       ? reception_ns - sync_local_ns
+                       : 0;
+  ptp.rt_last_sync_followup_gap_ns = sync_fu_gap_ns;
+  ptp.rt_pair_count++;
+
   const int64_t raw_offset =
-      (int64_t)ptp_time_ns + followup_correction_ns - reception_ns;
+      (int64_t)ptp_time_ns + sync_correction_ns + followup_correction_ns -
+      sync_local_ns;
   became_ready = realtime_update_offset_locked(raw_offset, reception_ns);
   gm = ptp.grandmaster_clock_id;
   source = ptp.source_clock_id;
   master_off = ptp.rt_master_offset_ns;
   samples = ptp.rt_sample_count;
+  pairs = ptp.rt_pair_count;
+  orphans = ptp.rt_orphan_followup_count;
+  mismatches = ptp.rt_pair_mismatch_count;
   if (ptp.rt_mastership_start_ns > 0 && reception_ns >= ptp.rt_mastership_start_ns)
     master_age = (uint32_t)((reception_ns - ptp.rt_mastership_start_ns) / 1000000LL);
   taskEXIT_CRITICAL(&ptp_state_mux);
@@ -598,10 +674,13 @@ static void process_followup_realtime(const uint8_t *data, size_t len,
   if (became_ready) {
     ESP_LOGI(TAG,
              "RT MASTER READY gm=%016llx source=%016llx age=%lums samples=%lu "
-             "masterOff=%+lldns mapRate=0ppm fixed",
+             "masterOff=%+lldns mapRate=0ppm fixed pair=%lu orphanFU=%lu "
+             "mismatch=%lu syncFuGap=%.2fms",
              (unsigned long long)gm, (unsigned long long)source,
              (unsigned long)master_age, (unsigned long)samples,
-             (long long)master_off);
+             (long long)master_off, (unsigned long)pairs,
+             (unsigned long)orphans, (unsigned long)mismatches,
+             (double)sync_fu_gap_ns / 1000000.0);
   }
 }
 
@@ -882,6 +961,16 @@ void ptp_clock_clear(void) {
   ptp.rt_sample_count = 0;
   ptp.rt_master_ready = false;
   ptp.rt_last_d7_clock_id = 0;
+  ptp.rt_sync_seq = 0;
+  ptp.rt_sync_local_ns = 0;
+  ptp.rt_sync_correction_ns = 0;
+  ptp.rt_sync_source_clock_id = 0;
+  ptp.rt_sync_source_ip = 0;
+  ptp.rt_awaiting_followup = false;
+  ptp.rt_pair_count = 0;
+  ptp.rt_orphan_followup_count = 0;
+  ptp.rt_pair_mismatch_count = 0;
+  ptp.rt_last_sync_followup_gap_ns = 0;
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
@@ -899,6 +988,13 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
     ptp.rt_last_followup_rx_ns = 0;
     ptp.rt_sample_count = 0;
     ptp.rt_master_ready = false;
+    ptp.rt_sync_seq = 0;
+    ptp.rt_sync_local_ns = 0;
+    ptp.rt_sync_correction_ns = 0;
+    ptp.rt_sync_source_clock_id = 0;
+    ptp.rt_sync_source_ip = 0;
+    ptp.rt_awaiting_followup = false;
+    ptp.rt_last_sync_followup_gap_ns = 0;
     ptp.locked = false;
     ptp.filtered_offset_ns = 0;
   } else {
@@ -991,6 +1087,16 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.rt_sample_count = 0;
     ptp.rt_master_ready = false;
     ptp.rt_last_d7_clock_id = 0;
+    ptp.rt_sync_seq = 0;
+    ptp.rt_sync_local_ns = 0;
+    ptp.rt_sync_correction_ns = 0;
+    ptp.rt_sync_source_clock_id = 0;
+    ptp.rt_sync_source_ip = 0;
+    ptp.rt_awaiting_followup = false;
+    ptp.rt_pair_count = 0;
+    ptp.rt_orphan_followup_count = 0;
+    ptp.rt_pair_mismatch_count = 0;
+    ptp.rt_last_sync_followup_gap_ns = 0;
   }
   task_handle = ptp.task_handle;
   taskEXIT_CRITICAL(&ptp_state_mux);
@@ -1045,6 +1151,14 @@ void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
   snapshot->source_clock_id = ptp.source_clock_id;
   snapshot->master_offset_ns = ptp.rt_master_offset_ns;
   snapshot->sample_count = ptp.rt_sample_count;
+  snapshot->pair_count = ptp.rt_pair_count;
+  snapshot->orphan_followup_count = ptp.rt_orphan_followup_count;
+  snapshot->pair_mismatch_count = ptp.rt_pair_mismatch_count;
+  if (ptp.rt_last_sync_followup_gap_ns > 0) {
+    const uint64_t gap_us = (uint64_t)ptp.rt_last_sync_followup_gap_ns / 1000ULL;
+    snapshot->sync_followup_gap_us =
+        gap_us > UINT32_MAX ? UINT32_MAX : (uint32_t)gap_us;
+  }
   snapshot->gm_change_count = ptp.rt_gm_changes;
   if (ptp.rt_mastership_start_ns > 0 && now_ns >= ptp.rt_mastership_start_ns)
     snapshot->mastership_age_ms =
