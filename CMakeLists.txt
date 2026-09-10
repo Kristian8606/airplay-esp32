@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Re-run CMake automatically when VERSION changes, even with an existing build directory.
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/VERSION")
+# Read VERSION as configuration data only.
+# Do NOT register it as a CMake/Ninja configure dependency: on ESP-IDF/Ninja
+# that can cause an endless "Re-running CMake" loop on some setups.
+# If VERSION is edited in an existing build tree, run `idf.py reconfigure` once.
 
 # Single source of truth for the firmware version.
 # Change only VERSION (for example v2.0.0 -> v2.0.1).

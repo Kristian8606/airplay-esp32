@@ -77,11 +77,8 @@ static const char *TAG = "ptp_clock";
 #define RT_MASTER_READY_AGE_MS 400U
 #define RT_MIN_MASTER_SAMPLES 4U
 
-/* Realtime ALAC uses NQPTP only to establish PHASE between the current
- * remote grandmaster and ESP monotonic time. Once a GM is ready, the running
- * remote-PTP -> ESP-local map has a fixed 1:1 slope. This deliberately keeps
- * movement of the asymmetric NQPTP offset estimator out of the media rate.
- * Physical I2S rate remains controlled solely by the existing audio PID. */
+/* Realtime ALAC follows the current filtered remote-to-local offset.
+ * Freezing it at startup hides relative clock drift from the audio servo. */
 
 #define PTP_TASK_PRIORITY_LEGACY   6U
 #define PTP_TASK_PRIORITY_REALTIME 8U
@@ -142,14 +139,6 @@ static struct {
   bool rt_master_ready;
   uint64_t rt_last_d7_clock_id; /* observation only; never rewrites the PTP epoch */
   uint32_t rt_gm_changes;
-
-  /* Fixed-slope remote-PTP -> ESP-local map. Phase is captured from the
-   * NQPTP estimator when a GM becomes ready. The slope remains exactly 1:1
-   * for the lifetime of that mastership epoch; no PTP rate learner can steer
-   * the realtime audio timeline. */
-  bool rt_time_map_valid;
-  int64_t rt_time_ref_remote_ns;
-  int64_t rt_time_ref_local_ns;
 
   // Master clock filter / realtime anchor-clock hint (0 = unspecified).
   uint64_t expected_clock_id;
@@ -334,19 +323,6 @@ static bool realtime_source_matches_locked(uint32_t source_ip) {
   return false;
 }
 
-/* Caller holds ptp_state_mux. Running realtime conversion intentionally
- * uses a fixed 1:1 slope:
- *   local = local_ref + (remote - remote_ref)
- * NQPTP filtered-offset convergence is therefore phase diagnostic only and
- * cannot impersonate a media clock-rate change. */
-static bool realtime_affine_to_local_locked(int64_t remote_ns,
-                                             int64_t *local_ns) {
-  if (!local_ns || !ptp.rt_time_map_valid) return false;
-  *local_ns = ptp.rt_time_ref_local_ns +
-              (remote_ns - ptp.rt_time_ref_remote_ns);
-  return true;
-}
-
 /* Reset only the estimator that belongs to one remote grandmaster. Audio
  * continuity is intentionally NOT represented here. Realtime ALAC owns a
  * separate RTP<->ESP-local presentation anchor and keeps using it while the
@@ -365,10 +341,6 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.rt_sample_count = 0;
   ptp.rt_master_ready = false;
   ptp.rt_last_d7_clock_id = 0; /* reject stale D7 from the previous GM */
-
-  ptp.rt_time_map_valid = false;
-  ptp.rt_time_ref_remote_ns = 0;
-  ptp.rt_time_ref_local_ns = 0;
 
   /* Realtime PTP lock means "the current GM estimator is ready" only. It no
    * longer means audio must stop: ALAC playout is in ESP-local time. */
@@ -425,8 +397,7 @@ static bool realtime_update_offset_locked(int64_t raw_offset_ns,
   ptp.rt_master_offset_ns = smoothed;
 
 
-  /* Keep the generic getters meaningful for diagnostics/upper layers, but
-   * realtime audio never uses this moving value as its presentation clock. */
+  /* Publish the same filtered estimate to audio and diagnostics. */
   ptp.filtered_offset_ns = smoothed;
   ptp.previous_offset = smoothed;
   ptp.previous_offset_time_ms = (uint32_t)(reception_ns / 1000000LL);
@@ -442,13 +413,6 @@ static bool realtime_update_offset_locked(int64_t raw_offset_ns,
     ptp.rt_master_ready = true;
     ptp.locked = true;
     ptp.lock_start_ms = (uint32_t)(reception_ns / 1000000LL);
-
-    /* Freeze the PHASE estimate into a fixed-slope realtime clock map. From
-     * this point on NQPTP may keep converging for diagnostics/reacquisition,
-     * but its moving offset cannot alter the media phase or media rate. */
-    ptp.rt_time_ref_local_ns = reception_ns;
-    ptp.rt_time_ref_remote_ns = reception_ns + smoothed;
-    ptp.rt_time_map_valid = true;
   }
   return !was_ready && ptp.rt_master_ready;
 }
@@ -918,9 +882,6 @@ void ptp_clock_clear(void) {
   ptp.rt_sample_count = 0;
   ptp.rt_master_ready = false;
   ptp.rt_last_d7_clock_id = 0;
-  ptp.rt_time_map_valid = false;
-  ptp.rt_time_ref_remote_ns = 0;
-  ptp.rt_time_ref_local_ns = 0;
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
@@ -940,9 +901,6 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
     ptp.rt_master_ready = false;
     ptp.locked = false;
     ptp.filtered_offset_ns = 0;
-    ptp.rt_time_map_valid = false;
-    ptp.rt_time_ref_remote_ns = 0;
-    ptp.rt_time_ref_local_ns = 0;
   } else {
     ptp.previous_offset_time_ms = 0;
     ptp.mastership_start_ms = 0;
@@ -1033,9 +991,6 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.rt_sample_count = 0;
     ptp.rt_master_ready = false;
     ptp.rt_last_d7_clock_id = 0;
-    ptp.rt_time_map_valid = false;
-    ptp.rt_time_ref_remote_ns = 0;
-    ptp.rt_time_ref_local_ns = 0;
   }
   task_handle = ptp.task_handle;
   taskEXIT_CRITICAL(&ptp_state_mux);
@@ -1067,28 +1022,25 @@ void ptp_clock_note_realtime_d7(uint64_t clock_id) {
 bool ptp_clock_realtime_time_to_local(uint64_t clock_id,
                                       uint64_t remote_ptp_ns,
                                       uint64_t *local_ns) {
-  if (!local_ns || clock_id == 0) return false;
-  bool ok = false;
-  int64_t local = 0;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  if (ptp.realtime_mode && ptp.rt_master_ready &&
-      clock_id == ptp.grandmaster_clock_id &&
-      ptp.rt_last_followup_rx_ns > 0 && ptp.rt_time_map_valid) {
-    ok = realtime_affine_to_local_locked((int64_t)remote_ptp_ns, &local);
-  }
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  if (!ok || local < 0) return false;
-  *local_ns = (uint64_t)local;
-  return true;
+  ptp_realtime_snapshot_t snapshot;
+  ptp_clock_get_realtime_snapshot(&snapshot);
+  return ptp_clock_realtime_snapshot_to_local(
+      &snapshot, clock_id, remote_ptp_ns, local_ns);
 }
 
 void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
   if (!snapshot) return;
   memset(snapshot, 0, sizeof(*snapshot));
-  const int64_t now_ns = get_local_time_ns();
   taskENTER_CRITICAL(&ptp_state_mux);
+  const int64_t now_ns = get_local_time_ns();
   snapshot->realtime_mode = ptp.realtime_mode;
-  snapshot->master_ready = ptp.rt_master_ready;
+  const int64_t age_ns = now_ns - ptp.rt_last_followup_rx_ns;
+  snapshot->sample_age_ms = ptp.rt_last_followup_rx_ns > 0 && age_ns >= 0
+      ? (uint32_t)((uint64_t)(age_ns / 1000000LL) > UINT32_MAX
+                       ? UINT32_MAX : (uint64_t)(age_ns / 1000000LL))
+      : UINT32_MAX;
+  snapshot->master_ready = ptp.rt_master_ready &&
+      snapshot->sample_age_ms <= LOCK_TIMEOUT_MS;
   snapshot->master_clock_id = ptp.grandmaster_clock_id;
   snapshot->source_clock_id = ptp.source_clock_id;
   snapshot->master_offset_ns = ptp.rt_master_offset_ns;

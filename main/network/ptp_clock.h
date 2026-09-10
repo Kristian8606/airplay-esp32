@@ -114,12 +114,35 @@ typedef struct {
   int64_t master_offset_ns;
   uint32_t mastership_age_ms;
   uint32_t sample_count;
+  uint32_t sample_age_ms; /* UINT32_MAX when no Follow_Up is available. */
   /* Monotonic within one realtime PTP session. Incremented whenever Announce
    * changes grandmasterIdentity after the first master has been observed.
    * Audio uses this only to distinguish mastership epochs; it never feeds
    * back into PTP selection/filtering. */
   uint32_t gm_change_count;
 } ptp_realtime_snapshot_t;
+
+/* Convert using one coherent clock snapshot. Both clock identity and readiness
+ * belong to the same observation as the offset (including D7 admission). */
+static inline bool ptp_clock_realtime_snapshot_to_local(
+    const ptp_realtime_snapshot_t *snapshot, uint64_t clock_id,
+    uint64_t remote_ns, uint64_t *local_ns) {
+  if (!snapshot || !local_ns || !snapshot->realtime_mode ||
+      !snapshot->master_ready || clock_id == 0 ||
+      clock_id != snapshot->master_clock_id || remote_ns > INT64_MAX)
+    return false;
+  const int64_t offset = snapshot->master_offset_ns;
+  if (offset >= 0) {
+    if (remote_ns < (uint64_t)offset) return false;
+    *local_ns = remote_ns - (uint64_t)offset;
+  } else {
+    const uint64_t magnitude = (uint64_t)(-(offset + 1)) + 1U;
+    if (magnitude > INT64_MAX || remote_ns > (uint64_t)INT64_MAX - magnitude)
+      return false;
+    *local_ns = remote_ns + magnitude;
+  }
+  return true;
+}
 
 void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot);
 

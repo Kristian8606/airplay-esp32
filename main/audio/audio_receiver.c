@@ -97,8 +97,9 @@ static volatile int32_t s_volume_target_q15 = 32768;
 typedef struct {
   bool anchor_valid;
   bool playing;
+  uint64_t anchor_clock_id;
   uint64_t anchor_ptp_ns;
-  uint64_t anchor_local_ns; /* authoritative presentation anchor for realtime ALAC */
+  uint64_t anchor_local_ns; /* current local conversion, cached during PTP holdover */
   uint32_t anchor_rtp;
   uint32_t generation;          /* timing/playout epoch */
   uint32_t media_revision;      /* changes on every buffered anchor update */
@@ -231,6 +232,7 @@ typedef struct {
   uint64_t rt_media_rebase_clock_id;
   uint32_t rt_media_rebase_epoch;
   int64_t rt_media_rebase_bias_ns;
+  int64_t rt_media_rebase_start_us;
   uint32_t generation;          /* timing/playout epoch */
   uint32_t media_revision;      /* changes on every buffered anchor update */
   uint32_t buffered_pcm_generation; /* survives buffered seek/anchor changes */
@@ -294,10 +296,30 @@ static TickType_t realtime_stage_wait_ticks(int64_t wait_us) {
   return (TickType_t)ticks64;
 }
 
+/* Remove a GM handover compensation at 50 us/second. This is phase
+ * convergence, not another hardware-rate controller. The initial handover
+ * stays continuous; a real old-epoch error is no longer preserved forever. */
+static int64_t realtime_remaining_bias(int64_t bias_ns, int64_t start_us,
+                                        int64_t now_us) {
+  if (bias_ns == 0 || now_us <= start_us) return bias_ns;
+  const uint64_t elapsed_us = (uint64_t)now_us - (uint64_t)start_us;
+  const uint64_t magnitude = bias_ns < 0
+      ? (uint64_t)(-(bias_ns + 1)) + 1U : (uint64_t)bias_ns;
+  /* 50 ppm = 0.05 ns per microsecond, i.e. 1 ns per 20 us. */
+  const uint64_t correction_ns = elapsed_us / 20U;
+  if (correction_ns >= magnitude) return 0;
+  return bias_ns < 0 ? bias_ns + (int64_t)correction_ns
+                     : bias_ns - (int64_t)correction_ns;
+}
+
 static void snapshot_state(timing_snapshot_t *out) {
+  uint64_t clock_id;
+  uint32_t epoch;
+  int64_t bias_ns, bias_start_us;
   taskENTER_CRITICAL(&s.state_mux);
   out->anchor_valid = s.anchor_valid;
   out->playing = s.playing;
+  out->anchor_clock_id = s.anchor_clock_id;
   out->anchor_ptp_ns = s.anchor_ptp_ns;
   out->anchor_local_ns = s.anchor_local_ns;
   out->anchor_rtp = s.anchor_rtp;
@@ -311,7 +333,42 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->timeline_reset_pending = s.timeline_reset_pending;
   out->stream_type = s.stream_type;
   out->playout_latency_samples = s.playout_latency_samples;
+  clock_id = s.anchor_clock_id;
+  epoch = s.rt_media_rebase_epoch;
+  bias_ns = s.rt_media_rebase_bias_ns;
+  bias_start_us = s.rt_media_rebase_start_us;
   taskEXIT_CRITICAL(&s.state_mux);
+
+  if (out->stream_type == AUDIO_STREAM_REALTIME && out->anchor_valid &&
+      !out->timeline_reset_pending && out->anchor_ptp_ns != 0U) {
+    ptp_realtime_snapshot_t ps;
+    ptp_clock_get_realtime_snapshot(&ps);
+    uint64_t local_ns;
+    if (ps.gm_change_count == epoch &&
+        ptp_clock_realtime_snapshot_to_local(
+            &ps, clock_id, out->anchor_ptp_ns, &local_ns)) {
+      const int64_t remaining = realtime_remaining_bias(
+          bias_ns, bias_start_us, esp_timer_get_time());
+      /* All normal timestamps are ESP uptime values. Reject overflow instead
+       * of publishing an invalid deadline if control input is malformed. */
+      if ((remaining > 0 && local_ns > (uint64_t)(INT64_MAX - remaining)) ||
+          (remaining < 0 && local_ns < (uint64_t)(-(remaining + 1)) + 1U))
+        return;
+      const int64_t effective = (int64_t)local_ns + remaining;
+      if (effective <= 0) return;
+      out->anchor_local_ns = (uint64_t)effective;
+      /* Cache the most recent valid local map for a temporary PTP outage or
+       * GM acquisition. Never overwrite an anchor changed during the lookup. */
+      taskENTER_CRITICAL(&s.state_mux);
+      if (s.stream_type == out->stream_type && s.generation == out->generation &&
+          s.anchor_valid && !s.timeline_reset_pending &&
+          s.anchor_clock_id == clock_id && s.rt_media_rebase_epoch == epoch &&
+          s.anchor_rtp == out->anchor_rtp && s.anchor_ptp_ns == out->anchor_ptp_ns) {
+        s.anchor_local_ns = out->anchor_local_ns;
+      }
+      taskEXIT_CRITICAL(&s.state_mux);
+    }
+  }
 }
 
 static uint32_t next_generation(uint32_t generation) {
@@ -386,11 +443,9 @@ static inline int32_t rtp_delta(uint32_t a, uint32_t b) {
 
 /* Presentation-clock boundary.
  * Buffered AAC intentionally keeps the existing PTP-domain behaviour.
- * Realtime ALAC is different: every validated D7 is converted once from the
- * current GM's PTP domain into ESP monotonic time, and all lower audio timing
- * (staging deadlines, startup phase, DMA completion error and PID input) then
- * stays in that single local clock domain. A PTP estimator adjustment or GM
- * epoch change therefore cannot masquerade as physical loudspeaker motion. */
+ * Realtime ALAC retains the remote D7 anchor. Each timing snapshot converts
+ * it with the current filtered PTP offset, even between D7 packets. Staging,
+ * playout and DMA/PID use that coherent snapshot in ESP monotonic time. */
 static bool timing_clock_ready(const timing_snapshot_t *snap) {
   if (!snap || !snap->anchor_valid || snap->timeline_reset_pending) return false;
   if (snap->stream_type == AUDIO_STREAM_REALTIME) return snap->anchor_local_ns != 0;
@@ -2105,15 +2160,13 @@ static void ap2_stats_task(void *arg) {
 
       bool map_valid = false;
       double map_delta_ms = 0.0;
-      if (rt.last_d7_local_ns != 0U && snap.anchor_valid &&
+      uint64_t live_d7_local_ns = 0;
+      if (snap.stream_type == AUDIO_STREAM_REALTIME &&
+          ptp_clock_realtime_snapshot_to_local(&ptp_rt, snap.anchor_clock_id,
+              snap.anchor_ptp_ns, &live_d7_local_ns) && snap.anchor_valid &&
           snap.anchor_local_ns != 0U && !snap.timeline_reset_pending) {
-        const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
-        const int32_t ds = rtp_delta(rt.last_d7_frame1, snap.anchor_rtp);
-        const int64_t mapped_local_ns =
-            (int64_t)snap.anchor_local_ns +
-            ((int64_t)ds * 1000000000LL) / (int64_t)sr;
-        map_delta_ms =
-            (double)(mapped_local_ns - (int64_t)rt.last_d7_local_ns) / 1000000.0;
+        map_delta_ms = (double)((int64_t)snap.anchor_local_ns -
+                                (int64_t)live_d7_local_ns) / 1000000.0;
         map_valid = true;
       }
 
@@ -2154,26 +2207,26 @@ static void ap2_stats_task(void *arg) {
       if (now.playout_state == 2 && now.output_sync_valid) {
         if (map_valid) {
           ESP_LOGI(TAG,
-                   "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=%+.2fms ptpD=%+.2fms gmReady=%d gmAge=%lums"
+                   "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=%+.2fms ptpD=%+.2fms gmReady=%d gmAge=%lums ptpAge=%lums"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
                    " stgMin=%.0fms wait=%.0fms",
                    sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
-                   map_delta_ms, ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   map_delta_ms, ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                    (double)rt.interval_max_interarrival_us / 1000.0,
                    rt.work_queue_depth, sil_delta, late_delta,
                    (double)stg_min_ahead / 1000.0,
                    (double)stg_wait_max / 1000.0);
         } else {
           ESP_LOGI(TAG,
-                   "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=-- ptpD=%+.2fms gmReady=%d gmAge=%lums"
+                   "ALAC sync=%+.2fms ppm=%+" PRId32 "/%+" PRId32 " pcm=%dms map=-- ptpD=%+.2fms gmReady=%d gmAge=%lums ptpAge=%lums"
                    " | miss=%" PRIu32 " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32
                    " give=%" PRIu32 " ia=%.0fms q=%" PRIu32
                    " | sil=%" PRIu32 " late=%" PRIu32
                    " stgMin=%.0fms wait=%.0fms",
                    sync_ms, now.servo_ppm, now.servo_target_ppm, pcm_ahead_ms,
-                   ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                   ptp_raw_filter_delta_ms, ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                    (double)rt.interval_max_interarrival_us / 1000.0,
                    rt.work_queue_depth, sil_delta, late_delta,
                    (double)stg_min_ahead / 1000.0,
@@ -2181,12 +2234,12 @@ static void ap2_stats_task(void *arg) {
         }
       } else {
         ESP_LOGI(TAG,
-                 "ALAC sync=-- pcm=%dms map=%s ptpD=%+.2fms gmReady=%d gmAge=%lums | miss=%" PRIu32
+                 "ALAC sync=-- pcm=%dms map=%s ptpD=%+.2fms gmReady=%d gmAge=%lums ptpAge=%lums | miss=%" PRIu32
                  " nack=%" PRIu32 " rtx=%" PRIu32 " retry=%" PRIu32 " give=%" PRIu32
                  " ia=%.0fms q=%" PRIu32 " | sil=%" PRIu32
                  " late=%" PRIu32 " stgMin=%.0fms wait=%.0fms | %s",
                  pcm_ahead_ms, map_valid ? "ok" : "--", ptp_raw_filter_delta_ms,
-                 ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
+                 ptp_rt.master_ready ? 1 : 0, (unsigned long)ptp_rt.mastership_age_ms, (unsigned long)ptp_rt.sample_age_ms, miss_delta, nack_delta, rtx_delta, retry_delta, give_delta,
                  (double)rt.interval_max_interarrival_us / 1000.0,
                  rt.work_queue_depth, sil_delta, late_delta,
                  (double)stg_min_ahead / 1000.0,
@@ -2936,10 +2989,10 @@ bool audio_receiver_set_realtime_anchor_local(
       effective_local_ns = candidate_local_ns;
     } else if (epoch_changed) {
       /* New GM/mastership epoch while audio is already running. Preserve the
-       * exact existing RTP<->local phase and calculate the one constant media
+       * exact existing RTP<->local phase and calculate the initial media
        * bias needed to express the new GM's D7 observations in that same
-       * local timeline. This is a media rebase only: PTP and the PID are not
-       * modified. */
+       * local timeline. The bias then converges to zero at 50 ppm;
+       * PTP estimation and the hardware PID remain independent. */
       const int sr = s.format.sample_rate > 0 ? s.format.sample_rate : 44100;
       const int32_t drtp = rtp_delta(rtp, s.anchor_rtp);
       const int64_t predicted_local_ns =
@@ -2957,15 +3010,17 @@ bool audio_receiver_set_realtime_anchor_local(
       s.rt_media_rebase_clock_id = clock_id;
       s.rt_media_rebase_epoch = gm_epoch;
       s.rt_media_rebase_bias_ns = rebase_bias_ns;
+      s.rt_media_rebase_start_us = esp_timer_get_time();
       result->rebased = true;
       log_rebase = true;
     } else if (s.rt_media_rebase_valid &&
                s.rt_media_rebase_epoch == gm_epoch &&
                s.rt_media_rebase_clock_id == clock_id) {
-      /* Same stable GM epoch: retain the rebase offset but keep consuming
-       * every D7, so sender timing/rate changes remain visible without ever
-       * reintroducing the GM epoch phase step. */
-      rebase_bias_ns = s.rt_media_rebase_bias_ns;
+      /* Same GM: follow the current filtered PTP offset and gradually retire
+       * the temporary handover bias. Ordinary D7 updates do not restart decay. */
+      rebase_bias_ns = realtime_remaining_bias(
+          s.rt_media_rebase_bias_ns, s.rt_media_rebase_start_us,
+          esp_timer_get_time());
       const int64_t adjusted = (int64_t)candidate_local_ns + rebase_bias_ns;
       if (adjusted <= 0) {
         taskEXIT_CRITICAL(&s.state_mux);
@@ -2977,7 +3032,7 @@ bool audio_receiver_set_realtime_anchor_local(
     committed = s.timeline_reset_pending;
     gen = commit_anchor_epoch_locked();
     s.anchor_clock_id = clock_id;
-    s.anchor_ptp_ns = remote_ptp_ns; /* diagnostic/reference only for ALAC */
+    s.anchor_ptp_ns = remote_ptp_ns; /* retained remote anchor for live PTP conversion */
     s.anchor_local_ns = effective_local_ns;
     s.anchor_rtp = rtp;
     s.anchor_valid = true;
@@ -2987,7 +3042,9 @@ bool audio_receiver_set_realtime_anchor_local(
 
     result->effective_local_ns = effective_local_ns;
     result->rebase_step_ns = rebase_step_ns;
-    result->rebase_bias_ns = s.rt_media_rebase_bias_ns;
+    result->rebase_bias_ns = realtime_remaining_bias(
+        s.rt_media_rebase_bias_ns, s.rt_media_rebase_start_us,
+        esp_timer_get_time());
   }
   taskEXIT_CRITICAL(&s.state_mux);
 

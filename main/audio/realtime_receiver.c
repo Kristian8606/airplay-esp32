@@ -605,9 +605,9 @@ static void reset_transport_tracking(void) {
   if (s_rt.missing) memset(s_rt.missing, 0, RT_MISSING_SLOTS * sizeof(*s_rt.missing));
 }
 
-/* Convert the latest D7 exactly once from the current ready GM's remote PTP
- * domain into ESP monotonic time and publish it as the realtime presentation
- * anchor. This is deliberately NOT a one-shot startup operation: D7 is the
+/* Admit each D7 with one coherent current-GM observation. The receiver keeps
+ * its remote anchor and refreshes local presentation snapshots from live PTP
+ * even between D7 packets. This is deliberately NOT a one-shot startup operation: D7 is the
  * sender's continuous RTP<->time observation, analogous to timing-anchor
  * refreshes on the buffered path. A GM transition never invalidates the old
  * local map; until the new GM is ready, conversion simply fails and playout
@@ -619,14 +619,12 @@ static void service_d7_anchor(void) {
   }
 
   uint64_t local_ns = 0;
-  if (!ptp_clock_realtime_time_to_local(s_rt.last_d7_clock_id,
-                                        s_rt.last_d7_raw_ptp_ns,
-                                        &local_ns)) {
-    return;
-  }
-
   ptp_realtime_snapshot_t ps = {0};
   ptp_clock_get_realtime_snapshot(&ps);
+  if (!ptp_clock_realtime_snapshot_to_local(&ps, s_rt.last_d7_clock_id,
+                                           s_rt.last_d7_raw_ptp_ns, &local_ns)) {
+    return;
+  }
   audio_realtime_anchor_result_t anchor_result = {0};
   if (!audio_receiver_set_realtime_anchor_local(
           s_rt.last_d7_clock_id, ps.gm_change_count,
@@ -909,7 +907,7 @@ static void alac_worker_task(void *arg) {
            xPortGetCoreID(), RT_WORK_PRIORITY, dcfg.sample_rate, dcfg.channels,
            dcfg.frame_size);
   ESP_LOGI(TAG,
-           "build=FIX13_SHAIRPORT_ALAC_R23P_LOG_CLEANUP localTimeline=1 continuousD7=1 nqptpPhase=1 fixedMapRate=0ppm gmRebaseSettle=1000ms phaseContinuous=1 noVirtualPTP=1 noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
+           "build=FIX14_ALAC_LIVE_PTP localTimeline=1 continuousD7=1 nqptpPhase=1 livePtpOffset=1 gmRebaseSettle=1000ms gmBiasDecay=50ppm noVirtualPTP=1 noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
            (unsigned)RT_MISSING_SLOTS, (unsigned)RT_DATA_POOL_SLOTS,
            (unsigned)RT_RTX_POOL_SLOTS);
 
