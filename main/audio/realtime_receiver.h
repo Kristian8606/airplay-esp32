@@ -89,6 +89,14 @@ typedef struct {
   void *deadline_ctx;
 } realtime_receiver_config_t;
 
+/* Large ingress packet pools may live in caller-owned shared PSRAM. This is
+ * intentionally limited to DATA/RTX slots; queues, decoder scratch and loss
+ * tracking keep their existing allocation and task logic. Call only before
+ * the first realtime start while the receiver is idle. */
+size_t realtime_receiver_packet_workspace_size(void);
+esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
+                                                  size_t workspace_bytes);
+
 esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
                                   const realtime_receiver_config_t *config);
 void realtime_receiver_stop(void);

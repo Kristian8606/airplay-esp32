@@ -34,6 +34,17 @@ typedef struct {
 } pcm_rtp_ring_stats_t;
 
 esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out);
+
+/* Size of the large stereo PCM backing array only. Tags/mutex/control state
+ * are deliberately excluded and retain their normal ownership. */
+size_t pcm_rtp_ring_storage_bytes(void);
+
+/* Construct the same RTP-addressed ring on caller-owned PCM storage. The
+ * storage must remain valid until the ring is destroyed and must not be
+ * concurrently reused by another codec while this ring is active. */
+esp_err_t pcm_rtp_ring_create_with_storage(pcm_rtp_ring_t **out,
+                                           void *storage,
+                                           size_t storage_bytes);
 void pcm_rtp_ring_destroy(pcm_rtp_ring_t *ring);
 
 /* O(1) hard media/session invalidation. Buffered seek/anchor changes do NOT

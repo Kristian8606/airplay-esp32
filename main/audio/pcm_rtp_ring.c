@@ -30,6 +30,7 @@ typedef struct {
 struct pcm_rtp_ring {
   SemaphoreHandle_t writer_mutex; /* writers/control only; I2S reads never lock */
   int16_t *pcm;
+  bool owns_pcm;
   pcm_slot_tag_t *tags;
   uint32_t generation;
   uint32_t tagged_slots;
@@ -157,20 +158,37 @@ static bool validity_has_range(const uint32_t valid[VALID_WORDS], uint32_t off,
   return true;
 }
 
-esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out) {
+size_t pcm_rtp_ring_storage_bytes(void) {
+  return (size_t)PCM_RTP_RING_FRAMES * PCM_RTP_CHANNELS * sizeof(int16_t);
+}
+
+static esp_err_t pcm_rtp_ring_create_internal(pcm_rtp_ring_t **out,
+                                              void *storage,
+                                              size_t storage_bytes) {
   if (!out) {
     return ESP_ERR_INVALID_ARG;
   }
   *out = NULL;
+
+  const size_t pcm_bytes = pcm_rtp_ring_storage_bytes();
+  if (storage && (storage_bytes < pcm_bytes ||
+                  ((uintptr_t)storage % _Alignof(int16_t)) != 0U)) {
+    return ESP_ERR_INVALID_ARG;
+  }
 
   pcm_rtp_ring_t *r = calloc(1, sizeof(*r));
   if (!r) {
     return ESP_ERR_NO_MEM;
   }
 
-  const size_t pcm_bytes = (size_t)PCM_RTP_RING_FRAMES * PCM_RTP_CHANNELS *
-                           sizeof(int16_t);
-  r->pcm = heap_caps_malloc(pcm_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (storage) {
+    r->pcm = (int16_t *)storage;
+    r->owns_pcm = false;
+  } else {
+    r->pcm = heap_caps_malloc(pcm_bytes,
+                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    r->owns_pcm = true;
+  }
   r->tags = heap_caps_calloc(PCM_RTP_SLOT_COUNT, sizeof(pcm_slot_tag_t),
                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!r->tags) {
@@ -191,12 +209,23 @@ esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out) {
   return ESP_OK;
 }
 
+esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out) {
+  return pcm_rtp_ring_create_internal(out, NULL, 0U);
+}
+
+esp_err_t pcm_rtp_ring_create_with_storage(pcm_rtp_ring_t **out,
+                                           void *storage,
+                                           size_t storage_bytes) {
+  if (!storage) return ESP_ERR_INVALID_ARG;
+  return pcm_rtp_ring_create_internal(out, storage, storage_bytes);
+}
+
 void pcm_rtp_ring_destroy(pcm_rtp_ring_t *r) {
   if (!r) {
     return;
   }
   if (r->writer_mutex) vSemaphoreDelete(r->writer_mutex);
-  free(r->pcm);
+  if (r->owns_pcm) free(r->pcm);
   free(r->tags);
   free(r);
 }

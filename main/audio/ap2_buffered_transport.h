@@ -117,6 +117,20 @@ typedef struct {
 
 esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
                                         const ap2_buffered_transport_config_t *cfg);
+
+/* Create the normal page-backed transport while using caller-owned storage
+ * for the compressed payload pages. Descriptor/hash/free-list metadata keeps
+ * its existing allocation/ownership. The supplied storage must remain valid
+ * for the entire lifetime of the transport and must not be used by another
+ * codec until ap2_buffered_transport_is_idle() is true.
+ *
+ * This is used by the audio engine to let buffered AAC and realtime ALAC
+ * reuse the same large PSRAM backing store without changing either transport
+ * algorithm. */
+esp_err_t ap2_buffered_transport_create_with_payload_storage(
+    ap2_buffered_transport_t **out,
+    const ap2_buffered_transport_config_t *cfg,
+    void *payload_storage, size_t payload_storage_bytes);
 /* Call only with the consumer stopped. If shutdown times out or DECODING
  * ownership remains, destruction is deferred; retain the pointer and retry. */
 void ap2_buffered_transport_destroy(ap2_buffered_transport_t *t);
@@ -124,6 +138,11 @@ esp_err_t ap2_buffered_transport_start(ap2_buffered_transport_t *t,
                                        uint16_t requested_port,
                                        uint16_t *bound_port);
 void ap2_buffered_transport_stop(ap2_buffered_transport_t *t);
+
+/* True only when no TCP reader and no decoder still own payload storage.
+ * A codec sharing the payload backing memory may acquire it only in this
+ * state. */
+bool ap2_buffered_transport_is_idle(ap2_buffered_transport_t *t);
 
 /* New codec/session boundary. READY/INVALID packets are immediately reusable.
  * WRITING/DECODING retain ownership only until the in-flight

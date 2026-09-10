@@ -212,6 +212,9 @@ typedef struct {
   uint8_t *decrypt_buf;
   int16_t *decode_pcm;
   int16_t *realtime_stage_pcm;
+  uint8_t *codec_workspace;       /* shared AAC payload / ALAC large buffers */
+  size_t codec_workspace_size;
+  bool realtime_workspace_bound;
   pcm_rtp_ring_t *pcm_ring;          /* final EQ'd PCM -> PTP/I2S */
   pcm_rtp_ring_t *realtime_stage_ring; /* raw decoded ALAC, RTP-addressed */
 
@@ -2274,6 +2277,19 @@ esp_err_t audio_receiver_init(void) {
            (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
+
+  /* Allocate the one large codec backing store first while PSRAM is least
+   * fragmented. Buffered AAC uses all 5 MiB as its page payload store.
+   * Realtime ALAC reuses the beginning of the same bytes for its raw PCM ring
+   * and DATA/RTX pools, but only after the buffered transport is fully idle. */
+  if (!s.codec_workspace) {
+    s.codec_workspace_size = AP2_BUFFERED_STORE_REQUEST_BYTES;
+    s.codec_workspace = heap_caps_malloc(
+        s.codec_workspace_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s.codec_workspace) s.codec_workspace = malloc(s.codec_workspace_size);
+    if (!s.codec_workspace) return ESP_ERR_NO_MEM;
+  }
+
   if (!s.packet) {
     s.packet = heap_caps_malloc(AP2_PACKET_MAX,
                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2302,12 +2318,47 @@ esp_err_t audio_receiver_init(void) {
     if (!s.realtime_stage_pcm)
       s.realtime_stage_pcm = malloc(AP2_PCM_CAPACITY_FRAMES * 2U * sizeof(int16_t));
   }
+
+  if (!s.transport) {
+    ap2_buffered_transport_config_t tcfg = {
+        .store_bytes = AP2_BUFFERED_STORE_REQUEST_BYTES,
+        .task_core = AP2_NETWORK_CORE,
+        .task_priority = AP2_RX_PRIORITY,
+        .task_stack = AP2_RX_STACK,
+    };
+    ESP_RETURN_ON_ERROR(ap2_buffered_transport_create_with_payload_storage(
+                            &s.transport, &tcfg, s.codec_workspace,
+                            s.codec_workspace_size),
+                        TAG, "buffered transport create failed");
+  }
+
   if (!s.pcm_ring && pcm_rtp_ring_create(&s.pcm_ring) != ESP_OK) {
     return ESP_ERR_NO_MEM;
   }
-  if (!s.realtime_stage_ring &&
-      pcm_rtp_ring_create(&s.realtime_stage_ring) != ESP_OK) {
+
+  const size_t rt_stage_bytes = pcm_rtp_ring_storage_bytes();
+  const size_t rt_pool_bytes = realtime_receiver_packet_workspace_size();
+  if (rt_stage_bytes > s.codec_workspace_size ||
+      rt_pool_bytes > s.codec_workspace_size - rt_stage_bytes) {
+    ESP_LOGE(TAG,
+             "shared codec workspace too small: have=%u KiB ALAC needs=%u KiB",
+             (unsigned)(s.codec_workspace_size / 1024U),
+             (unsigned)((rt_stage_bytes + rt_pool_bytes) / 1024U));
     return ESP_ERR_NO_MEM;
+  }
+
+  if (!s.realtime_stage_ring &&
+      pcm_rtp_ring_create_with_storage(
+          &s.realtime_stage_ring, s.codec_workspace, rt_stage_bytes) != ESP_OK) {
+    return ESP_ERR_NO_MEM;
+  }
+  if (!s.realtime_workspace_bound) {
+    ESP_RETURN_ON_ERROR(
+        realtime_receiver_set_packet_workspace(
+            s.codec_workspace + rt_stage_bytes,
+            s.codec_workspace_size - rt_stage_bytes),
+        TAG, "ALAC shared packet workspace bind failed");
+    s.realtime_workspace_bound = true;
   }
   if (!s.packet || !s.decrypt_buf || !s.decode_pcm || !s.realtime_stage_pcm || !s.pcm_ring ||
       !s.realtime_stage_ring) {
@@ -2318,22 +2369,17 @@ esp_err_t audio_receiver_init(void) {
   pcm_rtp_ring_set_generation(s.realtime_stage_ring, s.generation);
   __atomic_store_n(&s.realtime_stage_min_ahead_us, INT32_MAX, __ATOMIC_RELAXED);
   ESP_LOGI(TAG,
-           "PSRAM after PCM ring: total=%u KiB free=%u KiB largest=%u KiB",
+           "PSRAM after shared codec + final PCM: total=%u KiB free=%u KiB largest=%u KiB",
            (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
-  if (!s.transport) {
-    ap2_buffered_transport_config_t tcfg = {
-        .store_bytes = AP2_BUFFERED_STORE_REQUEST_BYTES,
-        .task_core = AP2_NETWORK_CORE,
-        .task_priority = AP2_RX_PRIORITY,
-        .task_stack = AP2_RX_STACK,
-    };
-    ESP_RETURN_ON_ERROR(ap2_buffered_transport_create(&s.transport, &tcfg),
-                        TAG, "buffered transport create failed");
-  }
   ESP_LOGI(TAG,
-           "PSRAM after compressed store: total=%u KiB free=%u KiB largest=%u KiB store=%u KiB",
+           "shared codec workspace=%u KiB: AAC payload=%u KiB; ALAC active use=%u KiB (raw PCM + DATA/RTX)",
+           (unsigned)(s.codec_workspace_size / 1024U),
+           (unsigned)(ap2_buffered_transport_capacity(s.transport) / 1024U),
+           (unsigned)((rt_stage_bytes + rt_pool_bytes) / 1024U));
+  ESP_LOGI(TAG,
+           "PSRAM after audio stores: total=%u KiB free=%u KiB largest=%u KiB store=%u KiB",
            (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
@@ -2484,6 +2530,17 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
                fmt_snap.format.frame_size);
       return ESP_ERR_NOT_SUPPORTED;
     }
+
+    /* AAC compressed payload pages and ALAC large realtime buffers are the
+     * same physical PSRAM. Never let ALAC reuse those bytes until the TCP
+     * reader and buffered decoder have completely released their ownership. */
+    if (s.transport && !ap2_buffered_transport_is_idle(s.transport)) {
+      ESP_LOGE(TAG,
+               "realtime start refused: buffered transport still owns shared codec workspace");
+      return ESP_ERR_INVALID_STATE;
+    }
+    if (s.transport) ap2_buffered_transport_clear(s.transport);
+
     /* SETUP may be followed by RECORD for the same live stream. Preserve
      * its anchor, cursor and EQ history; only a stopped stream needs startup. */
     if (realtime_receiver_is_running()) {

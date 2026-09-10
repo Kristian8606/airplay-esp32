@@ -1040,6 +1040,44 @@ static bool all_tasks_stopped(void) {
          s_rt.worker_task == NULL && s_rt.resend_task == NULL;
 }
 
+size_t realtime_receiver_packet_workspace_size(void) {
+  const size_t align = _Alignof(rt_packet_slot_t);
+  const size_t pools =
+      (size_t)(RT_DATA_POOL_SLOTS + RT_RTX_POOL_SLOTS) *
+      sizeof(rt_packet_slot_t);
+  /* Include enough headroom to align an arbitrary caller-provided base. */
+  return pools + (align - 1U);
+}
+
+esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
+                                                  size_t workspace_bytes) {
+  if (!workspace) return ESP_ERR_INVALID_ARG;
+  if (s_rt.running || !all_tasks_stopped() || s_rt.data_pool || s_rt.rtx_pool) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  const uintptr_t raw = (uintptr_t)workspace;
+  const uintptr_t align = (uintptr_t)_Alignof(rt_packet_slot_t);
+  const uintptr_t aligned = (raw + align - 1U) & ~(align - 1U);
+  const size_t skipped = (size_t)(aligned - raw);
+  const size_t data_bytes =
+      (size_t)RT_DATA_POOL_SLOTS * sizeof(rt_packet_slot_t);
+  const size_t rtx_bytes =
+      (size_t)RT_RTX_POOL_SLOTS * sizeof(rt_packet_slot_t);
+  if (workspace_bytes < skipped ||
+      workspace_bytes - skipped < data_bytes + rtx_bytes) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  s_rt.data_pool = (rt_packet_slot_t *)aligned;
+  s_rt.rtx_pool = (rt_packet_slot_t *)(aligned + data_bytes);
+  ESP_LOGI(TAG,
+           "shared packet workspace: DATA=%u KiB RTX=%u KiB total=%u KiB",
+           (unsigned)(data_bytes / 1024U), (unsigned)(rtx_bytes / 1024U),
+           (unsigned)((data_bytes + rtx_bytes) / 1024U));
+  return ESP_OK;
+}
+
 static esp_err_t ensure_transport_resources(void) {
   if (!s_rt.data_pool) {
     s_rt.data_pool = heap_caps_calloc(RT_DATA_POOL_SLOTS, sizeof(*s_rt.data_pool),

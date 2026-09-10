@@ -54,6 +54,7 @@ typedef struct {
 
 struct ap2_buffered_transport {
   uint8_t *pages;
+  bool owns_pages;
   uint16_t *page_next;
   uint16_t page_count;
   uint16_t free_page_head;
@@ -689,9 +690,14 @@ static void tcp_reader_task(void *arg) {
   vTaskDelete(NULL);
 }
 
-esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
-                                        const ap2_buffered_transport_config_t *cfg) {
+static esp_err_t ap2_buffered_transport_create_internal(
+    ap2_buffered_transport_t **out,
+    const ap2_buffered_transport_config_t *cfg,
+    void *payload_storage, size_t payload_storage_bytes) {
   if (!out || !cfg || cfg->store_bytes < 16384U) return ESP_ERR_INVALID_ARG;
+  if (payload_storage && payload_storage_bytes < cfg->store_bytes) {
+    return ESP_ERR_INVALID_ARG;
+  }
 
   size_t page_count_sz = cfg->store_bytes / AP2_STORE_PAGE_BYTES;
   if (page_count_sz == 0 || page_count_sz >= AP2_STORE_INVALID_INDEX) {
@@ -708,10 +714,16 @@ esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
   t->listen_sock = -1;
   t->client_sock = -1;
 
-  t->pages = heap_caps_malloc((size_t)page_count * AP2_STORE_PAGE_BYTES,
-                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!t->pages) {
-    t->pages = malloc((size_t)page_count * AP2_STORE_PAGE_BYTES);
+  if (payload_storage) {
+    t->pages = (uint8_t *)payload_storage;
+    t->owns_pages = false;
+  } else {
+    t->pages = heap_caps_malloc((size_t)page_count * AP2_STORE_PAGE_BYTES,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!t->pages) {
+      t->pages = malloc((size_t)page_count * AP2_STORE_PAGE_BYTES);
+    }
+    t->owns_pages = true;
   }
   t->packets = heap_caps_calloc(packet_count, sizeof(packet_desc_t),
                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -782,6 +794,20 @@ esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
   return ESP_OK;
 }
 
+esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
+                                        const ap2_buffered_transport_config_t *cfg) {
+  return ap2_buffered_transport_create_internal(out, cfg, NULL, 0U);
+}
+
+esp_err_t ap2_buffered_transport_create_with_payload_storage(
+    ap2_buffered_transport_t **out,
+    const ap2_buffered_transport_config_t *cfg,
+    void *payload_storage, size_t payload_storage_bytes) {
+  if (!payload_storage) return ESP_ERR_INVALID_ARG;
+  return ap2_buffered_transport_create_internal(out, cfg, payload_storage,
+                                                 payload_storage_bytes);
+}
+
 void ap2_buffered_transport_destroy(ap2_buffered_transport_t *t) {
   if (!t) return;
   ap2_buffered_transport_stop(t);
@@ -800,7 +826,7 @@ void ap2_buffered_transport_destroy(ap2_buffered_transport_t *t) {
   free(t->free_packet_stack);
   free(t->page_next);
   free(t->packets);
-  free(t->pages);
+  if (t->owns_pages) free(t->pages);
   free(t);
 }
 
@@ -852,6 +878,19 @@ void ap2_buffered_transport_stop(ap2_buffered_transport_t *t) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
   t->port = 0;
+}
+
+bool ap2_buffered_transport_is_idle(ap2_buffered_transport_t *t) {
+  if (!t) return true;
+  if (t->running ||
+      __atomic_load_n(&t->reader_task, __ATOMIC_ACQUIRE) != NULL) {
+    return false;
+  }
+  if (!t->mutex) return t->count_decoding == 0U;
+  xSemaphoreTake(t->mutex, portMAX_DELAY);
+  const bool idle = t->count_decoding == 0U;
+  xSemaphoreGive(t->mutex);
+  return idle;
 }
 
 static bool fill_ref_locked(ap2_buffered_transport_t *t, uint16_t slot,
