@@ -273,7 +273,7 @@ cleanup:
   // Immediate: stop audio and NTP
   audio_receiver_stop();
 
-  // AP2 RAW RX: no AirPlay 1 DACP grace/reconnect path.
+  // AirPlay receiver: no AirPlay 1 DACP grace/reconnect path.
   rtsp_conn_free(conn);
 
   slot->conn = NULL;

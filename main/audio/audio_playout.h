@@ -35,6 +35,16 @@ typedef struct {
   uint64_t write_total_us;
   uint32_t write_last_us;
   uint32_t write_max_us;
+  uint32_t write_enter_calls;
+  uint32_t write_inflight;
+  uint32_t disable_calls;
+  uint32_t disable_inflight;
+  int32_t last_disable_err;
+  uint32_t preload_errors;
+  int32_t last_preload_err;
+  uint32_t last_preload_loaded;
+  uint32_t enable_errors;
+  int32_t last_enable_err;
 } audio_playout_diag_t;
 
 esp_err_t audio_playout_init(void);

@@ -1,4 +1,5 @@
 #include "audio_receiver.h"
+#include "amp_control.h"
 #include "audio_eq.h"
 #include "dns_server.h"
 #include "hap.h"
@@ -48,6 +49,7 @@ static void print_firmware_banner(void) {
 void app_main(void) {
   print_firmware_banner();
   log_memory_state("boot");
+  ESP_ERROR_CHECK(amp_control_init());
 
   esp_err_t e = nvs_flash_init();
   if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {

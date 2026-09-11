@@ -162,6 +162,15 @@ typedef struct {
   uint32_t startup_sync_generation;
   int32_t startup_anchor_to_sync_ms;
   volatile uint32_t startup_sync_log_pending;
+  volatile uint32_t prime_stage;
+  uint32_t prime_guard_fail;
+  uint32_t prime_map_fail;
+  uint32_t prime_preload_fail;
+  uint32_t prime_revalidate_fail;
+  uint32_t prime_enable_fail;
+  uint32_t prime_probe_timeout;
+  uint32_t prime_pcm_miss;
+  uint32_t prime_write_fail;
   int32_t first_decode_from_anchor_ms;
   uint32_t first_decode_generation;
   uint32_t pcm_peak_in;
@@ -176,6 +185,43 @@ typedef struct {
   uint64_t servo_updates;
   uint64_t servo_errors;
 } diag_stats_t;
+
+typedef enum {
+  PRIME_DIAG_IDLE = 0,
+  PRIME_DIAG_FLUSH,
+  PRIME_DIAG_GUARD,
+  PRIME_DIAG_MAP_START,
+  PRIME_DIAG_PRELOAD,
+  PRIME_DIAG_WAIT_TARGET,
+  PRIME_DIAG_REVALIDATE_1,
+  PRIME_DIAG_ENABLE,
+  PRIME_DIAG_PROBE_EOF,
+  PRIME_DIAG_MAP_REAL,
+  PRIME_DIAG_REVALIDATE_2,
+  PRIME_DIAG_PCM_READ,
+  PRIME_DIAG_WRITE_REAL,
+  PRIME_DIAG_RUNNING,
+} prime_diag_stage_t;
+
+static const char *prime_diag_stage_name(uint32_t stage) {
+  switch ((prime_diag_stage_t)stage) {
+    case PRIME_DIAG_IDLE: return "IDLE";
+    case PRIME_DIAG_FLUSH: return "FLUSH";
+    case PRIME_DIAG_GUARD: return "GUARD";
+    case PRIME_DIAG_MAP_START: return "MAP0";
+    case PRIME_DIAG_PRELOAD: return "PRELOAD";
+    case PRIME_DIAG_WAIT_TARGET: return "WAIT";
+    case PRIME_DIAG_REVALIDATE_1: return "REVAL1";
+    case PRIME_DIAG_ENABLE: return "ENABLE";
+    case PRIME_DIAG_PROBE_EOF: return "PROBE";
+    case PRIME_DIAG_MAP_REAL: return "MAP1";
+    case PRIME_DIAG_REVALIDATE_2: return "REVAL2";
+    case PRIME_DIAG_PCM_READ: return "PCM";
+    case PRIME_DIAG_WRITE_REAL: return "WRITE";
+    case PRIME_DIAG_RUNNING: return "RUN";
+    default: return "?";
+  }
+}
 
 typedef struct {
   bool pending;
@@ -259,6 +305,12 @@ typedef struct {
    * sequence number from an older AAC session after ALAC was active. */
   volatile bool i2s_flush_requested;
   volatile bool playout_servo_reset_requested;
+  /* Hard stream/session boundaries are requested by the RTSP/control core but
+   * executed by the single-owner playout task. The sequence pair provides a
+   * bounded acknowledgement so the next codec SETUP cannot race ahead of an
+   * unprocessed I2S flush/reset. */
+  volatile uint32_t playout_quiesce_req;
+  volatile uint32_t playout_quiesce_ack;
 
   media_gap_event_t gap_event;
   media_miss_event_t miss_event;
@@ -1535,6 +1587,7 @@ static void ap2_playout_task(void *arg) {
   double pid_d_filtered_ms_s = 0.0;
   bool pid_prev_valid = false;
   s.diag.playout_state = PLAYOUT_STOPPED;
+  __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_IDLE, __ATOMIC_RELAXED);
 
   while (s.engine_running) {
     if (__atomic_exchange_n(&s.playout_servo_reset_requested, false,
@@ -1565,6 +1618,7 @@ static void ap2_playout_task(void *arg) {
       s.diag.dma_pipeline_blocks = 0;
       state = PLAYOUT_STOPPED;
       s.diag.playout_state = state;
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_IDLE, __ATOMIC_RELAXED);
       s.diag.playout_servo_session_resets++;
       if (re != ESP_OK) {
         s.diag.playout_servo_reset_errors++;
@@ -1579,7 +1633,22 @@ static void ap2_playout_task(void *arg) {
       s.diag.output_sync_valid = false;
       state = PLAYOUT_STOPPED;
       s.diag.playout_state = state;
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_IDLE, __ATOMIC_RELAXED);
       s.diag.playout_flushes++;
+    }
+
+    /* Acknowledge a hard boundary only after both pending control requests
+     * have been consumed and the local state machine is stopped. This keeps
+     * all I2S driver ownership on this task while giving RTSP a deterministic
+     * hand-off point before a new codec stream is started. */
+    const uint32_t quiesce_req =
+        __atomic_load_n(&s.playout_quiesce_req, __ATOMIC_ACQUIRE);
+    if (quiesce_req !=
+            __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_RELAXED) &&
+        state == PLAYOUT_STOPPED &&
+        !__atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) &&
+        !__atomic_load_n(&s.playout_servo_reset_requested, __ATOMIC_ACQUIRE)) {
+      __atomic_store_n(&s.playout_quiesce_ack, quiesce_req, __ATOMIC_RELEASE);
     }
 
     timing_snapshot_t snap;
@@ -1597,6 +1666,7 @@ static void ap2_playout_task(void *arg) {
       s.diag.dma_pipeline_blocks = 0;
       state = PLAYOUT_STOPPED;
       s.diag.playout_state = state;
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_IDLE, __ATOMIC_RELAXED);
       vTaskDelay(1);
       continue;
     }
@@ -1619,7 +1689,9 @@ static void ap2_playout_task(void *arg) {
       state = PLAYOUT_PRIMING;
       s.diag.playout_state = state;
       s.diag.playout_resyncs++;
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_FLUSH, __ATOMIC_RELAXED);
       audio_playout_flush(); /* READY/disabled for deterministic preload */
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_GUARD, __ATOMIC_RELAXED);
     }
 
     if (state == PLAYOUT_PRIMING) {
@@ -1643,6 +1715,7 @@ static void ap2_playout_task(void *arg) {
       }
       if (!pcm_rtp_ring_has_range(s.pcm_ring, guard_start, guard_frames,
                                   snap.pcm_generation)) {
+        s.diag.prime_guard_fail++;
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
         continue;
@@ -1658,25 +1731,31 @@ static void ap2_playout_task(void *arg) {
       const uint32_t silence_rtp =
           desired_rtp + AP2_START_SILENCE_FUTURE_BLOCKS * AUDIO_PLAYOUT_FRAMES;
       uint64_t silence_start_time_ns = 0;
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_MAP_START, __ATOMIC_RELAXED);
       if (!rtp_to_presentation_ns(&snap, silence_rtp, &silence_start_time_ns)) {
+        s.diag.prime_map_fail++;
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
         continue;
       }
 
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_PRELOAD, __ATOMIC_RELAXED);
       if (audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
                                        silence_rtp, 0U) != ESP_OK ||
           audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
                                        silence_rtp + AUDIO_PLAYOUT_FRAMES,
                                        0U) != ESP_OK) {
+        s.diag.prime_preload_fail++;
         audio_playout_flush();
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
         continue;
       }
 
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_WAIT_TARGET, __ATOMIC_RELAXED);
       wait_until_presentation_ns(&snap, silence_start_time_ns);
 
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_REVALIDATE_1, __ATOMIC_RELAXED);
       timing_snapshot_t after_wait;
       snapshot_state(&after_wait);
       if (!after_wait.playing || !after_wait.anchor_valid ||
@@ -1685,8 +1764,10 @@ static void ap2_playout_task(void *arg) {
           __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
           !timing_clock_ready(&after_wait) ||
           (snap.stream_type == AUDIO_STREAM_REALTIME &&
-           (after_wait.anchor_local_ns != snap.anchor_local_ns ||
+           (after_wait.anchor_clock_id != snap.anchor_clock_id ||
+            after_wait.anchor_ptp_ns != snap.anchor_ptp_ns ||
             after_wait.anchor_rtp != snap.anchor_rtp))) {
+        s.diag.prime_revalidate_fail++;
         audio_playout_flush();
           state = PLAYOUT_STOPPED;
         s.diag.playout_state = state;
@@ -1694,7 +1775,9 @@ static void ap2_playout_task(void *arg) {
       }
 
       /* This is the only enable for the whole startup epoch. */
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_ENABLE, __ATOMIC_RELAXED);
       if (audio_playout_enable() != ESP_OK) {
+        s.diag.prime_enable_fail++;
         audio_playout_flush();
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
@@ -1704,6 +1787,7 @@ static void ap2_playout_task(void *arg) {
       /* Wait for EOF of the first silent block.  The second silent descriptor
        * is already running, leaving one full block (~5.8 ms) to calculate the
        * exact RTP sample for descriptor #3 and queue it without stopping I2S. */
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_PROBE_EOF, __ATOMIC_RELAXED);
       const int64_t align_deadline = esp_timer_get_time() + AP2_START_ALIGN_TIMEOUT_US;
       audio_playout_completion_t probe_done;
       bool have_probe = false;
@@ -1720,6 +1804,7 @@ static void ap2_playout_task(void *arg) {
         }
       }
       if (!have_probe) {
+        s.diag.prime_probe_timeout++;
         audio_playout_flush();
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
@@ -1741,19 +1826,16 @@ static void ap2_playout_task(void *arg) {
           probe_done_time_ns > 0 ? (uint64_t)probe_done_time_ns + block_ns
                                  : silence_start_time_ns + 2ULL * block_ns;
 
-      /* Positive test offset means intentionally play content earlier.  At a
-       * fixed physical boundary that is equivalent to selecting the RTP sample
-       * whose nominal presentation time lies test_offset in the future. */
-      int64_t mapped_time_ns = (int64_t)real_boundary_time_ns +
-                           (int64_t)CONFIG_AP2_PLAYOUT_TEST_OFFSET_US * 1000LL;
-      if (mapped_time_ns < 0) mapped_time_ns = 0;
-
-      /* Round to the nearest RTP sample instead of truncating.  This makes the
-       * startup alignment resolution one sample (22.68 us at 44.1 kHz). */
+      /* Round the measured physical I2S boundary to the nearest RTP sample.
+       * This keeps startup alignment resolution at one sample (22.68 us at
+       * 44.1 kHz) without a diagnostic/manual presentation offset. */
       const uint64_t half_sample_ns = 500000000ULL / (uint64_t)sr;
       uint32_t real_start_rtp = 0;
-      if (!wanted_rtp_at_presentation_ns(&snap, (uint64_t)mapped_time_ns + half_sample_ns,
-                             &real_start_rtp)) {
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_MAP_REAL, __ATOMIC_RELAXED);
+      if (!wanted_rtp_at_presentation_ns(&snap,
+                                           real_boundary_time_ns + half_sample_ns,
+                                           &real_start_rtp)) {
+        s.diag.prime_map_fail++;
         audio_playout_flush();
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
@@ -1761,6 +1843,7 @@ static void ap2_playout_task(void *arg) {
       }
 
       /* Revalidate the timeline after waiting for the probe EOF. */
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_REVALIDATE_2, __ATOMIC_RELAXED);
       timing_snapshot_t align_snap;
       snapshot_state(&align_snap);
       if (!align_snap.playing || !align_snap.anchor_valid ||
@@ -1769,17 +1852,21 @@ static void ap2_playout_task(void *arg) {
           __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
           !timing_clock_ready(&align_snap) ||
           (snap.stream_type == AUDIO_STREAM_REALTIME &&
-           (align_snap.anchor_local_ns != snap.anchor_local_ns ||
+           (align_snap.anchor_clock_id != snap.anchor_clock_id ||
+            align_snap.anchor_ptp_ns != snap.anchor_ptp_ns ||
             align_snap.anchor_rtp != snap.anchor_rtp))) {
+        s.diag.prime_revalidate_fail++;
         audio_playout_flush();
           state = PLAYOUT_STOPPED;
         s.diag.playout_state = state;
         continue;
       }
 
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_PCM_READ, __ATOMIC_RELAXED);
       bool ok = pcm_rtp_ring_read_256(s.pcm_ring, real_start_rtp,
                                       snap.pcm_generation, block);
       if (!ok) {
+        s.diag.prime_pcm_miss++;
         /* Do not allow the already-running silent probe to leak into audible
          * timing indefinitely. A miss restarts the one-enable alignment epoch
          * after more PCM has arrived. */
@@ -1789,9 +1876,11 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
       apply_output_volume(block, AUDIO_PLAYOUT_FRAMES, &volume_current_q15);
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_WRITE_REAL, __ATOMIC_RELAXED);
       if (audio_playout_write_tagged(block, AUDIO_PLAYOUT_FRAMES,
                                      real_start_rtp,
                                      snap.generation) != ESP_OK) {
+        s.diag.prime_write_fail++;
         audio_playout_flush();
         s.diag.playout_prime_waits++;
         vTaskDelay(1);
@@ -1815,6 +1904,7 @@ static void ap2_playout_task(void *arg) {
       s.diag.dma_pipeline_blocks = 2U; /* silent #2 + first real block */
       state = PLAYOUT_RUNNING;
       s.diag.playout_state = state;
+      __atomic_store_n(&s.diag.prime_stage, PRIME_DIAG_RUNNING, __ATOMIC_RELAXED);
       s.diag.playout_starts++;
       s.diag.startup_probe_sync_us = probe_sync_us;
       s.diag.startup_align_samples = align_samples;
@@ -2293,6 +2383,26 @@ static void ap2_stats_task(void *arg) {
                  now.playout_state == 1 ? "PRIME" : "STOP");
       }
     }
+    if (now.playout_state == 1U) {
+      ESP_LOGI(TAG,
+               "PRIME DIAG stage=%s fail[g=%" PRIu32 " map=%" PRIu32
+               " pre=%" PRIu32 " rv=%" PRIu32 " en=%" PRIu32
+               " probe=%" PRIu32 " pcm=%" PRIu32 " wr=%" PRIu32 "]"
+               " i2s[disIn=%" PRIu32 " dis=%" PRIu32 " disErr=%" PRId32
+               " preErr=%" PRIu32 "/%" PRId32 "/%" PRIu32
+               " enErr=%" PRIu32 "/%" PRId32
+               " wrIn=%" PRIu32 " enter=%" PRIu32 " done=%" PRIu64 "]",
+               prime_diag_stage_name(
+                   __atomic_load_n(&s.diag.prime_stage, __ATOMIC_RELAXED)),
+               now.prime_guard_fail, now.prime_map_fail, now.prime_preload_fail,
+               now.prime_revalidate_fail, now.prime_enable_fail,
+               now.prime_probe_timeout, now.prime_pcm_miss, now.prime_write_fail,
+               pdiag.disable_inflight, pdiag.disable_calls, pdiag.last_disable_err,
+               pdiag.preload_errors, pdiag.last_preload_err, pdiag.last_preload_loaded,
+               pdiag.enable_errors, pdiag.last_enable_err,
+               pdiag.write_inflight, pdiag.write_enter_calls, pdiag.write_calls);
+    }
+
     prev = now;
     pcm_prev = pcm;
     pdiag_prev = pdiag;
@@ -2668,6 +2778,19 @@ esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port) {
   return ESP_ERR_NOT_SUPPORTED;
 }
 
+static bool wait_playout_quiesced(uint32_t request, uint32_t timeout_ms) {
+  if (!s.playout_task || !s.engine_running) return true;
+  const int64_t deadline_us =
+      esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
+  while (esp_timer_get_time() < deadline_us) {
+    if (__atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_ACQUIRE) == request) {
+      return true;
+    }
+    vTaskDelay(1);
+  }
+  return __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_ACQUIRE) == request;
+}
+
 void audio_receiver_stop(void) {
   stats_session_stop();
   /* A codec switch is a hard session boundary. Stop both possible producers
@@ -2685,6 +2808,24 @@ void audio_receiver_stop(void) {
   taskEXIT_CRITICAL(&s.state_mux);
   mark_timeline_discontinuity();
   __atomic_store_n(&s.playout_servo_reset_requested, true, __ATOMIC_RELEASE);
+  const uint32_t quiesce_request =
+      __atomic_add_fetch(&s.playout_quiesce_req, 1U, __ATOMIC_ACQ_REL);
+
+  /* The comment above defines this as a hard boundary, so make that true in
+   * execution too: do not let the next RTSP SETUP overtake the Core1 I2S
+   * flush/reset. The wait is normally only a few milliseconds and is bounded
+   * so a genuine I2S stall is surfaced rather than hanging the control task. */
+  if (!wait_playout_quiesced(quiesce_request, 250U)) {
+    ESP_LOGE(TAG,
+             "PLAYOUT quiesce timeout req=%" PRIu32 " ack=%" PRIu32
+             " state=%" PRIu32 " flush=%d servoReset=%d",
+             quiesce_request,
+             __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_ACQUIRE),
+             s.diag.playout_state,
+             __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ? 1 : 0,
+             __atomic_load_n(&s.playout_servo_reset_requested,
+                             __ATOMIC_ACQUIRE) ? 1 : 0);
+  }
 
   if (s.transport) {
     ap2_buffered_transport_stop(s.transport);

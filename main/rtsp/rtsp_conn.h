@@ -29,6 +29,8 @@ struct rtsp_conn {
   // Audio streaming state
   bool stream_active;
   bool stream_paused;
+  bool amp_session_active;
+  int64_t pause_started_us;
   int64_t stream_type;    // 96=UDP realtime, 103=TCP buffered
   uint16_t data_port;     // UDP port for audio data (type 96)
   uint16_t control_port;  // UDP port for control (retransmit requests)

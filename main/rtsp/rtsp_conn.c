@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "audio_receiver.h"
+#include "amp_control.h"
 #include "esp_log.h"
 #include "ptp_clock.h"
 #include "settings.h"
@@ -49,6 +50,14 @@ rtsp_conn_t *rtsp_conn_create(void) {
 void rtsp_conn_free(rtsp_conn_t *conn) {
   if (!conn) {
     return;
+  }
+
+  /* The RTSP connection owns exactly one amplifier session reference.
+   * Stream TEARDOWN intentionally does not touch it: only destruction of the
+   * control connection starts the amplifier power-off grace period. */
+  if (conn->amp_session_active) {
+    conn->amp_session_active = false;
+    amp_control_session_disconnected();
   }
 
   // Persist volume at disconnect

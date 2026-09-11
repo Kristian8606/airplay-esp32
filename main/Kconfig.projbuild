@@ -1,4 +1,4 @@
-menu "AP2 RAW RX Debug"
+menu "AirPlay Receiver"
     config DEFAULT_AP_SSID
         string "Setup AP SSID"
         default "ESP32-AirPlay-Setup"
@@ -22,6 +22,45 @@ menu "AP2 RAW RX Debug"
         default n
 endmenu
 
+menu "Amplifier Power Control"
+    config AIRPLAY_AMP_CONTROL
+        bool "Enable amplifier power control GPIO"
+        default y
+        help
+            Drive an amplifier enable/standby GPIO from a dedicated low-priority
+            task. RTSP code only updates the session state and wakes that task;
+            GPIO access and the delayed power-off never run in the audio/RTSP path.
+
+    config AIRPLAY_AMP_GPIO
+        int "Amplifier control GPIO"
+        default 21
+        range 0 48
+        depends on AIRPLAY_AMP_CONTROL
+
+    choice AIRPLAY_AMP_ACTIVE_LEVEL
+        prompt "Amplifier GPIO active level"
+        default AIRPLAY_AMP_ACTIVE_HIGH
+        depends on AIRPLAY_AMP_CONTROL
+
+        config AIRPLAY_AMP_ACTIVE_HIGH
+            bool "Active HIGH"
+
+        config AIRPLAY_AMP_ACTIVE_LOW
+            bool "Active LOW"
+    endchoice
+
+    config AIRPLAY_AMP_OFF_DELAY_SEC
+        int "Amplifier power-off delay after AirPlay disconnect (seconds)"
+        default 300
+        range 0 3600
+        depends on AIRPLAY_AMP_CONTROL
+        help
+            The amplifier remains enabled while at least one AirPlay control
+            session is active. After the last session disconnects, the amp task
+            waits this long before switching the GPIO inactive. A reconnect
+            during the delay keeps the amplifier on.
+endmenu
+
 menu "I2S Playout"
     config I2S_SCK_IO
         int "I2S MCLK GPIO"
@@ -35,16 +74,6 @@ menu "I2S Playout"
     config I2S_DO_IO
         int "I2S DATA OUT GPIO"
         default 12
-    config AP2_PLAYOUT_TEST_OFFSET_US
-        int "AirPlay playout test offset (us; positive advances ESP audio)"
-        default 0
-        range -200000 200000
-        help
-            Diagnostic-only presentation offset for multiroom testing.
-            Positive values advance the selected RTP content relative to the
-            physical I2S sample boundary; negative values delay it. The playout engine applies
-            this at the one-enable sample-alignment boundary. Keep 0 for normal
-            use. Nonzero values are diagnostic/manual trim only.
 endmenu
 
 menu "RGB Audio/VU LED"
