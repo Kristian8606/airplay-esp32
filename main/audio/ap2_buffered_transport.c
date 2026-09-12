@@ -11,6 +11,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "audio_diag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -36,17 +37,26 @@ typedef struct {
   uint64_t arrival_id;
   uint32_t seq;
   uint32_t rtp;
-  uint32_t ssrc;
   bool invalidated;
   bool ready_indexed;
   uint16_t ready_hash_next;
 } packet_desc_t;
 
 typedef struct {
-  bool in_use;
   uint32_t from_seq;
   uint32_t until_seq;
 } invalid_seq_range_t;
+
+/* Writer-owned snapshot of a WRITING packet. Once reserve_packet_locked()
+ * returns, these page-chain coordinates remain stable until this same reader
+ * publishes or aborts the packet. FLUSH/session clear never frees WRITING
+ * ownership underneath recv(). */
+typedef struct {
+  uint16_t slot;
+  uint16_t first_page;
+  uint16_t page_count;
+  size_t packet_len;
+} packet_write_ref_t;
 
 struct ap2_buffered_transport {
   uint8_t *pages;
@@ -76,6 +86,28 @@ struct ap2_buffered_transport {
   uint32_t count_decoding;
   uint32_t count_invalid;
 
+  /* Monotonic revision of the READY candidate set. Inserts/removals bump it
+   * under the transport mutex. A failed recovery scan caches the revision it
+   * inspected so the higher-priority AAC processor does not rescan the same
+   * descriptors until TCP/control actually changes the candidate set. */
+  uint32_t ready_revision;
+
+  /* Cache only RECOVERY MISSES. Exact RTP lookup always runs first. The cache
+   * key includes the decoder cursor and media revision; wanted_rtp may advance
+   * without a READY-set change, so a miss also records the earliest playhead
+   * at which a packet that was previously beyond max_lead can become eligible. */
+  bool recovery_miss_valid;
+  uint32_t recovery_miss_media_generation;
+  uint32_t recovery_miss_ready_revision;
+  bool recovery_miss_expected_valid;
+  uint32_t recovery_miss_expected_rtp;
+  uint32_t recovery_miss_expected_seq;
+  uint32_t recovery_miss_frame_samples;
+  int32_t recovery_miss_max_lead_samples;
+  uint32_t recovery_miss_wanted_rtp;
+  bool recovery_miss_future_valid;
+  uint32_t recovery_miss_future_wanted_rtp;
+
   /* Last live media floor observed by the AAC processor. This is only used
    * by writer-side GC when the page store is under pressure; it never gates
    * decode. The generation tags prevent a decoder snapshot from the previous
@@ -103,8 +135,6 @@ struct ap2_buffered_transport {
   int client_sock;
   uint16_t port;
   volatile bool running;
-  volatile bool peer_closed;
-  volatile int peer_error;
   TaskHandle_t reader_task;
 
   int task_core;
@@ -205,6 +235,11 @@ static inline uint16_t ready_hash_bucket(const ap2_buffered_transport_t *t,
   return (uint16_t)(x & (uint32_t)(t->ready_bucket_count - 1U));
 }
 
+static inline void ready_revision_bump_locked(ap2_buffered_transport_t *t) {
+  t->ready_revision++;
+  if (t->ready_revision == 0) t->ready_revision = 1;
+}
+
 static void ready_index_insert_locked(ap2_buffered_transport_t *t,
                                       uint16_t slot) {
   packet_desc_t *d = &t->packets[slot];
@@ -216,6 +251,7 @@ static void ready_index_insert_locked(ap2_buffered_transport_t *t,
   d->ready_hash_next = t->ready_buckets[b];
   t->ready_buckets[b] = slot;
   d->ready_indexed = true;
+  ready_revision_bump_locked(t);
 }
 
 static void ready_index_remove_locked(ap2_buffered_transport_t *t,
@@ -239,6 +275,55 @@ static void ready_index_remove_locked(ap2_buffered_transport_t *t,
   }
   d->ready_indexed = false;
   d->ready_hash_next = AP2_STORE_INVALID_INDEX;
+  ready_revision_bump_locked(t);
+}
+
+static bool recovery_miss_still_current_locked(
+    const ap2_buffered_transport_t *t, uint32_t wanted_rtp,
+    uint32_t expected_rtp, uint32_t expected_seq, bool expected_valid,
+    uint32_t frame_samples, int32_t max_lead_samples,
+    uint32_t media_generation) {
+  if (!t->recovery_miss_valid ||
+      t->recovery_miss_media_generation != media_generation ||
+      t->recovery_miss_ready_revision != t->ready_revision ||
+      t->recovery_miss_expected_valid != expected_valid ||
+      t->recovery_miss_frame_samples != frame_samples ||
+      t->recovery_miss_max_lead_samples != max_lead_samples) {
+    return false;
+  }
+  if (expected_valid &&
+      (t->recovery_miss_expected_rtp != expected_rtp ||
+       t->recovery_miss_expected_seq != expected_seq)) {
+    return false;
+  }
+
+  /* A backwards playhead move without a media revision should never be hidden
+   * by the cache. Normal forward motion can only create a new candidate when a
+   * previously too-far-ahead READY packet reaches the max-lead boundary. */
+  if ((int32_t)(wanted_rtp - t->recovery_miss_wanted_rtp) < 0) return false;
+  if (t->recovery_miss_future_valid &&
+      (int32_t)(wanted_rtp - t->recovery_miss_future_wanted_rtp) >= 0) {
+    return false;
+  }
+  return true;
+}
+
+static void recovery_miss_record_locked(
+    ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
+    uint32_t expected_seq, bool expected_valid, uint32_t frame_samples,
+    int32_t max_lead_samples, uint32_t media_generation,
+    bool future_valid, uint32_t future_wanted_rtp) {
+  t->recovery_miss_valid = true;
+  t->recovery_miss_media_generation = media_generation;
+  t->recovery_miss_ready_revision = t->ready_revision;
+  t->recovery_miss_expected_valid = expected_valid;
+  t->recovery_miss_expected_rtp = expected_rtp;
+  t->recovery_miss_expected_seq = expected_seq;
+  t->recovery_miss_frame_samples = frame_samples;
+  t->recovery_miss_max_lead_samples = max_lead_samples;
+  t->recovery_miss_wanted_rtp = wanted_rtp;
+  t->recovery_miss_future_valid = future_valid;
+  t->recovery_miss_future_wanted_rtp = future_wanted_rtp;
 }
 
 static uint16_t ready_index_find_exact_locked(
@@ -368,7 +453,8 @@ static uint32_t reap_stale_ready_locked(ap2_buffered_transport_t *t,
 }
 
 static bool reserve_packet_locked(ap2_buffered_transport_t *t, size_t packet_len,
-                                  uint16_t *slot_out) {
+                                  packet_write_ref_t *out) {
+  if (!out) return false;
   const uint16_t needed_pages =
       (uint16_t)((packet_len + AP2_STORE_PAGE_BYTES - 1U) / AP2_STORE_PAGE_BYTES);
   if (needed_pages == 0 || needed_pages > t->page_count) return false;
@@ -416,7 +502,12 @@ static bool reserve_packet_locked(ap2_buffered_transport_t *t, size_t packet_len
     prev = page;
   }
   d->first_page = first;
-  *slot_out = slot;
+  if (out) {
+    out->slot = slot;
+    out->first_page = first;
+    out->page_count = needed_pages;
+    out->packet_len = packet_len;
+  }
   return true;
 }
 
@@ -444,34 +535,25 @@ static ssize_t socket_read_exact(ap2_buffered_transport_t *t, int sock,
       continue;
     }
 
-    xSemaphoreTake(t->mutex, portMAX_DELAY);
-    if (n == 0) t->peer_closed = true;
-    else t->peer_error = errno;
-    xSemaphoreGive(t->mutex);
     return n == 0 ? 0 : -1;
   }
   return off == len ? (ssize_t)off : 0;
 }
 
 static bool recv_packet_into_pages(ap2_buffered_transport_t *t, int sock,
-                                   uint16_t slot) {
-  uint16_t page;
-  uint16_t page_count;
-  size_t packet_len;
-
-  xSemaphoreTake(t->mutex, portMAX_DELAY);
-  if (slot >= t->packet_count ||
-      t->packets[slot].state != AP2_BUFFERED_PACKET_WRITING) {
-    xSemaphoreGive(t->mutex);
+                                   const packet_write_ref_t *wr) {
+  if (!t || !wr || wr->slot >= t->packet_count ||
+      wr->first_page == AP2_STORE_INVALID_INDEX || wr->page_count == 0) {
     return false;
   }
-  page = t->packets[slot].first_page;
-  page_count = t->packets[slot].page_count;
-  packet_len = t->packets[slot].packet_len;
-  xSemaphoreGive(t->mutex);
 
-  size_t remaining = packet_len;
-  for (uint16_t i = 0; i < page_count && remaining > 0; ++i) {
+  /* reserve_packet_locked() transferred exclusive WRITING ownership to this
+   * TCP reader. The page chain cannot be reclaimed by FLUSH/store clear until
+   * publish/abort, so recv() does not need to re-enter transport->mutex just
+   * to reread immutable reservation metadata. */
+  uint16_t page = wr->first_page;
+  size_t remaining = wr->packet_len;
+  for (uint16_t i = 0; i < wr->page_count && remaining > 0; ++i) {
     if (page == AP2_STORE_INVALID_INDEX) return false;
     size_t n = remaining > AP2_STORE_PAGE_BYTES ? AP2_STORE_PAGE_BYTES : remaining;
     uint8_t *dst = t->pages + (size_t)page * AP2_STORE_PAGE_BYTES;
@@ -505,7 +587,6 @@ static void publish_written_packet(ap2_buffered_transport_t *t, uint16_t slot) {
   const uint8_t *p = t->pages + (size_t)d->first_page * AP2_STORE_PAGE_BYTES;
   d->seq = be32_local(p) & 0x007fffffU;
   d->rtp = be32_local(p + 4);
-  d->ssrc = be32_local(p + 8);
   d->arrival_id = ++t->next_arrival_id;
 
   /* untilSeq is exclusive: retire completed deferred rules before judging
@@ -532,8 +613,6 @@ static void store_clear_epoch(ap2_buffered_transport_t *t) {
   xSemaphoreTake(t->mutex, portMAX_DELAY);
   t->store_epoch++;
   if (t->store_epoch == 0) t->store_epoch = 1;
-  t->peer_closed = false;
-  t->peer_error = 0;
   t->cursor_seq_valid = false;
   t->cursor_flush_pending = false;
   t->media_floor_valid = false;
@@ -568,11 +647,9 @@ static void store_clear_epoch(ap2_buffered_transport_t *t) {
 static void tcp_reader_task(void *arg) {
   ap2_buffered_transport_t *t = (ap2_buffered_transport_t *)arg;
 
-  ESP_LOGI(TAG,
-           "reader task core=%d store=%u KiB page=%uB pages=%u slots=%u rtp_hash=%u",
-           xPortGetCoreID(), (unsigned)(t->capacity_bytes / 1024U),
-           (unsigned)AP2_STORE_PAGE_BYTES, (unsigned)t->page_count,
-           (unsigned)t->packet_count, (unsigned)t->ready_bucket_count);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_TCP_READER,
+                                    xPortGetCoreID(), t->task_priority,
+                                    t->packet_count);
 
   while (t->running) {
     struct sockaddr_storage addr;
@@ -587,6 +664,7 @@ static void tcp_reader_task(void *arg) {
     }
 
     store_clear_epoch(t);
+    AUDIO_DIAG_TRANSPORT_AAC_SESSION_RESET();
     t->client_sock = c;
 
     int rcvbuf = CONFIG_LWIP_TCP_WND_DEFAULT;
@@ -616,23 +694,31 @@ static void tcp_reader_task(void *arg) {
       }
       size_t packet_len = (size_t)wire_len - 2U;
 
-      uint16_t slot = AP2_STORE_INVALID_INDEX;
+      packet_write_ref_t wr = {
+          .slot = AP2_STORE_INVALID_INDEX,
+          .first_page = AP2_STORE_INVALID_INDEX,
+      };
       while (t->running) {
         xSemaphoreTake(t->mutex, portMAX_DELAY);
-        bool ok = reserve_packet_locked(t, packet_len, &slot);
+        bool ok = reserve_packet_locked(t, packet_len, &wr);
         xSemaphoreGive(t->mutex);
-        if (ok) break;
+        if (ok) {
+          AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_END();
+          break;
+        }
         /* No writable descriptor/pages: this is the intentional AirPlay TCP
          * backpressure point. We stop recv() until decode/GC returns storage. */
+        AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_BEGIN();
         xSemaphoreTake(t->space_ready, pdMS_TO_TICKS(100));
       }
-      if (!t->running || slot == AP2_STORE_INVALID_INDEX) break;
+      if (!t->running || wr.slot == AP2_STORE_INVALID_INDEX) break;
 
-      if (!recv_packet_into_pages(t, c, slot)) {
-        abort_write(t, slot);
+      if (!recv_packet_into_pages(t, c, &wr)) {
+        abort_write(t, wr.slot);
         break;
       }
-      publish_written_packet(t, slot);
+      publish_written_packet(t, wr.slot);
+      AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK((uint32_t)packet_len);
     }
 
     shutdown(c, SHUT_RDWR);
@@ -856,7 +942,6 @@ static bool fill_ref_locked(ap2_buffered_transport_t *t, uint16_t slot,
   out->arrival_id = d->arrival_id;
   out->seq = d->seq;
   out->rtp = d->rtp;
-  out->ssrc = d->ssrc;
   out->packet_len = d->packet_len;
   return true;
 }
@@ -867,37 +952,11 @@ static bool ref_matches_locked(ap2_buffered_transport_t *t,
          t->packets[ref->slot].arrival_id == ref->arrival_id;
 }
 
-bool ap2_buffered_transport_mark_invalid(ap2_buffered_transport_t *t,
-                                         const ap2_buffered_packet_ref_t *ref) {
-  if (!t || !ref) return false;
-  bool ok = false;
-  xSemaphoreTake(t->mutex, portMAX_DELAY);
-  if (ref_matches_locked(t, ref)) {
-    packet_desc_t *d = &t->packets[ref->slot];
-    if (d->state == AP2_BUFFERED_PACKET_READY ||
-        d->state == AP2_BUFFERED_PACKET_DECODING) {
-      d->invalidated = true;
-      if (d->state == AP2_BUFFERED_PACKET_READY) {
-        ready_index_remove_locked(t, ref->slot);
-        if (t->count_ready) t->count_ready--;
-        t->count_invalid++;
-        d->state = AP2_BUFFERED_PACKET_INVALID;
-      }
-      ok = true;
-    }
-  }
-  xSemaphoreGive(t->mutex);
-  if (ok) signal_space(t);
-  return ok;
-}
-
 bool ap2_buffered_transport_acquire_media_next(
     ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
     uint32_t expected_seq, bool expected_valid, bool allow_recovery_scan,
     uint32_t frame_samples, int32_t max_lead_samples,
-    uint32_t media_generation, bool *out_forced_recovery,
-    ap2_buffered_packet_ref_t *out) {
-  if (out_forced_recovery) *out_forced_recovery = false;
+    uint32_t media_generation, ap2_buffered_packet_ref_t *out) {
   if (!t || !out || frame_samples == 0) return false;
   if (__atomic_load_n(&t->media_generation, __ATOMIC_ACQUIRE) !=
       media_generation) {
@@ -944,6 +1003,11 @@ bool ap2_buffered_transport_acquire_media_next(
     best_slot = ready_index_find_exact_locked(
         t, expected_rtp, wanted_rtp, frame_samples, max_lead_samples,
         &exact_ready_too_early);
+    if (best_slot != AP2_STORE_INVALID_INDEX) {
+      AUDIO_DIAG_TRANSPORT_CURSOR_EXACT_HIT();
+    } else {
+      AUDIO_DIAG_TRANSPORT_CURSOR_EXACT_MISS(exact_ready_too_early ? 1U : 0U);
+    }
     if (best_slot == AP2_STORE_INVALID_INDEX && exact_ready_too_early) {
       xSemaphoreGive(t->mutex);
       return false;
@@ -951,17 +1015,34 @@ bool ap2_buffered_transport_acquire_media_next(
     if (best_slot == AP2_STORE_INVALID_INDEX && !allow_recovery_scan) {
       if (!t->cursor_flush_pending &&
           !packet_is_invalid_by_rule_locked(t, expected_seq)) {
+        AUDIO_DIAG_TRANSPORT_CURSOR_GUARD_WAIT();
         xSemaphoreGive(t->mutex);
         return false;
       }
-      if (out_forced_recovery) *out_forced_recovery = true;
     }
   }
 
   /* Recovery-only path. Pay for the full descriptor scan only when there is
    * no contiguous decoder cursor (startup/seek/new neighbourhood), FLUSH has
-   * made that cursor impossible, or the reorder deadline has been reached. */
+   * made that cursor impossible, or the reorder deadline has been reached.
+   *
+   * A failed scan is memoized against the READY-set revision and cursor query.
+   * Repeating the same O(N) scan before TCP publishes/removes anything cannot
+   * produce a different answer, so yield back to the receiver loop instead. */
   if (best_slot == AP2_STORE_INVALID_INDEX && t->count_ready != 0) {
+    if (recovery_miss_still_current_locked(
+            t, wanted_rtp, expected_rtp, expected_seq, expected_valid,
+            frame_samples, max_lead_samples, media_generation)) {
+      xSemaphoreGive(t->mutex);
+      return false;
+    }
+
+    bool future_valid = false;
+    uint32_t future_wanted_rtp = 0;
+    int32_t future_frames = INT32_MAX;
+
+    AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_SCAN(
+        (expected_valid && !allow_recovery_scan) ? 1U : 0U);
     for (uint16_t i = 0; i < t->packet_count; ++i) {
       packet_desc_t *d = &t->packets[i];
       if (d->state != AP2_BUFFERED_PACKET_READY || !d->ready_indexed ||
@@ -970,7 +1051,17 @@ bool ap2_buffered_transport_acquire_media_next(
       }
 
       const int32_t playhead_delta = (int32_t)(d->rtp - wanted_rtp);
-      if (playhead_delta > max_lead_samples) continue;
+      if (playhead_delta > max_lead_samples) {
+        const int64_t until_eligible =
+            (int64_t)playhead_delta - (int64_t)max_lead_samples;
+        if (until_eligible > 0 && until_eligible <= INT32_MAX &&
+            (int32_t)until_eligible < future_frames) {
+          future_frames = (int32_t)until_eligible;
+          future_wanted_rtp = wanted_rtp + (uint32_t)future_frames;
+          future_valid = true;
+        }
+        continue;
+      }
       if ((int64_t)playhead_delta + (int64_t)frame_samples <= 0) continue;
 
       int klass;
@@ -1012,6 +1103,21 @@ bool ap2_buffered_transport_acquire_media_next(
         best_arrival = d->arrival_id;
       }
     }
+    AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_RESULT(
+        best_slot != AP2_STORE_INVALID_INDEX ? 1U : 0U,
+        best_slot != AP2_STORE_INVALID_INDEX ? t->packets[best_slot].rtp : 0U,
+        best_slot != AP2_STORE_INVALID_INDEX ? best_distance : 0,
+        best_slot != AP2_STORE_INVALID_INDEX ? (uint32_t)best_class : 0U);
+    if (best_slot == AP2_STORE_INVALID_INDEX) {
+      recovery_miss_record_locked(
+          t, wanted_rtp, expected_rtp, expected_seq, expected_valid,
+          frame_samples, max_lead_samples, media_generation, future_valid,
+          future_wanted_rtp);
+    } else {
+      t->recovery_miss_valid = false;
+    }
+  } else if (best_slot == AP2_STORE_INVALID_INDEX) {
+    AUDIO_DIAG_TRANSPORT_CURSOR_NO_READY();
   }
 
   /* A genuine acquire miss can require a full descriptor scan. Control may
@@ -1040,26 +1146,6 @@ bool ap2_buffered_transport_acquire_media_next(
   return best_slot != AP2_STORE_INVALID_INDEX;
 }
 
-bool ap2_buffered_transport_defer_decode(ap2_buffered_transport_t *t,
-                                         const ap2_buffered_packet_ref_t *ref) {
-  if (!t || !ref) return false;
-  bool deferred = false;
-  xSemaphoreTake(t->mutex, portMAX_DELAY);
-  if (ref_matches_locked(t, ref)) {
-    packet_desc_t *d = &t->packets[ref->slot];
-    if (d->state == AP2_BUFFERED_PACKET_DECODING && !d->invalidated &&
-        d->store_epoch == t->store_epoch) {
-      if (t->count_decoding) t->count_decoding--;
-      t->count_ready++;
-      d->state = AP2_BUFFERED_PACKET_READY;
-      ready_index_insert_locked(t, ref->slot);
-      deferred = true;
-    }
-  }
-  xSemaphoreGive(t->mutex);
-  return deferred;
-}
-
 ssize_t ap2_buffered_transport_copy_packet(ap2_buffered_transport_t *t,
                                            const ap2_buffered_packet_ref_t *ref,
                                            void *dst_, size_t dst_capacity) {
@@ -1076,6 +1162,14 @@ ssize_t ap2_buffered_transport_copy_packet(ap2_buffered_transport_t *t,
     return -1;
   }
   const packet_desc_t *d = &t->packets[ref->slot];
+  /* This is the early FLUSH/epoch validation point. It shares the metadata
+   * lock already needed for the page snapshot, avoiding a second transport
+   * lock on every normal AAC packet. A later FLUSH is still caught by the
+   * publish_mutex commit barrier before decoded PCM becomes visible. */
+  if (d->invalidated || d->store_epoch != t->store_epoch) {
+    xSemaphoreGive(t->mutex);
+    return -1;
+  }
   packet_len = d->packet_len;
   first_page = d->first_page;
   page_count = d->page_count;
@@ -1142,7 +1236,6 @@ esp_err_t ap2_buffered_transport_add_invalid_seq_range(
   if (!rule_installed &&
       invalid_ranges_ensure_capacity_locked(t, t->invalid_range_count + 1U)) {
     invalid_seq_range_t *r = &t->invalid_ranges[t->invalid_range_count++];
-    r->in_use = true;
     r->from_seq = from_seq;
     r->until_seq = until_seq;
     rule_installed = true;

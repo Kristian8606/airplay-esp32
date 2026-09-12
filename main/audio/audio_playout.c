@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "driver/i2s_std.h"
+#include "audio_diag.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -186,16 +187,13 @@ esp_err_t audio_playout_init(void) {
   /* Keep the channel READY/disabled. Preload both DMA descriptors before
    * the exact PTP start edge, then enables the channel. This removes the
    * zero-descriptor ambiguity that made earlier EOF counting unreliable. */
-  ESP_LOGI(TAG,
-           "I2S: 44100Hz stereo 16-bit, DMA=%ux%u, MCLK=%" PRIu32
-           "Hz, pins %d/%d/%d/%d, ISR_IRAM=%d",
-           (unsigned)I2S_DMA_DESC_NUM, (unsigned)I2S_DMA_FRAME_NUM,
-           s_nominal_mclk_hz, CONFIG_I2S_SCK_IO, CONFIG_I2S_BCK_IO,
-           CONFIG_I2S_WS_IO, CONFIG_I2S_DO_IO,
+  AUDIO_DIAG_PLAYOUT_I2S(
+      s_nominal_mclk_hz, (uint32_t)I2S_DMA_DESC_NUM,
+      (uint32_t)I2S_DMA_FRAME_NUM,
 #if CONFIG_I2S_ISR_IRAM_SAFE
-           1
+      1U
 #else
-           0
+      0U
 #endif
   );
   return ESP_OK;

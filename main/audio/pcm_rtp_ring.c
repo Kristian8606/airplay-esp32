@@ -3,8 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "audio_diag.h"
 #include "esp_heap_caps.h"
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -34,8 +34,6 @@ struct pcm_rtp_ring {
   pcm_slot_tag_t *tags;
   uint32_t generation;
 };
-
-static const char *TAG = "pcm_rtp_ring";
 
 static inline uint32_t page_base(uint32_t rtp) {
   return rtp & ~(PCM_RTP_SLOT_FRAMES - 1U);
@@ -135,9 +133,8 @@ size_t pcm_rtp_ring_storage_bytes(void) {
   return (size_t)PCM_RTP_RING_FRAMES * PCM_RTP_CHANNELS * sizeof(int16_t);
 }
 
-static esp_err_t pcm_rtp_ring_create_internal(pcm_rtp_ring_t **out,
-                                              void *storage,
-                                              size_t storage_bytes) {
+static esp_err_t pcm_rtp_ring_create_internal(
+    pcm_rtp_ring_t **out, void *storage, size_t storage_bytes) {
   if (!out) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -173,11 +170,15 @@ static esp_err_t pcm_rtp_ring_create_internal(pcm_rtp_ring_t **out,
     return ESP_ERR_NO_MEM;
   }
 
-  ESP_LOGI(TAG,
-           "direct RTP PCM ring: %u slots x %u frames = %u frames, %u bytes, %u ms @44.1k",
-           (unsigned)PCM_RTP_SLOT_COUNT, (unsigned)PCM_RTP_SLOT_FRAMES,
-           (unsigned)PCM_RTP_RING_FRAMES, (unsigned)pcm_bytes,
-           (unsigned)(((uint64_t)PCM_RTP_RING_FRAMES * 1000ULL) / 44100ULL));
+#if defined(CONFIG_AIRPLAY_DIAG_BUFFER) && CONFIG_AIRPLAY_DIAG_BUFFER
+  const audio_diag_pcm_ring_id_t diag_ring_id =
+      storage ? AUDIO_DIAG_PCM_RING_ALAC_STAGE : AUDIO_DIAG_PCM_RING_FINAL;
+  AUDIO_DIAG_BUFFER_PCM_RING(diag_ring_id,
+                             (uint32_t)PCM_RTP_SLOT_COUNT,
+                             (uint32_t)PCM_RTP_SLOT_FRAMES,
+                             (uint32_t)PCM_RTP_RING_FRAMES,
+                             (uint32_t)pcm_bytes);
+#endif
   *out = r;
   return ESP_OK;
 }

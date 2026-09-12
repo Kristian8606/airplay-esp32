@@ -19,6 +19,7 @@
 #include "sodium.h"
 
 #include "audio_receiver.h"
+#include "audio_diag.h"
 #include "amp_control.h"
 #include "hap.h"
 #include "ptp_clock.h"
@@ -552,6 +553,8 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
     return -1;
   }
 
+  AUDIO_DIAG_FLUSH_RTSP_BEGIN(socket, req.method);
+
   // Extract DACP headers if present (AirPlay 1 only — modern iOS AirPlay 2
   // does not send these; it uses MRP for remote control instead).
   // parse_raw_header uses a static buffer — copy before calling again.
@@ -579,6 +582,7 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
   for (const rtsp_method_handler_t *h = method_handlers; h->method; h++) {
     if (strcasecmp(req.method, h->method) == 0) {
       h->handler(socket, conn, &req, raw_request, raw_len);
+      AUDIO_DIAG_FLUSH_RTSP_END(socket, req.method);
       return 0;
     }
   }
@@ -591,6 +595,7 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
     rtsp_send_http_response(socket, conn, 501, "Not Implemented", "text/plain",
                             "Not Implemented", 15);
   }
+  AUDIO_DIAG_FLUSH_RTSP_END(socket, req.method);
   return 0;
 }
 

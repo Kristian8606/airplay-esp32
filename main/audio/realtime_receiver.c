@@ -10,6 +10,7 @@
 
 #include "alac_decoder.h"
 #include "audio_crypto.h"
+#include "audio_diag.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -412,7 +413,6 @@ static void missing_add_range(uint32_t first_ext, uint16_t count,
                                      ? (uint32_t)s_rt.cfg.format.frame_size
                                      : 352U;
 
-  uint16_t tracked = 0;
   for (uint16_t i = 0; i < count; ++i) {
     const uint32_t ext = first_ext + i;
     if (have_min && ext > min_active &&
@@ -444,10 +444,8 @@ static void missing_add_range(uint32_t first_ext, uint16_t count,
       if (s_rt.active_missing_count != UINT16_MAX) {
         s_rt.active_missing_count++;
       }
-      tracked++;
     }
   }
-  (void)tracked;
 }
 
 static void missing_mark_received(uint32_t ext_seq) {
@@ -700,8 +698,9 @@ done:
 
 static void data_rx_task(void *arg) {
   (void)arg;
-  ESP_LOGI(TAG, "DATA_RX started core=%d prio=%d pool=%u",
-           xPortGetCoreID(), RT_DATA_RX_PRIORITY, (unsigned)RT_DATA_POOL_SLOTS);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_RT_DATA,
+                                    xPortGetCoreID(), RT_DATA_RX_PRIORITY,
+                                    RT_DATA_POOL_SLOTS);
 
   while (rt_running()) {
     rt_packet_slot_t *slot = NULL;
@@ -735,8 +734,9 @@ static void data_rx_task(void *arg) {
 
 static void control_rx_task(void *arg) {
   (void)arg;
-  ESP_LOGI(TAG, "CTRL_RX started core=%d prio=%d rtx_pool=%u",
-           xPortGetCoreID(), RT_CTRL_RX_PRIORITY, (unsigned)RT_RTX_POOL_SLOTS);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_RT_CTRL,
+                                    xPortGetCoreID(), RT_CTRL_RX_PRIORITY,
+                                    RT_RTX_POOL_SLOTS);
   while (rt_running() && s_rt.control_sock >= 0) {
     const ssize_t n = recv(s_rt.control_sock, s_rt.control_packet, RT_PACKET_MAX, 0);
     if (n <= 0) {
@@ -785,14 +785,9 @@ static void alac_worker_task(void *arg) {
     return;
   }
 
-  ESP_LOGI(TAG,
-           "ALAC_WORK started core=%d prio=%d sr=%d ch=%d frame=%d single_decoder=1",
-           xPortGetCoreID(), RT_WORK_PRIORITY, dcfg.sample_rate, dcfg.channels,
-           dcfg.frame_size);
-  ESP_LOGI(TAG,
-           "build=FIX14_ALAC_LIVE_PTP localTimeline=1 continuousD7=1 nqptpPhase=1 livePtpOffset=1 gmRebaseSettle=1000ms gmBiasDecay=50ppm noVirtualPTP=1 noArrivalAnchor=1 missing=%u dataPool=%u rtxPool=%u",
-           (unsigned)RT_MISSING_SLOTS, (unsigned)RT_DATA_POOL_SLOTS,
-           (unsigned)RT_RTX_POOL_SLOTS);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_RT_WORK,
+                                    xPortGetCoreID(), RT_WORK_PRIORITY,
+                                    (uint32_t)dcfg.frame_size);
 
   while (rt_running() || (s_rt.work_q && uxQueueMessagesWaiting(s_rt.work_q) != 0U)) {
     rt_packet_slot_t *slot = NULL;
@@ -860,13 +855,9 @@ static void alac_worker_task(void *arg) {
 
 static void resend_task(void *arg) {
   (void)arg;
-  ESP_LOGI(TAG,
-           "RESEND event-driven core=%d prio=%d activeScan=%ums first=%ums "
-           "retry=%ums lastReq=%ums finalLoss=%ums",
-           xPortGetCoreID(), RT_RESEND_PRIORITY, (unsigned)RT_RESEND_SCAN_MS,
-           (unsigned)RT_RESEND_FIRST_MS, (unsigned)RT_RESEND_RETRY_MS,
-           (unsigned)RT_RESEND_LAST_REQUEST_MS,
-           (unsigned)RT_FINAL_LOSS_MARGIN_MS);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_RT_RESEND,
+                                    xPortGetCoreID(), RT_RESEND_PRIORITY,
+                                    RT_RESEND_SCAN_MS);
   while (rt_running()) {
     rt_resend_event_t ev = {0};
     const TickType_t wait_ticks =
@@ -931,10 +922,9 @@ esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
 
   s_rt.data_pool = (rt_packet_slot_t *)aligned;
   s_rt.rtx_pool = (rt_packet_slot_t *)(aligned + data_bytes);
-  ESP_LOGI(TAG,
-           "shared packet workspace: DATA=%u KiB RTX=%u KiB total=%u KiB",
-           (unsigned)(data_bytes / 1024U), (unsigned)(rtx_bytes / 1024U),
-           (unsigned)((data_bytes + rtx_bytes) / 1024U));
+  AUDIO_DIAG_BUFFER_PACKET_WORKSPACE(
+      (uint32_t)(data_bytes / 1024U), (uint32_t)(rtx_bytes / 1024U),
+      (uint32_t)((data_bytes + rtx_bytes) / 1024U));
   return ESP_OK;
 }
 
@@ -1053,12 +1043,14 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   struct timeval tv = {.tv_sec = 0, .tv_usec = RT_SOCKET_TIMEOUT_MS * 1000U};
   (void)setsockopt(s_rt.data_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
+#if defined(CONFIG_AIRPLAY_DIAG_TRANSPORT) && CONFIG_AIRPLAY_DIAG_TRANSPORT
   int actual_rcvbuf = 0;
   socklen_t actual_rcvbuf_len = sizeof(actual_rcvbuf);
   if (getsockopt(s_rt.data_sock, SOL_SOCKET, SO_RCVBUF, &actual_rcvbuf,
                  &actual_rcvbuf_len) == 0) {
-    ESP_LOGI(TAG, "DATA SO_RCVBUF requested=131072 actual=%d", actual_rcvbuf);
+    AUDIO_DIAG_TRANSPORT_SOCKET_BUFFER(131072U, (uint32_t)actual_rcvbuf);
   }
+#endif
 
   if (control_port != 0) {
     uint16_t bound_control = 0;
@@ -1104,9 +1096,7 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
     return ESP_FAIL;
   }
 
-  ESP_LOGI(TAG,
-           "UDP realtime ports data=%u control=%u tasks=DATA/CTRL/WORK/RESEND",
-           (unsigned)data_port, (unsigned)control_port);
+  AUDIO_DIAG_TRANSPORT_PORTS((uint32_t)data_port, (uint32_t)control_port);
   return ESP_OK;
 }
 
@@ -1127,7 +1117,7 @@ void realtime_receiver_stop(void) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 
-  ESP_LOGI(TAG, "realtime stopped");
+  AUDIO_DIAG_LIFECYCLE_REALTIME_STOPPED();
 
 }
 
@@ -1147,8 +1137,8 @@ void realtime_receiver_set_client_control(uint32_t client_ip,
   taskEXIT_CRITICAL(&s_rt_control_mux);
 
   if (valid) {
-    ESP_LOGI(TAG, "retransmit target=%s:%u", inet_ntoa(next.sin_addr),
-             (unsigned)client_control_port);
+    AUDIO_DIAG_TRANSPORT_RETRANSMIT_TARGET(next.sin_addr.s_addr,
+                                           client_control_port);
   }
 }
 

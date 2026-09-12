@@ -1,4 +1,5 @@
 #include "audio_receiver.h"
+#include "audio_diag.h"
 #include "amp_control.h"
 #include "audio_eq.h"
 #include "dns_server.h"
@@ -74,6 +75,10 @@ void app_main(void) {
   }
   log_memory_state("post-wifi");
 
+  /* Temporary diagnostics must exist before PTP/audio init so category-owned
+   * startup events are captured by the low-priority worker. This is a no-op
+   * when diagnostics are disabled or no category is selected. */
+  (void)AUDIO_DIAG_INIT();
   ESP_ERROR_CHECK(ptp_clock_init());
   ESP_ERROR_CHECK(hap_init());
   ESP_ERROR_CHECK(audio_receiver_init());
@@ -83,13 +88,14 @@ void app_main(void) {
   ESP_ERROR_CHECK(rtsp_server_start());
 
   const esp_app_desc_t *app = esp_app_get_description();
-  const char *fw_name = app ? app->project_name : "airplay-esp32";
+  const char *fw_version = app ? app->version : "unknown";
   char ip[32] = {0};
   if (wifi_get_ip_str(ip, sizeof(ip)) == ESP_OK) {
-    ESP_LOGI(TAG, "%s ready; Web UI / WiFi scan / logs / OTA: http://%s/",
-             fw_name, ip);
+    ESP_LOGI(TAG, "airplay-esp32 %s ready; Web UI / WiFi scan / logs / OTA: http://%s/",
+             fw_version, ip);
   } else {
-    ESP_LOGI(TAG, "%s ready; setup UI: http://192.168.4.1/", fw_name);
+    ESP_LOGI(TAG, "airplay-esp32 %s ready; setup UI: http://192.168.4.1/",
+             fw_version);
   }
 
   while (1) {

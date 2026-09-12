@@ -1,3 +1,61 @@
+menuconfig AIRPLAY_DIAGNOSTICS
+    bool "Enable temporary AirPlay diagnostics"
+    default n
+    help
+        Master compile-time switch for temporary AirPlay diagnostics.
+        The permanent 2-second audio_status log is independent and remains
+        available when this option is disabled.
+
+        When disabled, category counters, timestamps, arrays, buffers, helper
+        functions and the low-priority audio_diag task are not compiled.
+
+if AIRPLAY_DIAGNOSTICS
+
+    config AIRPLAY_DIAG_TRANSPORT
+        bool "TRANSPORT - TCP/UDP RX, sequence and retransmit diagnostics"
+        default n
+
+    config AIRPLAY_DIAG_BUFFER
+        bool "BUFFER - AAC store, ALAC queues and PCM ring diagnostics"
+        default n
+
+    config AIRPLAY_DIAG_FLUSH
+        bool "FLUSH - FLUSH/FLUSHBUFFERED/AutoMix diagnostics"
+        default n
+
+    config AIRPLAY_DIAG_CODEC
+        bool "CODEC - AAC/ALAC decoder diagnostics"
+        default n
+
+    config AIRPLAY_DIAG_SYNC
+        bool "SYNC - PTP, anchors, PID and ppm diagnostics"
+        default n
+
+    config AIRPLAY_DIAG_PLAYOUT
+        bool "PLAYOUT - scheduler, I2S, DMA and late/early diagnostics"
+        default n
+
+    config AIRPLAY_DIAG_LIFECYCLE
+        bool "LIFECYCLE - task/session/generation/race diagnostics"
+        default n
+
+    config AIRPLAY_DIAG_ACTIVE
+        bool
+        default y if AIRPLAY_DIAG_TRANSPORT || AIRPLAY_DIAG_BUFFER || AIRPLAY_DIAG_FLUSH || AIRPLAY_DIAG_CODEC || AIRPLAY_DIAG_SYNC || AIRPLAY_DIAG_PLAYOUT || AIRPLAY_DIAG_LIFECYCLE
+        default n
+
+    config AIRPLAY_DIAG_HIGH_RATE_TRACE
+        bool "Allow high-rate packet/sample/block tracing"
+        depends on AIRPLAY_DIAG_ACTIVE
+        default n
+        help
+            Enables diagnostics which may record every packet, sample block or
+            other high-frequency event. Use only for short targeted tests.
+            Audio must never block waiting for diagnostic output; trace data
+            may be dropped instead.
+
+endif
+
 menu "AirPlay Receiver"
     config DEFAULT_AP_SSID
         string "Setup AP SSID"

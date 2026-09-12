@@ -42,7 +42,6 @@ typedef struct {
   uint64_t arrival_id;
   uint32_t seq;
   uint32_t rtp;
-  uint32_t ssrc;
   size_t packet_len;
 } ap2_buffered_packet_ref_t;
 
@@ -84,8 +83,6 @@ void ap2_buffered_transport_clear(ap2_buffered_transport_t *t);
 /* TCP packets are published directly from WRITING to READY/INVALID after the
  * payload header is parsed. Transport arrival order does not gate
  * ownership or decode. */
-bool ap2_buffered_transport_mark_invalid(ap2_buffered_transport_t *t,
-                                         const ap2_buffered_packet_ref_t *ref);
 
 /* Select the best READY packet for the media timeline.
  *
@@ -111,14 +108,7 @@ bool ap2_buffered_transport_acquire_media_next(
     ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
     uint32_t expected_seq, bool expected_valid, bool allow_recovery_scan,
     uint32_t frame_samples, int32_t max_lead_samples,
-    uint32_t media_generation, bool *out_forced_recovery,
-    ap2_buffered_packet_ref_t *out);
-
-/* DECODING -> READY. Used by the reorder guard when a forward media jump is
- * visible but there is still enough decoded PCM time to wait for a missing
- * replacement packet. */
-bool ap2_buffered_transport_defer_decode(ap2_buffered_transport_t *t,
-                                         const ap2_buffered_packet_ref_t *ref);
+    uint32_t media_generation, ap2_buffered_packet_ref_t *out);
 
 /* Gather a DECODING packet into the codec scratch buffer. TCP wrote directly
  * into page storage; this is the one contiguous copy required by the current

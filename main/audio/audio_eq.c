@@ -41,7 +41,6 @@ typedef struct {
   int sample_rate;
   float preamp_gain;
   bool ready;
-  uint64_t clip_count;
 } audio_eq_runtime_t;
 
 static audio_eq_runtime_t s_eq;
@@ -342,11 +341,9 @@ static inline float process_chain_hot(float x, const biquad_coeff_t *coeff,
 
 static inline int16_t saturate_s16(float sample) {
   if (sample > 32767.0f) {
-    s_eq.clip_count++;
     return 32767;
   }
   if (sample < -32768.0f) {
-    s_eq.clip_count++;
     return -32768;
   }
   return (int16_t)lrintf(sample);

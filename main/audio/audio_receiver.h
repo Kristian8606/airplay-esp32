@@ -32,18 +32,6 @@ typedef struct {
   size_t key_len;
 } audio_encrypt_t;
 
-typedef struct {
-  uint32_t packets_received;
-  uint32_t packets_decoded;
-  uint32_t packets_dropped;
-  uint32_t decrypt_errors;
-  uint32_t buffer_underruns;
-  uint32_t buffer_overruns;
-  uint32_t late_frames;
-  uint16_t last_seq;
-  uint32_t last_timestamp;
-} audio_stats_t;
-
 typedef enum {
   AUDIO_STREAM_NONE = 0,
   AUDIO_STREAM_REALTIME = 96,  /* AP2 realtime UDP ALAC */
@@ -64,8 +52,6 @@ void audio_receiver_stop_buffered_only(void);
 uint16_t audio_receiver_get_stream_port(void);
 uint16_t audio_receiver_get_buffered_port(void);
 size_t audio_receiver_get_buffered_audio_buffer_size(void);
-
-void audio_receiver_get_stats(audio_stats_t *stats);
 
 /* Software output volume. Q15: 0=mute, 32768=0 dB/full scale. */
 void audio_receiver_set_volume_q15(int32_t volume_q15);

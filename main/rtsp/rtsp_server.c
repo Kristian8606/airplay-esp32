@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "audio_receiver.h"
+#include "audio_diag.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -162,6 +163,7 @@ static void client_task(void *pvParameters) {
     return;
   }
   slot->conn = conn;
+  AUDIO_DIAG_FLUSH_RTSP_SESSION_RESET(slot->socket);
 
   // Get client IP address for timing requests
   struct sockaddr_in peer_addr;
