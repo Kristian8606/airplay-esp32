@@ -13,6 +13,7 @@
 
 #include "audio_diag.h"
 #include "ptp_clock.h"
+#include "ptp_clock_engine.h"
 #include "spiram_task.h"
 
 static const char *TAG = "ptp_clock";
@@ -84,6 +85,10 @@ static const char *TAG = "ptp_clock";
 #define PTP_TASK_PRIORITY_LEGACY   6U
 #define PTP_TASK_PRIORITY_REALTIME 8U
 
+#define PTP_STEP_FILTER_NS        500000LL  /* 0.5 ms */
+#define PTP_STEP_RAW_FILTER_NS   2000000LL /* 2.0 ms */
+#define PTP_STEP_LOG_COOLDOWN_NS 1000000000LL
+
 // PTP state
 static struct {
   bool running;
@@ -94,6 +99,10 @@ static struct {
 
   // Synchronization state
   bool locked;
+  /* Buffered presentation may remain in holdover after a qualified lock is
+   * temporarily lost because Sync packets stop arriving. Real timing-domain
+   * resets clear this latch. */
+  bool legacy_presentation_ready;
   uint32_t lock_candidate_start_ms;
   uint32_t last_sync_ms;
   int64_t filtered_offset_ns; // PTP_time = local_time + offset
@@ -108,6 +117,24 @@ static struct {
   uint16_t last_sync_seq;
   int64_t last_sync_local_ns;
   bool awaiting_followup;
+  int64_t last_sync_correction_ns;
+  uint64_t last_sync_source_clock_id;
+  int64_t last_sync_process_lag_ns;
+
+  /* NQPTP-derived buffered clock estimator. Socket admission / pairing stays
+   * in this file; filtering and source/GM epochs live in the pure engine. */
+  ptp_clock_engine_t legacy_engine;
+  int64_t legacy_last_step_log_ns;
+
+  /* Buffered AAC keeps remote RTP anchors in the PTP coordinate system in
+   * which they were received. A same-source grandmaster handover can change
+   * the absolute PTP origin by seconds or hours even though physical time is
+   * continuous. Accumulate that coordinate change separately so audio can
+   * translate an old anchor into the current GM domain without a flush/reset. */
+  int64_t legacy_domain_translation_ns;
+  bool legacy_handover_pending;
+  int64_t legacy_handover_from_offset_ns;
+  uint32_t legacy_handover_epoch;
 
   /* AirPlay 2 realtime-only clock-domain state. Buffered AAC does not use
    * these fields and continues through the legacy path above. */
@@ -117,6 +144,7 @@ static struct {
   uint64_t grandmaster_clock_id;  // Announce grandmasterIdentity
 
   int64_t rt_master_offset_ns;
+  int64_t rt_raw_offset_ns;
   int64_t rt_previous_offset_ns;
   int64_t rt_previous_offset_time_ns;
   int64_t rt_mastership_start_ns;
@@ -215,110 +243,188 @@ static int64_t parse_ptp_correction_ns(const uint8_t *data, size_t len) {
 // dampening negative jitter (smaller offset = longer delay) slowly, the
 // filter converges to the offset corresponding to the minimum network
 // delay — the best available approximation of the true clock offset.
-typedef enum {
-  PTP_OFFSET_EVENT_NONE = 0,
-  PTP_OFFSET_EVENT_LOCKED,
-  PTP_OFFSET_EVENT_LOST,
-} ptp_offset_event_t;
-
 typedef struct {
-  ptp_offset_event_t event;
-  int64_t filtered_offset_ns;
-  int64_t dev_ns;
-  uint32_t sample_count;
+  bool emit;
+  const char *reason;
   uint64_t source_clock_id;
-} ptp_offset_log_t;
+  uint64_t grandmaster_clock_id;
+  uint32_t epoch;
+  int64_t raw_offset_ns;
+  int64_t filtered_offset_ns;
+  int64_t raw_filter_delta_ns;
+  int64_t filtered_step_ns;
+  int64_t rx_lag_ns;
+  uint16_t seq;
+} ptp_step_log_t;
 
-static void log_offset_event(const ptp_offset_log_t *ev) {
-  if (!ev) return;
-  if (ev->event == PTP_OFFSET_EVENT_LOCKED) {
-    ESP_LOGI(TAG,
-             "LOCKED: source=%016llx offset=%+lldns dev=%lldns samples=%lu",
-             (unsigned long long)ev->source_clock_id,
-             (long long)ev->filtered_offset_ns, (long long)ev->dev_ns,
-             (unsigned long)ev->sample_count);
-  } else if (ev->event == PTP_OFFSET_EVENT_LOST) {
-    ESP_LOGW(TAG, "LOST LOCK: dev=%lldns (threshold=%lldns)",
-             (long long)ev->dev_ns, (long long)(LOCK_THRESHOLD_NS * 4));
-  }
+static int64_t abs_i64(int64_t v) {
+  if (v >= 0) return v;
+  if (v == INT64_MIN) return INT64_MAX;
+  return -v;
 }
 
-/* Caller must hold ptp_state_mux. */
-static void update_offset_locked(int64_t new_offset_ns, uint32_t now_ms,
-                                 ptp_offset_log_t *log_ev) {
-  if (log_ev) memset(log_ev, 0, sizeof(*log_ev));
+static void log_ptp_step(const ptp_step_log_t *ev) {
+  if (!ev || !ev->emit || !ev->reason) return;
+  ESP_LOGW(TAG,
+           "PTP | STEP | reason=%s | src=%016llx | gm=%016llx | epoch=%lu | "
+           "raw=%+.3fms | filt=%+.3fms | ptpD=%+.3fms | dFilt=%+.3fms | "
+           "rxLag=%.3fms | seq=%u",
+           ev->reason,
+           (unsigned long long)ev->source_clock_id,
+           (unsigned long long)ev->grandmaster_clock_id,
+           (unsigned long)ev->epoch,
+           (double)ev->raw_offset_ns / 1000000.0,
+           (double)ev->filtered_offset_ns / 1000000.0,
+           (double)ev->raw_filter_delta_ns / 1000000.0,
+           (double)ev->filtered_step_ns / 1000000.0,
+           (double)ev->rx_lag_ns / 1000000.0,
+           (unsigned)ev->seq);
+}
 
-  ptp.last_sync_ms = now_ms;
-  ptp.sample_count++;
+/* Caller holds ptp_state_mux. Only accepted samples advance freshness, lock
+ * qualification and public sample_count. This fixes the old behaviour where
+ * an outlier could keep a stale clock looking alive. */
+static void update_legacy_offset_locked(int64_t raw_offset_ns,
+                                        int64_t reception_ns,
+                                        int64_t rx_lag_ns,
+                                        uint16_t seq,
+                                        ptp_step_log_t *step_ev) {
+  if (step_ev) memset(step_ev, 0, sizeof(*step_ev));
 
-  int64_t smoothed_offset;
-
-  if (ptp.previous_offset_time_ms == 0) {
-    // First sample (or after reset): accept unconditionally
-    smoothed_offset = new_offset_ns;
-    ptp.mastership_start_ms = now_ms;
-  } else {
-    // Reject obvious outliers (more than 50ms from current estimate)
-    int64_t diff = new_offset_ns - ptp.filtered_offset_ns;
-    if (diff < 0) diff = -diff;
-    if (diff > OUTLIER_THRESHOLD_NS) {
-      AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_OUTLIER);
-      return;
-    }
-
-    int64_t jitter = new_offset_ns - ptp.previous_offset;
-    uint32_t mastership_time_ms = now_ms - ptp.mastership_start_ms;
-
-    if (jitter >= 0) {
-      if (mastership_time_ms < STARTUP_DURATION_MS) {
-        smoothed_offset = ptp.previous_offset + jitter / SMOOTH_POS_STARTUP_DIV;
-      } else {
-        smoothed_offset = ptp.previous_offset + jitter / SMOOTH_POS_STEADY_DIV;
-      }
-    } else {
-      int64_t clamped_jitter = jitter;
-      if (clamped_jitter < SMOOTH_NEG_CLAMP_NS) {
-        clamped_jitter = SMOOTH_NEG_CLAMP_NS;
-      }
-      smoothed_offset = ptp.previous_offset + clamped_jitter / SMOOTH_NEG_DIV;
-    }
+  const ptp_clock_engine_sample_t r = ptp_clock_engine_add_sample(
+      &ptp.legacy_engine, raw_offset_ns, reception_ns);
+  if (!r.accepted) {
+    if (r.outlier) AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_OUTLIER);
+    return;
   }
 
-  ptp.previous_offset = smoothed_offset;
-  ptp.previous_offset_time_ms = now_ms;
-  ptp.filtered_offset_ns = smoothed_offset;
+  /* The first accepted sample in a new same-source GM epoch reveals the
+   * absolute coordinate shift. Apply that shift to the accumulated media
+   * translation before publishing the new PTP offset, so readers can take one
+   * coherent snapshot containing both sides of the handover. */
+  if (ptp.legacy_handover_pending &&
+      r.epoch == ptp.legacy_handover_epoch) {
+    int64_t translated = 0;
+    if (ptp_clock_engine_accumulate_translation(
+            ptp.legacy_domain_translation_ns,
+            ptp.legacy_handover_from_offset_ns, r.filtered_offset_ns,
+            &translated)) {
+      ptp.legacy_domain_translation_ns = translated;
+    } else {
+      /* Arithmetic failure is impossible for real PTP offsets, but fail closed
+       * rather than publish a discontinuous audio clock. */
+      ptp.locked = false;
+      ptp.lock_candidate_start_ms = 0;
+    }
+    ptp.legacy_handover_pending = false;
+  }
 
+  ptp.filtered_offset_ns = r.filtered_offset_ns;
+  ptp.sample_count = r.accepted_samples;
+  ptp.last_sync_ms = (uint32_t)(reception_ns / 1000000LL);
+
+  const int64_t dev = abs_i64(r.raw_filter_delta_ns);
   if (ptp.sample_count >= MIN_SAMPLES_FOR_LOCK) {
-    int64_t dev = new_offset_ns - smoothed_offset;
-    if (dev < 0) dev = -dev;
-
     if (dev < LOCK_THRESHOLD_NS) {
       if (!ptp.locked) {
-        if (ptp.lock_candidate_start_ms == 0) {
+        const uint32_t now_ms = (uint32_t)(reception_ns / 1000000LL);
+        if (ptp.lock_candidate_start_ms == 0)
           ptp.lock_candidate_start_ms = now_ms;
-        }
         if ((now_ms - ptp.lock_candidate_start_ms) >= LOCK_STABLE_TIME_MS) {
           ptp.locked = true;
+          ptp.legacy_presentation_ready = true;
           ptp.lock_candidate_start_ms = 0;
-          if (log_ev) {
-            log_ev->event = PTP_OFFSET_EVENT_LOCKED;
-            log_ev->filtered_offset_ns = ptp.filtered_offset_ns;
-            log_ev->dev_ns = dev;
-            log_ev->sample_count = ptp.sample_count;
-            log_ev->source_clock_id = ptp.legacy_sample_clock_id;
-          }
         }
       }
     } else {
       ptp.lock_candidate_start_ms = 0;
-      if (ptp.locked && dev > LOCK_THRESHOLD_NS * 4) {
+      if (ptp.locked && dev > LOCK_THRESHOLD_NS * 4)
         ptp.locked = false;
-        if (log_ev) {
-          log_ev->event = PTP_OFFSET_EVENT_LOST;
-          log_ev->dev_ns = dev;
-        }
-      }
     }
+  }
+
+  /* Permanent event log: only meaningful estimator motion, and at most once
+   * per second. Ordinary PTP counters remain in compile-time audio_diag. */
+  if (step_ev && r.accepted_samples >= MIN_SAMPLES_FOR_LOCK &&
+      abs_i64(r.filtered_step_ns) >= PTP_STEP_FILTER_NS &&
+      (ptp.legacy_last_step_log_ns == 0 ||
+       reception_ns - ptp.legacy_last_step_log_ns >= PTP_STEP_LOG_COOLDOWN_NS)) {
+    step_ev->emit = true;
+    step_ev->reason = abs_i64(r.raw_filter_delta_ns) >= PTP_STEP_RAW_FILTER_NS
+                          ? "raw-filter-gap" : "offset";
+    step_ev->source_clock_id = ptp.legacy_engine.source_clock_id;
+    step_ev->grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+    step_ev->epoch = ptp.legacy_engine.epoch;
+    step_ev->raw_offset_ns = r.raw_offset_ns;
+    step_ev->filtered_offset_ns = r.filtered_offset_ns;
+    step_ev->raw_filter_delta_ns = r.raw_filter_delta_ns;
+    step_ev->filtered_step_ns = r.filtered_step_ns;
+    step_ev->rx_lag_ns = rx_lag_ns;
+    step_ev->seq = seq;
+    ptp.legacy_last_step_log_ns = reception_ns;
+  }
+}
+
+static void fill_domain_step_locked(const char *reason,
+                                    const ptp_clock_engine_domain_event_t *de,
+                                    int64_t reception_ns, bool preserve_holdover,
+                                    ptp_step_log_t *step_ev) {
+  if (!step_ev || !de || (!de->source_changed && !de->gm_changed)) return;
+  memset(step_ev, 0, sizeof(*step_ev));
+  step_ev->emit = true;
+  step_ev->reason = reason;
+  step_ev->source_clock_id = de->new_source_clock_id;
+  step_ev->grandmaster_clock_id = de->new_grandmaster_clock_id;
+  step_ev->epoch = de->epoch;
+  /* set_domain() intentionally starts the new estimator clean. For a normal
+   * same-source GM handover, log the old active clock estimate instead of a
+   * misleading zero and keep that estimate as short holdover until the new
+   * GM produces accepted samples. */
+  step_ev->raw_offset_ns = preserve_holdover && de->old_estimator_valid
+                               ? de->old_raw_offset_ns
+                               : ptp.legacy_engine.raw_offset_ns;
+  step_ev->filtered_offset_ns = preserve_holdover && de->old_estimator_valid
+                                    ? de->old_filtered_offset_ns
+                                    : ptp.legacy_engine.filtered_offset_ns;
+  step_ev->raw_filter_delta_ns =
+      step_ev->raw_offset_ns - step_ev->filtered_offset_ns;
+  step_ev->filtered_step_ns = 0;
+  step_ev->rx_lag_ns = 0;
+  step_ev->seq = 0;
+  ptp.legacy_last_step_log_ns = reception_ns;
+
+  /* Preserve the mapping of already-published buffered RTP anchors across a
+   * same-source GM change. The actual shift becomes known on the first accepted
+   * sample from the new epoch. A source change is a true domain break and
+   * starts a fresh translation basis. */
+  if (de->gm_changed && !de->source_changed && de->old_estimator_valid) {
+    ptp.legacy_handover_pending = true;
+    ptp.legacy_handover_from_offset_ns = de->old_filtered_offset_ns;
+    ptp.legacy_handover_epoch = de->epoch;
+  } else if (de->source_changed) {
+    ptp.legacy_presentation_ready = false;
+    ptp.legacy_domain_translation_ns = 0;
+    ptp.legacy_handover_pending = false;
+    ptp.legacy_handover_from_offset_ns = 0;
+    ptp.legacy_handover_epoch = 0;
+  }
+
+  /* Never pair a pre-handover Sync with a post-handover Follow_Up. */
+  ptp.awaiting_followup = false;
+  ptp.last_sync_seq = 0;
+  ptp.last_sync_local_ns = 0;
+  ptp.last_sync_correction_ns = 0;
+  ptp.last_sync_source_clock_id = 0;
+  ptp.last_sync_process_lag_ns = 0;
+
+  if (!preserve_holdover) {
+    /* A source-clock change is a true timing-domain break: old clock state
+     * must not drive RTP presentation for the new source. */
+    ptp.locked = false;
+    ptp.lock_candidate_start_ms = 0;
+    ptp.last_sync_ms = 0;
+    ptp.sample_count = 0;
+    ptp.filtered_offset_ns = 0;
   }
 }
 
@@ -342,6 +448,7 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.source_clock_id = source_clock;
   ptp.grandmaster_clock_id = new_gm;
   ptp.rt_master_offset_ns = 0;
+  ptp.rt_raw_offset_ns = 0;
   ptp.rt_previous_offset_ns = 0;
   ptp.rt_previous_offset_time_ns = 0;
   ptp.rt_mastership_start_ns = 0;
@@ -378,6 +485,7 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
 static bool realtime_update_offset_locked(int64_t raw_offset_ns,
                                           int64_t reception_ns) {
   const bool was_ready = ptp.rt_master_ready;
+  ptp.rt_raw_offset_ns = raw_offset_ns;
   ptp.rt_last_followup_rx_ns = reception_ns;
   ptp.last_sync_ms = (uint32_t)(reception_ns / 1000000LL);
   ptp.rt_sample_count++;
@@ -438,86 +546,147 @@ static void legacy_note_source_locked(uint64_t source_clock_id) {
   }
 }
 
-// Master filter check. Caller must hold ptp_state_mux.
-static bool master_matches_locked(const uint8_t *data) {
-  if (ptp.expected_clock_id == 0) return true;
-  if (parse_ptp_clock_id(data) == ptp.expected_clock_id) return true;
+/* Buffered mode follows one PTP source. Before SETRATEANCHORTIME gives us the
+ * expected source, lock onto the first observed source and mark any competing
+ * source as mixed rather than letting estimators alternate between clocks. */
+static bool legacy_source_admitted_locked(uint64_t source_clock_id) {
+  if (source_clock_id == 0) return false;
+  if (ptp.expected_clock_id != 0) {
+    if (source_clock_id == ptp.expected_clock_id) return true;
+    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
+    return false;
+  }
+  if (ptp.legacy_engine.source_clock_id == 0 ||
+      ptp.legacy_engine.source_clock_id == source_clock_id)
+    return true;
+
+  ptp.legacy_source_mixed = true;
   AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
   return false;
 }
 
-// Legacy/buffered SYNC path. Kept byte-for-byte in behaviour so AAC timing is
-// not changed by the realtime handover work.
-static void process_sync_legacy(const uint8_t *data, size_t len, uint16_t seq) {
-  const int64_t local_sync_ns = get_local_time_ns();
-  const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-  ptp_offset_log_t log_ev = {0};
+static void process_announce_legacy(const uint8_t *data, size_t len,
+                                    int64_t reception_ns) {
+  if (len < PTP_HEADER_SIZE) return;
+  const uint64_t source_clock = parse_ptp_clock_id(data);
+  const uint64_t gm = parse_announce_grandmaster_id(data, len);
+  if (source_clock == 0 || gm == 0) return;
+
+  ptp_step_log_t step_ev = {0};
+  taskENTER_CRITICAL(&ptp_state_mux);
+  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_ANNOUNCE);
+  if (legacy_source_admitted_locked(source_clock)) {
+    legacy_note_source_locked(source_clock);
+    ptp_clock_engine_domain_event_t de = {0};
+    if (ptp_clock_engine_set_domain(&ptp.legacy_engine, source_clock, gm, &de)) {
+      if (de.gm_changed || de.source_changed) {
+        const bool gm_holdover = de.gm_changed && !de.source_changed &&
+                                 de.old_estimator_valid && ptp.locked &&
+                                 ptp.last_sync_ms != 0;
+        fill_domain_step_locked(gm_holdover ? "gm-handover"
+                                            : (de.gm_changed ? "gm-change"
+                                                             : "source-change"),
+                                &de, reception_ns, gm_holdover, &step_ev);
+      }
+    }
+  }
+  taskEXIT_CRITICAL(&ptp_state_mux);
+  log_ptp_step(&step_ev);
+}
+
+static void process_sync_legacy(const uint8_t *data, size_t len, uint16_t seq,
+                                int64_t reception_ns) {
+  if (len < PTP_HEADER_SIZE || reception_ns <= 0) return;
+  const int64_t processing_lag_ns = get_local_time_ns() - reception_ns;
+  const uint64_t source_clock = parse_ptp_clock_id(data);
+  const int64_t sync_correction_ns = parse_ptp_correction_ns(data, len);
+  ptp_step_log_t step_ev = {0};
 
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (!master_matches_locked(data)) {
+  if (!legacy_source_admitted_locked(source_clock)) {
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
 
-  legacy_note_source_locked(parse_ptp_clock_id(data));
+  legacy_note_source_locked(source_clock);
+  if (ptp.legacy_engine.source_clock_id != source_clock) {
+    ptp_clock_engine_domain_event_t de = {0};
+    if (ptp_clock_engine_set_domain(&ptp.legacy_engine, source_clock, 0, &de) &&
+        de.source_changed) {
+      fill_domain_step_locked("source-change", &de, reception_ns, false,
+                              &step_ev);
+    }
+  }
+
   AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_SYNC);
+  if (ptp.awaiting_followup)
+    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_PAIR_MISMATCH);
+
   ptp.last_sync_seq = seq;
-  ptp.last_sync_local_ns = local_sync_ns;
+  ptp.last_sync_local_ns = reception_ns;
+  ptp.last_sync_correction_ns = sync_correction_ns;
+  ptp.last_sync_source_clock_id = source_clock;
+  ptp.last_sync_process_lag_ns = processing_lag_ns > 0 ? processing_lag_ns : 0;
   ptp.awaiting_followup = true;
 
-  uint16_t flags = ((uint16_t)data[6] << 8) | data[7];
-  bool two_step = (flags & 0x0200) != 0;
-
+  const uint16_t flags = ((uint16_t)data[6] << 8) | data[7];
+  const bool two_step = (flags & 0x0200) != 0;
   if (!two_step && len >= PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) {
-    uint64_t ptp_time_ns = parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
-    if (len >= 16) {
-      int64_t correction_field =
-          ((int64_t)data[8] << 56) | ((int64_t)data[9] << 48) |
-          ((int64_t)data[10] << 40) | ((int64_t)data[11] << 32) |
-          ((int64_t)data[12] << 24) | ((int64_t)data[13] << 16) |
-          ((int64_t)data[14] << 8) | (int64_t)data[15];
-      correction_field /= 65536;
-      ptp_time_ns = (uint64_t)((int64_t)ptp_time_ns + correction_field);
+    const uint64_t ptp_time_ns =
+        parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
+    if (ptp_time_ns <= INT64_MAX) {
+      const int64_t raw_offset = (int64_t)ptp_time_ns + sync_correction_ns -
+                                 reception_ns;
+      update_legacy_offset_locked(raw_offset, reception_ns,
+                                  ptp.last_sync_process_lag_ns, seq, &step_ev);
     }
-    const int64_t offset = (int64_t)ptp_time_ns - local_sync_ns;
-    update_offset_locked(offset, now_ms, &log_ev);
     ptp.awaiting_followup = false;
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
-  log_offset_event(&log_ev);
+  log_ptp_step(&step_ev);
 }
 
 static void process_followup_legacy(const uint8_t *data, size_t len,
-                                    uint16_t seq) {
-  const uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-  ptp_offset_log_t log_ev = {0};
+                                    uint16_t seq, int64_t reception_ns) {
+  if (len < PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) return;
+  const uint64_t followup_source = parse_ptp_clock_id(data);
+  const int64_t followup_correction_ns = parse_ptp_correction_ns(data, len);
+  const uint64_t ptp_time_ns =
+      parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
+  if (ptp_time_ns > INT64_MAX) return;
 
+  ptp_step_log_t step_ev = {0};
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (!master_matches_locked(data) || !ptp.awaiting_followup ||
-      seq != ptp.last_sync_seq) {
+  if (!legacy_source_admitted_locked(followup_source)) {
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
 
-  legacy_note_source_locked(parse_ptp_clock_id(data));
   AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_FOLLOWUP);
-  ptp.awaiting_followup = false;
-  if (len >= PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) {
-    uint64_t ptp_time_ns = parse_ptp_timestamp_ns(data + PTP_TIMESTAMP_OFFSET);
-    if (len >= 16) {
-      int64_t correction_field =
-          ((int64_t)data[8] << 56) | ((int64_t)data[9] << 48) |
-          ((int64_t)data[10] << 40) | ((int64_t)data[11] << 32) |
-          ((int64_t)data[12] << 24) | ((int64_t)data[13] << 16) |
-          ((int64_t)data[14] << 8) | (int64_t)data[15];
-      correction_field /= 65536;
-      ptp_time_ns = (uint64_t)((int64_t)ptp_time_ns + correction_field);
-    }
-    const int64_t offset = (int64_t)ptp_time_ns - ptp.last_sync_local_ns;
-    update_offset_locked(offset, now_ms, &log_ev);
+  if (!ptp.awaiting_followup) {
+    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_ORPHAN_FOLLOWUP);
+    taskEXIT_CRITICAL(&ptp_state_mux);
+    return;
   }
+  if (seq != ptp.last_sync_seq ||
+      followup_source != ptp.last_sync_source_clock_id) {
+    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_PAIR_MISMATCH);
+    taskEXIT_CRITICAL(&ptp_state_mux);
+    return;
+  }
+
+  const int64_t sync_local_ns = ptp.last_sync_local_ns;
+  const int64_t raw_offset = (int64_t)ptp_time_ns +
+                             ptp.last_sync_correction_ns +
+                             followup_correction_ns - sync_local_ns;
+  ptp.awaiting_followup = false;
+  AUDIO_DIAG_SYNC_GAP_NS(reception_ns >= sync_local_ns
+                             ? reception_ns - sync_local_ns : 0);
+  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_PAIR_OK);
+  update_legacy_offset_locked(raw_offset, reception_ns,
+                              ptp.last_sync_process_lag_ns, seq, &step_ev);
   taskEXIT_CRITICAL(&ptp_state_mux);
-  log_offset_event(&log_ev);
+  log_ptp_step(&step_ev);
 }
 
 static void process_announce_realtime(const uint8_t *data, size_t len,
@@ -547,6 +716,17 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
   taskEXIT_CRITICAL(&ptp_state_mux);
 
   if (changed) {
+    if (old_gm != 0) {
+      ptp_step_log_t step_ev = {
+          .emit = true,
+          .reason = "gm-change",
+          .source_clock_id = source_clock,
+          .grandmaster_clock_id = gm,
+          .epoch = ptp.rt_gm_changes + 1U,
+      };
+      log_ptp_step(&step_ev);
+    }
+#if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
     struct in_addr src = {.s_addr = source_ip};
     struct in_addr peer = {.s_addr = peer_ip};
     char src_text[INET_ADDRSTRLEN] = {0};
@@ -554,10 +734,13 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
     inet_ntop(AF_INET, &src, src_text, sizeof(src_text));
     if (peer_ip) inet_ntop(AF_INET, &peer, peer_text, sizeof(peer_text));
     ESP_LOGI(TAG,
-             "RT ANNOUNCE peer=%s wanted=%s source=%016llx gm=%016llx oldGM=%016llx",
+             "RT ANNOUNCE | peer=%s | wanted=%s | source=%016llx | gm=%016llx | oldGM=%016llx",
              src_text, peer_ip ? peer_text : "any",
              (unsigned long long)source_clock, (unsigned long long)gm,
              (unsigned long long)old_gm);
+#else
+    (void)peer_ip;
+#endif
   }
 }
 
@@ -651,14 +834,22 @@ static void process_followup_realtime(const uint8_t *data, size_t len,
     master_age = (uint32_t)((reception_ns - ptp.rt_mastership_start_ns) / 1000000LL);
   taskEXIT_CRITICAL(&ptp_state_mux);
 
+#if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
   if (became_ready) {
     ESP_LOGI(TAG,
-             "RT MASTER READY gm=%016llx source=%016llx age=%lums samples=%lu "
-             "masterOff=%+lldns",
+             "RT MASTER READY | gm=%016llx | source=%016llx | age=%lums | samples=%lu | masterOff=%+lldns",
              (unsigned long long)gm, (unsigned long long)source,
              (unsigned long)master_age, (unsigned long)samples,
              (long long)master_off);
   }
+#else
+  (void)became_ready;
+  (void)gm;
+  (void)source;
+  (void)master_off;
+  (void)master_age;
+  (void)samples;
+#endif
 }
 
 static void process_ptp_message(const uint8_t *data, size_t len,
@@ -676,13 +867,13 @@ static void process_ptp_message(const uint8_t *data, size_t len,
   if (!realtime) {
     switch (msg_type) {
     case PTP_MSG_SYNC:
-      if (is_event_port) process_sync_legacy(data, len, seq);
+      if (is_event_port) process_sync_legacy(data, len, seq, reception_ns);
       break;
     case PTP_MSG_FOLLOW_UP:
-      if (!is_event_port) process_followup_legacy(data, len, seq);
+      if (!is_event_port) process_followup_legacy(data, len, seq, reception_ns);
       break;
     case PTP_MSG_ANNOUNCE:
-      AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_ANNOUNCE);
+      if (!is_event_port) process_announce_legacy(data, len, reception_ns);
       break;
     default:
       break;
@@ -752,6 +943,7 @@ static int create_ptp_socket(uint16_t port) {
 
 // PTP task - listens for messages on both ports
 static void ptp_task(void *pvParameters) {
+  (void)pvParameters;
   uint8_t buffer[256];
 
   while (ptp.running) {
@@ -846,6 +1038,7 @@ esp_err_t ptp_clock_init(void) {
   memset(&ptp, 0, sizeof(ptp));
   ptp.event_socket = -1;
   ptp.general_socket = -1;
+  ptp_clock_engine_init(&ptp.legacy_engine, OUTLIER_THRESHOLD_NS);
 
   // Create sockets
   ptp.event_socket = create_ptp_socket(PTP_EVENT_PORT);
@@ -908,6 +1101,7 @@ void ptp_clock_stop(void) {
 void ptp_clock_clear(void) {
   taskENTER_CRITICAL(&ptp_state_mux);
   ptp.locked = false;
+  ptp.legacy_presentation_ready = false;
   ptp.lock_candidate_start_ms = 0;
   ptp.last_sync_ms = 0;
   ptp.filtered_offset_ns = 0;
@@ -921,12 +1115,19 @@ void ptp_clock_clear(void) {
   ptp.expected_clock_id = 0;
   ptp.legacy_sample_clock_id = 0;
   ptp.legacy_source_mixed = false;
+  ptp_clock_engine_init(&ptp.legacy_engine, OUTLIER_THRESHOLD_NS);
+  ptp.legacy_last_step_log_ns = 0;
+  ptp.legacy_domain_translation_ns = 0;
+  ptp.legacy_handover_pending = false;
+  ptp.legacy_handover_from_offset_ns = 0;
+  ptp.legacy_handover_epoch = 0;
 
   /* Keep mode + timing peer across a stream-level clear, but drop the
    * realtime GM estimator. No audio continuity state lives in ptp_clock. */
   ptp.source_clock_id = 0;
   ptp.grandmaster_clock_id = 0;
   ptp.rt_master_offset_ns = 0;
+  ptp.rt_raw_offset_ns = 0;
   ptp.rt_previous_offset_ns = 0;
   ptp.rt_previous_offset_time_ns = 0;
   ptp.rt_mastership_start_ns = 0;
@@ -945,11 +1146,12 @@ void ptp_clock_clear(void) {
 void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
   if (pause_duration_ms < PTP_LONG_PAUSE_THRESHOLD_MS) return;
 
+  ptp_step_log_t step_ev = {0};
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (ptp.realtime_mode) {
-    /* Only estimator history is stale after a long pause. The realtime audio
-     * presentation anchor remains in ESP-local time and is not touched. */
+  const bool realtime = ptp.realtime_mode;
+  if (realtime) {
     ptp.rt_master_offset_ns = 0;
+    ptp.rt_raw_offset_ns = 0;
     ptp.rt_previous_offset_ns = 0;
     ptp.rt_previous_offset_time_ns = 0;
     ptp.rt_mastership_start_ns = 0;
@@ -964,21 +1166,39 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
     ptp.rt_awaiting_followup = false;
     ptp.locked = false;
     ptp.filtered_offset_ns = 0;
+    step_ev.source_clock_id = ptp.source_clock_id;
+    step_ev.grandmaster_clock_id = ptp.grandmaster_clock_id;
+    step_ev.epoch = ptp.grandmaster_clock_id ? ptp.rt_gm_changes + 1U : 0U;
   } else {
-    ptp.previous_offset_time_ms = 0;
-    ptp.mastership_start_ms = 0;
+    ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
+    ptp.filtered_offset_ns = 0;
+    ptp.sample_count = 0;
+    ptp.last_sync_ms = 0;
+    ptp.locked = false;
+    ptp.legacy_presentation_ready = false;
+    ptp.lock_candidate_start_ms = 0;
+    ptp.awaiting_followup = false;
+    step_ev.source_clock_id = ptp.legacy_engine.source_clock_id;
+    step_ev.grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+    step_ev.epoch = ptp.legacy_engine.epoch;
   }
+  step_ev.emit = true;
+  step_ev.reason = "clock-reset";
   taskEXIT_CRITICAL(&ptp_state_mux);
 
-  ESP_LOGI(TAG, "notify_resume: pause=%lu ms, resetting %s PTP smoothing",
+  log_ptp_step(&step_ev);
+#if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
+  ESP_LOGI(TAG, "PTP resume reset | pause=%lums | mode=%s",
            (unsigned long)pause_duration_ms,
-           ptp.realtime_mode ? "realtime-master" : "legacy");
+           realtime ? "realtime" : "buffered");
+#endif
 }
 
 bool ptp_clock_is_locked(void) {
   const int64_t now_ns = get_local_time_ns();
   const uint32_t now_ms = (uint32_t)(now_ns / 1000000LL);
   bool locked;
+  ptp_step_log_t step_ev = {0};
 
   taskENTER_CRITICAL(&ptp_state_mux);
   if (ptp.realtime_mode) {
@@ -986,15 +1206,38 @@ bool ptp_clock_is_locked(void) {
         now_ns - ptp.rt_last_followup_rx_ns >
             (int64_t)LOCK_TIMEOUT_MS * 1000000LL) {
       ptp.rt_master_ready = false;
+      if (ptp.locked) {
+        step_ev.emit = true;
+        step_ev.reason = "lock-lost";
+        step_ev.source_clock_id = ptp.source_clock_id;
+        step_ev.grandmaster_clock_id = ptp.grandmaster_clock_id;
+        step_ev.epoch = ptp.grandmaster_clock_id ? ptp.rt_gm_changes + 1U : 0U;
+        step_ev.raw_offset_ns = ptp.rt_raw_offset_ns;
+        step_ev.filtered_offset_ns = ptp.rt_master_offset_ns;
+        step_ev.raw_filter_delta_ns =
+            ptp.rt_raw_offset_ns - ptp.rt_master_offset_ns;
+      }
       ptp.locked = false;
     }
   } else if (ptp.locked && ptp.last_sync_ms > 0 &&
              (now_ms - ptp.last_sync_ms) > LOCK_TIMEOUT_MS) {
     ptp.locked = false;
     ptp.lock_candidate_start_ms = 0;
+    step_ev.emit = true;
+    step_ev.reason = "lock-lost";
+    step_ev.source_clock_id = ptp.legacy_engine.source_clock_id;
+    step_ev.grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+    step_ev.epoch = ptp.legacy_engine.epoch;
+    step_ev.raw_offset_ns = ptp.legacy_engine.raw_offset_ns;
+    step_ev.filtered_offset_ns = ptp.legacy_engine.filtered_offset_ns;
+    step_ev.raw_filter_delta_ns =
+        ptp.legacy_engine.raw_offset_ns - ptp.legacy_engine.filtered_offset_ns;
   }
-  locked = ptp.locked;
+  locked = ptp.realtime_mode
+               ? ptp.locked
+               : (ptp.locked || ptp.legacy_presentation_ready);
   taskEXIT_CRITICAL(&ptp_state_mux);
+  log_ptp_step(&step_ev);
   return locked;
 }
 
@@ -1015,6 +1258,58 @@ int64_t ptp_clock_get_offset_ns(void) {
   return offset_ns;
 }
 
+
+void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
+  if (!snapshot) return;
+  memset(snapshot, 0, sizeof(*snapshot));
+  snapshot->sample_age_ms = UINT32_MAX;
+
+  const int64_t now_ns = get_local_time_ns();
+  taskENTER_CRITICAL(&ptp_state_mux);
+  snapshot->realtime_mode = ptp.realtime_mode;
+  snapshot->locked = ptp.locked;
+  if (ptp.realtime_mode) {
+    snapshot->valid = ptp.rt_master_ready && ptp.rt_last_followup_rx_ns > 0;
+    snapshot->source_clock_id = ptp.source_clock_id;
+    snapshot->grandmaster_clock_id = ptp.grandmaster_clock_id;
+    snapshot->epoch = ptp.grandmaster_clock_id ? ptp.rt_gm_changes + 1U : 0U;
+    snapshot->raw_offset_ns = ptp.rt_raw_offset_ns;
+    snapshot->filtered_offset_ns = ptp.rt_master_offset_ns;
+    snapshot->raw_filter_delta_ns =
+        ptp.rt_raw_offset_ns - ptp.rt_master_offset_ns;
+    snapshot->presentation_offset_ns = ptp.filtered_offset_ns;
+    snapshot->domain_translation_ns = 0;
+    snapshot->sample_count = ptp.rt_sample_count;
+    if (ptp.rt_last_followup_rx_ns > 0 && now_ns >= ptp.rt_last_followup_rx_ns) {
+      const uint64_t age_ms = (uint64_t)((now_ns - ptp.rt_last_followup_rx_ns) /
+                                         1000000LL);
+      snapshot->sample_age_ms = age_ms > UINT32_MAX ? UINT32_MAX
+                                                    : (uint32_t)age_ms;
+    }
+  } else {
+    snapshot->valid = ptp.legacy_engine.valid;
+    snapshot->source_clock_id = ptp.legacy_engine.source_clock_id;
+    snapshot->grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+    snapshot->epoch = ptp.legacy_engine.epoch;
+    snapshot->raw_offset_ns = ptp.legacy_engine.raw_offset_ns;
+    snapshot->filtered_offset_ns = ptp.legacy_engine.filtered_offset_ns;
+    snapshot->raw_filter_delta_ns =
+        ptp.legacy_engine.raw_offset_ns - ptp.legacy_engine.filtered_offset_ns;
+    snapshot->presentation_offset_ns = ptp.filtered_offset_ns;
+    snapshot->domain_translation_ns = ptp.legacy_domain_translation_ns;
+    snapshot->sample_count = ptp.legacy_engine.accepted_samples;
+    if (ptp.legacy_engine.last_accepted_time_ns > 0 &&
+        now_ns >= ptp.legacy_engine.last_accepted_time_ns) {
+      const uint64_t age_ms =
+          (uint64_t)((now_ns - ptp.legacy_engine.last_accepted_time_ns) /
+                     1000000LL);
+      snapshot->sample_age_ms = age_ms > UINT32_MAX ? UINT32_MAX
+                                                    : (uint32_t)age_ms;
+    }
+  }
+  taskEXIT_CRITICAL(&ptp_state_mux);
+}
+
 void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
   bool changed = false;
   TaskHandle_t task_handle = NULL;
@@ -1028,6 +1323,7 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     /* Stream-mode transition starts the selected estimator fresh. This does
      * not touch any PCM/ring/cursor/PID/DMA/I2S state. */
     ptp.locked = false;
+    ptp.legacy_presentation_ready = false;
     ptp.lock_candidate_start_ms = 0;
     ptp.last_sync_ms = 0;
     ptp.filtered_offset_ns = 0;
@@ -1041,6 +1337,12 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.expected_clock_id = 0;
     ptp.legacy_sample_clock_id = 0;
     ptp.legacy_source_mixed = false;
+    ptp_clock_engine_init(&ptp.legacy_engine, OUTLIER_THRESHOLD_NS);
+    ptp.legacy_last_step_log_ns = 0;
+    ptp.legacy_domain_translation_ns = 0;
+    ptp.legacy_handover_pending = false;
+    ptp.legacy_handover_from_offset_ns = 0;
+    ptp.legacy_handover_epoch = 0;
     ptp.source_clock_id = 0;
     ptp.grandmaster_clock_id = 0;
     ptp.rt_master_offset_ns = 0;
@@ -1064,14 +1366,18 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     vTaskPrioritySet(task_handle, enabled ? PTP_TASK_PRIORITY_REALTIME
                                          : PTP_TASK_PRIORITY_LEGACY);
   }
+#if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
   if (changed) {
     struct in_addr peer = {.s_addr = timing_peer_ip};
     char peer_text[INET_ADDRSTRLEN] = {0};
     if (timing_peer_ip) inet_ntop(AF_INET, &peer, peer_text, sizeof(peer_text));
-    ESP_LOGI(TAG, "PTP mode=%s timingPeer=%s",
+    ESP_LOGI(TAG, "PTP mode=%s | timingPeer=%s",
              enabled ? "AP2-realtime" : "legacy/buffered",
              enabled && timing_peer_ip ? peer_text : "none");
   }
+#else
+  (void)changed;
+#endif
 }
 
 void ptp_clock_note_realtime_d7(uint64_t clock_id) {
@@ -1123,59 +1429,83 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
   bool was_locked = false;
   uint64_t learned_source = 0;
   bool source_mixed = false;
+  ptp_step_log_t step_ev = {0};
 
   taskENTER_CRITICAL(&ptp_state_mux);
   realtime = ptp.realtime_mode;
   if (clock_id != ptp.expected_clock_id) {
     changed = true;
     was_locked = ptp.locked;
-    learned_source = ptp.legacy_sample_clock_id;
+    learned_source = ptp.legacy_engine.source_clock_id;
     source_mixed = ptp.legacy_source_mixed;
     ptp.expected_clock_id = clock_id;
     if (!realtime) {
-      /* PTP packets can arrive before SETRATEANCHORTIME. If the estimator was
-       * built from one source and that exact source is now confirmed by the
-       * RTSP anchor, keep the estimator/lock. Otherwise retain the original
-       * conservative reset behaviour so samples from another master can never
-       * leak into the media timeline. */
-      preserved_legacy =
-          clock_id != 0 && ptp.sample_count > 0 && !ptp.legacy_source_mixed &&
-          ptp.legacy_sample_clock_id == clock_id;
+      preserved_legacy = clock_id != 0 && ptp.legacy_engine.valid &&
+          !ptp.legacy_source_mixed &&
+          ptp.legacy_engine.source_clock_id == clock_id;
       if (!preserved_legacy) {
+        const uint32_t old_epoch = ptp.legacy_engine.epoch;
+        ptp_clock_engine_domain_event_t de = {0};
+        if (clock_id != 0 && ptp.legacy_engine.source_clock_id != clock_id) {
+          (void)ptp_clock_engine_set_domain(&ptp.legacy_engine, clock_id, 0, &de);
+          ptp.legacy_domain_translation_ns = 0;
+          ptp.legacy_handover_pending = false;
+          ptp.legacy_handover_from_offset_ns = 0;
+          ptp.legacy_handover_epoch = 0;
+        } else {
+          ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
+        }
+        if (ptp.legacy_engine.epoch == old_epoch)
+          ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
+
         ptp.locked = false;
+        ptp.legacy_presentation_ready = false;
         ptp.lock_candidate_start_ms = 0;
         ptp.last_sync_ms = 0;
         ptp.filtered_offset_ns = 0;
         ptp.sample_count = 0;
-        ptp.previous_offset = 0;
-        ptp.previous_offset_time_ms = 0;
-        ptp.mastership_start_ms = 0;
         ptp.last_sync_seq = 0;
         ptp.last_sync_local_ns = 0;
+        ptp.last_sync_correction_ns = 0;
+        ptp.last_sync_source_clock_id = 0;
+        ptp.last_sync_process_lag_ns = 0;
         ptp.awaiting_followup = false;
-        ptp.legacy_sample_clock_id = 0;
+        ptp.legacy_sample_clock_id = clock_id;
         ptp.legacy_source_mixed = false;
+
+        step_ev.emit = clock_id != 0;
+        step_ev.reason = "clock-reset";
+        step_ev.source_clock_id = clock_id;
+        step_ev.grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+        step_ev.epoch = ptp.legacy_engine.epoch;
       }
     }
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
 
+  log_ptp_step(&step_ev);
   if (changed) {
+#if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
     if (!realtime && preserved_legacy) {
       ESP_LOGI(TAG,
-               "PTP anchor clock confirmed: %016llx source=%016llx preserving %s estimator",
+               "PTP anchor clock confirmed | clock=%016llx | source=%016llx | estimator=%s",
                (unsigned long long)clock_id,
                (unsigned long long)learned_source,
                was_locked ? "locked" : "acquiring");
     } else if (!realtime) {
       ESP_LOGI(TAG,
-               "PTP anchor clock hint: %016llx source=%016llx mixed=%d -> reset estimator",
+               "PTP anchor clock reset | clock=%016llx | source=%016llx | mixed=%d",
                (unsigned long long)clock_id,
                (unsigned long long)learned_source, source_mixed ? 1 : 0);
     } else {
-      ESP_LOGI(TAG, "RT anchor clock hint: %016llx",
+      ESP_LOGI(TAG, "RT anchor clock hint | clock=%016llx",
                (unsigned long long)clock_id);
     }
+#else
+    (void)was_locked;
+    (void)learned_source;
+    (void)source_mixed;
+#endif
   }
 }
 

@@ -33,6 +33,7 @@ set(SRC_FILES
     "network/wifi.c"
     "network/mdns_airplay.c"
     "network/ptp_clock.c"
+    "network/ptp_clock_engine.c"
     "network/socket_utils.c"
     "network/web_server.c"
     "network/ota.c"

@@ -27,6 +27,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "network/ptp_clock.h"
+#include "network/ptp_clock_engine.h"
 #include "network/socket_utils.h"
 
 #define AP2_PACKET_MAX             8192U
@@ -88,6 +89,7 @@
 #define AP2_CSTORE_DECODE_BURST          8U
 #define AP2_CSTORE_REORDER_GUARD_MS    300U
 #define AP2_DECODE_IDLE_TICKS            1U
+#define AP2_PHASE_HISTORY_SAMPLES        32U
 
 /* ALAC reorder release point. Missing PCM stays absent in the raw RTP ring
  * while retransmission runs independently. Only when the physical PTP
@@ -106,6 +108,9 @@ typedef struct {
   uint64_t anchor_clock_id;
   uint64_t anchor_ptp_ns;
   uint64_t anchor_local_ns; /* current local conversion, cached during PTP holdover */
+  int64_t anchor_domain_translation_ns; /* buffered anchor's PTP-domain basis */
+  int64_t buffered_ptp_offset_ns;       /* coherent offset captured for this snapshot */
+  bool buffered_clock_map_valid;
   uint32_t anchor_rtp;
   uint32_t generation;          /* timing/playout epoch */
   uint32_t media_revision;      /* changes on every buffered anchor update */
@@ -122,6 +127,12 @@ typedef struct {
   int32_t us;
   uint32_t generation;
   bool valid;
+
+  /* Passive Shairport-style robust phase observation. It is never fed into
+   * PID, cursor movement or playout decisions in this version. */
+  int32_t phase_samples[AP2_PHASE_HISTORY_SAMPLES];
+  uint8_t phase_count;
+  uint8_t phase_index;
 } output_sync_state_t;
 
 typedef struct {
@@ -157,6 +168,7 @@ typedef struct {
   uint64_t anchor_clock_id;
   uint64_t anchor_ptp_ns;
   uint64_t anchor_local_ns; /* ESP monotonic time corresponding to anchor_rtp */
+  int64_t anchor_domain_translation_ns; /* buffered raw-anchor translation basis */
   uint32_t anchor_rtp;
   /* Realtime media-domain rebase. This is deliberately separate from PTP:
    * it only maps a new GM epoch onto the already-running local media phase. */
@@ -194,6 +206,8 @@ typedef struct {
    * task reads them; no packet/decode/I2S-completion instrumentation is added. */
   volatile bool status_sync_valid;
   volatile int32_t status_sync_us;
+  volatile bool status_phase_valid;
+  volatile int32_t status_phase_us;
   volatile int32_t status_servo_ppm;
   volatile uint32_t status_sync_generation;
 } ap2_state_t;
@@ -255,6 +269,9 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->anchor_clock_id = s.anchor_clock_id;
   out->anchor_ptp_ns = s.anchor_ptp_ns;
   out->anchor_local_ns = s.anchor_local_ns;
+  out->anchor_domain_translation_ns = s.anchor_domain_translation_ns;
+  out->buffered_ptp_offset_ns = 0;
+  out->buffered_clock_map_valid = false;
   out->anchor_rtp = s.anchor_rtp;
   out->generation = s.generation;
   out->media_revision = s.media_revision;
@@ -271,6 +288,25 @@ static void snapshot_state(timing_snapshot_t *out) {
   bias_ns = s.rt_media_rebase_bias_ns;
   bias_start_us = s.rt_media_rebase_start_us;
   taskEXIT_CRITICAL(&s.state_mux);
+
+  if (out->stream_type == AUDIO_STREAM_BUFFERED) {
+    ptp_clock_snapshot_t ps = {0};
+    ptp_clock_get_snapshot(&ps);
+    if (!ps.realtime_mode) {
+      out->buffered_ptp_offset_ns = ps.presentation_offset_ns;
+      out->buffered_clock_map_valid = true;
+      if (out->anchor_valid && !out->timeline_reset_pending) {
+        uint64_t translated_anchor = 0;
+        if (ptp_clock_engine_translate_timestamp(
+                out->anchor_ptp_ns, out->anchor_domain_translation_ns,
+                ps.domain_translation_ns, &translated_anchor)) {
+          out->anchor_ptp_ns = translated_anchor;
+        } else {
+          out->buffered_clock_map_valid = false;
+        }
+      }
+    }
+  }
 
   if (out->stream_type == AUDIO_STREAM_REALTIME && out->anchor_valid &&
       !out->timeline_reset_pending && out->anchor_ptp_ns != 0U) {
@@ -336,6 +372,7 @@ static void mark_timeline_discontinuity(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.anchor_valid = false;
   s.timeline_reset_pending = true;
+  s.anchor_domain_translation_ns = 0;
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;
   s.rt_media_rebase_epoch = 0;
@@ -375,21 +412,27 @@ static inline int32_t rtp_delta(uint32_t a, uint32_t b) {
 }
 
 /* Presentation-clock boundary.
- * Buffered AAC intentionally keeps the existing PTP-domain behaviour.
- * Realtime ALAC retains the remote D7 anchor. Each timing snapshot converts
- * it with the current filtered PTP offset, even between D7 packets. Staging,
- * playout and DMA/PID use that coherent snapshot in ESP monotonic time. */
+ * Buffered AAC keeps PTP-authoritative rate/phase, but the clock offset and the
+ * translated anchor are captured as one coherent snapshot. A same-source GM
+ * handover can therefore change absolute PTP coordinates without changing the
+ * media interval now-anchor. Realtime ALAC remains entirely ESP-local here. */
 static bool timing_clock_ready(const timing_snapshot_t *snap) {
   if (!snap || !snap->anchor_valid || snap->timeline_reset_pending) return false;
   if (snap->stream_type == AUDIO_STREAM_REALTIME) return snap->anchor_local_ns != 0;
-  return ptp_clock_is_locked();
+  return snap->buffered_clock_map_valid && ptp_clock_is_locked();
 }
 
 static uint64_t presentation_now_ns(const timing_snapshot_t *snap) {
-  if (snap && snap->stream_type == AUDIO_STREAM_REALTIME) {
-    return (uint64_t)esp_timer_get_time() * 1000ULL;
+  const uint64_t local_ns = (uint64_t)esp_timer_get_time() * 1000ULL;
+  if (snap && snap->stream_type == AUDIO_STREAM_REALTIME) return local_ns;
+  if (snap) {
+    uint64_t mapped = 0;
+    if (ptp_clock_engine_translate_timestamp(
+            local_ns, 0, snap->buffered_ptp_offset_ns, &mapped)) {
+      return mapped;
+    }
   }
-  return ptp_clock_get_time_ns();
+  return 0;
 }
 
 static uint64_t presentation_anchor_ns(const timing_snapshot_t *snap) {
@@ -429,16 +472,38 @@ static double status_frames_to_ms(uint32_t frames, int sample_rate) {
   return ((double)frames * 1000.0) / (double)sr;
 }
 
-static void status_publish_sync(int32_t sync_us, int32_t servo_ppm,
-                              uint32_t generation) {
+static void status_publish_sync(int32_t sync_us, int32_t phase_us,
+                                int32_t servo_ppm, uint32_t generation) {
   __atomic_store_n(&s.status_sync_us, sync_us, __ATOMIC_RELAXED);
+  __atomic_store_n(&s.status_phase_us, phase_us, __ATOMIC_RELAXED);
   __atomic_store_n(&s.status_servo_ppm, servo_ppm, __ATOMIC_RELAXED);
   __atomic_store_n(&s.status_sync_generation, generation, __ATOMIC_RELAXED);
+  __atomic_store_n(&s.status_phase_valid, true, __ATOMIC_RELAXED);
   __atomic_store_n(&s.status_sync_valid, true, __ATOMIC_RELEASE);
 }
 
 static void status_invalidate_sync(void) {
+  __atomic_store_n(&s.status_phase_valid, false, __ATOMIC_RELAXED);
   __atomic_store_n(&s.status_sync_valid, false, __ATOMIC_RELEASE);
+}
+
+static int32_t robust_phase_center_us(const output_sync_state_t *sync) {
+  if (!sync || !sync->valid || sync->phase_count == 0) return 0;
+  if (sync->phase_count < 4U) return sync->us;
+
+  int32_t sorted[AP2_PHASE_HISTORY_SAMPLES];
+  const uint32_t n = sync->phase_count;
+  for (uint32_t i = 0; i < n; ++i) sorted[i] = sync->phase_samples[i];
+  for (uint32_t i = 1; i < n; ++i) {
+    const int32_t v = sorted[i];
+    uint32_t j = i;
+    while (j > 0 && sorted[j - 1U] > v) {
+      sorted[j] = sorted[j - 1U];
+      --j;
+    }
+    sorted[j] = v;
+  }
+  return (int32_t)(((int64_t)sorted[1] + (int64_t)sorted[n - 2U]) / 2LL);
 }
 
 static void audio_status_task(void *arg) {
@@ -469,35 +534,43 @@ static void audio_status_task(void *arg) {
         __atomic_load_n(&s.status_sync_valid, __ATOMIC_ACQUIRE) &&
         __atomic_load_n(&s.status_sync_generation, __ATOMIC_RELAXED) ==
             snap.generation;
+    const bool phase_valid = sync_valid &&
+        __atomic_load_n(&s.status_phase_valid, __ATOMIC_RELAXED);
     const int32_t sync_us =
         __atomic_load_n(&s.status_sync_us, __ATOMIC_RELAXED);
+    const int32_t phase_us =
+        __atomic_load_n(&s.status_phase_us, __ATOMIC_RELAXED);
     const int32_t correction_ppm =
         __atomic_load_n(&s.status_servo_ppm, __ATOMIC_RELAXED);
+
+    ptp_clock_snapshot_t ps = {0};
+    ptp_clock_get_snapshot(&ps);
+    const uint32_t gm_short = (uint32_t)(ps.grandmaster_clock_id & 0xffffffffU);
+    const double ptp_delta_ms = (double)ps.raw_filter_delta_ns / 1000000.0;
 
     if (task_stream == AUDIO_STREAM_BUFFERED) {
       ap2_buffered_transport_usage_t usage = {0};
       ap2_buffered_transport_get_usage(s.transport, &usage);
-      const unsigned used_pct = usage.capacity_bytes
-          ? (unsigned)((usage.used_bytes * 100U) / usage.capacity_bytes)
-          : 0U;
-      if (sync_valid) {
+      if (sync_valid && phase_valid && ps.valid) {
         ESP_LOGI(STATUS_TAG,
-                 "AAC sync=%+.2fms i2s=%+ldppm "
-                 "cbuf=%u%%(%u/%uKiB ready=%lu) pcm=%.0fms",
-                 (double)sync_us / 1000.0, (long)correction_ppm,
-                 used_pct,
+                 "AAC | sync=%+.2fms | phase=%+.2fms | i2s=%+ldppm | "
+                 "ptpD=%+.2fms | gm=%08lx | epoch=%lu | cbuf=%u/%uKiB | pcm=%.0fms",
+                 (double)sync_us / 1000.0, (double)phase_us / 1000.0,
+                 (long)correction_ppm, ptp_delta_ms,
+                 (unsigned long)gm_short, (unsigned long)ps.epoch,
                  (unsigned)(usage.used_bytes / 1024U),
                  (unsigned)(usage.capacity_bytes / 1024U),
-                 (unsigned long)usage.ready_packets,
                  status_frames_to_ms(pcm_frames, sr));
       } else {
         ESP_LOGI(STATUS_TAG,
-                 "AAC sync=n/a i2s=%+ldppm "
-                 "cbuf=%u%%(%u/%uKiB ready=%lu) pcm=%.0fms",
-                 (long)correction_ppm, used_pct,
+                 "AAC | sync=%s | phase=%s | i2s=%+ldppm | ptpD=%s | "
+                 "gm=%08lx | epoch=%lu | cbuf=%u/%uKiB | pcm=%.0fms",
+                 sync_valid ? "valid" : "n/a",
+                 phase_valid ? "valid" : "n/a",
+                 (long)correction_ppm, ps.valid ? "valid" : "n/a",
+                 (unsigned long)gm_short, (unsigned long)ps.epoch,
                  (unsigned)(usage.used_bytes / 1024U),
                  (unsigned)(usage.capacity_bytes / 1024U),
-                 (unsigned long)usage.ready_packets,
                  status_frames_to_ms(pcm_frames, sr));
       }
     } else if (task_stream == AUDIO_STREAM_REALTIME) {
@@ -518,20 +591,26 @@ static void audio_status_task(void *arg) {
             s.realtime_stage_ring, raw_cursor, snap.generation,
             PCM_RTP_RING_FRAMES);
       }
-      if (sync_valid) {
+      if (sync_valid && phase_valid && ps.valid) {
         ESP_LOGI(STATUS_TAG,
-                 "ALAC sync=%+.2fms i2s=%+ldppm "
-                 "frameq=%lu/%lu raw=%.2fms pcm=%.0fms",
-                 (double)sync_us / 1000.0, (long)correction_ppm,
+                 "ALAC | sync=%+.2fms | phase=%+.2fms | i2s=%+ldppm | "
+                 "ptpD=%+.2fms | gm=%08lx | epoch=%lu | frameq=%lu/%lu | "
+                 "raw=%.0fms | pcm=%.0fms",
+                 (double)sync_us / 1000.0, (double)phase_us / 1000.0,
+                 (long)correction_ppm, ptp_delta_ms,
+                 (unsigned long)gm_short, (unsigned long)ps.epoch,
                  (unsigned long)usage.work_queue_depth,
                  (unsigned long)usage.work_queue_capacity,
                  status_frames_to_ms(raw_frames, sr),
                  status_frames_to_ms(pcm_frames, sr));
       } else {
         ESP_LOGI(STATUS_TAG,
-                 "ALAC sync=n/a i2s=%+ldppm "
-                 "frameq=%lu/%lu raw=%.2fms pcm=%.0fms",
-                 (long)correction_ppm,
+                 "ALAC | sync=%s | phase=%s | i2s=%+ldppm | ptpD=%s | "
+                 "gm=%08lx | epoch=%lu | frameq=%lu/%lu | raw=%.0fms | pcm=%.0fms",
+                 sync_valid ? "valid" : "n/a",
+                 phase_valid ? "valid" : "n/a",
+                 (long)correction_ppm, ps.valid ? "valid" : "n/a",
+                 (unsigned long)gm_short, (unsigned long)ps.epoch,
                  (unsigned long)usage.work_queue_depth,
                  (unsigned long)usage.work_queue_capacity,
                  status_frames_to_ms(raw_frames, sr),
@@ -618,7 +697,7 @@ static int64_t completion_presentation_ns(const timing_snapshot_t *snap,
                                           const audio_playout_completion_t *done) {
   const int64_t local_ns = done->done_local_us * 1000LL;
   if (snap->stream_type == AUDIO_STREAM_REALTIME) return local_ns;
-  return local_ns + ptp_clock_get_offset_ns();
+  return local_ns + snap->buffered_ptp_offset_ns;
 }
 
 /* Pace DMA submission in the stream's presentation clock. For AAC this is
@@ -1226,9 +1305,19 @@ static void process_i2s_completions(const timing_snapshot_t *snap) {
       s.output_sync.us = sync_us;
       s.output_sync.generation = done.generation;
       s.output_sync.valid = true;
+      s.output_sync.phase_count = 0;
+      s.output_sync.phase_index = 0;
     } else {
+      /* Keep the existing EMA exactly as the PID input. */
       s.output_sync.us += (sync_us - s.output_sync.us) / 8;
     }
+
+    /* Passive robust phase history only. No controller reads these raw samples. */
+    s.output_sync.phase_samples[s.output_sync.phase_index] = sync_us;
+    s.output_sync.phase_index =
+        (uint8_t)((s.output_sync.phase_index + 1U) % AP2_PHASE_HISTORY_SAMPLES);
+    if (s.output_sync.phase_count < AP2_PHASE_HISTORY_SAMPLES)
+      s.output_sync.phase_count++;
   }
 }
 
@@ -1793,7 +1882,8 @@ static void ap2_playout_task(void *arg) {
         next_target = servo_ppm;
       }
       servo_target_ppm = next_target;
-      status_publish_sync(s.output_sync.us, servo_ppm, snap.generation);
+      status_publish_sync(s.output_sync.us, robust_phase_center_us(&s.output_sync),
+                          servo_ppm, snap.generation);
     }
 
     if (write_err == ESP_OK && s.output_sync.valid &&
@@ -2462,6 +2552,8 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   if (clock_id) {
     ptp_clock_set_master_clock_id(clock_id);
   }
+  ptp_clock_snapshot_t ptp_snap = {0};
+  ptp_clock_get_snapshot(&ptp_snap);
   uint32_t gen;
   uint32_t revision;
   bool committed;
@@ -2473,6 +2565,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_clock_id = clock_id;
   s.anchor_ptp_ns = ptp_ns;
   s.anchor_local_ns = 0; /* buffered/AAC remains PTP-authoritative */
+  s.anchor_domain_translation_ns = ptp_snap.domain_translation_ns;
   s.anchor_rtp = rtp;
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;
@@ -2587,6 +2680,7 @@ bool audio_receiver_set_realtime_anchor_local(
     s.anchor_clock_id = clock_id;
     s.anchor_ptp_ns = remote_ptp_ns; /* retained remote anchor for live PTP conversion */
     s.anchor_local_ns = effective_local_ns;
+    s.anchor_domain_translation_ns = 0;
     s.anchor_rtp = rtp;
     s.anchor_valid = true;
     accepted = true;
