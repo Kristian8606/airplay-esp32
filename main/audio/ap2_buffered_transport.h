@@ -44,76 +44,7 @@ typedef struct {
   uint32_t rtp;
   uint32_t ssrc;
   size_t packet_len;
-  bool have_transport_prev;
-  uint32_t transport_prev_seq;
-  uint32_t transport_prev_rtp;
 } ap2_buffered_packet_ref_t;
-
-typedef struct {
-  uint32_t ready_total;
-  uint32_t ready_stale;
-  uint32_t ready_overlap;
-  uint32_t ready_forward_window;
-  uint32_t ready_future;
-  uint32_t decoding_total;
-  uint32_t invalid_total;
-  uint32_t writing_total;
-
-  uint32_t exact_expected_rtp_ready;
-  uint32_t exact_expected_rtp_decoding;
-  uint32_t exact_expected_rtp_invalid;
-  uint32_t exact_expected_seq_ready;
-  uint32_t exact_expected_seq_decoding;
-  uint32_t exact_expected_seq_invalid;
-
-  bool expected_seq_invalid_by_rule;
-  bool expected_rule_is_range;
-  uint32_t expected_rule_from_seq;
-  uint32_t expected_rule_until_seq;
-
-  bool nearest_before_valid;
-  uint32_t nearest_before_seq;
-  uint32_t nearest_before_rtp;
-  int32_t nearest_before_delta;
-
-  bool nearest_after_valid;
-  uint32_t nearest_after_seq;
-  uint32_t nearest_after_rtp;
-  int32_t nearest_after_delta;
-
-  bool nearest_expected_valid;
-  uint32_t nearest_expected_seq;
-  uint32_t nearest_expected_rtp;
-  int32_t nearest_expected_delta;
-
-  bool transport_last_valid;
-  uint32_t transport_last_seq;
-  uint32_t transport_last_rtp;
-  uint32_t invalidation_rules;
-  uint32_t invalidation_rule_capacity;
-  uint32_t free_packet_slots;
-  uint32_t free_pages;
-} ap2_buffered_transport_media_diag_t;
-
-typedef struct {
-  uint64_t socket_bytes;
-  uint64_t packet_bytes_released;
-  size_t store_payload_bytes;
-  size_t store_allocated_bytes;
-  size_t store_high_water;
-  uint64_t packets_received_total;
-  uint32_t packets_ready;
-  uint32_t packets_decoding;
-  uint32_t packets_invalid;
-  uint64_t stale_ready_reaped;
-  uint32_t invalidation_rules;
-  uint32_t free_packet_slots;
-  uint32_t free_pages;
-  uint32_t invalidation_rule_capacity;
-  uint64_t invalidation_rule_grows;
-  uint64_t invalidation_rule_alloc_failures;
-  uint64_t invalidation_rules_retired;
-} ap2_buffered_transport_stats_t;
 
 esp_err_t ap2_buffered_transport_create(ap2_buffered_transport_t **out,
                                         const ap2_buffered_transport_config_t *cfg);
@@ -151,9 +82,8 @@ bool ap2_buffered_transport_is_idle(ap2_buffered_transport_t *t);
 void ap2_buffered_transport_clear(ap2_buffered_transport_t *t);
 
 /* TCP packets are published directly from WRITING to READY/INVALID after the
- * payload header is parsed. Transport arrival order is retained only as
- * diagnostic predecessor metadata inside each packet descriptor; it is not an
- * ownership queue and cannot gate decode. */
+ * payload header is parsed. Transport arrival order does not gate
+ * ownership or decode. */
 bool ap2_buffered_transport_mark_invalid(ap2_buffered_transport_t *t,
                                          const ap2_buffered_packet_ref_t *ref);
 
@@ -245,14 +175,21 @@ void ap2_buffered_transport_reset_media_floor(ap2_buffered_transport_t *t);
 bool ap2_buffered_transport_ref_is_invalid(
     ap2_buffered_transport_t *t, const ap2_buffered_packet_ref_t *ref);
 
-void ap2_buffered_transport_get_stats(ap2_buffered_transport_t *t,
-                                      ap2_buffered_transport_stats_t *out);
 
-/* Diagnostic snapshot of the compressed media neighbourhood. It is read-only
- * and intended for rare cursor/miss diagnostics, not the steady-state path. */
-void ap2_buffered_transport_get_media_diag(
-    ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
-    uint32_t expected_seq, bool expected_valid, uint32_t frame_samples,
-    int32_t max_lead_samples, ap2_buffered_transport_media_diag_t *out);
 
 size_t ap2_buffered_transport_capacity(ap2_buffered_transport_t *t);
+
+/* Low-frequency diagnostics snapshot. This is intentionally pulled by the
+ * low-priority audio status task instead of being maintained in the packet
+ * hot path. */
+typedef struct {
+  size_t capacity_bytes;
+  size_t used_bytes;
+  uint32_t ready_packets;
+  uint32_t decoding_packets;
+  uint32_t invalid_packets;
+  uint32_t free_packets;
+} ap2_buffered_transport_usage_t;
+
+void ap2_buffered_transport_get_usage(ap2_buffered_transport_t *t,
+                                      ap2_buffered_transport_usage_t *out);

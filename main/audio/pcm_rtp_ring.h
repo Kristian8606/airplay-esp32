@@ -25,14 +25,6 @@
 
 typedef struct pcm_rtp_ring pcm_rtp_ring_t;
 
-typedef struct {
-  uint32_t generation;
-  uint32_t tagged_slots;
-  uint64_t slot_writes;
-  uint64_t future_collisions;
-  uint64_t unanchored_replacements;
-} pcm_rtp_ring_stats_t;
-
 esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out);
 
 /* Size of the large stereo PCM backing array only. Tags/mutex/control state
@@ -75,18 +67,29 @@ bool pcm_rtp_ring_read(const pcm_rtp_ring_t *ring, uint32_t first_rtp,
 bool pcm_rtp_ring_read_256(const pcm_rtp_ring_t *ring, uint32_t first_rtp,
                            uint32_t generation, int16_t *out_stereo_256);
 
+/* Rare buffered-playout fallback used only after the exact fast path misses.
+ * If the correct RTP page/generation is stable but its validity bitmap has
+ * sparse holes, preserve every valid PCM frame and synthesize zero only for
+ * the actually-missing frames. This prevents a one-frame media hole from
+ * turning into a whole 256-frame silent block. Returns false for page/tag/
+ * generation races so the caller can keep the existing fail-safe behavior. */
+bool pcm_rtp_ring_read_256_conceal(const pcm_rtp_ring_t *ring,
+                                   uint32_t first_rtp, uint32_t generation,
+                                   int16_t *out_stereo_256,
+                                   uint32_t *out_missing_frames);
+
 /* O(number of touched 1024-frame pages) readiness check used only while
  * priming a new timeline. No PCM is copied. */
 bool pcm_rtp_ring_has_range(const pcm_rtp_ring_t *ring, uint32_t first_rtp,
                             uint32_t frames, uint32_t generation);
 
-/* Diagnostic/cache-query helper: count valid PCM from first_rtp forward,
- * capped at max_frames.  The result is exact to one frame and describes the
- * addressable store itself rather than a producer's last-decoded timestamp. */
+/* Low-frequency lock-free diagnostic: count contiguous valid frames starting
+ * at first_rtp. It uses the existing page seqlock and never blocks a producer. */
 uint32_t pcm_rtp_ring_contiguous_frames(const pcm_rtp_ring_t *ring,
                                         uint32_t first_rtp,
-                                        uint32_t max_frames,
-                                        uint32_t generation);
+                                        uint32_t generation,
+                                        uint32_t max_frames);
+
 
 
 /* Rare control-path operation used by FLUSHBUFFERED. Clears PCM validity in
@@ -101,5 +104,3 @@ void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *ring, uint32_t from_rtp,
 void pcm_rtp_ring_invalidate_before(pcm_rtp_ring_t *ring, uint32_t until_rtp,
                                     uint32_t generation);
 
-void pcm_rtp_ring_get_stats(const pcm_rtp_ring_t *ring,
-                            pcm_rtp_ring_stats_t *out);

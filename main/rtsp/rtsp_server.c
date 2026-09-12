@@ -273,6 +273,13 @@ cleanup:
   // Immediate: stop audio and NTP
   audio_receiver_stop();
 
+  // Stop the AirPlay 2 event listener before rtsp_conn_free() closes its
+  // listening socket.  Closing it first can wake select()/accept() on a
+  // descriptor that is being torn down and report EINVAL on a normal
+  // disconnect.  rtsp_stop_event_port_task() sets the stop flag first,
+  // shuts down the sockets to unblock the task, and waits for it to exit.
+  rtsp_stop_event_port_task();
+
   // AirPlay receiver: no AirPlay 1 DACP grace/reconnect path.
   rtsp_conn_free(conn);
 
@@ -285,22 +292,35 @@ cleanup:
   vTaskDelete(NULL);
 }
 
-// Signal old client to stop (non-blocking)
-static void signal_old_client_stop(int old_slot) {
-  client_slot_t *old = &clients[old_slot];
-  if (old->task == NULL) {
+// Signal a client to stop.  The server must wait for the task to finish its
+// global audio/PTP cleanup before giving a replacement client stream ownership.
+static void signal_client_stop(int slot_idx) {
+  client_slot_t *slot = &clients[slot_idx];
+  if (slot->task == NULL) {
     return;
   }
 
-  ESP_LOGI(TAG, "Signaling old client to stop");
-  old->is_old = true;
-  old->should_stop = true;
+  ESP_LOGI(TAG, "Signaling client slot %d to stop", slot_idx);
+  slot->is_old = true;
+  slot->should_stop = true;
 
-  // Shutdown socket to unblock recv
-  if (old->socket >= 0) {
-    shutdown(old->socket, SHUT_RDWR);
+  // Shutdown socket to unblock recv/crypto read immediately.
+  if (slot->socket >= 0) {
+    shutdown(slot->socket, SHUT_RDWR);
   }
-  // Task will clean itself up
+}
+
+static bool wait_client_stopped(int slot_idx, TickType_t timeout_ticks) {
+  client_slot_t *slot = &clients[slot_idx];
+  TickType_t start = xTaskGetTickCount();
+
+  while (slot->task != NULL) {
+    if ((TickType_t)(xTaskGetTickCount() - start) >= timeout_ticks) {
+      return false;
+    }
+    vTaskDelay(1);
+  }
+  return true;
 }
 
 static void server_task(void *pvParameters) {
@@ -371,28 +391,37 @@ static void server_task(void *pvParameters) {
     // Find slot for new client (alternate between 0 and 1)
     int new_slot = 1 - current_slot;
 
-    // If new slot still has a running task, wait for it to fully exit.
-    // With static TCBs we MUST NOT reuse until the old task is deleted.
+    // A spare slot should normally already be free.  If a stale task is still
+    // finishing there, do not reuse its slot until cleanup is complete.
     if (clients[new_slot].task != NULL) {
-      clients[new_slot].should_stop = true;
-      if (clients[new_slot].socket >= 0) {
-        shutdown(clients[new_slot].socket, SHUT_RDWR);
-      }
-      int timeout = 30; // 3 seconds max
-      while (clients[new_slot].task != NULL && timeout > 0) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        timeout--;
-      }
-      if (clients[new_slot].task != NULL) {
+      signal_client_stop(new_slot);
+      if (!wait_client_stopped(new_slot, pdMS_TO_TICKS(3000))) {
         ESP_LOGE(TAG, "Slot %d task did not exit in time", new_slot);
         close(new_socket);
         continue;
       }
     }
-    // Signal old client to stop (in background)
-    signal_old_client_stop(current_slot);
 
-    // Setup new slot
+    // Serialize RTSP ownership.  client_task cleanup performs global
+    // audio_receiver_stop() and rtsp_conn_free() -> ptp_clock_clear().
+    // The replacement must not start until those operations are complete.
+    if (clients[current_slot].task != NULL) {
+      signal_client_stop(current_slot);
+      ESP_LOGI(TAG,
+               "Waiting for old client slot %d cleanup before replacement",
+               current_slot);
+      if (!wait_client_stopped(current_slot, pdMS_TO_TICKS(3000))) {
+        ESP_LOGE(TAG,
+                 "Old client slot %d did not release audio ownership in time",
+                 current_slot);
+        close(new_socket);
+        continue;
+      }
+      ESP_LOGI(TAG, "Old client cleanup complete; starting replacement");
+    }
+
+    // Setup new slot only after the previous owner has completed all global
+    // audio/PTP cleanup.
     clients[new_slot].socket = new_socket;
     clients[new_slot].should_stop = false;
     clients[new_slot].is_old = false;

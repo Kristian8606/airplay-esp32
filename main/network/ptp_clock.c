@@ -162,6 +162,14 @@ static struct {
 
   // Master clock filter / realtime anchor-clock hint (0 = unspecified).
   uint64_t expected_clock_id;
+
+  /* Legacy/buffered PTP can begin acquiring before RTSP delivers the
+   * SETRATEANCHORTIME clock id. Remember which PTP source built that
+   * pre-anchor estimator so a later matching anchor can confirm it instead
+   * of destroying a freshly acquired lock. If more than one source is seen
+   * before the anchor, be conservative and force the old reset path. */
+  uint64_t legacy_sample_clock_id;
+  bool legacy_source_mixed;
 } ptp = {0};
 
 /* PTP state is written by the PTP task on Core 0 and read/reset from RTSP/audio
@@ -243,13 +251,15 @@ typedef struct {
   uint32_t sample_count;
   uint32_t sync_count;
   uint32_t followup_count;
+  uint64_t source_clock_id;
 } ptp_offset_log_t;
 
 static void log_offset_event(const ptp_offset_log_t *ev) {
   if (!ev) return;
   if (ev->event == PTP_OFFSET_EVENT_LOCKED) {
     ESP_LOGI(TAG,
-             "LOCKED: offset=%+lldns dev=%lldns samples=%lu sync=%lu followup=%lu",
+             "LOCKED: source=%016llx offset=%+lldns dev=%lldns samples=%lu sync=%lu followup=%lu",
+             (unsigned long long)ev->source_clock_id,
              (long long)ev->filtered_offset_ns, (long long)ev->dev_ns,
              (unsigned long)ev->sample_count, (unsigned long)ev->sync_count,
              (unsigned long)ev->followup_count);
@@ -327,6 +337,7 @@ static void update_offset_locked(int64_t new_offset_ns, uint32_t now_ms,
             log_ev->sample_count = ptp.sample_count;
             log_ev->sync_count = ptp.sync_count;
             log_ev->followup_count = ptp.followup_count;
+            log_ev->source_clock_id = ptp.legacy_sample_clock_id;
           }
         }
       }
@@ -455,6 +466,17 @@ static bool realtime_update_offset_locked(int64_t raw_offset_ns,
   return !was_ready && ptp.rt_master_ready;
 }
 
+/* Track the source identity behind the legacy estimator while no RTSP
+ * anchor clock has been supplied yet. Caller holds ptp_state_mux. */
+static void legacy_note_source_locked(uint64_t source_clock_id) {
+  if (source_clock_id == 0) return;
+  if (ptp.legacy_sample_clock_id == 0) {
+    ptp.legacy_sample_clock_id = source_clock_id;
+  } else if (ptp.legacy_sample_clock_id != source_clock_id) {
+    ptp.legacy_source_mixed = true;
+  }
+}
+
 // Master filter check. Caller must hold ptp_state_mux.
 static bool master_matches_locked(const uint8_t *data) {
   if (ptp.expected_clock_id == 0) return true;
@@ -476,6 +498,7 @@ static void process_sync_legacy(const uint8_t *data, size_t len, uint16_t seq) {
     return;
   }
 
+  legacy_note_source_locked(parse_ptp_clock_id(data));
   ptp.sync_count++;
   ptp.last_sync_seq = seq;
   ptp.last_sync_local_ns = local_sync_ns;
@@ -515,6 +538,7 @@ static void process_followup_legacy(const uint8_t *data, size_t len,
     return;
   }
 
+  legacy_note_source_locked(parse_ptp_clock_id(data));
   ptp.followup_count++;
   ptp.awaiting_followup = false;
   if (len >= PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) {
@@ -948,6 +972,8 @@ void ptp_clock_clear(void) {
   ptp.sync_count = 0;
   ptp.followup_count = 0;
   ptp.expected_clock_id = 0;
+  ptp.legacy_sample_clock_id = 0;
+  ptp.legacy_source_mixed = false;
 
   /* Keep mode + timing peer across a stream-level clear, but drop the
    * realtime GM estimator. No audio continuity state lives in ptp_clock. */
@@ -1077,6 +1103,8 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.sync_count = 0;
     ptp.followup_count = 0;
     ptp.expected_clock_id = 0;
+    ptp.legacy_sample_clock_id = 0;
+    ptp.legacy_source_mixed = false;
     ptp.source_clock_id = 0;
     ptp.grandmaster_clock_id = 0;
     ptp.rt_master_offset_ns = 0;
@@ -1169,34 +1197,65 @@ void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
 void ptp_clock_set_master_clock_id(uint64_t clock_id) {
   bool changed = false;
   bool realtime = false;
+  bool preserved_legacy = false;
+  bool was_locked = false;
+  uint64_t learned_source = 0;
+  bool source_mixed = false;
 
   taskENTER_CRITICAL(&ptp_state_mux);
   realtime = ptp.realtime_mode;
   if (clock_id != ptp.expected_clock_id) {
     changed = true;
+    was_locked = ptp.locked;
+    learned_source = ptp.legacy_sample_clock_id;
+    source_mixed = ptp.legacy_source_mixed;
     ptp.expected_clock_id = clock_id;
     if (!realtime) {
-      /* Original buffered/legacy behaviour. */
-      ptp.locked = false;
-      ptp.lock_start_ms = 0;
-      ptp.lock_candidate_start_ms = 0;
-      ptp.last_sync_ms = 0;
-      ptp.filtered_offset_ns = 0;
-      ptp.raw_offset_ns = 0;
-      ptp.sample_count = 0;
-      ptp.previous_offset = 0;
-      ptp.previous_offset_time_ms = 0;
-      ptp.mastership_start_ms = 0;
-      ptp.last_sync_seq = 0;
-      ptp.last_sync_local_ns = 0;
-      ptp.awaiting_followup = false;
+      /* PTP packets can arrive before SETRATEANCHORTIME. If the estimator was
+       * built from one source and that exact source is now confirmed by the
+       * RTSP anchor, keep the estimator/lock. Otherwise retain the original
+       * conservative reset behaviour so samples from another master can never
+       * leak into the media timeline. */
+      preserved_legacy =
+          clock_id != 0 && ptp.sample_count > 0 && !ptp.legacy_source_mixed &&
+          ptp.legacy_sample_clock_id == clock_id;
+      if (!preserved_legacy) {
+        ptp.locked = false;
+        ptp.lock_start_ms = 0;
+        ptp.lock_candidate_start_ms = 0;
+        ptp.last_sync_ms = 0;
+        ptp.filtered_offset_ns = 0;
+        ptp.raw_offset_ns = 0;
+        ptp.sample_count = 0;
+        ptp.previous_offset = 0;
+        ptp.previous_offset_time_ms = 0;
+        ptp.mastership_start_ms = 0;
+        ptp.last_sync_seq = 0;
+        ptp.last_sync_local_ns = 0;
+        ptp.awaiting_followup = false;
+        ptp.legacy_sample_clock_id = 0;
+        ptp.legacy_source_mixed = false;
+      }
     }
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
 
   if (changed) {
-    ESP_LOGI(TAG, "%s anchor clock hint: %016llx",
-             realtime ? "RT" : "PTP", (unsigned long long)clock_id);
+    if (!realtime && preserved_legacy) {
+      ESP_LOGI(TAG,
+               "PTP anchor clock confirmed: %016llx source=%016llx preserving %s estimator",
+               (unsigned long long)clock_id,
+               (unsigned long long)learned_source,
+               was_locked ? "locked" : "acquiring");
+    } else if (!realtime) {
+      ESP_LOGI(TAG,
+               "PTP anchor clock hint: %016llx source=%016llx mixed=%d -> reset estimator",
+               (unsigned long long)clock_id,
+               (unsigned long long)learned_source, source_mixed ? 1 : 0);
+    } else {
+      ESP_LOGI(TAG, "RT anchor clock hint: %016llx",
+               (unsigned long long)clock_id);
+    }
   }
 }
 

@@ -37,13 +37,9 @@ typedef struct {
   uint32_t seq;
   uint32_t rtp;
   uint32_t ssrc;
-  bool accounted;
   bool invalidated;
   bool ready_indexed;
   uint16_t ready_hash_next;
-  bool have_transport_prev;
-  uint32_t transport_prev_seq;
-  uint32_t transport_prev_rtp;
 } packet_desc_t;
 
 typedef struct {
@@ -72,17 +68,10 @@ struct ap2_buffered_transport {
 
   /* TCP order is observational only. The reader records predecessor metadata
    * directly into each packet; no metadata FIFO gates ownership or decode. */
-  bool transport_prev_valid;
-  uint32_t transport_prev_seq;
-  uint32_t transport_prev_rtp;
 
   size_t capacity_bytes;
-  size_t payload_bytes;
-  size_t allocated_bytes;
-  size_t high_water;
   uint64_t next_arrival_id;
   uint32_t store_epoch;
-  uint64_t packets_received_total;
   uint32_t count_ready;
   uint32_t count_decoding;
   uint32_t count_invalid;
@@ -99,14 +88,10 @@ struct ap2_buffered_transport {
   uint32_t media_floor_generation;
   uint32_t media_floor_rtp;
   uint32_t media_floor_frame_samples;
-  uint64_t stale_ready_reaped;
 
   invalid_seq_range_t *invalid_ranges;
   uint32_t invalid_range_count;
   uint32_t invalid_range_capacity;
-  uint64_t invalid_range_grows;
-  uint64_t invalid_range_alloc_failures;
-  uint64_t invalid_ranges_retired;
   bool invalid_before_active;
   uint32_t invalid_before_seq;
   bool invalidate_all_active;
@@ -126,8 +111,6 @@ struct ap2_buffered_transport {
   int task_priority;
   uint32_t task_stack;
 
-  uint64_t socket_bytes;
-  uint64_t packet_bytes_released;
 };
 
 static inline uint32_t be32_local(const uint8_t *p) {
@@ -150,13 +133,11 @@ static bool invalid_ranges_ensure_capacity_locked(
                               : AP2_STORE_INITIAL_INVALID_RANGES;
   while (new_capacity < needed) {
     if (new_capacity > UINT32_MAX / 2U) {
-      t->invalid_range_alloc_failures++;
       return false;
     }
     new_capacity *= 2U;
   }
   if ((size_t)new_capacity > SIZE_MAX / sizeof(*t->invalid_ranges)) {
-    t->invalid_range_alloc_failures++;
     return false;
   }
 
@@ -164,14 +145,12 @@ static bool invalid_ranges_ensure_capacity_locked(
       realloc(t->invalid_ranges,
               (size_t)new_capacity * sizeof(*t->invalid_ranges));
   if (!grown) {
-    t->invalid_range_alloc_failures++;
     return false;
   }
   memset(grown + t->invalid_range_capacity, 0,
          (size_t)(new_capacity - t->invalid_range_capacity) * sizeof(*grown));
   t->invalid_ranges = grown;
   t->invalid_range_capacity = new_capacity;
-  t->invalid_range_grows++;
   return true;
 }
 
@@ -192,7 +171,6 @@ static uint32_t retire_completed_invalid_ranges_locked(
       if (i != last) t->invalid_ranges[i] = t->invalid_ranges[last];
       memset(&t->invalid_ranges[last], 0, sizeof(t->invalid_ranges[last]));
       t->invalid_range_count--;
-      t->invalid_ranges_retired++;
       retired++;
       continue;
     }
@@ -341,14 +319,6 @@ static void packet_make_free_locked(ap2_buffered_transport_t *t, uint16_t slot) 
   if (d->page_count != 0 && d->first_page != AP2_STORE_INVALID_INDEX) {
     pages_release_locked(t, d->first_page, d->page_count);
   }
-  if (d->accounted) {
-    size_t alloc = (size_t)d->page_count * AP2_STORE_PAGE_BYTES;
-    t->allocated_bytes = t->allocated_bytes >= alloc ? t->allocated_bytes - alloc : 0;
-    t->payload_bytes = t->payload_bytes >= d->packet_len
-                           ? t->payload_bytes - d->packet_len
-                           : 0;
-    t->packet_bytes_released += d->packet_len;
-  }
 
   memset(d, 0, sizeof(*d));
   d->state = AP2_BUFFERED_PACKET_FREE;
@@ -394,7 +364,6 @@ static uint32_t reap_stale_ready_locked(ap2_buffered_transport_t *t,
       reaped++;
     }
   }
-  t->stale_ready_reaped += reaped;
   return reaped;
 }
 
@@ -469,7 +438,6 @@ static ssize_t socket_read_exact(ap2_buffered_transport_t *t, int sock,
     ssize_t n = recv(sock, dst + off, len - off, 0);
     if (n > 0) {
       off += (size_t)n;
-      t->socket_bytes += (uint64_t)n;
       continue;
     }
     if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -539,18 +507,6 @@ static void publish_written_packet(ap2_buffered_transport_t *t, uint16_t slot) {
   d->rtp = be32_local(p + 4);
   d->ssrc = be32_local(p + 8);
   d->arrival_id = ++t->next_arrival_id;
-  d->accounted = true;
-  d->have_transport_prev = t->transport_prev_valid;
-  d->transport_prev_seq = t->transport_prev_seq;
-  d->transport_prev_rtp = t->transport_prev_rtp;
-  t->transport_prev_valid = true;
-  t->transport_prev_seq = d->seq;
-  t->transport_prev_rtp = d->rtp;
-  t->packets_received_total++;
-
-  t->payload_bytes += d->packet_len;
-  t->allocated_bytes += (size_t)d->page_count * AP2_STORE_PAGE_BYTES;
-  if (t->allocated_bytes > t->high_water) t->high_water = t->allocated_bytes;
 
   /* untilSeq is exclusive: retire completed deferred rules before judging
    * this packet so untilSeq itself remains valid replacement media. */
@@ -578,7 +534,6 @@ static void store_clear_epoch(ap2_buffered_transport_t *t) {
   if (t->store_epoch == 0) t->store_epoch = 1;
   t->peer_closed = false;
   t->peer_error = 0;
-  t->transport_prev_valid = false;
   t->cursor_seq_valid = false;
   t->cursor_flush_pending = false;
   t->media_floor_valid = false;
@@ -903,9 +858,6 @@ static bool fill_ref_locked(ap2_buffered_transport_t *t, uint16_t slot,
   out->rtp = d->rtp;
   out->ssrc = d->ssrc;
   out->packet_len = d->packet_len;
-  out->have_transport_prev = d->have_transport_prev;
-  out->transport_prev_seq = d->transport_prev_seq;
-  out->transport_prev_rtp = d->transport_prev_rtp;
   return true;
 }
 
@@ -1349,144 +1301,25 @@ bool ap2_buffered_transport_ref_is_invalid(
   return invalid;
 }
 
-void ap2_buffered_transport_get_stats(ap2_buffered_transport_t *t,
-                                      ap2_buffered_transport_stats_t *out) {
-  if (!t || !out) return;
-  memset(out, 0, sizeof(*out));
-
-  xSemaphoreTake(t->mutex, portMAX_DELAY);
-  out->socket_bytes = t->socket_bytes;
-  out->packet_bytes_released = t->packet_bytes_released;
-  out->store_payload_bytes = t->payload_bytes;
-  out->store_allocated_bytes = t->allocated_bytes;
-  out->store_high_water = t->high_water;
-  out->free_packet_slots = t->free_packet_top;
-  out->free_pages = t->free_pages;
-  out->invalidation_rule_capacity = t->invalid_range_capacity;
-  out->invalidation_rule_grows = t->invalid_range_grows;
-  out->invalidation_rule_alloc_failures = t->invalid_range_alloc_failures;
-  out->invalidation_rules_retired = t->invalid_ranges_retired;
-  out->packets_received_total = t->packets_received_total;
-  out->packets_ready = t->count_ready;
-  out->packets_decoding = t->count_decoding;
-  out->packets_invalid = t->count_invalid;
-  out->stale_ready_reaped = t->stale_ready_reaped;
-  out->invalidation_rules = t->invalid_range_count +
-                            (t->invalid_before_active ? 1U : 0U) +
-                            (t->invalidate_all_active ? 1U : 0U);
-  xSemaphoreGive(t->mutex);
-}
-
-void ap2_buffered_transport_get_media_diag(
-    ap2_buffered_transport_t *t, uint32_t wanted_rtp, uint32_t expected_rtp,
-    uint32_t expected_seq, bool expected_valid, uint32_t frame_samples,
-    int32_t max_lead_samples, ap2_buffered_transport_media_diag_t *out) {
-  if (!t || !out || frame_samples == 0) return;
-  memset(out, 0, sizeof(*out));
-  expected_seq &= 0x007fffffU;
-
-  xSemaphoreTake(t->mutex, portMAX_DELAY);
-  out->transport_last_valid = t->transport_prev_valid;
-  out->transport_last_seq = t->transport_prev_seq;
-  out->transport_last_rtp = t->transport_prev_rtp;
-  out->invalidation_rules = t->invalid_range_count +
-                            (t->invalid_before_active ? 1U : 0U) +
-                            (t->invalidate_all_active ? 1U : 0U);
-  out->invalidation_rule_capacity = t->invalid_range_capacity;
-  out->free_packet_slots = t->free_packet_top;
-  out->free_pages = t->free_pages;
-  if (expected_valid) {
-    out->expected_seq_invalid_by_rule =
-        packet_is_invalid_by_rule_locked(t, expected_seq);
-    for (uint32_t i = 0; i < t->invalid_range_count; ++i) {
-      const invalid_seq_range_t *r = &t->invalid_ranges[i];
-      if (seq23_delta_local(expected_seq, r->from_seq) >= 0 &&
-          seq23_delta_local(expected_seq, r->until_seq) < 0) {
-        out->expected_rule_is_range = true;
-        out->expected_rule_from_seq = r->from_seq;
-        out->expected_rule_until_seq = r->until_seq;
-        break;
-      }
-    }
-  }
-
-  int64_t nearest_expected_abs = INT64_MAX;
-  for (uint16_t i = 0; i < t->packet_count; ++i) {
-    const packet_desc_t *d = &t->packets[i];
-    if (d->state == AP2_BUFFERED_PACKET_WRITING) {
-      out->writing_total++;
-      continue;
-    }
-    if (d->store_epoch != t->store_epoch || d->arrival_id == 0) continue;
-
-    if (expected_valid && d->rtp == expected_rtp) {
-      if (d->state == AP2_BUFFERED_PACKET_READY)
-        out->exact_expected_rtp_ready++;
-      else if (d->state == AP2_BUFFERED_PACKET_DECODING)
-        out->exact_expected_rtp_decoding++;
-      else if (d->state == AP2_BUFFERED_PACKET_INVALID)
-        out->exact_expected_rtp_invalid++;
-    }
-    if (expected_valid && d->seq == expected_seq) {
-      if (d->state == AP2_BUFFERED_PACKET_READY)
-        out->exact_expected_seq_ready++;
-      else if (d->state == AP2_BUFFERED_PACKET_DECODING)
-        out->exact_expected_seq_decoding++;
-      else if (d->state == AP2_BUFFERED_PACKET_INVALID)
-        out->exact_expected_seq_invalid++;
-    }
-
-    if (d->state == AP2_BUFFERED_PACKET_DECODING) {
-      out->decoding_total++;
-      continue;
-    }
-    if (d->state == AP2_BUFFERED_PACKET_INVALID || d->invalidated) {
-      out->invalid_total++;
-      continue;
-    }
-    if (d->state != AP2_BUFFERED_PACKET_READY || !d->ready_indexed) continue;
-
-    out->ready_total++;
-    const int32_t delta = (int32_t)(d->rtp - wanted_rtp);
-    if ((int64_t)delta + (int64_t)frame_samples <= 0)
-      out->ready_stale++;
-    else if (delta > max_lead_samples)
-      out->ready_future++;
-    else if (delta <= 0)
-      out->ready_overlap++;
-    else
-      out->ready_forward_window++;
-
-    if (delta <= 0 &&
-        (!out->nearest_before_valid || delta > out->nearest_before_delta)) {
-      out->nearest_before_valid = true;
-      out->nearest_before_seq = d->seq;
-      out->nearest_before_rtp = d->rtp;
-      out->nearest_before_delta = delta;
-    }
-    if (delta > 0 &&
-        (!out->nearest_after_valid || delta < out->nearest_after_delta)) {
-      out->nearest_after_valid = true;
-      out->nearest_after_seq = d->seq;
-      out->nearest_after_rtp = d->rtp;
-      out->nearest_after_delta = delta;
-    }
-
-    if (expected_valid) {
-      const int32_t de = (int32_t)(d->rtp - expected_rtp);
-      const int64_t ade = de < 0 ? -(int64_t)de : (int64_t)de;
-      if (!out->nearest_expected_valid || ade < nearest_expected_abs) {
-        nearest_expected_abs = ade;
-        out->nearest_expected_valid = true;
-        out->nearest_expected_seq = d->seq;
-        out->nearest_expected_rtp = d->rtp;
-        out->nearest_expected_delta = de;
-      }
-    }
-  }
-  xSemaphoreGive(t->mutex);
-}
-
 size_t ap2_buffered_transport_capacity(ap2_buffered_transport_t *t) {
   return t ? t->capacity_bytes : 0U;
+}
+
+void ap2_buffered_transport_get_usage(ap2_buffered_transport_t *t,
+                                      ap2_buffered_transport_usage_t *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  if (!t) return;
+
+  /* One constant-time snapshot every two seconds. Do not add counters to the
+   * TCP/decode path just for logging. */
+  xSemaphoreTake(t->mutex, portMAX_DELAY);
+  out->capacity_bytes = t->capacity_bytes;
+  out->used_bytes =
+      (size_t)(t->page_count - t->free_pages) * AP2_STORE_PAGE_BYTES;
+  out->ready_packets = t->count_ready;
+  out->decoding_packets = t->count_decoding;
+  out->invalid_packets = t->count_invalid;
+  out->free_packets = t->free_packet_top;
+  xSemaphoreGive(t->mutex);
 }

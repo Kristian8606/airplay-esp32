@@ -25,30 +25,10 @@ typedef struct {
   uint32_t curr_mclk_hz;
 } audio_playout_tune_info_t;
 
-typedef struct {
-  uint64_t submitted_frames;
-  uint64_t completed_frames;
-  uint64_t tagged_completions;
-  uint64_t untagged_completions;
-  uint64_t completion_overflows;
-  uint64_t write_calls;
-  uint64_t write_total_us;
-  uint32_t write_last_us;
-  uint32_t write_max_us;
-  uint32_t write_enter_calls;
-  uint32_t write_inflight;
-  uint32_t disable_calls;
-  uint32_t disable_inflight;
-  int32_t last_disable_err;
-  uint32_t preload_errors;
-  int32_t last_preload_err;
-  uint32_t last_preload_loaded;
-  uint32_t enable_errors;
-  int32_t last_enable_err;
-} audio_playout_diag_t;
+
 
 esp_err_t audio_playout_init(void);
-void audio_playout_flush(void);
+esp_err_t audio_playout_flush(void);
 
 /* Preload is valid only while the TX channel is disabled/READY. It is used for
  * the first two blocks of an epoch so the channel starts with known audio in
@@ -70,7 +50,6 @@ esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
 bool audio_playout_poll_completion(audio_playout_completion_t *out);
 
 bool audio_playout_is_enabled(void);
-void audio_playout_get_diag(audio_playout_diag_t *out);
 uint32_t audio_playout_hardware_latency_us(void);
 
 /* Fine tune the active TX master clock. The ESP-IDF 5.5 API requires READY,

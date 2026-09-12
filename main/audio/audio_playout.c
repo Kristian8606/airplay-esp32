@@ -47,29 +47,6 @@ static DRAM_ATTR audio_playout_completion_t s_done_q[TX_DONE_Q_CAP];
 static DRAM_ATTR uint32_t s_done_head;
 static DRAM_ATTR uint32_t s_done_tail;
 
-static uint64_t s_submitted_frames;
-/* ISR-owned diagnostics stay 32-bit so Xtensa does not need 64-bit atomic
- * helper calls while flash cache is disabled. They reset at session/flush
- * boundaries; at 44.1 kHz completed_frames wraps only after ~27 hours. */
-static DRAM_ATTR uint32_t s_completed_frames;
-static DRAM_ATTR uint32_t s_tagged_completions;
-static DRAM_ATTR uint32_t s_untagged_completions;
-static DRAM_ATTR uint32_t s_completion_overflows;
-static uint64_t s_write_calls;
-static uint64_t s_write_total_us;
-static uint32_t s_write_last_us;
-static uint32_t s_write_max_us;
-static uint32_t s_write_enter_calls;
-static uint32_t s_write_inflight;
-static uint32_t s_disable_calls;
-static uint32_t s_disable_inflight;
-static int32_t s_last_disable_err;
-static uint32_t s_preload_errors;
-static int32_t s_last_preload_err;
-static uint32_t s_last_preload_loaded;
-static uint32_t s_enable_errors;
-static int32_t s_last_enable_err;
-
 static inline void queues_reset(void) {
   __atomic_store_n(&s_tag_head, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&s_tag_tail, 0U, __ATOMIC_RELEASE);
@@ -130,43 +107,15 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
   (void)user_ctx;
 
   tx_tag_t tag;
-  if (!tag_pop_isr(&tag)) {
-    __atomic_add_fetch(&s_untagged_completions, 1U, __ATOMIC_RELAXED);
-    return false;
-  }
+  if (!tag_pop_isr(&tag)) return false;
 
   /* esp_timer_get_time() is lock-free and documented for ISR use. Timestamp
    * the DMA EOF itself; conversion to PTP is done later in task context. */
   const int64_t done_local_us = esp_timer_get_time();
-  __atomic_add_fetch(&s_completed_frames, tag.frames, __ATOMIC_RELAXED);
-  __atomic_add_fetch(&s_tagged_completions, 1U, __ATOMIC_RELAXED);
-  if (!done_push_isr(&tag, done_local_us)) {
-    __atomic_add_fetch(&s_completion_overflows, 1U, __ATOMIC_RELAXED);
-  }
+  (void)done_push_isr(&tag, done_local_us);
   return false;
 }
 
-static void diag_reset(void) {
-  __atomic_store_n(&s_submitted_frames, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_completed_frames, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_tagged_completions, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_untagged_completions, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_completion_overflows, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_calls, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_total_us, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_last_us, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_max_us, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_enter_calls, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_inflight, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_disable_calls, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_disable_inflight, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_last_disable_err, ESP_OK, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_preload_errors, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_last_preload_err, ESP_OK, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_last_preload_loaded, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_enable_errors, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_last_enable_err, ESP_OK, __ATOMIC_RELAXED);
-}
 
 esp_err_t audio_playout_init(void) {
   if (s_tx) {
@@ -217,7 +166,6 @@ esp_err_t audio_playout_init(void) {
   }
 
   queues_reset();
-  diag_reset();
   s_enabled = false;
   s_preload_pending = false;
   s_tune_ppm = 0;
@@ -253,22 +201,18 @@ esp_err_t audio_playout_init(void) {
   return ESP_OK;
 }
 
-void audio_playout_flush(void) {
+esp_err_t audio_playout_flush(void) {
   if (!s_tx) {
-    return;
+    return ESP_ERR_INVALID_STATE;
   }
 
   if (s_enabled) {
-    __atomic_add_fetch(&s_disable_calls, 1U, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_disable_inflight, 1U, __ATOMIC_RELEASE);
     esp_err_t de = i2s_channel_disable(s_tx);
-    __atomic_store_n(&s_disable_inflight, 0U, __ATOMIC_RELEASE);
-    __atomic_store_n(&s_last_disable_err, (int32_t)de, __ATOMIC_RELAXED);
     if (de == ESP_OK || de == ESP_ERR_INVALID_STATE) {
       s_enabled = false;
       s_preload_pending = false;
     } else {
-      return;
+      return de;
     }
   } else if (s_preload_pending) {
     /* There is no public "discard preload" API. A failed realtime timeline
@@ -280,47 +224,28 @@ void audio_playout_flush(void) {
     esp_err_t ee = i2s_channel_enable(s_tx);
     if (ee == ESP_OK) {
       s_enabled = true;
-      __atomic_add_fetch(&s_disable_calls, 1U, __ATOMIC_RELAXED);
-      __atomic_store_n(&s_disable_inflight, 1U, __ATOMIC_RELEASE);
       esp_err_t de = i2s_channel_disable(s_tx);
-      __atomic_store_n(&s_disable_inflight, 0U, __ATOMIC_RELEASE);
-      __atomic_store_n(&s_last_disable_err, (int32_t)de, __ATOMIC_RELAXED);
       if (de == ESP_OK || de == ESP_ERR_INVALID_STATE) {
         s_enabled = false;
         s_preload_pending = false;
       } else {
-        return;
+        return de;
       }
     } else {
       /* If enable says the driver is not READY, try to converge it to READY.
-       * This is exceptional and remains visible through the enable diagnostics. */
-      __atomic_add_fetch(&s_enable_errors, 1U, __ATOMIC_RELAXED);
-      __atomic_store_n(&s_last_enable_err, (int32_t)ee, __ATOMIC_RELAXED);
+       * This is exceptional; converge the channel back to READY. */
       esp_err_t de = i2s_channel_disable(s_tx);
-      __atomic_store_n(&s_last_disable_err, (int32_t)de, __ATOMIC_RELAXED);
       if (de == ESP_OK || de == ESP_ERR_INVALID_STATE) {
         s_enabled = false;
         s_preload_pending = false;
       } else {
-        return;
+        return de;
       }
     }
   }
 
   queues_reset();
-  /* Keep lifecycle failure counters across flushes. Only per-epoch DMA/write
-   * counters are reset here. */
-  __atomic_store_n(&s_submitted_frames, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_completed_frames, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_tagged_completions, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_untagged_completions, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_completion_overflows, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_calls, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_total_us, 0ULL, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_last_us, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_max_us, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_enter_calls, 0U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_inflight, 0U, __ATOMIC_RELAXED);
+  return ESP_OK;
 }
 
 esp_err_t audio_playout_preload_tagged(const int16_t *stereo, uint32_t frames,
@@ -331,18 +256,13 @@ esp_err_t audio_playout_preload_tagged(const int16_t *stereo, uint32_t frames,
   size_t loaded = 0;
   const size_t bytes = (size_t)frames * 2U * sizeof(int16_t);
   esp_err_t err = i2s_channel_preload_data(s_tx, stereo, bytes, &loaded);
-  __atomic_store_n(&s_last_preload_loaded, (uint32_t)loaded, __ATOMIC_RELAXED);
   if (loaded > 0U) s_preload_pending = true;
   if (err != ESP_OK || loaded != bytes) {
-    esp_err_t ret = err == ESP_OK ? ESP_ERR_NO_MEM : err;
-    __atomic_add_fetch(&s_preload_errors, 1U, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_last_preload_err, (int32_t)ret, __ATOMIC_RELAXED);
-    return ret;
+    return err == ESP_OK ? ESP_ERR_NO_MEM : err;
   }
   if (!tag_push(rtp, generation, frames)) {
     return ESP_ERR_NO_MEM;
   }
-  __atomic_add_fetch(&s_submitted_frames, frames, __ATOMIC_RELAXED);
   return ESP_OK;
 }
 
@@ -357,9 +277,6 @@ esp_err_t audio_playout_enable(void) {
   if (err == ESP_OK) {
     s_enabled = true;
     s_preload_pending = false;
-  } else {
-    __atomic_add_fetch(&s_enable_errors, 1U, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_last_enable_err, (int32_t)err, __ATOMIC_RELAXED);
   }
   return err;
 }
@@ -379,27 +296,13 @@ esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
 
   size_t written = 0;
   const size_t bytes = (size_t)frames * 2U * sizeof(int16_t);
-  __atomic_add_fetch(&s_write_enter_calls, 1U, __ATOMIC_RELAXED);
-  __atomic_store_n(&s_write_inflight, 1U, __ATOMIC_RELEASE);
-  const int64_t t0 = esp_timer_get_time();
   esp_err_t err = i2s_channel_write(s_tx, stereo, bytes, &written,
                                     portMAX_DELAY);
-  __atomic_store_n(&s_write_inflight, 0U, __ATOMIC_RELEASE);
-  const uint32_t elapsed_us = (uint32_t)(esp_timer_get_time() - t0);
-  __atomic_store_n(&s_write_last_us, elapsed_us, __ATOMIC_RELAXED);
-  __atomic_add_fetch(&s_write_calls, 1ULL, __ATOMIC_RELAXED);
-  __atomic_add_fetch(&s_write_total_us, elapsed_us, __ATOMIC_RELAXED);
-  uint32_t old_max = __atomic_load_n(&s_write_max_us, __ATOMIC_RELAXED);
-  while (elapsed_us > old_max &&
-         !__atomic_compare_exchange_n(&s_write_max_us, &old_max, elapsed_us,
-                                      false, __ATOMIC_RELAXED,
-                                      __ATOMIC_RELAXED)) {
-  }
+
 
   if (err == ESP_OK && written == bytes) {
-    __atomic_add_fetch(&s_submitted_frames, frames, __ATOMIC_RELAXED);
-    /* Diagnostic RGB/VU is deliberately fed from the final I2S submission
-     * path. When disabled in menuconfig this compiles to a no-op. */
+    /* RGB/VU is fed from the final I2S submission path. When disabled
+     * in menuconfig this compiles to a no-op. */
     led_audio_feed(stereo, frames);
     return ESP_OK;
   }
@@ -428,30 +331,6 @@ bool audio_playout_is_enabled(void) {
   return s_enabled;
 }
 
-void audio_playout_get_diag(audio_playout_diag_t *out) {
-  if (!out) {
-    return;
-  }
-  out->submitted_frames = __atomic_load_n(&s_submitted_frames, __ATOMIC_RELAXED);
-  out->completed_frames = (uint64_t)__atomic_load_n(&s_completed_frames, __ATOMIC_RELAXED);
-  out->tagged_completions = (uint64_t)__atomic_load_n(&s_tagged_completions, __ATOMIC_RELAXED);
-  out->untagged_completions = (uint64_t)__atomic_load_n(&s_untagged_completions, __ATOMIC_RELAXED);
-  out->completion_overflows = (uint64_t)__atomic_load_n(&s_completion_overflows, __ATOMIC_RELAXED);
-  out->write_calls = __atomic_load_n(&s_write_calls, __ATOMIC_RELAXED);
-  out->write_total_us = __atomic_load_n(&s_write_total_us, __ATOMIC_RELAXED);
-  out->write_last_us = __atomic_load_n(&s_write_last_us, __ATOMIC_RELAXED);
-  out->write_max_us = __atomic_load_n(&s_write_max_us, __ATOMIC_RELAXED);
-  out->write_enter_calls = __atomic_load_n(&s_write_enter_calls, __ATOMIC_RELAXED);
-  out->write_inflight = __atomic_load_n(&s_write_inflight, __ATOMIC_ACQUIRE);
-  out->disable_calls = __atomic_load_n(&s_disable_calls, __ATOMIC_RELAXED);
-  out->disable_inflight = __atomic_load_n(&s_disable_inflight, __ATOMIC_ACQUIRE);
-  out->last_disable_err = __atomic_load_n(&s_last_disable_err, __ATOMIC_RELAXED);
-  out->preload_errors = __atomic_load_n(&s_preload_errors, __ATOMIC_RELAXED);
-  out->last_preload_err = __atomic_load_n(&s_last_preload_err, __ATOMIC_RELAXED);
-  out->last_preload_loaded = __atomic_load_n(&s_last_preload_loaded, __ATOMIC_RELAXED);
-  out->enable_errors = __atomic_load_n(&s_enable_errors, __ATOMIC_RELAXED);
-  out->last_enable_err = __atomic_load_n(&s_last_enable_err, __ATOMIC_RELAXED);
-}
 
 esp_err_t audio_playout_reset_tune(void) {
   if (!s_tx || s_nominal_mclk_hz == 0U) {
