@@ -40,6 +40,13 @@ set(SRC_FILES
     "network/log_stream.c"
 )
 
+
+# Temporary diagnostics are a true compile-time feature. When the master
+# switch is off, or all categories are off, audio_diag.c is not compiled.
+if(CONFIG_AIRPLAY_DIAG_ACTIVE)
+    list(APPEND SRC_FILES "audio/audio_diag.c")
+endif()
+
 idf_component_register(
     SRCS ${SRC_FILES}
     INCLUDE_DIRS "." "audio" "rtsp" "plist" "hap" "network"

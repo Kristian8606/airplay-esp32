@@ -1,4 +1,5 @@
 #include "audio_receiver.h"
+#include "audio_diag.h"
 #include "amp_control.h"
 #include "audio_eq.h"
 #include "dns_server.h"
@@ -74,6 +75,10 @@ void app_main(void) {
   }
   log_memory_state("post-wifi");
 
+  /* Temporary diagnostics must exist before PTP/audio init so category-owned
+   * startup events are captured by the low-priority worker. This is a no-op
+   * when diagnostics are disabled or no category is selected. */
+  (void)AUDIO_DIAG_INIT();
   ESP_ERROR_CHECK(ptp_clock_init());
   ESP_ERROR_CHECK(hap_init());
   ESP_ERROR_CHECK(audio_receiver_init());

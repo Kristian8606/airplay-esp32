@@ -7,11 +7,9 @@
 
 #include "audio_receiver.h"
 #include "amp_control.h"
-#include "esp_log.h"
 #include "ptp_clock.h"
 #include "settings.h"
 
-static const char *TAG = "rtsp_conn";
 
 static int32_t volume_db_to_q15(float volume_db){
     if (volume_db <= -30.0f)

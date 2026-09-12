@@ -12,6 +12,7 @@
 #include "aac_decoder.h"
 #include "audio_eq.h"
 #include "audio_crypto.h"
+#include "audio_diag.h"
 #include "ap2_buffered_transport.h"
 #include "pcm_rtp_ring.h"
 #include "audio_playout.h"
@@ -33,7 +34,7 @@
 #define AP2_PROCESS_STACK          6144U
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
-#define AP2_DIAG_STACK             3072U
+#define AP2_STATUS_STACK             3072U
 #define AP2_NETWORK_CORE           0
 #define AP2_DECODE_CORE            1
 #define AP2_BUFFERED_PROCESSOR_CORE 0
@@ -41,9 +42,9 @@
 #define AP2_DECODE_PRIORITY        6
 #define AP2_PLAYOUT_PRIORITY       8
 #define AP2_RT_STAGE_PRIORITY      7
-#define AP2_DIAG_PRIORITY          1
-#define AP2_DIAG_CORE              0
-#define AP2_DIAG_PERIOD_MS      2000U
+#define AP2_STATUS_PRIORITY          1
+#define AP2_STATUS_CORE              0
+#define AP2_STATUS_PERIOD_MS      2000U
 #define AP2_PCM_CAPACITY_FRAMES    4096U
 
 #define AP2_PID_CALC_PERIOD_US    1000000LL  /* PID math at 1 Hz */
@@ -91,7 +92,7 @@
 #define AP2_RT_STAGE_COMMIT_MARGIN_US REALTIME_RECOVERY_FINAL_MARGIN_US
 
 static const char *TAG = "audio_shairport";
-static const char *DIAG_TAG = "audio_status";
+static const char *STATUS_TAG = "audio_status";
 
 /* Updated by RTSP control on Core0, consumed by playout on Core1. */
 static volatile int32_t s_volume_target_q15 = 32768;
@@ -134,9 +135,9 @@ typedef struct {
   TaskHandle_t processor_task;
   TaskHandle_t playout_task;
   TaskHandle_t realtime_stage_task;
-  volatile bool diag_running;
-  SemaphoreHandle_t diag_stop_sem;
-  audio_stream_type_t diag_stream_type;
+  volatile bool status_running;
+  SemaphoreHandle_t status_stop_sem;
+  audio_stream_type_t status_stream_type;
   uint8_t *packet;
   uint8_t *decrypt_buf;
   int16_t *decode_pcm;
@@ -186,12 +187,12 @@ typedef struct {
 
   output_sync_state_t output_sync;
 
-  /* Only the existing 1 Hz PID loop publishes these. The 2 s diagnostic
+  /* Only the existing 1 Hz PID loop publishes these. The 2 s status
    * task reads them; no packet/decode/I2S-completion instrumentation is added. */
-  volatile bool diag_sync_valid;
-  volatile int32_t diag_sync_us;
-  volatile int32_t diag_servo_ppm;
-  volatile uint32_t diag_sync_generation;
+  volatile bool status_sync_valid;
+  volatile int32_t status_sync_us;
+  volatile int32_t status_servo_ppm;
+  volatile uint32_t status_sync_generation;
 } ap2_state_t;
 
 static ap2_state_t s = {
@@ -415,33 +416,33 @@ static bool wanted_rtp_at_presentation_ns(const timing_snapshot_t *snap,
   return true;
 }
 
-/* Runtime diagnostics policy:
+/* Permanent audio-status policy:
  * - exactly one low-priority task owns periodic audio-status logging;
  * - the hot packet/decode path maintains no counters/timers just for logging;
  * - the playout task publishes sync/ppm only at its already-existing 1 Hz PID;
  * - codec switch/pause destroys this task, so there is no dormant logger. */
-static double diag_frames_to_ms(uint32_t frames, int sample_rate) {
+static double status_frames_to_ms(uint32_t frames, int sample_rate) {
   const uint32_t sr = sample_rate > 0 ? (uint32_t)sample_rate : 44100U;
   return ((double)frames * 1000.0) / (double)sr;
 }
 
-static void diag_publish_sync(int32_t sync_us, int32_t servo_ppm,
+static void status_publish_sync(int32_t sync_us, int32_t servo_ppm,
                               uint32_t generation) {
-  __atomic_store_n(&s.diag_sync_us, sync_us, __ATOMIC_RELAXED);
-  __atomic_store_n(&s.diag_servo_ppm, servo_ppm, __ATOMIC_RELAXED);
-  __atomic_store_n(&s.diag_sync_generation, generation, __ATOMIC_RELAXED);
-  __atomic_store_n(&s.diag_sync_valid, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&s.status_sync_us, sync_us, __ATOMIC_RELAXED);
+  __atomic_store_n(&s.status_servo_ppm, servo_ppm, __ATOMIC_RELAXED);
+  __atomic_store_n(&s.status_sync_generation, generation, __ATOMIC_RELAXED);
+  __atomic_store_n(&s.status_sync_valid, true, __ATOMIC_RELEASE);
 }
 
-static void diag_invalidate_sync(void) {
-  __atomic_store_n(&s.diag_sync_valid, false, __ATOMIC_RELEASE);
+static void status_invalidate_sync(void) {
+  __atomic_store_n(&s.status_sync_valid, false, __ATOMIC_RELEASE);
 }
 
-static void audio_diag_task(void *arg) {
+static void audio_status_task(void *arg) {
   const audio_stream_type_t task_stream = (audio_stream_type_t)(intptr_t)arg;
 
   for (;;) {
-    if (xSemaphoreTake(s.diag_stop_sem, pdMS_TO_TICKS(AP2_DIAG_PERIOD_MS)) ==
+    if (xSemaphoreTake(s.status_stop_sem, pdMS_TO_TICKS(AP2_STATUS_PERIOD_MS)) ==
         pdTRUE) {
       break;
     }
@@ -462,13 +463,13 @@ static void audio_diag_task(void *arg) {
     }
 
     const bool sync_valid =
-        __atomic_load_n(&s.diag_sync_valid, __ATOMIC_ACQUIRE) &&
-        __atomic_load_n(&s.diag_sync_generation, __ATOMIC_RELAXED) ==
+        __atomic_load_n(&s.status_sync_valid, __ATOMIC_ACQUIRE) &&
+        __atomic_load_n(&s.status_sync_generation, __ATOMIC_RELAXED) ==
             snap.generation;
     const int32_t sync_us =
-        __atomic_load_n(&s.diag_sync_us, __ATOMIC_RELAXED);
+        __atomic_load_n(&s.status_sync_us, __ATOMIC_RELAXED);
     const int32_t correction_ppm =
-        __atomic_load_n(&s.diag_servo_ppm, __ATOMIC_RELAXED);
+        __atomic_load_n(&s.status_servo_ppm, __ATOMIC_RELAXED);
     const int32_t crystal_ppm = -correction_ppm;
 
     if (task_stream == AUDIO_STREAM_BUFFERED) {
@@ -478,24 +479,24 @@ static void audio_diag_task(void *arg) {
           ? (unsigned)((usage.used_bytes * 100U) / usage.capacity_bytes)
           : 0U;
       if (sync_valid) {
-        ESP_LOGI(DIAG_TAG,
+        ESP_LOGI(STATUS_TAG,
                  "AAC sync=%+.2fms xtal~=%+ldppm i2s=%+ldppm "
-                 "cbuf=%u%%(%u/%uKiB ready=%lu) pcm=%.2fms",
+                 "cbuf=%u%%(%u/%uKiB ready=%lu) pcm=%.0fms",
                  (double)sync_us / 1000.0, (long)crystal_ppm,
                  (long)correction_ppm, used_pct,
                  (unsigned)(usage.used_bytes / 1024U),
                  (unsigned)(usage.capacity_bytes / 1024U),
                  (unsigned long)usage.ready_packets,
-                 diag_frames_to_ms(pcm_frames, sr));
+                 status_frames_to_ms(pcm_frames, sr));
       } else {
-        ESP_LOGI(DIAG_TAG,
+        ESP_LOGI(STATUS_TAG,
                  "AAC sync=n/a xtal~=n/a i2s=%+ldppm "
-                 "cbuf=%u%%(%u/%uKiB ready=%lu) pcm=%.2fms",
+                 "cbuf=%u%%(%u/%uKiB ready=%lu) pcm=%.0fms",
                  (long)correction_ppm, used_pct,
                  (unsigned)(usage.used_bytes / 1024U),
                  (unsigned)(usage.capacity_bytes / 1024U),
                  (unsigned long)usage.ready_packets,
-                 diag_frames_to_ms(pcm_frames, sr));
+                 status_frames_to_ms(pcm_frames, sr));
       }
     } else if (task_stream == AUDIO_STREAM_REALTIME) {
       realtime_receiver_usage_t usage = {0};
@@ -516,71 +517,71 @@ static void audio_diag_task(void *arg) {
             PCM_RTP_RING_FRAMES);
       }
       if (sync_valid) {
-        ESP_LOGI(DIAG_TAG,
+        ESP_LOGI(STATUS_TAG,
                  "ALAC sync=%+.2fms xtal~=%+ldppm i2s=%+ldppm "
-                 "frameq=%lu/%lu raw=%.2fms pcm=%.2fms",
+                 "frameq=%lu/%lu raw=%.2fms pcm=%.0fms",
                  (double)sync_us / 1000.0, (long)crystal_ppm,
                  (long)correction_ppm,
                  (unsigned long)usage.work_queue_depth,
                  (unsigned long)usage.work_queue_capacity,
-                 diag_frames_to_ms(raw_frames, sr),
-                 diag_frames_to_ms(pcm_frames, sr));
+                 status_frames_to_ms(raw_frames, sr),
+                 status_frames_to_ms(pcm_frames, sr));
       } else {
-        ESP_LOGI(DIAG_TAG,
+        ESP_LOGI(STATUS_TAG,
                  "ALAC sync=n/a xtal~=n/a i2s=%+ldppm "
-                 "frameq=%lu/%lu raw=%.2fms pcm=%.2fms",
+                 "frameq=%lu/%lu raw=%.2fms pcm=%.0fms",
                  (long)correction_ppm,
                  (unsigned long)usage.work_queue_depth,
                  (unsigned long)usage.work_queue_capacity,
-                 diag_frames_to_ms(raw_frames, sr),
-                 diag_frames_to_ms(pcm_frames, sr));
+                 status_frames_to_ms(raw_frames, sr),
+                 status_frames_to_ms(pcm_frames, sr));
       }
     }
   }
 
   taskENTER_CRITICAL(&s.state_mux);
-  s.diag_stream_type = AUDIO_STREAM_NONE;
+  s.status_stream_type = AUDIO_STREAM_NONE;
   taskEXIT_CRITICAL(&s.state_mux);
-  __atomic_store_n(&s.diag_running, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&s.status_running, false, __ATOMIC_RELEASE);
   vTaskDelete(NULL);
 }
 
-static bool audio_diag_stop_and_wait(void) {
-  if (!__atomic_load_n(&s.diag_running, __ATOMIC_ACQUIRE)) return true;
+static bool audio_status_stop_and_wait(void) {
+  if (!__atomic_load_n(&s.status_running, __ATOMIC_ACQUIRE)) return true;
 
-  if (s.diag_stop_sem) xSemaphoreGive(s.diag_stop_sem);
+  if (s.status_stop_sem) xSemaphoreGive(s.status_stop_sem);
   for (uint32_t i = 0; i < 100U; ++i) {
-    if (!__atomic_load_n(&s.diag_running, __ATOMIC_ACQUIRE)) return true;
+    if (!__atomic_load_n(&s.status_running, __ATOMIC_ACQUIRE)) return true;
     vTaskDelay(1);
   }
   ESP_LOGW(TAG, "audio status task stop timed out");
   return false;
 }
 
-static void audio_diag_start(audio_stream_type_t stream_type) {
+static void audio_status_start(audio_stream_type_t stream_type) {
   if (stream_type != AUDIO_STREAM_BUFFERED &&
       stream_type != AUDIO_STREAM_REALTIME) return;
 
   taskENTER_CRITICAL(&s.state_mux);
-  const bool same_stream = s.diag_stream_type == stream_type;
+  const bool same_stream = s.status_stream_type == stream_type;
   taskEXIT_CRITICAL(&s.state_mux);
-  if (__atomic_load_n(&s.diag_running, __ATOMIC_ACQUIRE) && same_stream) return;
+  if (__atomic_load_n(&s.status_running, __ATOMIC_ACQUIRE) && same_stream) return;
 
-  if (!audio_diag_stop_and_wait() || !s.diag_stop_sem) return;
-  while (xSemaphoreTake(s.diag_stop_sem, 0) == pdTRUE) {}
+  if (!audio_status_stop_and_wait() || !s.status_stop_sem) return;
+  while (xSemaphoreTake(s.status_stop_sem, 0) == pdTRUE) {}
 
   taskENTER_CRITICAL(&s.state_mux);
-  s.diag_stream_type = stream_type;
+  s.status_stream_type = stream_type;
   taskEXIT_CRITICAL(&s.state_mux);
-  __atomic_store_n(&s.diag_running, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&s.status_running, true, __ATOMIC_RELEASE);
 
-  if (xTaskCreatePinnedToCore(audio_diag_task, "audio_status", AP2_DIAG_STACK,
+  if (xTaskCreatePinnedToCore(audio_status_task, "audio_status", AP2_STATUS_STACK,
                               (void *)(intptr_t)stream_type,
-                              AP2_DIAG_PRIORITY, NULL,
-                              AP2_DIAG_CORE) != pdPASS) {
-    __atomic_store_n(&s.diag_running, false, __ATOMIC_RELEASE);
+                              AP2_STATUS_PRIORITY, NULL,
+                              AP2_STATUS_CORE) != pdPASS) {
+    __atomic_store_n(&s.status_running, false, __ATOMIC_RELEASE);
     taskENTER_CRITICAL(&s.state_mux);
-    s.diag_stream_type = AUDIO_STREAM_NONE;
+    s.status_stream_type = AUDIO_STREAM_NONE;
     taskEXIT_CRITICAL(&s.state_mux);
     ESP_LOGW(TAG, "audio status task create failed");
   }
@@ -697,9 +698,8 @@ static void ap2_buffered_processor_task(void *arg) {
    * only when the media cursor itself becomes discontinuous. */
   audio_eq_reset_state();
 
-  ESP_LOGI(TAG,
-           "addressable buffered processor core=%d prio=%u media_order=1 exact_hash=1",
-           xPortGetCoreID(), (unsigned)AP2_DECODE_PRIORITY);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_AAC_PROCESSOR,
+                                    xPortGetCoreID(), AP2_DECODE_PRIORITY, 0U);
 
   while (s.rx_running) {
     bool made_progress = false;
@@ -795,23 +795,16 @@ static void ap2_buffered_processor_task(void *arg) {
       const bool allow_recovery_scan =
           !have_decoded_sequence || expected_lead <= reorder_guard;
 
-      bool forced_recovery = false;
       ap2_buffered_packet_ref_t pkt = {0};
       if (!ap2_buffered_transport_acquire_media_next(
               s.transport, wanted, expected_timestamp, expected_seq,
               have_decoded_sequence, allow_recovery_scan, frame_samples,
-              max_lead, snap.media_revision, &forced_recovery, &pkt)) {
+              max_lead, snap.media_revision, &pkt)) {
         /* Missing exact media above the reorder guard is normal
          * waiting. Hash miss -> unlock -> sleep -> retry. */
         break;
       }
       made_progress = true;
-
-      if (ap2_buffered_transport_ref_is_invalid(s.transport, &pkt)) {
-        decoder_history_dirty = true;
-        ap2_buffered_transport_release(s.transport, &pkt);
-        continue;
-      }
 
       const int32_t lead = rtp_delta(pkt.rtp, wanted);
       if ((int64_t)lead + (int64_t)frame_samples <= 0) {
@@ -819,30 +812,13 @@ static void ap2_buffered_processor_task(void *arg) {
         continue;
       }
 
-      /* If the exact decoder continuation is missing but the PCM timeline still
-       * has comfortable lead, do not immediately jump the AAC decoder forward.
-       * Return the candidate to READY and give Apple time to publish a missing
-       * replacement media block. Once the expected position is
-       * within the guard of the playhead, progress wins over waiting. */
-      if (have_decoded_sequence) {
-        const int32_t media_gap = rtp_delta(pkt.rtp, expected_timestamp);
-        if (media_gap > 0 && expected_lead > reorder_guard &&
-            !forced_recovery) {
-          if (!ap2_buffered_transport_defer_decode(s.transport, &pkt)) {
-            /* A FLUSH may have invalidated the DECODING packet while the
-             * reorder decision was being made. In that race, release its
-             * ownership instead of leaving an invalid packet pinned. */
-            ap2_buffered_transport_release(s.transport, &pkt);
-          }
-          vTaskDelay(1);
-          break;
-        }
-      }
-
       if (pkt.packet_len > AP2_PACKET_MAX ||
           ap2_buffered_transport_copy_packet(s.transport, &pkt, s.packet,
                                              AP2_PACKET_MAX) !=
               (ssize_t)pkt.packet_len) {
+        /* copy_packet() performs the early DECODING validity/epoch check under
+         * the same transport lock used for its page snapshot. If FLUSH already
+         * invalidated this AU, no codec/EQ history has consumed it yet. */
         ap2_buffered_transport_release(s.transport, &pkt);
         continue;
       }
@@ -879,8 +855,8 @@ static void ap2_buffered_processor_task(void *arg) {
         expected_timestamp = 0;
         expected_seq = 0;
         audio_eq_reset_state();
-        ESP_LOGI(TAG, "AAC decoder ready %dHz %dch", snap.format.sample_rate,
-                 snap.format.channels);
+        AUDIO_DIAG_CODEC_AAC_READY((uint32_t)snap.format.sample_rate,
+                                   (uint32_t)snap.format.channels);
       }
 
       int32_t timestamp_gap = 0;
@@ -931,14 +907,10 @@ static void ap2_buffered_processor_task(void *arg) {
       pcm_process_common_eq(s.decode_pcm, (size_t)frames, info.channels,
                             snap.format.sample_rate);
 
-      /* Declarative invalidation can race an in-flight decode. It never steals
-       * DECODING pages, so re-check validity exactly at PCM publication. */
-      if (ap2_buffered_transport_ref_is_invalid(s.transport, &pkt)) {
-        decoder_history_dirty = true;
-        ap2_buffered_transport_release(s.transport, &pkt);
-        continue;
-      }
-
+      /* FLUSH / PCM COMMIT BARRIER: pcm_store_with_backpressure() takes
+       * publish_mutex and validates this DECODING ref while that mutex is held.
+       * This is the authoritative race check; a standalone check immediately
+       * before it could be invalidated by FLUSH one instruction later. */
       if (pcm_store_with_backpressure(pkt.rtp, s.decode_pcm, (size_t)frames,
                                       info.channels, snap.pcm_generation, &pkt)) {
         /* FLUSH and publication share publish_mutex. If FLUSH runs now, it
@@ -1093,9 +1065,8 @@ static void realtime_stage_task(void *arg) {
   (void)arg;
   int16_t *pcm = s.realtime_stage_pcm;
 
-  ESP_LOGI(TAG,
-           "ALAC staging: raw RTP PCM -> ordered EQ -> final PCM ring, core=%d prio=%u",
-           xPortGetCoreID(), (unsigned)AP2_RT_STAGE_PRIORITY);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_ALAC_STAGE,
+                                    xPortGetCoreID(), AP2_RT_STAGE_PRIORITY, 0U);
 
   uint32_t local_generation = 0;
   __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
@@ -1363,7 +1334,7 @@ static void ap2_playout_task(void *arg) {
       pid_last_tune_us = pid_last_calc_us;
 
       s.output_sync.valid = false;
-      diag_invalidate_sync();
+      status_invalidate_sync();
       state = PLAYOUT_STOPPED;
     }
 
@@ -1373,7 +1344,7 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
       s.output_sync.valid = false;
-      diag_invalidate_sync();
+      status_invalidate_sync();
       state = PLAYOUT_STOPPED;
     }
 
@@ -1421,7 +1392,7 @@ static void ap2_playout_task(void *arg) {
       pid_d_filtered_ms_s = 0.0;
       servo_target_ppm = servo_ppm;
       s.output_sync.valid = false;
-      diag_invalidate_sync();
+      status_invalidate_sync();
       state = PLAYOUT_PRIMING;
       if (!playout_flush_checked("prime-start")) {
         state = PLAYOUT_STOPPED;
@@ -1747,7 +1718,7 @@ static void ap2_playout_task(void *arg) {
         next_target = servo_ppm;
       }
       servo_target_ppm = next_target;
-      diag_publish_sync(s.output_sync.us, servo_ppm, snap.generation);
+      status_publish_sync(s.output_sync.us, servo_ppm, snap.generation);
     }
 
     if (write_err == ESP_OK && s.output_sync.valid &&
@@ -1791,14 +1762,15 @@ static void ap2_playout_task(void *arg) {
 
 esp_err_t audio_receiver_init(void) {
   if (!s.publish_mutex) s.publish_mutex = xSemaphoreCreateMutex();
-  if (!s.diag_stop_sem) s.diag_stop_sem = xSemaphoreCreateBinary();
-  if (!s.publish_mutex || !s.diag_stop_sem) return ESP_ERR_NO_MEM;
+  if (!s.status_stop_sem) s.status_stop_sem = xSemaphoreCreateBinary();
+  if (!s.publish_mutex || !s.status_stop_sem) return ESP_ERR_NO_MEM;
 
-  ESP_LOGI(TAG,
-           "PSRAM before audio alloc: total=%u KiB free=%u KiB largest=%u KiB",
-           (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
+  AUDIO_DIAG_BUFFER_PSRAM(
+      AUDIO_DIAG_PSRAM_BEFORE_AUDIO,
+      (uint32_t)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
+      (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+      (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
+      0U);
 
   /* Allocate the one large codec backing store first while PSRAM is least
    * fragmented. Buffered AAC uses all 5 MiB as its page payload store.
@@ -1889,22 +1861,22 @@ esp_err_t audio_receiver_init(void) {
 
   pcm_rtp_ring_set_generation(s.pcm_ring, s.buffered_pcm_generation);
   pcm_rtp_ring_set_generation(s.realtime_stage_ring, s.generation);
-  ESP_LOGI(TAG,
-           "PSRAM after shared codec + final PCM: total=%u KiB free=%u KiB largest=%u KiB",
-           (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U));
-  ESP_LOGI(TAG,
-           "shared codec workspace=%u KiB: AAC payload=%u KiB; ALAC active use=%u KiB (raw PCM + DATA/RTX)",
-           (unsigned)(s.codec_workspace_size / 1024U),
-           (unsigned)(ap2_buffered_transport_capacity(s.transport) / 1024U),
-           (unsigned)((rt_stage_bytes + rt_pool_bytes) / 1024U));
-  ESP_LOGI(TAG,
-           "PSRAM after audio stores: total=%u KiB free=%u KiB largest=%u KiB store=%u KiB",
-           (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(ap2_buffered_transport_capacity(s.transport) / 1024U));
+  AUDIO_DIAG_BUFFER_PSRAM(
+      AUDIO_DIAG_PSRAM_AFTER_SHARED,
+      (uint32_t)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
+      (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+      (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
+      0U);
+  AUDIO_DIAG_BUFFER_WORKSPACE(
+      (uint32_t)(s.codec_workspace_size / 1024U),
+      (uint32_t)(ap2_buffered_transport_capacity(s.transport) / 1024U),
+      (uint32_t)((rt_stage_bytes + rt_pool_bytes) / 1024U));
+  AUDIO_DIAG_BUFFER_PSRAM(
+      AUDIO_DIAG_PSRAM_AFTER_STORES,
+      (uint32_t)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
+      (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+      (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
+      (uint32_t)(ap2_buffered_transport_capacity(s.transport) / 1024U));
 
   ESP_RETURN_ON_ERROR(audio_playout_init(), TAG, "I2S playout init failed");
   s.engine_running = true;
@@ -1913,28 +1885,15 @@ esp_err_t audio_receiver_init(void) {
                               &s.playout_task, AP2_DECODE_CORE) != pdPASS) {
     return ESP_FAIL;
   }
-  ESP_LOGI(TAG,
-           "PTP/RTP playout task started core=%d prio=%u block=%u buffered_guard=%ums realtime_prime=%ums",
-           AP2_DECODE_CORE, (unsigned)AP2_PLAYOUT_PRIORITY,
-           (unsigned)AUDIO_PLAYOUT_FRAMES,
-           (unsigned)((AP2_START_PRIME_GUARD_BLOCKS * AUDIO_PLAYOUT_FRAMES *
-                       1000U) / 44100U),
-           (unsigned)AP2_REALTIME_PRIME_MS);
+  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(
+      AUDIO_DIAG_TASK_PLAYOUT, AP2_DECODE_CORE, AP2_PLAYOUT_PRIORITY,
+      AUDIO_PLAYOUT_FRAMES);
   if (xTaskCreatePinnedToCore(realtime_stage_task, "alac_stage",
                               AP2_RT_STAGE_STACK, NULL, AP2_RT_STAGE_PRIORITY,
                               &s.realtime_stage_task, AP2_DECODE_CORE) != pdPASS) {
     return ESP_FAIL;
   }
 
-  ESP_LOGI(TAG, "AP2 buffered: TCP -> addressable compressed store -> media-order AAC scheduler -> PCM RTP ring");
-  ESP_LOGI(TAG, "AP2 buffered: TCP payload recv writes directly into page-backed packet storage");
-  ESP_LOGI(TAG, "AP2 buffered: compressed store=%u KiB (requested=%u KiB), decoded target=%u ms",
-           (unsigned)(ap2_buffered_transport_capacity(s.transport) / 1024U),
-           (unsigned)(AP2_BUFFERED_STORE_REQUEST_BYTES / 1024U),
-           (unsigned)AP2_PCM_TARGET_MS);
-  ESP_LOGI(TAG, "AP2 buffered: future packets remain addressable; only full store applies TCP backpressure");
-  ESP_LOGI(TAG, "AP2 output: existing exact PTP/RTP PCM playout and I2S PID preserved");
-  ESP_LOGI(TAG, "ALAC: immediate decode -> raw RTP PCM ring -> ordered EQ -> final PCM ring");
   return ESP_OK;
 }
 
@@ -1986,7 +1945,7 @@ void audio_receiver_set_stream_type(audio_stream_type_t t) {
   changed = s.stream_type != t;
   s.stream_type = t;
   taskEXIT_CRITICAL(&s.state_mux);
-  if (changed) (void)audio_diag_stop_and_wait();
+  if (changed) (void)audio_status_stop_and_wait();
 }
 
 esp_err_t audio_receiver_start_buffered(uint16_t port) {
@@ -2108,10 +2067,7 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
     taskEXIT_CRITICAL(&s.state_mux);
     __atomic_store_n(&s.realtime_stage_running, true, __ATOMIC_RELEASE);
     realtime_stage_kick();
-    ESP_LOGI(TAG,
-             "REALTIME epoch prepared gen=%" PRIu32
-             " waiting for sender D7/SETRATE anchor (no arrival-time fallback)",
-             rt_gen);
+    AUDIO_DIAG_LIFECYCLE_REALTIME_EPOCH(rt_gen);
 
     realtime_receiver_config_t cfg = {
         .format = fmt_snap.format,
@@ -2165,8 +2121,8 @@ void audio_receiver_stop(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);
-  diag_invalidate_sync();
-  (void)audio_diag_stop_and_wait();
+  status_invalidate_sync();
+  (void)audio_status_stop_and_wait();
   mark_timeline_discontinuity();
   __atomic_store_n(&s.playout_servo_reset_requested, true, __ATOMIC_RELEASE);
   const uint32_t quiesce_request =
@@ -2206,9 +2162,6 @@ void audio_receiver_stop(void) {
     ap2_buffered_transport_clear(s.transport);
   }
 
-  taskENTER_CRITICAL(&s.state_mux);
-  taskEXIT_CRITICAL(&s.state_mux);
-
   /* Do not reset the stateful EQ asynchronously from the control core. AAC
    * and the ALAC staging task each reset it on their next generation. */
   s.port = 0;
@@ -2232,7 +2185,6 @@ int32_t audio_receiver_get_volume_q15(void) {
   return __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
 }
 
-void audio_receiver_get_stats(audio_stats_t *out) { if (out) memset(out, 0, sizeof(*out)); }
 void audio_receiver_flush(void) { mark_timeline_discontinuity(); }
 void audio_receiver_seek_flush(void) { mark_timeline_discontinuity(); }
 
@@ -2381,8 +2333,8 @@ void audio_receiver_pause(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);
-  diag_invalidate_sync();
-  (void)audio_diag_stop_and_wait();
+  status_invalidate_sync();
+  (void)audio_status_stop_and_wait();
   mark_timeline_discontinuity();
 }
 
@@ -2400,10 +2352,10 @@ void audio_receiver_set_playing(bool p) {
   stream_type = s.stream_type;
   taskEXIT_CRITICAL(&s.state_mux);
   if (p) {
-    audio_diag_start(stream_type);
+    audio_status_start(stream_type);
   } else {
-    diag_invalidate_sync();
-    (void)audio_diag_stop_and_wait();
+    status_invalidate_sync();
+    (void)audio_status_stop_and_wait();
     mark_timeline_discontinuity();
   }
 }

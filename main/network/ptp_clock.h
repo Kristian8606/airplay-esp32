@@ -63,22 +63,6 @@ int64_t ptp_clock_get_offset_ns(void);
 void ptp_clock_notify_resume(uint32_t pause_duration_ms);
 
 /**
- * Get synchronization statistics.
- */
-typedef struct {
-  uint32_t sync_count;        // Number of SYNC messages received
-  uint32_t followup_count;    // Number of FOLLOW_UP messages received
-  int64_t last_offset_ns;     // Last RAW measured offset (pre-smoothing)
-  int64_t filtered_offset_ns; // Exported filtered offset (what timing uses)
-  int64_t raw_filter_delta_ns; // RAW - filtered estimator delta
-  uint32_t lock_time_ms;      // Time since lock achieved (0 if not locked)
-  uint32_t outlier_count;     // Samples rejected as outliers since start
-} ptp_stats_t;
-
-void ptp_clock_get_stats(ptp_stats_t *stats);
-
-
-/**
  * Enable the AirPlay 2 realtime NQPTP-style estimator path.
  *
  * In realtime mode the PTP source is selected by the RTSP client's IPv4
@@ -115,12 +99,6 @@ typedef struct {
   uint32_t mastership_age_ms;
   uint32_t sample_count;
   uint32_t sample_age_ms; /* UINT32_MAX when no Follow_Up is available. */
-  /* Realtime two-step PTP diagnostics. pair_count is the number of accepted
-   * Sync/Follow_Up pairs (one-step Sync samples are counted too). */
-  uint32_t pair_count;
-  uint32_t orphan_followup_count;
-  uint32_t pair_mismatch_count;
-  uint32_t sync_followup_gap_us;
   /* Monotonic within one realtime PTP session. Incremented whenever Announce
    * changes grandmasterIdentity after the first master has been observed.
    * Audio uses this only to distinguish mastership epochs; it never feeds
