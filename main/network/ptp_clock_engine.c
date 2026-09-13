@@ -165,51 +165,44 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
 }
 
 
-bool ptp_clock_engine_accumulate_translation(int64_t current_translation_ns,
-                                             int64_t old_offset_ns,
-                                             int64_t new_offset_ns,
-                                             int64_t *updated_translation_ns) {
-  if (!updated_translation_ns) return false;
 
-  int64_t shift_ns;
-  if ((old_offset_ns < 0 && new_offset_ns > INT64_MAX + old_offset_ns) ||
-      (old_offset_ns > 0 && new_offset_ns < INT64_MIN + old_offset_ns)) {
-    return false;
+static bool add_signed_u64(uint64_t base, int64_t delta, uint64_t *out) {
+  if (!out) return false;
+  if (delta >= 0) {
+    const uint64_t add = (uint64_t)delta;
+    if (base > UINT64_MAX - add) return false;
+    *out = base + add;
+  } else {
+    const uint64_t sub = (uint64_t)(-(delta + 1)) + 1U;
+    if (base < sub) return false;
+    *out = base - sub;
   }
-  shift_ns = new_offset_ns - old_offset_ns;
-
-  if ((shift_ns > 0 && current_translation_ns > INT64_MAX - shift_ns) ||
-      (shift_ns < 0 && current_translation_ns < INT64_MIN - shift_ns)) {
-    return false;
-  }
-
-  *updated_translation_ns = current_translation_ns + shift_ns;
   return true;
 }
 
-bool ptp_clock_engine_translate_timestamp(uint64_t timestamp_ns,
-                                          int64_t base_translation_ns,
-                                          int64_t current_translation_ns,
-                                          uint64_t *translated_ns) {
-  if (!translated_ns) return false;
-
-  int64_t delta_ns;
-  if ((base_translation_ns < 0 &&
-       current_translation_ns > INT64_MAX + base_translation_ns) ||
-      (base_translation_ns > 0 &&
-       current_translation_ns < INT64_MIN + base_translation_ns)) {
-    return false;
+bool ptp_clock_engine_remote_to_local(uint64_t remote_ns, int64_t offset_ns,
+                                      uint64_t *local_ns) {
+  if (offset_ns == INT64_MIN) {
+    if (!local_ns || remote_ns > UINT64_MAX - ((uint64_t)INT64_MAX + 1ULL))
+      return false;
+    *local_ns = remote_ns + ((uint64_t)INT64_MAX + 1ULL);
+    return true;
   }
-  delta_ns = current_translation_ns - base_translation_ns;
+  return add_signed_u64(remote_ns, -offset_ns, local_ns);
+}
 
-  if (delta_ns >= 0) {
-    const uint64_t add = (uint64_t)delta_ns;
-    if (timestamp_ns > UINT64_MAX - add) return false;
-    *translated_ns = timestamp_ns + add;
-  } else {
-    const uint64_t sub = (uint64_t)(-(delta_ns + 1)) + 1U;
-    if (timestamp_ns < sub) return false;
-    *translated_ns = timestamp_ns - sub;
-  }
-  return true;
+bool ptp_clock_engine_local_to_remote(uint64_t local_ns, int64_t offset_ns,
+                                      uint64_t *remote_ns) {
+  return add_signed_u64(local_ns, offset_ns, remote_ns);
+}
+
+bool ptp_clock_engine_handover_ready(bool have_local_anchor, bool clock_locked,
+                                     uint64_t anchor_clock_id,
+                                     uint64_t current_master_clock_id,
+                                     uint32_t mastership_age_ms,
+                                     uint32_t last_anchor_age_ms) {
+  return have_local_anchor && clock_locked && anchor_clock_id != 0 &&
+         current_master_clock_id != 0 &&
+         anchor_clock_id != current_master_clock_id &&
+         mastership_age_ms >= 400U && last_anchor_age_ms >= 5000U;
 }

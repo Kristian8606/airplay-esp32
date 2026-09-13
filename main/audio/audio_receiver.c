@@ -107,10 +107,9 @@ typedef struct {
   bool playing;
   uint64_t anchor_clock_id;
   uint64_t anchor_ptp_ns;
-  uint64_t anchor_local_ns; /* current local conversion, cached during PTP holdover */
-  int64_t anchor_domain_translation_ns; /* buffered anchor's PTP-domain basis */
-  int64_t buffered_ptp_offset_ns;       /* coherent offset captured for this snapshot */
-  bool buffered_clock_map_valid;
+  uint64_t anchor_local_ns; /* last valid ESP-local anchor for buffered holdover */
+  uint64_t anchor_local_update_us; /* last qualified same-master refresh */
+  bool anchor_local_valid;
   uint32_t anchor_rtp;
   uint32_t generation;          /* timing/playout epoch */
   uint32_t media_revision;      /* changes on every buffered anchor update */
@@ -168,7 +167,9 @@ typedef struct {
   uint64_t anchor_clock_id;
   uint64_t anchor_ptp_ns;
   uint64_t anchor_local_ns; /* ESP monotonic time corresponding to anchor_rtp */
-  int64_t anchor_domain_translation_ns; /* buffered raw-anchor translation basis */
+  uint64_t anchor_local_update_us; /* last qualified same-master local-anchor refresh */
+  bool anchor_local_valid;
+  uint32_t buffered_hold_log_epoch; /* diagnostics only; never drives timing */
   uint32_t anchor_rtp;
   /* Realtime media-domain rebase. This is deliberately separate from PTP:
    * it only maps a new GM epoch onto the already-running local media phase. */
@@ -269,9 +270,8 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->anchor_clock_id = s.anchor_clock_id;
   out->anchor_ptp_ns = s.anchor_ptp_ns;
   out->anchor_local_ns = s.anchor_local_ns;
-  out->anchor_domain_translation_ns = s.anchor_domain_translation_ns;
-  out->buffered_ptp_offset_ns = 0;
-  out->buffered_clock_map_valid = false;
+  out->anchor_local_update_us = s.anchor_local_update_us;
+  out->anchor_local_valid = s.anchor_local_valid;
   out->anchor_rtp = s.anchor_rtp;
   out->generation = s.generation;
   out->media_revision = s.media_revision;
@@ -289,20 +289,113 @@ static void snapshot_state(timing_snapshot_t *out) {
   bias_start_us = s.rt_media_rebase_start_us;
   taskEXIT_CRITICAL(&s.state_mux);
 
-  if (out->stream_type == AUDIO_STREAM_BUFFERED) {
+  if (out->stream_type == AUDIO_STREAM_BUFFERED && out->anchor_valid &&
+      !out->timeline_reset_pending) {
     ptp_clock_snapshot_t ps = {0};
     ptp_clock_get_snapshot(&ps);
     if (!ps.realtime_mode) {
-      out->buffered_ptp_offset_ns = ps.presentation_offset_ns;
-      out->buffered_clock_map_valid = true;
-      if (out->anchor_valid && !out->timeline_reset_pending) {
-        uint64_t translated_anchor = 0;
-        if (ptp_clock_engine_translate_timestamp(
-                out->anchor_ptp_ns, out->anchor_domain_translation_ns,
-                ps.domain_translation_ns, &translated_anchor)) {
-          out->anchor_ptp_ns = translated_anchor;
-        } else {
-          out->buffered_clock_map_valid = false;
+      const uint64_t now_us = (uint64_t)esp_timer_get_time();
+      const bool same_master = ps.grandmaster_clock_id != 0 &&
+                               ps.grandmaster_clock_id == out->anchor_clock_id;
+      const bool qualified_master =
+          ps.valid && ps.locked && ps.mastership_age_ms >= 400U;
+
+      if (same_master && qualified_master) {
+        /* Shairport Sync semantics: while the advertised master is the same
+         * clock that owns the RTSP anchor, continuously refresh the local
+         * representation and remember exactly when that mapping was last
+         * known-good. A transient GM may not move this cached local point. */
+        uint64_t local_anchor = 0;
+        if (ptp_clock_engine_remote_to_local(
+                out->anchor_ptp_ns, ps.filtered_offset_ns, &local_anchor)) {
+          bool refreshed = false;
+          taskENTER_CRITICAL(&s.state_mux);
+          if (s.stream_type == AUDIO_STREAM_BUFFERED && s.anchor_valid &&
+              s.anchor_clock_id == out->anchor_clock_id &&
+              s.anchor_ptp_ns == out->anchor_ptp_ns) {
+            s.anchor_local_ns = local_anchor;
+            s.anchor_local_update_us = now_us;
+            s.anchor_local_valid = true;
+            refreshed = true;
+          }
+          taskEXIT_CRITICAL(&s.state_mux);
+          if (refreshed) {
+            out->anchor_local_ns = local_anchor;
+            out->anchor_local_update_us = now_us;
+            out->anchor_local_valid = true;
+          }
+        }
+      } else if (!same_master && ps.grandmaster_clock_id != 0 &&
+                 out->anchor_local_valid && out->anchor_local_ns != 0 &&
+                 out->anchor_local_update_us != 0) {
+        /* Shairport does not time handover from first mismatch observation.
+         * It measures from the last successful local-anchor update by the old
+         * master. That timestamp stops moving as soon as the GM differs. */
+        const uint64_t stale_age_us =
+            now_us >= out->anchor_local_update_us
+                ? now_us - out->anchor_local_update_us
+                : 0;
+        const uint32_t stale_age_ms =
+            stale_age_us / 1000ULL > UINT32_MAX
+                ? UINT32_MAX
+                : (uint32_t)(stale_age_us / 1000ULL);
+
+        bool log_hold = false;
+        taskENTER_CRITICAL(&s.state_mux);
+        if (s.stream_type == AUDIO_STREAM_BUFFERED && s.anchor_valid &&
+            s.anchor_clock_id == out->anchor_clock_id &&
+            s.anchor_ptp_ns == out->anchor_ptp_ns &&
+            s.buffered_hold_log_epoch != ps.epoch) {
+          s.buffered_hold_log_epoch = ps.epoch;
+          log_hold = true;
+        }
+        taskEXIT_CRITICAL(&s.state_mux);
+        if (log_hold) {
+          ESP_LOGW(TAG,
+                   "AAC GM HOLD: anchor=%08" PRIx32
+                   " current=%08" PRIx32 " age=%" PRIu32 "ms",
+                   (uint32_t)(out->anchor_clock_id & 0xffffffffULL),
+                   (uint32_t)(ps.grandmaster_clock_id & 0xffffffffULL),
+                   stale_age_ms);
+        }
+
+        /* Only a qualified new GM may take ownership. Rebuild its remote
+         * anchor from the exact same cached ESP-local media point. */
+        if (ps.valid &&
+            ptp_clock_engine_handover_ready(
+                out->anchor_local_valid, ps.locked, out->anchor_clock_id,
+                ps.grandmaster_clock_id, ps.mastership_age_ms, stale_age_ms)) {
+          uint64_t new_remote_anchor = 0;
+          if (ptp_clock_engine_local_to_remote(
+                  out->anchor_local_ns, ps.filtered_offset_ns,
+                  &new_remote_anchor)) {
+            bool committed = false;
+            taskENTER_CRITICAL(&s.state_mux);
+            if (s.stream_type == AUDIO_STREAM_BUFFERED && s.anchor_valid &&
+                s.anchor_clock_id == out->anchor_clock_id &&
+                s.anchor_ptp_ns == out->anchor_ptp_ns &&
+                s.anchor_local_valid &&
+                s.anchor_local_ns == out->anchor_local_ns &&
+                s.anchor_local_update_us == out->anchor_local_update_us) {
+              s.anchor_clock_id = ps.grandmaster_clock_id;
+              s.anchor_ptp_ns = new_remote_anchor;
+              /* Deliberately preserve anchor_local_ns and its old update time.
+               * On the next qualified snapshot the now-current GM refreshes
+               * them, matching Shairport's two-step handover behaviour. */
+              committed = true;
+            }
+            taskEXIT_CRITICAL(&s.state_mux);
+            if (committed) {
+              ESP_LOGW(TAG,
+                       "AAC GM COMMIT: %08" PRIx32 " -> %08" PRIx32
+                       " after %" PRIu32 "ms",
+                       (uint32_t)(out->anchor_clock_id & 0xffffffffULL),
+                       (uint32_t)(ps.grandmaster_clock_id & 0xffffffffULL),
+                       stale_age_ms);
+              out->anchor_clock_id = ps.grandmaster_clock_id;
+              out->anchor_ptp_ns = new_remote_anchor;
+            }
+          }
         }
       }
     }
@@ -372,7 +465,9 @@ static void mark_timeline_discontinuity(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.anchor_valid = false;
   s.timeline_reset_pending = true;
-  s.anchor_domain_translation_ns = 0;
+  s.anchor_local_update_us = 0;
+  s.anchor_local_valid = false;
+  s.buffered_hold_log_epoch = 0;
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;
   s.rt_media_rebase_epoch = 0;
@@ -411,33 +506,24 @@ static inline int32_t rtp_delta(uint32_t a, uint32_t b) {
   return (int32_t)(a - b);
 }
 
-/* Presentation-clock boundary.
- * Buffered AAC keeps PTP-authoritative rate/phase, but the clock offset and the
- * translated anchor are captured as one coherent snapshot. A same-source GM
- * handover can therefore change absolute PTP coordinates without changing the
- * media interval now-anchor. Realtime ALAC remains entirely ESP-local here. */
+/* Presentation-clock boundary. Both codecs schedule against ESP monotonic
+ * time. Buffered AAC continuously converts its remote anchor to local time
+ * while its anchor GM is current, then freezes that local anchor across GM
+ * acquisition exactly like Shairport Sync. */
 static bool timing_clock_ready(const timing_snapshot_t *snap) {
   if (!snap || !snap->anchor_valid || snap->timeline_reset_pending) return false;
-  if (snap->stream_type == AUDIO_STREAM_REALTIME) return snap->anchor_local_ns != 0;
-  return snap->buffered_clock_map_valid && ptp_clock_is_locked();
+  if (snap->stream_type == AUDIO_STREAM_BUFFERED)
+    return snap->anchor_local_valid && snap->anchor_local_ns != 0;
+  return snap->anchor_local_ns != 0;
 }
 
 static uint64_t presentation_now_ns(const timing_snapshot_t *snap) {
-  const uint64_t local_ns = (uint64_t)esp_timer_get_time() * 1000ULL;
-  if (snap && snap->stream_type == AUDIO_STREAM_REALTIME) return local_ns;
-  if (snap) {
-    uint64_t mapped = 0;
-    if (ptp_clock_engine_translate_timestamp(
-            local_ns, 0, snap->buffered_ptp_offset_ns, &mapped)) {
-      return mapped;
-    }
-  }
-  return 0;
+  (void)snap;
+  return (uint64_t)esp_timer_get_time() * 1000ULL;
 }
 
 static uint64_t presentation_anchor_ns(const timing_snapshot_t *snap) {
-  return snap->stream_type == AUDIO_STREAM_REALTIME ? snap->anchor_local_ns
-                                                     : snap->anchor_ptp_ns;
+  return snap ? snap->anchor_local_ns : 0;
 }
 
 static bool wanted_rtp_now(const timing_snapshot_t *snap, uint32_t *out) {
@@ -695,14 +781,11 @@ static bool rtp_to_presentation_ns(const timing_snapshot_t *snap, uint32_t rtp,
 
 static int64_t completion_presentation_ns(const timing_snapshot_t *snap,
                                           const audio_playout_completion_t *done) {
-  const int64_t local_ns = done->done_local_us * 1000LL;
-  if (snap->stream_type == AUDIO_STREAM_REALTIME) return local_ns;
-  return local_ns + snap->buffered_ptp_offset_ns;
+  (void)snap;
+  return done->done_local_us * 1000LL;
 }
 
-/* Pace DMA submission in the stream's presentation clock. For AAC this is
- * still PTP. For realtime ALAC it is ESP monotonic time after D7->local
- * conversion. */
+/* Pace DMA submission in ESP monotonic presentation time. */
 static void wait_until_presentation_ns(const timing_snapshot_t *snap,
                                        uint64_t target_ns) {
   while (s.engine_running) {
@@ -809,7 +892,7 @@ static void ap2_buffered_processor_task(void *arg) {
     snapshot_state(&state_snap);
     if (!play_enabled || state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
         !state_snap.playing || !state_snap.anchor_valid ||
-        state_snap.timeline_reset_pending || !ptp_clock_is_locked()) {
+        state_snap.timeline_reset_pending || !timing_clock_ready(&state_snap)) {
       if (!made_progress) vTaskDelay(delay_ticks_at_least_one(5));
       continue;
     }
@@ -822,7 +905,7 @@ static void ap2_buffered_processor_task(void *arg) {
       snapshot_state(&state_snap);
       if (!play_enabled || state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
           !state_snap.playing || !state_snap.anchor_valid ||
-          state_snap.timeline_reset_pending || !ptp_clock_is_locked()) {
+          state_snap.timeline_reset_pending || !timing_clock_ready(&state_snap)) {
         break;
       }
 
@@ -2552,8 +2635,6 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   if (clock_id) {
     ptp_clock_set_master_clock_id(clock_id);
   }
-  ptp_clock_snapshot_t ptp_snap = {0};
-  ptp_clock_get_snapshot(&ptp_snap);
   uint32_t gen;
   uint32_t revision;
   bool committed;
@@ -2564,8 +2645,10 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   revision = s.media_revision = next_generation(s.media_revision);
   s.anchor_clock_id = clock_id;
   s.anchor_ptp_ns = ptp_ns;
-  s.anchor_local_ns = 0; /* buffered/AAC remains PTP-authoritative */
-  s.anchor_domain_translation_ns = ptp_snap.domain_translation_ns;
+  s.anchor_local_ns = 0; /* established after the anchor GM is PTP-locked */
+  s.anchor_local_update_us = 0;
+  s.anchor_local_valid = false;
+  s.buffered_hold_log_epoch = 0;
   s.anchor_rtp = rtp;
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;
@@ -2680,7 +2763,6 @@ bool audio_receiver_set_realtime_anchor_local(
     s.anchor_clock_id = clock_id;
     s.anchor_ptp_ns = remote_ptp_ns; /* retained remote anchor for live PTP conversion */
     s.anchor_local_ns = effective_local_ns;
-    s.anchor_domain_translation_ns = 0;
     s.anchor_rtp = rtp;
     s.anchor_valid = true;
     accepted = true;

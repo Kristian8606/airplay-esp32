@@ -99,10 +99,6 @@ static struct {
 
   // Synchronization state
   bool locked;
-  /* Buffered presentation may remain in holdover after a qualified lock is
-   * temporarily lost because Sync packets stop arriving. Real timing-domain
-   * resets clear this latch. */
-  bool legacy_presentation_ready;
   uint32_t lock_candidate_start_ms;
   uint32_t last_sync_ms;
   int64_t filtered_offset_ns; // PTP_time = local_time + offset
@@ -126,15 +122,6 @@ static struct {
   ptp_clock_engine_t legacy_engine;
   int64_t legacy_last_step_log_ns;
 
-  /* Buffered AAC keeps remote RTP anchors in the PTP coordinate system in
-   * which they were received. A same-source grandmaster handover can change
-   * the absolute PTP origin by seconds or hours even though physical time is
-   * continuous. Accumulate that coordinate change separately so audio can
-   * translate an old anchor into the current GM domain without a flush/reset. */
-  int64_t legacy_domain_translation_ns;
-  bool legacy_handover_pending;
-  int64_t legacy_handover_from_offset_ns;
-  uint32_t legacy_handover_epoch;
 
   /* AirPlay 2 realtime-only clock-domain state. Buffered AAC does not use
    * these fields and continues through the legacy path above. */
@@ -298,26 +285,6 @@ static void update_legacy_offset_locked(int64_t raw_offset_ns,
     return;
   }
 
-  /* The first accepted sample in a new same-source GM epoch reveals the
-   * absolute coordinate shift. Apply that shift to the accumulated media
-   * translation before publishing the new PTP offset, so readers can take one
-   * coherent snapshot containing both sides of the handover. */
-  if (ptp.legacy_handover_pending &&
-      r.epoch == ptp.legacy_handover_epoch) {
-    int64_t translated = 0;
-    if (ptp_clock_engine_accumulate_translation(
-            ptp.legacy_domain_translation_ns,
-            ptp.legacy_handover_from_offset_ns, r.filtered_offset_ns,
-            &translated)) {
-      ptp.legacy_domain_translation_ns = translated;
-    } else {
-      /* Arithmetic failure is impossible for real PTP offsets, but fail closed
-       * rather than publish a discontinuous audio clock. */
-      ptp.locked = false;
-      ptp.lock_candidate_start_ms = 0;
-    }
-    ptp.legacy_handover_pending = false;
-  }
 
   ptp.filtered_offset_ns = r.filtered_offset_ns;
   ptp.sample_count = r.accepted_samples;
@@ -332,7 +299,6 @@ static void update_legacy_offset_locked(int64_t raw_offset_ns,
           ptp.lock_candidate_start_ms = now_ms;
         if ((now_ms - ptp.lock_candidate_start_ms) >= LOCK_STABLE_TIME_MS) {
           ptp.locked = true;
-          ptp.legacy_presentation_ready = true;
           ptp.lock_candidate_start_ms = 0;
         }
       }
@@ -393,21 +359,6 @@ static void fill_domain_step_locked(const char *reason,
   step_ev->seq = 0;
   ptp.legacy_last_step_log_ns = reception_ns;
 
-  /* Preserve the mapping of already-published buffered RTP anchors across a
-   * same-source GM change. The actual shift becomes known on the first accepted
-   * sample from the new epoch. A source change is a true domain break and
-   * starts a fresh translation basis. */
-  if (de->gm_changed && !de->source_changed && de->old_estimator_valid) {
-    ptp.legacy_handover_pending = true;
-    ptp.legacy_handover_from_offset_ns = de->old_filtered_offset_ns;
-    ptp.legacy_handover_epoch = de->epoch;
-  } else if (de->source_changed) {
-    ptp.legacy_presentation_ready = false;
-    ptp.legacy_domain_translation_ns = 0;
-    ptp.legacy_handover_pending = false;
-    ptp.legacy_handover_from_offset_ns = 0;
-    ptp.legacy_handover_epoch = 0;
-  }
 
   /* Never pair a pre-handover Sync with a post-handover Follow_Up. */
   ptp.awaiting_followup = false;
@@ -1101,7 +1052,6 @@ void ptp_clock_stop(void) {
 void ptp_clock_clear(void) {
   taskENTER_CRITICAL(&ptp_state_mux);
   ptp.locked = false;
-  ptp.legacy_presentation_ready = false;
   ptp.lock_candidate_start_ms = 0;
   ptp.last_sync_ms = 0;
   ptp.filtered_offset_ns = 0;
@@ -1117,10 +1067,6 @@ void ptp_clock_clear(void) {
   ptp.legacy_source_mixed = false;
   ptp_clock_engine_init(&ptp.legacy_engine, OUTLIER_THRESHOLD_NS);
   ptp.legacy_last_step_log_ns = 0;
-  ptp.legacy_domain_translation_ns = 0;
-  ptp.legacy_handover_pending = false;
-  ptp.legacy_handover_from_offset_ns = 0;
-  ptp.legacy_handover_epoch = 0;
 
   /* Keep mode + timing peer across a stream-level clear, but drop the
    * realtime GM estimator. No audio continuity state lives in ptp_clock. */
@@ -1175,7 +1121,6 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
     ptp.sample_count = 0;
     ptp.last_sync_ms = 0;
     ptp.locked = false;
-    ptp.legacy_presentation_ready = false;
     ptp.lock_candidate_start_ms = 0;
     ptp.awaiting_followup = false;
     step_ev.source_clock_id = ptp.legacy_engine.source_clock_id;
@@ -1194,52 +1139,6 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
 #endif
 }
 
-bool ptp_clock_is_locked(void) {
-  const int64_t now_ns = get_local_time_ns();
-  const uint32_t now_ms = (uint32_t)(now_ns / 1000000LL);
-  bool locked;
-  ptp_step_log_t step_ev = {0};
-
-  taskENTER_CRITICAL(&ptp_state_mux);
-  if (ptp.realtime_mode) {
-    if (ptp.rt_master_ready && ptp.rt_last_followup_rx_ns > 0 &&
-        now_ns - ptp.rt_last_followup_rx_ns >
-            (int64_t)LOCK_TIMEOUT_MS * 1000000LL) {
-      ptp.rt_master_ready = false;
-      if (ptp.locked) {
-        step_ev.emit = true;
-        step_ev.reason = "lock-lost";
-        step_ev.source_clock_id = ptp.source_clock_id;
-        step_ev.grandmaster_clock_id = ptp.grandmaster_clock_id;
-        step_ev.epoch = ptp.grandmaster_clock_id ? ptp.rt_gm_changes + 1U : 0U;
-        step_ev.raw_offset_ns = ptp.rt_raw_offset_ns;
-        step_ev.filtered_offset_ns = ptp.rt_master_offset_ns;
-        step_ev.raw_filter_delta_ns =
-            ptp.rt_raw_offset_ns - ptp.rt_master_offset_ns;
-      }
-      ptp.locked = false;
-    }
-  } else if (ptp.locked && ptp.last_sync_ms > 0 &&
-             (now_ms - ptp.last_sync_ms) > LOCK_TIMEOUT_MS) {
-    ptp.locked = false;
-    ptp.lock_candidate_start_ms = 0;
-    step_ev.emit = true;
-    step_ev.reason = "lock-lost";
-    step_ev.source_clock_id = ptp.legacy_engine.source_clock_id;
-    step_ev.grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
-    step_ev.epoch = ptp.legacy_engine.epoch;
-    step_ev.raw_offset_ns = ptp.legacy_engine.raw_offset_ns;
-    step_ev.filtered_offset_ns = ptp.legacy_engine.filtered_offset_ns;
-    step_ev.raw_filter_delta_ns =
-        ptp.legacy_engine.raw_offset_ns - ptp.legacy_engine.filtered_offset_ns;
-  }
-  locked = ptp.realtime_mode
-               ? ptp.locked
-               : (ptp.locked || ptp.legacy_presentation_ready);
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  log_ptp_step(&step_ev);
-  return locked;
-}
 
 uint64_t ptp_clock_get_time_ns(void) {
   const int64_t local_ns = get_local_time_ns();
@@ -1265,7 +1164,28 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
   snapshot->sample_age_ms = UINT32_MAX;
 
   const int64_t now_ns = get_local_time_ns();
+  const uint32_t now_ms = (uint32_t)(now_ns / 1000000LL);
+  ptp_step_log_t step_ev = {0};
   taskENTER_CRITICAL(&ptp_state_mux);
+
+  /* Snapshot is the buffered timing read boundary, so expire a stale lock
+   * here. Audio can then continue from its cached local anchor without treating
+   * stale PTP as newly qualified. */
+  if (!ptp.realtime_mode && ptp.locked && ptp.last_sync_ms > 0 &&
+      (now_ms - ptp.last_sync_ms) > LOCK_TIMEOUT_MS) {
+    ptp.locked = false;
+    ptp.lock_candidate_start_ms = 0;
+    step_ev.emit = true;
+    step_ev.reason = "lock-lost";
+    step_ev.source_clock_id = ptp.legacy_engine.source_clock_id;
+    step_ev.grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+    step_ev.epoch = ptp.legacy_engine.epoch;
+    step_ev.raw_offset_ns = ptp.legacy_engine.raw_offset_ns;
+    step_ev.filtered_offset_ns = ptp.legacy_engine.filtered_offset_ns;
+    step_ev.raw_filter_delta_ns =
+        ptp.legacy_engine.raw_offset_ns - ptp.legacy_engine.filtered_offset_ns;
+  }
+
   snapshot->realtime_mode = ptp.realtime_mode;
   snapshot->locked = ptp.locked;
   if (ptp.realtime_mode) {
@@ -1277,8 +1197,6 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
     snapshot->filtered_offset_ns = ptp.rt_master_offset_ns;
     snapshot->raw_filter_delta_ns =
         ptp.rt_raw_offset_ns - ptp.rt_master_offset_ns;
-    snapshot->presentation_offset_ns = ptp.filtered_offset_ns;
-    snapshot->domain_translation_ns = 0;
     snapshot->sample_count = ptp.rt_sample_count;
     if (ptp.rt_last_followup_rx_ns > 0 && now_ns >= ptp.rt_last_followup_rx_ns) {
       const uint64_t age_ms = (uint64_t)((now_ns - ptp.rt_last_followup_rx_ns) /
@@ -1295,8 +1213,14 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
     snapshot->filtered_offset_ns = ptp.legacy_engine.filtered_offset_ns;
     snapshot->raw_filter_delta_ns =
         ptp.legacy_engine.raw_offset_ns - ptp.legacy_engine.filtered_offset_ns;
-    snapshot->presentation_offset_ns = ptp.filtered_offset_ns;
-    snapshot->domain_translation_ns = ptp.legacy_domain_translation_ns;
+    if (ptp.legacy_engine.mastership_start_time_ns > 0 &&
+        now_ns >= ptp.legacy_engine.mastership_start_time_ns) {
+      const uint64_t age_ms =
+          (uint64_t)((now_ns - ptp.legacy_engine.mastership_start_time_ns) /
+                     1000000LL);
+      snapshot->mastership_age_ms = age_ms > UINT32_MAX ? UINT32_MAX
+                                                        : (uint32_t)age_ms;
+    }
     snapshot->sample_count = ptp.legacy_engine.accepted_samples;
     if (ptp.legacy_engine.last_accepted_time_ns > 0 &&
         now_ns >= ptp.legacy_engine.last_accepted_time_ns) {
@@ -1308,6 +1232,7 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
     }
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
+  log_ptp_step(&step_ev);
 }
 
 void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
@@ -1323,7 +1248,6 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     /* Stream-mode transition starts the selected estimator fresh. This does
      * not touch any PCM/ring/cursor/PID/DMA/I2S state. */
     ptp.locked = false;
-    ptp.legacy_presentation_ready = false;
     ptp.lock_candidate_start_ms = 0;
     ptp.last_sync_ms = 0;
     ptp.filtered_offset_ns = 0;
@@ -1339,10 +1263,6 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.legacy_source_mixed = false;
     ptp_clock_engine_init(&ptp.legacy_engine, OUTLIER_THRESHOLD_NS);
     ptp.legacy_last_step_log_ns = 0;
-    ptp.legacy_domain_translation_ns = 0;
-    ptp.legacy_handover_pending = false;
-    ptp.legacy_handover_from_offset_ns = 0;
-    ptp.legacy_handover_epoch = 0;
     ptp.source_clock_id = 0;
     ptp.grandmaster_clock_id = 0;
     ptp.rt_master_offset_ns = 0;
@@ -1448,10 +1368,6 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
         ptp_clock_engine_domain_event_t de = {0};
         if (clock_id != 0 && ptp.legacy_engine.source_clock_id != clock_id) {
           (void)ptp_clock_engine_set_domain(&ptp.legacy_engine, clock_id, 0, &de);
-          ptp.legacy_domain_translation_ns = 0;
-          ptp.legacy_handover_pending = false;
-          ptp.legacy_handover_from_offset_ns = 0;
-          ptp.legacy_handover_epoch = 0;
         } else {
           ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
         }
@@ -1459,7 +1375,6 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
           ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
 
         ptp.locked = false;
-        ptp.legacy_presentation_ready = false;
         ptp.lock_candidate_start_ms = 0;
         ptp.last_sync_ms = 0;
         ptp.filtered_offset_ns = 0;

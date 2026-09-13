@@ -28,14 +28,6 @@ void ptp_clock_stop(void);
 void ptp_clock_clear(void);
 
 /**
- * Check whether PTP presentation timing is usable.
- * Realtime mode requires a fresh lock. Buffered mode remains usable in
- * holdover after it has achieved a real lock once for the current timing
- * domain; source/session/clock resets revoke that qualification.
- */
-bool ptp_clock_is_locked(void);
-
-/**
  * Get current PTP time in nanoseconds.
  * Returns local time adjusted by PTP offset.
  * @return PTP time in nanoseconds since epoch
@@ -58,13 +50,9 @@ typedef struct {
   int64_t raw_offset_ns;
   int64_t filtered_offset_ns;
   int64_t raw_filter_delta_ns;
-  /* Buffered presentation mapping. presentation_offset_ns is the exact offset
-   * used by ptp_clock_get_time_ns(), including same-source GM holdover.
-   * domain_translation_ns accumulates only absolute coordinate changes between
-   * GM epochs; buffered RTP anchors subtract the value captured when they were
-   * received so a handover cannot move media time. */
-  int64_t presentation_offset_ns;
-  int64_t domain_translation_ns;
+  /* Age of the current mastership; buffered audio uses this to qualify a
+   * new GM while the media timeline remains in ESP-local time. */
+  uint32_t mastership_age_ms;
   uint32_t sample_count;
   uint32_t sample_age_ms; /* UINT32_MAX when no accepted timing sample exists. */
 } ptp_clock_snapshot_t;
