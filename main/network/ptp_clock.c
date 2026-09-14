@@ -1165,7 +1165,6 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
 
   const int64_t now_ns = get_local_time_ns();
   const uint32_t now_ms = (uint32_t)(now_ns / 1000000LL);
-  ptp_step_log_t step_ev = {0};
   taskENTER_CRITICAL(&ptp_state_mux);
 
   /* Snapshot is the buffered timing read boundary, so expire a stale lock
@@ -1175,15 +1174,6 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
       (now_ms - ptp.last_sync_ms) > LOCK_TIMEOUT_MS) {
     ptp.locked = false;
     ptp.lock_candidate_start_ms = 0;
-    step_ev.emit = true;
-    step_ev.reason = "lock-lost";
-    step_ev.source_clock_id = ptp.legacy_engine.source_clock_id;
-    step_ev.grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
-    step_ev.epoch = ptp.legacy_engine.epoch;
-    step_ev.raw_offset_ns = ptp.legacy_engine.raw_offset_ns;
-    step_ev.filtered_offset_ns = ptp.legacy_engine.filtered_offset_ns;
-    step_ev.raw_filter_delta_ns =
-        ptp.legacy_engine.raw_offset_ns - ptp.legacy_engine.filtered_offset_ns;
   }
 
   snapshot->realtime_mode = ptp.realtime_mode;
@@ -1232,7 +1222,6 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
     }
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
-  log_ptp_step(&step_ev);
 }
 
 void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {

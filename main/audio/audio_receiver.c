@@ -169,7 +169,6 @@ typedef struct {
   uint64_t anchor_local_ns; /* ESP monotonic time corresponding to anchor_rtp */
   uint64_t anchor_local_update_us; /* last qualified same-master local-anchor refresh */
   bool anchor_local_valid;
-  uint32_t buffered_hold_log_epoch; /* diagnostics only; never drives timing */
   uint32_t anchor_rtp;
   /* Realtime media-domain rebase. This is deliberately separate from PTP:
    * it only maps a new GM epoch onto the already-running local media phase. */
@@ -340,24 +339,6 @@ static void snapshot_state(timing_snapshot_t *out) {
                 ? UINT32_MAX
                 : (uint32_t)(stale_age_us / 1000ULL);
 
-        bool log_hold = false;
-        taskENTER_CRITICAL(&s.state_mux);
-        if (s.stream_type == AUDIO_STREAM_BUFFERED && s.anchor_valid &&
-            s.anchor_clock_id == out->anchor_clock_id &&
-            s.anchor_ptp_ns == out->anchor_ptp_ns &&
-            s.buffered_hold_log_epoch != ps.epoch) {
-          s.buffered_hold_log_epoch = ps.epoch;
-          log_hold = true;
-        }
-        taskEXIT_CRITICAL(&s.state_mux);
-        if (log_hold) {
-          ESP_LOGW(TAG,
-                   "AAC GM HOLD: anchor=%08" PRIx32
-                   " current=%08" PRIx32 " age=%" PRIu32 "ms",
-                   (uint32_t)(out->anchor_clock_id & 0xffffffffULL),
-                   (uint32_t)(ps.grandmaster_clock_id & 0xffffffffULL),
-                   stale_age_ms);
-        }
 
         /* Only a qualified new GM may take ownership. Rebuild its remote
          * anchor from the exact same cached ESP-local media point. */
@@ -386,12 +367,6 @@ static void snapshot_state(timing_snapshot_t *out) {
             }
             taskEXIT_CRITICAL(&s.state_mux);
             if (committed) {
-              ESP_LOGW(TAG,
-                       "AAC GM COMMIT: %08" PRIx32 " -> %08" PRIx32
-                       " after %" PRIu32 "ms",
-                       (uint32_t)(out->anchor_clock_id & 0xffffffffULL),
-                       (uint32_t)(ps.grandmaster_clock_id & 0xffffffffULL),
-                       stale_age_ms);
               out->anchor_clock_id = ps.grandmaster_clock_id;
               out->anchor_ptp_ns = new_remote_anchor;
             }
@@ -467,7 +442,6 @@ static void mark_timeline_discontinuity(void) {
   s.timeline_reset_pending = true;
   s.anchor_local_update_us = 0;
   s.anchor_local_valid = false;
-  s.buffered_hold_log_epoch = 0;
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;
   s.rt_media_rebase_epoch = 0;
@@ -2648,7 +2622,6 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_local_ns = 0; /* established after the anchor GM is PTP-locked */
   s.anchor_local_update_us = 0;
   s.anchor_local_valid = false;
-  s.buffered_hold_log_epoch = 0;
   s.anchor_rtp = rtp;
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;

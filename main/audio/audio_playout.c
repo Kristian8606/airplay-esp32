@@ -11,6 +11,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "led.h"
 
 #define TAG "audio_playout"
@@ -20,6 +22,13 @@
 #define I2S_RATE_HZ       44100U
 #define TX_TAG_Q_CAP      8U
 #define TX_DONE_Q_CAP     8U
+
+/* Allocate the I2S/GDMA channel from Core1 so its external interrupt is
+ * serviced on the same core as the playout task, away from Core0 network/PTP
+ * traffic. This helper task exists only during boot-time initialisation. */
+#define AUDIO_PLAYOUT_INIT_CORE  1
+#define AUDIO_PLAYOUT_INIT_STACK 4096U
+#define AUDIO_PLAYOUT_INIT_PRIO  5U
 
 typedef struct {
   uint32_t rtp;
@@ -118,7 +127,7 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
 }
 
 
-esp_err_t audio_playout_init(void) {
+static esp_err_t audio_playout_init_current_core(void) {
   if (s_tx) {
     return ESP_OK;
   }
@@ -197,6 +206,51 @@ esp_err_t audio_playout_init(void) {
 #endif
   );
   return ESP_OK;
+}
+
+typedef struct {
+  SemaphoreHandle_t done;
+  esp_err_t result;
+} audio_playout_init_ctx_t;
+
+static void audio_playout_init_task(void *arg) {
+  audio_playout_init_ctx_t *ctx = (audio_playout_init_ctx_t *)arg;
+  ctx->result = audio_playout_init_current_core();
+  xSemaphoreGive(ctx->done);
+  vTaskDelete(NULL);
+}
+
+esp_err_t audio_playout_init(void) {
+  if (s_tx) {
+    return ESP_OK;
+  }
+
+#if CONFIG_FREERTOS_UNICORE
+  return audio_playout_init_current_core();
+#else
+  SemaphoreHandle_t done = xSemaphoreCreateBinary();
+  if (!done) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  audio_playout_init_ctx_t ctx = {
+      .done = done,
+      .result = ESP_FAIL,
+  };
+
+  BaseType_t created = xTaskCreatePinnedToCore(
+      audio_playout_init_task, "i2s_init", AUDIO_PLAYOUT_INIT_STACK, &ctx,
+      AUDIO_PLAYOUT_INIT_PRIO, NULL, AUDIO_PLAYOUT_INIT_CORE);
+  if (created != pdPASS) {
+    vSemaphoreDelete(done);
+    return ESP_ERR_NO_MEM;
+  }
+
+  (void)xSemaphoreTake(done, portMAX_DELAY);
+  const esp_err_t result = ctx.result;
+  vSemaphoreDelete(done);
+  return result;
+#endif
 }
 
 esp_err_t audio_playout_flush(void) {
@@ -338,13 +392,6 @@ esp_err_t audio_playout_reset_tune(void) {
     return ESP_OK;
   }
 
-  const bool was_enabled = s_enabled;
-  if (was_enabled) {
-    esp_err_t de = i2s_channel_disable(s_tx);
-    if (de != ESP_OK) return de;
-    s_enabled = false;
-  }
-
   /* ADDSUB is relative to the current MCLK. Query the actual clock first and
    * return it to the nominal value. This avoids retaining a few Hz of rounding
    * residue after several incremental ppm changes in the previous session. */
@@ -368,11 +415,6 @@ esp_err_t audio_playout_reset_tune(void) {
     s_tune_ppm = 0;
   }
 
-  if (was_enabled) {
-    esp_err_t ee = i2s_channel_enable(s_tx);
-    if (ee == ESP_OK) s_enabled = true;
-    if (err == ESP_OK && ee != ESP_OK) err = ee;
-  }
   return err;
 }
 
@@ -417,19 +459,13 @@ esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
   };
   i2s_tuning_info_t info = {0};
 
-  /* IDF 5.5 requires READY for rate tuning. This is intentionally executed
-   * only between application writes on the playout task. Espressif's own
-   * dynamic-tuning example uses this same disable/tune/enable sequence. */
-  esp_err_t err = i2s_channel_disable(s_tx);
-  if (err != ESP_OK) return err;
-  s_enabled = false;
-  err = i2s_channel_tune_rate(s_tx, &cfg, &info);
+  /* i2s_channel_tune_rate() is the IDF runtime fine-tuning API. Keep
+   * the active DMA ring running so clock correction cannot reset TX/GDMA
+   * state or disturb the application tag-to-EOF chronology. */
+  esp_err_t err = i2s_channel_tune_rate(s_tx, &cfg, &info);
   if (err == ESP_OK) {
     s_tune_ppm = target_ppm;
   }
-  esp_err_t en_err = i2s_channel_enable(s_tx);
-  if (en_err == ESP_OK) s_enabled = true;
-  if (err == ESP_OK && en_err != ESP_OK) err = en_err;
 
   if (out) {
     out->requested_ppm = s_tune_ppm;
