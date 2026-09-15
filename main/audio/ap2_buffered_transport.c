@@ -75,6 +75,7 @@ struct ap2_buffered_transport {
    * descriptor pool; payload ownership remains in packet_desc_t. */
   uint16_t *ready_buckets;
   uint16_t ready_bucket_count;
+  uint32_t ready_bits[AP2_STORE_MAX_PACKET_SLOTS / 32U];
 
   /* TCP order is observational only. The reader records predecessor metadata
    * directly into each packet; no metadata FIFO gates ownership or decode. */
@@ -130,6 +131,7 @@ struct ap2_buffered_transport {
 
   SemaphoreHandle_t mutex;
   SemaphoreHandle_t space_ready;
+  SemaphoreHandle_t media_ready;
 
   int listen_sock;
   int client_sock;
@@ -235,6 +237,19 @@ static inline uint16_t ready_hash_bucket(const ap2_buffered_transport_t *t,
   return (uint16_t)(x & (uint32_t)(t->ready_bucket_count - 1U));
 }
 
+/* Coalesced wake hint; READY index and media revision remain authoritative. */
+void ap2_buffered_transport_notify_media(ap2_buffered_transport_t *t) {
+  if (t && t->media_ready) xSemaphoreGive(t->media_ready);
+}
+
+void ap2_buffered_transport_wait_media(ap2_buffered_transport_t *t,
+                                       uint32_t timeout_ms) {
+  if (!t || !t->media_ready) return;
+  TickType_t ticks = pdMS_TO_TICKS(timeout_ms);
+  if (!ticks) ticks = 1;
+  (void)xSemaphoreTake(t->media_ready, ticks);
+}
+
 static inline void ready_revision_bump_locked(ap2_buffered_transport_t *t) {
   t->ready_revision++;
   if (t->ready_revision == 0) t->ready_revision = 1;
@@ -251,6 +266,7 @@ static void ready_index_insert_locked(ap2_buffered_transport_t *t,
   d->ready_hash_next = t->ready_buckets[b];
   t->ready_buckets[b] = slot;
   d->ready_indexed = true;
+  t->ready_bits[slot >> 5] |= 1U << (slot & 31U);
   ready_revision_bump_locked(t);
 }
 
@@ -274,6 +290,7 @@ static void ready_index_remove_locked(ap2_buffered_transport_t *t,
     cur = t->packets[cur].ready_hash_next;
   }
   d->ready_indexed = false;
+  t->ready_bits[slot >> 5] &= ~(1U << (slot & 31U));
   d->ready_hash_next = AP2_STORE_INVALID_INDEX;
   ready_revision_bump_locked(t);
 }
@@ -606,7 +623,7 @@ static void publish_written_packet(ap2_buffered_transport_t *t, uint16_t slot) {
     ready_index_insert_locked(t, slot);
   }
   xSemaphoreGive(t->mutex);
-
+  ap2_buffered_transport_notify_media(t);
 }
 
 static void store_clear_epoch(ap2_buffered_transport_t *t) {
@@ -794,10 +811,11 @@ static esp_err_t ap2_buffered_transport_create_internal(
                                   : 0U;
   t->mutex = xSemaphoreCreateMutex();
   t->space_ready = xSemaphoreCreateBinary();
+  t->media_ready = xSemaphoreCreateBinary();
 
   if (!t->pages || !t->packets || !t->page_next || !t->free_packet_stack ||
       !t->ready_buckets || !t->invalid_ranges || !t->mutex ||
-      !t->space_ready) {
+      !t->space_ready || !t->media_ready) {
     ap2_buffered_transport_destroy(t);
     return ESP_ERR_NO_MEM;
   }
@@ -862,6 +880,7 @@ void ap2_buffered_transport_destroy(ap2_buffered_transport_t *t) {
   }
   if (t->mutex) vSemaphoreDelete(t->mutex);
   if (t->space_ready) vSemaphoreDelete(t->space_ready);
+  if (t->media_ready) vSemaphoreDelete(t->media_ready);
   free(t->invalid_ranges);
   free(t->ready_buckets);
   free(t->free_packet_stack);
@@ -908,6 +927,7 @@ void ap2_buffered_transport_clear(ap2_buffered_transport_t *t) {
 void ap2_buffered_transport_stop(ap2_buffered_transport_t *t) {
   if (!t) return;
   t->running = false;
+  ap2_buffered_transport_notify_media(t);
   if (t->client_sock >= 0) shutdown(t->client_sock, SHUT_RDWR);
   if (t->listen_sock >= 0) {
     shutdown(t->listen_sock, SHUT_RDWR);
@@ -1022,12 +1042,12 @@ bool ap2_buffered_transport_acquire_media_next(
     }
   }
 
-  /* Recovery-only path. Pay for the full descriptor scan only when there is
+  /* Recovery-only path. Scan the compact READY bitmap and live descriptors when there is
    * no contiguous decoder cursor (startup/seek/new neighbourhood), FLUSH has
    * made that cursor impossible, or the reorder deadline has been reached.
    *
    * A failed scan is memoized against the READY-set revision and cursor query.
-   * Repeating the same O(N) scan before TCP publishes/removes anything cannot
+   * Repeating the same scan before TCP publishes/removes anything cannot
    * produce a different answer, so yield back to the receiver loop instead. */
   if (best_slot == AP2_STORE_INVALID_INDEX && t->count_ready != 0) {
     if (recovery_miss_still_current_locked(
@@ -1043,64 +1063,69 @@ bool ap2_buffered_transport_acquire_media_next(
 
     AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_SCAN(
         (expected_valid && !allow_recovery_scan) ? 1U : 0U);
-    for (uint16_t i = 0; i < t->packet_count; ++i) {
-      packet_desc_t *d = &t->packets[i];
-      if (d->state != AP2_BUFFERED_PACKET_READY || !d->ready_indexed ||
-          d->invalidated || d->store_epoch != t->store_epoch) {
-        continue;
-      }
-
-      const int32_t playhead_delta = (int32_t)(d->rtp - wanted_rtp);
-      if (playhead_delta > max_lead_samples) {
-        const int64_t until_eligible =
-            (int64_t)playhead_delta - (int64_t)max_lead_samples;
-        if (until_eligible > 0 && until_eligible <= INT32_MAX &&
-            (int32_t)until_eligible < future_frames) {
-          future_frames = (int32_t)until_eligible;
-          future_wanted_rtp = wanted_rtp + (uint32_t)future_frames;
-          future_valid = true;
-        }
-        continue;
-      }
-      if ((int64_t)playhead_delta + (int64_t)frame_samples <= 0) continue;
-
-      int klass;
-      int32_t distance;
-      if (expected_valid) {
-        const int32_t d_expected = (int32_t)(d->rtp - expected_rtp);
-        if (d_expected == 0) {
-          klass = 0;
-          distance = 0;
-        } else if (d_expected > 0) {
-          klass = 1;
-          distance = d_expected;
-        } else if ((int64_t)d_expected + (int64_t)frame_samples > 0) {
-          klass = 2;
-          distance = -d_expected;
-        } else {
+    for (uint32_t word = 0; word < (t->packet_count + 31U) / 32U; ++word) {
+      uint32_t bits = t->ready_bits[word];
+      while (bits) {
+        const uint16_t i = (uint16_t)(word * 32U + (uint32_t)__builtin_ctz(bits));
+        bits &= bits - 1U;
+        packet_desc_t *d = &t->packets[i];
+        if (d->state != AP2_BUFFERED_PACKET_READY || !d->ready_indexed ||
+            d->invalidated || d->store_epoch != t->store_epoch) {
           continue;
         }
-      } else {
-        if (playhead_delta <= 0 &&
-            (int64_t)playhead_delta + (int64_t)frame_samples > 0) {
-          klass = 0;
-          distance = -playhead_delta;
-        } else if (playhead_delta > 0) {
-          klass = 1;
-          distance = playhead_delta;
-        } else {
+
+        const int32_t playhead_delta = (int32_t)(d->rtp - wanted_rtp);
+        if (playhead_delta > max_lead_samples) {
+          const int64_t until_eligible =
+              (int64_t)playhead_delta - (int64_t)max_lead_samples;
+          if (until_eligible > 0 && until_eligible <= INT32_MAX &&
+              (int32_t)until_eligible < future_frames) {
+            future_frames = (int32_t)until_eligible;
+            future_wanted_rtp = wanted_rtp + (uint32_t)future_frames;
+            future_valid = true;
+          }
           continue;
         }
-      }
+        if ((int64_t)playhead_delta + (int64_t)frame_samples <= 0) continue;
 
-      if (best_slot == AP2_STORE_INVALID_INDEX || klass < best_class ||
-          (klass == best_class && distance < best_distance) ||
-          (klass == best_class && distance == best_distance &&
-           d->arrival_id > best_arrival)) {
-        best_slot = i;
-        best_class = klass;
-        best_distance = distance;
-        best_arrival = d->arrival_id;
+        int klass;
+        int32_t distance;
+        if (expected_valid) {
+          const int32_t d_expected = (int32_t)(d->rtp - expected_rtp);
+          if (d_expected == 0) {
+            klass = 0;
+            distance = 0;
+          } else if (d_expected > 0) {
+            klass = 1;
+            distance = d_expected;
+          } else if ((int64_t)d_expected + (int64_t)frame_samples > 0) {
+            klass = 2;
+            distance = -d_expected;
+          } else {
+            continue;
+          }
+        } else {
+          if (playhead_delta <= 0 &&
+              (int64_t)playhead_delta + (int64_t)frame_samples > 0) {
+            klass = 0;
+            distance = -playhead_delta;
+          } else if (playhead_delta > 0) {
+            klass = 1;
+            distance = playhead_delta;
+          } else {
+            continue;
+          }
+        }
+
+        if (best_slot == AP2_STORE_INVALID_INDEX || klass < best_class ||
+            (klass == best_class && distance < best_distance) ||
+            (klass == best_class && distance == best_distance &&
+             d->arrival_id > best_arrival)) {
+          best_slot = i;
+          best_class = klass;
+          best_distance = distance;
+          best_arrival = d->arrival_id;
+        }
       }
     }
     AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_RESULT(
@@ -1215,6 +1240,28 @@ uint32_t ap2_buffered_transport_reap_invalid(ap2_buffered_transport_t *t,
   return n;
 }
 
+void ap2_buffered_transport_return_packet(ap2_buffered_transport_t *t,
+                                          const ap2_buffered_packet_ref_t *ref) {
+  if (!t || !ref) return;
+  bool freed = false;
+  xSemaphoreTake(t->mutex, portMAX_DELAY);
+  if (ref_matches_locked(t, ref) &&
+      t->packets[ref->slot].state == AP2_BUFFERED_PACKET_DECODING) {
+    packet_desc_t *d = &t->packets[ref->slot];
+    if (d->invalidated || d->store_epoch != t->store_epoch) {
+      packet_make_free_locked(t, ref->slot);
+      freed = true;
+    } else {
+      if (t->count_decoding) t->count_decoding--;
+      d->state = AP2_BUFFERED_PACKET_READY;
+      t->count_ready++;
+      ready_index_insert_locked(t, ref->slot);
+    }
+  }
+  xSemaphoreGive(t->mutex);
+  if (freed) signal_space(t);
+}
+
 esp_err_t ap2_buffered_transport_add_invalid_seq_range(
     ap2_buffered_transport_t *t, uint32_t from_seq, uint32_t until_seq) {
   if (!t) return ESP_ERR_INVALID_ARG;
@@ -1274,13 +1321,12 @@ esp_err_t ap2_buffered_transport_add_invalid_seq_range(
   }
   xSemaphoreGive(t->mutex);
   if (marked) signal_space(t);
+  ap2_buffered_transport_notify_media(t);
   return ESP_OK;
 }
 
-void ap2_buffered_transport_clear_invalidation_rules(
+static void clear_invalidation_rules_locked(
     ap2_buffered_transport_t *t) {
-  if (!t) return;
-  xSemaphoreTake(t->mutex, portMAX_DELAY);
   if (t->invalid_ranges && t->invalid_range_capacity) {
     memset(t->invalid_ranges, 0,
            (size_t)t->invalid_range_capacity * sizeof(*t->invalid_ranges));
@@ -1288,6 +1334,13 @@ void ap2_buffered_transport_clear_invalidation_rules(
   t->invalid_range_count = 0;
   t->invalid_before_active = false;
   t->invalidate_all_active = false;
+}
+
+void ap2_buffered_transport_clear_invalidation_rules(
+    ap2_buffered_transport_t *t) {
+  if (!t) return;
+  xSemaphoreTake(t->mutex, portMAX_DELAY);
+  clear_invalidation_rules_locked(t);
   xSemaphoreGive(t->mutex);
 }
 
@@ -1322,6 +1375,7 @@ uint32_t ap2_buffered_transport_invalidate_before_seq(
   }
   xSemaphoreGive(t->mutex);
   if (marked) signal_space(t);
+  ap2_buffered_transport_notify_media(t);
   return marked;
 }
 
@@ -1349,6 +1403,7 @@ uint32_t ap2_buffered_transport_invalidate_all(ap2_buffered_transport_t *t) {
   }
   xSemaphoreGive(t->mutex);
   if (marked) signal_space(t);
+  ap2_buffered_transport_notify_media(t);
   return marked;
 }
 
@@ -1357,17 +1412,21 @@ void ap2_buffered_transport_begin_media_update(ap2_buffered_transport_t *t) {
 }
 
 void ap2_buffered_transport_end_media_update(ap2_buffered_transport_t *t,
-                                             uint32_t revision) {
+                                             uint32_t revision,
+                                             bool retire_invalidation_rules) {
   if (!t) return;
+  /* Already INVALID packets retain that state; only future rules retire. */
+  if (retire_invalidation_rules) clear_invalidation_rules_locked(t);
   t->media_floor_valid = false;
   __atomic_store_n(&t->media_generation, revision, __ATOMIC_RELEASE);
   xSemaphoreGive(t->mutex);
+  ap2_buffered_transport_notify_media(t);
 }
 
 void ap2_buffered_transport_set_media_generation(
     ap2_buffered_transport_t *t, uint32_t revision) {
   ap2_buffered_transport_begin_media_update(t);
-  ap2_buffered_transport_end_media_update(t, revision);
+  ap2_buffered_transport_end_media_update(t, revision, false);
 }
 
 void ap2_buffered_transport_reset_media_floor(ap2_buffered_transport_t *t) {

@@ -57,7 +57,32 @@ static DRAM_ATTR audio_playout_completion_t s_done_q[TX_DONE_Q_CAP];
 static DRAM_ATTR uint32_t s_done_head;
 static DRAM_ATTR uint32_t s_done_tail;
 
+static DRAM_ATTR uint32_t s_fault;
+/* Only the single playout owner may wait; ISR never dereferences this handle
+ * after the task exits (the persistent playout task owns I2S for its lifetime). */
+static DRAM_ATTR TaskHandle_t s_completion_waiter;
+
+bool audio_playout_has_fault(void) {
+  return __atomic_load_n(&s_fault, __ATOMIC_ACQUIRE) != 0U;
+}
+
+static bool IRAM_ATTR wake_completion_waiter(void) {
+  BaseType_t woken = pdFALSE;
+  TaskHandle_t waiter = __atomic_load_n(&s_completion_waiter, __ATOMIC_ACQUIRE);
+  if (waiter) vTaskNotifyGiveFromISR(waiter, &woken);
+  return woken == pdTRUE;
+}
+
+static bool IRAM_ATTR on_send_q_ovf(i2s_chan_handle_t handle,
+                                    i2s_event_data_t *event, void *user_ctx) {
+  (void)handle; (void)event; (void)user_ctx;
+  __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
+  return wake_completion_waiter();
+}
+
 static inline void queues_reset(void) {
+  /* Called only with DMA stopped, so no ISR can republish an old fault. */
+  __atomic_store_n(&s_fault, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&s_tag_head, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&s_tag_tail, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&s_done_head, 0U, __ATOMIC_RELEASE);
@@ -117,13 +142,17 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
   (void)user_ctx;
 
   tx_tag_t tag;
-  if (!tag_pop_isr(&tag)) return false;
+  if (!tag_pop_isr(&tag)) {
+    __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
+    return wake_completion_waiter();
+  }
 
   /* esp_timer_get_time() is lock-free and documented for ISR use. Timestamp
    * the DMA EOF itself; conversion to PTP is done later in task context. */
   const int64_t done_local_us = esp_timer_get_time();
-  (void)done_push_isr(&tag, done_local_us);
-  return false;
+  if (!done_push_isr(&tag, done_local_us))
+    __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
+  return wake_completion_waiter();
 }
 
 
@@ -167,7 +196,7 @@ static esp_err_t audio_playout_init_current_core(void) {
       .on_recv = NULL,
       .on_recv_q_ovf = NULL,
       .on_sent = on_sent,
-      .on_send_q_ovf = NULL,
+      .on_send_q_ovf = on_send_q_ovf,
   };
   err = i2s_channel_register_event_callback(s_tx, &callbacks, NULL);
   if (err != ESP_OK) {
@@ -335,7 +364,7 @@ esp_err_t audio_playout_enable(void) {
 
 esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
                                      uint32_t rtp, uint32_t generation) {
-  if (!s_tx || !s_enabled || !stereo || frames == 0U) {
+  if (!s_tx || !s_enabled || !stereo || frames == 0U || audio_playout_has_fault()) {
     return ESP_ERR_INVALID_STATE;
   }
 
@@ -352,7 +381,7 @@ esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
                                     portMAX_DELAY);
 
 
-  if (err == ESP_OK && written == bytes) {
+  if (err == ESP_OK && written == bytes && !audio_playout_has_fault()) {
     /* RGB/VU is fed from the final I2S submission path. When disabled
      * in menuconfig this compiles to a no-op. */
     led_audio_feed(stereo, frames);
@@ -365,7 +394,7 @@ esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
 }
 
 bool audio_playout_poll_completion(audio_playout_completion_t *out) {
-  if (!out) {
+  if (!out || audio_playout_has_fault()) {
     return false;
   }
   const uint32_t tail = __atomic_load_n(&s_done_tail, __ATOMIC_RELAXED);
@@ -377,6 +406,21 @@ bool audio_playout_poll_completion(audio_playout_completion_t *out) {
   __atomic_store_n(&s_done_tail, (tail + 1U) % TX_DONE_Q_CAP,
                    __ATOMIC_RELEASE);
   return true;
+}
+
+bool audio_playout_wait_completion(audio_playout_completion_t *out,
+                                    uint32_t timeout_ticks) {
+  /* Arm before checking the queue: an EOF between checking and blocking must
+   * leave a notification. Notifications are only a wake hint; the queue owns
+   * the completion data, including when several EOFs coalesce. */
+  __atomic_store_n(&s_completion_waiter, xTaskGetCurrentTaskHandle(), __ATOMIC_RELEASE);
+  bool ready = audio_playout_poll_completion(out);
+  if (!ready && !audio_playout_has_fault()) {
+    (void)ulTaskNotifyTake(pdTRUE, (TickType_t)timeout_ticks);
+    ready = audio_playout_poll_completion(out);
+  }
+  __atomic_store_n(&s_completion_waiter, NULL, __ATOMIC_RELEASE);
+  return ready;
 }
 
 bool audio_playout_is_enabled(void) {

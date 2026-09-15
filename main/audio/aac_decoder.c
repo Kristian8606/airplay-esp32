@@ -8,14 +8,12 @@
 #include "esp_audio_dec.h"
 #include "esp_log.h"
 
-#define ADTS_HEADER_LEN 7U
+#define ADTS_HEADER_LEN AAC_DECODER_INPUT_HEADROOM
 #define AAC_INPUT_MAX   8192U
 
 struct aac_decoder {
   aac_decoder_config_t config;
   void *handle;
-  uint8_t *adts_scratch;
-  size_t adts_capacity;
 };
 
 static const char *TAG = "aac_dec_v1";
@@ -83,9 +81,7 @@ aac_decoder_t *aac_decoder_create(const aac_decoder_config_t *config) {
     return NULL;
   }
   d->config = *config;
-  d->adts_capacity = AAC_INPUT_MAX + ADTS_HEADER_LEN;
-  d->adts_scratch = malloc(d->adts_capacity);
-  if (!d->adts_scratch || !open_decoder(d)) {
+  if (!open_decoder(d)) {
     aac_decoder_destroy(d);
     return NULL;
   }
@@ -99,7 +95,6 @@ void aac_decoder_destroy(aac_decoder_t *d) {
   if (d->handle) {
     esp_aac_dec_close(d->handle);
   }
-  free(d->adts_scratch);
   free(d);
 }
 
@@ -107,7 +102,7 @@ bool aac_decoder_reset(aac_decoder_t *d) {
   return d && open_decoder(d);
 }
 
-int aac_decoder_decode(aac_decoder_t *d, const uint8_t *input,
+int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
                        size_t input_len, int16_t *output,
                        size_t output_capacity_frames,
                        aac_decode_info_t *info) {
@@ -119,13 +114,12 @@ int aac_decoder_decode(aac_decoder_t *d, const uint8_t *input,
   const uint8_t *decode_data = input;
   size_t decode_len = input_len;
   if (!has_adts(input, input_len)) {
-    if (input_len + ADTS_HEADER_LEN > d->adts_capacity) {
+    if (input_len > AAC_INPUT_MAX || input_len > 8191U - ADTS_HEADER_LEN) {
       return -1;
     }
-    make_adts(d->adts_scratch, input_len, d->config.sample_rate,
+    make_adts(input - ADTS_HEADER_LEN, input_len, d->config.sample_rate,
               d->config.channels);
-    memcpy(d->adts_scratch + ADTS_HEADER_LEN, input, input_len);
-    decode_data = d->adts_scratch;
+    decode_data = input - ADTS_HEADER_LEN;
     decode_len = input_len + ADTS_HEADER_LEN;
   }
 

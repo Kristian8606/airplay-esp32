@@ -2093,7 +2093,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
       if (ps.realtime_mode) {
         ptp_clock_set_master_clock_id(clock_id); /* observation/hint only */
         uint64_t local_ns = 0;
-        if (ptp_clock_realtime_time_to_local(clock_id, network_time_ns,
+        if (ptp_clock_realtime_snapshot_to_local(&ps, clock_id, network_time_ns,
                                               &local_ns)) {
           ESP_LOGI(TAG,
                    "SETRATEANCHORTIME RT local raw=%llu local=%llu gm=%016llx age=%lums",

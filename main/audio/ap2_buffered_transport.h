@@ -121,6 +121,11 @@ ssize_t ap2_buffered_transport_copy_packet(ap2_buffered_transport_t *t,
 void ap2_buffered_transport_release(ap2_buffered_transport_t *t,
                                     const ap2_buffered_packet_ref_t *ref);
 
+/* Abandon decoder chronology after a cursor move, retaining valid compressed
+ * media for later selection. Invalidated/old-session refs are freed instead. */
+void ap2_buffered_transport_return_packet(ap2_buffered_transport_t *t,
+                                          const ap2_buffered_packet_ref_t *ref);
+
 /* INVALID -> FREE. Writer also reaps lazily when storage is needed, so GC does
  * not gate playout. */
 uint32_t ap2_buffered_transport_reap_invalid(ap2_buffered_transport_t *t,
@@ -151,10 +156,13 @@ void ap2_buffered_transport_clear_invalidation_rules(
 /* Anchor revision, distinct from the playout generation. Increment on EVERY
  * buffered anchor update. begin/end serialize anchor commit with pressure GC.
  * Acquire before entering receiver state_mux; end after leaving it. Never wait
- * for a transport mutex from inside a critical section. */
+ * for a transport mutex from inside a critical section. A committed timeline
+ * passes retire_invalidation_rules=true so rule retirement and the new
+ * revision become visible together, before TCP publication can resume. */
 void ap2_buffered_transport_begin_media_update(ap2_buffered_transport_t *t);
 void ap2_buffered_transport_end_media_update(ap2_buffered_transport_t *t,
-                                             uint32_t revision);
+                                             uint32_t revision,
+                                             bool retire_invalidation_rules);
 /* Standalone update (takes the transport mutex). */
 void ap2_buffered_transport_set_media_generation(
     ap2_buffered_transport_t *t, uint32_t generation);
@@ -183,3 +191,8 @@ typedef struct {
 
 void ap2_buffered_transport_get_usage(ap2_buffered_transport_t *t,
                                       ap2_buffered_transport_usage_t *out);
+
+/* One AAC consumer; persistent binary wake hint, safe across codec switches. */
+void ap2_buffered_transport_notify_media(ap2_buffered_transport_t *transport);
+void ap2_buffered_transport_wait_media(ap2_buffered_transport_t *transport,
+                                       uint32_t timeout_ms);

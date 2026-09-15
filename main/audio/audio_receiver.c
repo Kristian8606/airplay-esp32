@@ -46,7 +46,6 @@
 #define AP2_STATUS_PRIORITY          1
 #define AP2_STATUS_CORE              0
 #define AP2_STATUS_PERIOD_MS      2000U
-#define AP2_STATUS_STOP_TIMEOUT_MS  100U
 #define AP2_PCM_CAPACITY_FRAMES    4096U
 
 #define AP2_PID_CALC_PERIOD_US    1000000LL  /* PID math at 1 Hz */
@@ -148,9 +147,10 @@ typedef struct {
   TaskHandle_t processor_task;
   TaskHandle_t playout_task;
   TaskHandle_t realtime_stage_task;
-  volatile bool status_running;
-  SemaphoreHandle_t status_stop_sem;
-  audio_stream_type_t status_stream_type;
+  TaskHandle_t status_task;
+  SemaphoreHandle_t status_wake;
+  SemaphoreHandle_t playout_wake;
+  esp_timer_handle_t playout_timer;
   uint8_t *packet;
   uint8_t *decrypt_buf;
   int16_t *decode_pcm;
@@ -259,11 +259,22 @@ static int64_t realtime_remaining_bias(int64_t bias_ns, int64_t start_us,
                      : bias_ns - (int64_t)correction_ns;
 }
 
-static void snapshot_state(timing_snapshot_t *out) {
-  uint64_t clock_id;
-  uint32_t epoch;
-  int64_t bias_ns, bias_start_us;
-  taskENTER_CRITICAL(&s.state_mux);
+static void playout_wake(void) {
+  if (s.playout_wake) xSemaphoreGive(s.playout_wake);
+}
+
+static void playout_timer_callback(void *arg) {
+  (void)arg;
+  playout_wake();
+}
+
+static void media_control_wake(void) {
+  ap2_buffered_transport_notify_media(s.transport);
+  playout_wake();
+}
+
+/* Pure read: only playout refreshes the cached PTP mapping. */
+static void snapshot_state_locked(timing_snapshot_t *out) {
   out->anchor_valid = s.anchor_valid;
   out->playing = s.playing;
   out->anchor_clock_id = s.anchor_clock_id;
@@ -282,6 +293,22 @@ static void snapshot_state(timing_snapshot_t *out) {
   out->timeline_reset_pending = s.timeline_reset_pending;
   out->stream_type = s.stream_type;
   out->playout_latency_samples = s.playout_latency_samples;
+}
+
+static void snapshot_state(timing_snapshot_t *out) {
+  taskENTER_CRITICAL(&s.state_mux);
+  snapshot_state_locked(out);
+  taskEXIT_CRITICAL(&s.state_mux);
+}
+
+/* Single writer for PTP refresh; control still owns anchor publication. */
+static void refresh_timing_snapshot(timing_snapshot_t *out) {
+  uint64_t clock_id;
+  uint32_t epoch;
+  int64_t bias_ns, bias_start_us;
+  taskENTER_CRITICAL(&s.state_mux);
+  snapshot_state_locked(out);
+  const bool was_local_valid = out->anchor_local_valid;
   clock_id = s.anchor_clock_id;
   epoch = s.rt_media_rebase_epoch;
   bias_ns = s.rt_media_rebase_bias_ns;
@@ -310,6 +337,9 @@ static void snapshot_state(timing_snapshot_t *out) {
           bool refreshed = false;
           taskENTER_CRITICAL(&s.state_mux);
           if (s.stream_type == AUDIO_STREAM_BUFFERED && s.anchor_valid &&
+              !s.timeline_reset_pending && s.generation == out->generation &&
+              s.media_revision == out->media_revision &&
+              s.anchor_rtp == out->anchor_rtp &&
               s.anchor_clock_id == out->anchor_clock_id &&
               s.anchor_ptp_ns == out->anchor_ptp_ns) {
             s.anchor_local_ns = local_anchor;
@@ -353,6 +383,9 @@ static void snapshot_state(timing_snapshot_t *out) {
             bool committed = false;
             taskENTER_CRITICAL(&s.state_mux);
             if (s.stream_type == AUDIO_STREAM_BUFFERED && s.anchor_valid &&
+                !s.timeline_reset_pending && s.generation == out->generation &&
+                s.media_revision == out->media_revision &&
+                s.anchor_rtp == out->anchor_rtp &&
                 s.anchor_clock_id == out->anchor_clock_id &&
                 s.anchor_ptp_ns == out->anchor_ptp_ns &&
                 s.anchor_local_valid &&
@@ -389,10 +422,12 @@ static void snapshot_state(timing_snapshot_t *out) {
       /* All normal timestamps are ESP uptime values. Reject overflow instead
        * of publishing an invalid deadline if control input is malformed. */
       if ((remaining > 0 && local_ns > (uint64_t)(INT64_MAX - remaining)) ||
-          (remaining < 0 && local_ns < (uint64_t)(-(remaining + 1)) + 1U))
+          (remaining < 0 && local_ns < (uint64_t)(-(remaining + 1)) + 1U)) {
+        snapshot_state(out);
         return;
+      }
       const int64_t effective = (int64_t)local_ns + remaining;
-      if (effective <= 0) return;
+      if (effective <= 0) { snapshot_state(out); return; }
       out->anchor_local_ns = (uint64_t)effective;
       /* Cache the most recent valid local map for a temporary PTP outage or
        * GM acquisition. Never overwrite an anchor changed during the lookup. */
@@ -406,6 +441,10 @@ static void snapshot_state(timing_snapshot_t *out) {
       taskEXIT_CRITICAL(&s.state_mux);
     }
   }
+  /* Return the committed map, including any control change during lookup. */
+  snapshot_state(out);
+  if (!was_local_valid && out->anchor_local_valid)
+    ap2_buffered_transport_notify_media(s.transport);
 }
 
 static uint32_t next_generation(uint32_t generation) {
@@ -417,16 +456,14 @@ static uint32_t next_generation(uint32_t generation) {
  * changes must not call this: they change the timing epoch, not the identity
  * of already received RTP-addressed PCM. */
 static uint32_t reset_buffered_pcm_store(void) {
-  uint32_t new_gen;
   taskENTER_CRITICAL(&s.state_mux);
-  new_gen = next_generation(s.buffered_pcm_generation);
-  taskEXIT_CRITICAL(&s.state_mux);
-
+  /* All identities used by the shared final ring come from the timing epoch
+   * allocator. A hard media reset is also a hard timing boundary; incrementing
+   * a separate AAC counter could reuse the preceding ALAC ring generation. */
+  const uint32_t new_gen = s.generation = next_generation(s.generation);
   if (s.pcm_ring) {
     pcm_rtp_ring_set_generation(s.pcm_ring, new_gen);
   }
-
-  taskENTER_CRITICAL(&s.state_mux);
   s.buffered_pcm_generation = new_gen;
   taskEXIT_CRITICAL(&s.state_mux);
   return new_gen;
@@ -449,6 +486,7 @@ static void mark_timeline_discontinuity(void) {
   taskEXIT_CRITICAL(&s.state_mux);
   realtime_stage_kick();
   __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
+  media_control_wake();
 }
 
 static uint32_t commit_anchor_epoch_locked(void) {
@@ -526,7 +564,7 @@ static bool wanted_rtp_at_presentation_ns(const timing_snapshot_t *snap,
  * - exactly one low-priority task owns periodic audio-status logging;
  * - the hot packet/decode path maintains no counters/timers just for logging;
  * - the playout task publishes sync/ppm only at its already-existing 1 Hz PID;
- * - codec switch/pause destroys this task, so there is no dormant logger. */
+ * - one persistent task sleeps on a semaphore while paused; control never waits. */
 static double status_frames_to_ms(uint32_t frames, int sample_rate) {
   const uint32_t sr = sample_rate > 0 ? (uint32_t)sample_rate : 44100U;
   return ((double)frames * 1000.0) / (double)sr;
@@ -567,19 +605,20 @@ static int32_t robust_phase_center_us(const output_sync_state_t *sync) {
 }
 
 static void audio_status_task(void *arg) {
-  const audio_stream_type_t task_stream = (audio_stream_type_t)(intptr_t)arg;
-
+  (void)arg;
   for (;;) {
-    if (xSemaphoreTake(s.status_stop_sem, pdMS_TO_TICKS(AP2_STATUS_PERIOD_MS)) ==
-        pdTRUE) {
-      break;
-    }
-
     timing_snapshot_t snap;
     snapshot_state(&snap);
-    if (!snap.playing || snap.stream_type != task_stream || !s.engine_running) {
-      break;
-    }
+    const bool active = s.engine_running && snap.playing &&
+        (snap.stream_type == AUDIO_STREAM_BUFFERED ||
+         snap.stream_type == AUDIO_STREAM_REALTIME);
+    if (xSemaphoreTake(s.status_wake, active ? pdMS_TO_TICKS(AP2_STATUS_PERIOD_MS)
+                                            : portMAX_DELAY) == pdTRUE) continue;
+    snapshot_state(&snap);
+    if (!s.engine_running || !snap.playing ||
+        (snap.stream_type != AUDIO_STREAM_BUFFERED &&
+         snap.stream_type != AUDIO_STREAM_REALTIME)) continue;
+    const audio_stream_type_t task_stream = snap.stream_type;
 
     const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
     uint32_t wanted = 0;
@@ -679,64 +718,10 @@ static void audio_status_task(void *arg) {
     }
   }
 
-  taskENTER_CRITICAL(&s.state_mux);
-  s.status_stream_type = AUDIO_STREAM_NONE;
-  taskEXIT_CRITICAL(&s.state_mux);
-  __atomic_store_n(&s.status_running, false, __ATOMIC_RELEASE);
-  vTaskDelete(NULL);
 }
 
-static bool audio_status_stop_and_wait(void) {
-  if (!__atomic_load_n(&s.status_running, __ATOMIC_ACQUIRE)) return true;
-
-  AUDIO_DIAG_FLUSH_STATUS_WAIT_BEGIN();
-  if (s.status_stop_sem) xSemaphoreGive(s.status_stop_sem);
-  TickType_t timeout_ticks = pdMS_TO_TICKS(AP2_STATUS_STOP_TIMEOUT_MS);
-  if (timeout_ticks == 0) timeout_ticks = 1;
-  for (TickType_t i = 0; i < timeout_ticks; ++i) {
-    if (!__atomic_load_n(&s.status_running, __ATOMIC_ACQUIRE)) {
-      AUDIO_DIAG_FLUSH_STATUS_WAIT_END(0U);
-      return true;
-    }
-    vTaskDelay(1);
-  }
-  if (!__atomic_load_n(&s.status_running, __ATOMIC_ACQUIRE)) {
-    AUDIO_DIAG_FLUSH_STATUS_WAIT_END(0U);
-    return true;
-  }
-  AUDIO_DIAG_FLUSH_STATUS_WAIT_END(1U);
-  ESP_LOGW(TAG, "audio status task stop timed out after %u ms",
-           (unsigned)AP2_STATUS_STOP_TIMEOUT_MS);
-  return false;
-}
-
-static void audio_status_start(audio_stream_type_t stream_type) {
-  if (stream_type != AUDIO_STREAM_BUFFERED &&
-      stream_type != AUDIO_STREAM_REALTIME) return;
-
-  taskENTER_CRITICAL(&s.state_mux);
-  const bool same_stream = s.status_stream_type == stream_type;
-  taskEXIT_CRITICAL(&s.state_mux);
-  if (__atomic_load_n(&s.status_running, __ATOMIC_ACQUIRE) && same_stream) return;
-
-  if (!audio_status_stop_and_wait() || !s.status_stop_sem) return;
-  while (xSemaphoreTake(s.status_stop_sem, 0) == pdTRUE) {}
-
-  taskENTER_CRITICAL(&s.state_mux);
-  s.status_stream_type = stream_type;
-  taskEXIT_CRITICAL(&s.state_mux);
-  __atomic_store_n(&s.status_running, true, __ATOMIC_RELEASE);
-
-  if (xTaskCreatePinnedToCore(audio_status_task, "audio_status", AP2_STATUS_STACK,
-                              (void *)(intptr_t)stream_type,
-                              AP2_STATUS_PRIORITY, NULL,
-                              AP2_STATUS_CORE) != pdPASS) {
-    __atomic_store_n(&s.status_running, false, __ATOMIC_RELEASE);
-    taskENTER_CRITICAL(&s.state_mux);
-    s.status_stream_type = AUDIO_STREAM_NONE;
-    taskEXIT_CRITICAL(&s.state_mux);
-    ESP_LOGW(TAG, "audio status task create failed");
-  }
+static void audio_status_notify(void) {
+  if (s.status_wake) xSemaphoreGive(s.status_wake);
 }
 
 static bool rtp_to_presentation_ns(const timing_snapshot_t *snap, uint32_t rtp,
@@ -763,19 +748,35 @@ static int64_t completion_presentation_ns(const timing_snapshot_t *snap,
 static void wait_until_presentation_ns(const timing_snapshot_t *snap,
                                        uint64_t target_ns) {
   while (s.engine_running) {
+    timing_snapshot_t current;
+    snapshot_state(&current);
+    if (!current.playing || !current.anchor_valid || current.timeline_reset_pending ||
+        current.generation != snap->generation ||
+        current.media_revision != snap->media_revision ||
+        current.anchor_clock_id != snap->anchor_clock_id ||
+        current.anchor_ptp_ns != snap->anchor_ptp_ns ||
+        current.anchor_rtp != snap->anchor_rtp ||
+        __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE)) break;
     const uint64_t now = presentation_now_ns(snap);
-    if (now >= target_ns) return;
+    if (now >= target_ns) break;
     const uint64_t remain_us = (target_ns - now) / 1000ULL;
-    if (remain_us > 2000ULL) {
-      vTaskDelay(1);
-    } else if (remain_us > 250ULL) {
-      esp_rom_delay_us(100);
-    } else if (remain_us > 40ULL) {
-      esp_rom_delay_us(20);
+    if (remain_us > 250U) {
+      /* Wake slightly before the edge. Timer/control tokens are hints only;
+       * re-read time and revision after every wake, including a stale token. */
+      (void)esp_timer_stop(s.playout_timer);
+      if (esp_timer_start_once(s.playout_timer, remain_us - 200U) == ESP_OK) {
+        (void)xSemaphoreTake(s.playout_wake, pdMS_TO_TICKS(50));
+        (void)esp_timer_stop(s.playout_timer);
+      } else if (remain_us > (uint64_t)portTICK_PERIOD_MS * 1000U + 250U) {
+        vTaskDelay(1);
+      } else {
+        esp_rom_delay_us(100);
+      }
     } else {
-      esp_rom_delay_us(2);
+      esp_rom_delay_us(remain_us > 40U ? 20U : 2U);
     }
   }
+  (void)esp_timer_stop(s.playout_timer);
 }
 
 /* Buffered AirPlay 2 addressable model: transport arrival, media validity,
@@ -796,12 +797,18 @@ static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
 
 /* Lock order: publish_mutex -> transport or PCM writer mutex -> state_mux.
  * Never sleep for backpressure with publish_mutex held. I2S remains lock-free. */
-static bool pcm_store_with_backpressure(uint32_t rtp, const int16_t *pcm,
+typedef enum {
+  PCM_STORE_DROPPED = 0,
+  PCM_STORE_PUBLISHED,
+  PCM_STORE_RESELECT,
+} pcm_store_result_t;
+
+static pcm_store_result_t pcm_store_with_backpressure(uint32_t rtp, const int16_t *pcm,
                                         size_t frames, int channels,
                                         uint32_t pcm_generation,
                                         const ap2_buffered_packet_ref_t *pkt) {
   if (!pcm || !pkt || channels != 2 || frames == 0 ||
-      frames > PCM_RTP_SLOT_FRAMES) return false;
+      frames > PCM_RTP_SLOT_FRAMES) return PCM_STORE_DROPPED;
   while (s.rx_running) {
     xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
     timing_snapshot_t snap;
@@ -810,27 +817,42 @@ static bool pcm_store_with_backpressure(uint32_t rtp, const int16_t *pcm,
         snap.stream_type != AUDIO_STREAM_BUFFERED ||
         ap2_buffered_transport_ref_is_invalid(s.transport, pkt)) {
       xSemaphoreGive(s.publish_mutex);
-      return false;
+      return PCM_STORE_DROPPED;
+    }
+    if (snap.playing && snap.anchor_valid && !snap.timeline_reset_pending &&
+        !timing_clock_ready(&snap)) {
+      xSemaphoreGive(s.publish_mutex);
+      ap2_buffered_transport_wait_media(s.transport, 10U);
+      continue;
     }
     uint32_t wanted = 0;
     const bool wanted_valid = wanted_rtp_now(&snap, &wanted);
-    if (wanted_valid && rtp_delta(rtp + (uint32_t)frames, wanted) <= 0) {
+    const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+    const int32_t max_lead = (int32_t)(((int64_t)sr * AP2_BUFFERED_LEAD_MS) / 1000LL);
+    if (!wanted_valid || rtp_delta(rtp, wanted) > max_lead) {
+      /* A pause/backward seek can move this already-decoded AU out of the
+       * live window. Return its compressed ref to READY instead of pinning
+       * the only decoder behind a protected PCM page from the new window. */
       xSemaphoreGive(s.publish_mutex);
-      return false;
+      return PCM_STORE_RESELECT;
+    }
+    if (rtp_delta(rtp + (uint32_t)frames, wanted) <= 0) {
+      xSemaphoreGive(s.publish_mutex);
+      return PCM_STORE_DROPPED;
     }
     const bool stored = pcm_rtp_ring_write(s.pcm_ring, rtp, pcm, frames, channels,
                                            pcm_generation, wanted, wanted_valid);
     xSemaphoreGive(s.publish_mutex);
-    if (stored) return true;
+    if (stored) {
+      playout_wake();
+      return PCM_STORE_PUBLISHED;
+    }
     vTaskDelay(1);
   }
-  return false;
+  return PCM_STORE_DROPPED;
 }
 
-static TickType_t delay_ticks_at_least_one(uint32_t delay_ms) {
-  TickType_t ticks = pdMS_TO_TICKS(delay_ms);
-  return ticks > 0 ? ticks : (TickType_t)1;
-}
+
 
 static void ap2_buffered_processor_task(void *arg) {
   (void)arg;
@@ -839,7 +861,6 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t expected_timestamp = 0;
   uint32_t expected_seq = 0;
   bool have_decoded_sequence = false;
-  bool play_enabled = false;
   bool decoder_history_dirty = false;
 
   /* EQ/AAC history belongs to media chronology, not to the PTP presentation
@@ -854,20 +875,10 @@ static void ap2_buffered_processor_task(void *arg) {
     bool made_progress = false;
     timing_snapshot_t state_snap;
     snapshot_state(&state_snap);
-    const bool control_play_enabled =
-        state_snap.stream_type == AUDIO_STREAM_BUFFERED && state_snap.playing;
-
-    if (control_play_enabled != play_enabled) {
-      play_enabled = control_play_enabled;
-    }
-
-    /* TCP publishes directly into the addressable READY index. There is no
-     * metadata FIFO and no transport-order ownership phase here. */
-    snapshot_state(&state_snap);
-    if (!play_enabled || state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
+    if (state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
         !state_snap.playing || !state_snap.anchor_valid ||
         state_snap.timeline_reset_pending || !timing_clock_ready(&state_snap)) {
-      if (!made_progress) vTaskDelay(delay_ticks_at_least_one(5));
+      ap2_buffered_transport_wait_media(s.transport, 10U);
       continue;
     }
 
@@ -877,7 +888,7 @@ static void ap2_buffered_processor_task(void *arg) {
     for (uint32_t decoded_now = 0; decoded_now < AP2_CSTORE_DECODE_BURST;
          ++decoded_now) {
       snapshot_state(&state_snap);
-      if (!play_enabled || state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
+      if (state_snap.stream_type != AUDIO_STREAM_BUFFERED ||
           !state_snap.playing || !state_snap.anchor_valid ||
           state_snap.timeline_reset_pending || !timing_clock_ready(&state_snap)) {
         break;
@@ -974,7 +985,7 @@ static void ap2_buffered_processor_task(void *arg) {
 
       int dec_len = audio_crypto_decrypt_buffered(&s.encrypt, s.packet,
                                                    pkt.packet_len,
-                                                   s.decrypt_buf,
+                                                   s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM,
                                                    AP2_PACKET_MAX);
       if (dec_len < 0) {
         ap2_buffered_transport_release(s.transport, &pkt);
@@ -1035,7 +1046,7 @@ static void ap2_buffered_processor_task(void *arg) {
       }
 
       aac_decode_info_t info = {0};
-      int frames = aac_decoder_decode(decoder, s.decrypt_buf, (size_t)dec_len,
+      int frames = aac_decoder_decode(decoder, s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, (size_t)dec_len,
                                       s.decode_pcm, AP2_PCM_CAPACITY_FRAMES,
                                       &info);
       if (frames < 0) {
@@ -1060,13 +1071,21 @@ static void ap2_buffered_processor_task(void *arg) {
        * publish_mutex and validates this DECODING ref while that mutex is held.
        * This is the authoritative race check; a standalone check immediately
        * before it could be invalidated by FLUSH one instruction later. */
-      if (pcm_store_with_backpressure(pkt.rtp, s.decode_pcm, (size_t)frames,
-                                      info.channels, snap.pcm_generation, &pkt)) {
+      const pcm_store_result_t stored = pcm_store_with_backpressure(
+          pkt.rtp, s.decode_pcm, (size_t)frames, info.channels,
+          snap.pcm_generation, &pkt);
+      if (stored == PCM_STORE_PUBLISHED) {
         /* FLUSH and publication share publish_mutex. If FLUSH runs now, it
          * invalidates this PCM itself; no post-write rollback can erase a
          * replacement at the same RTP address. */
         ap2_buffered_transport_release(s.transport, &pkt);
         continue;
+      }
+
+      if (stored == PCM_STORE_RESELECT) {
+        decoder_history_dirty = true;
+        ap2_buffered_transport_return_packet(s.transport, &pkt);
+        break;
       }
 
       if (ap2_buffered_transport_ref_is_invalid(s.transport, &pkt))
@@ -1079,8 +1098,8 @@ static void ap2_buffered_processor_task(void *arg) {
 
     /* CPU0 also hosts network/PTP/control work. Even with infinite READY
      * backlog this worker must yield after every bounded decode burst. */
-    vTaskDelay(made_progress ? AP2_DECODE_IDLE_TICKS
-                             : delay_ticks_at_least_one(5));
+    if (made_progress) vTaskDelay(AP2_DECODE_IDLE_TICKS);
+    else ap2_buffered_transport_wait_media(s.transport, 10U);
   }
 
   if (decoder) aac_decoder_destroy(decoder);
@@ -1387,9 +1406,22 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
   if (target < 0) target = 0;
   if (target > 32768) target = 32768;
   const int32_t start = *current_q15;
+  if (start == target) {
+    if (target == 32768) return;
+    if (target == 0) {
+      memset(pcm, 0, (size_t)frames * 2U * sizeof(*pcm));
+      return;
+    }
+    for (uint32_t i = 0; i < frames * 2U; ++i) {
+      const int32_t y = (int32_t)pcm[i] * target;
+      pcm[i] = (int16_t)(y >= 0 ? (y + 16384) >> 15
+                                      : -(((-y) + 16384) >> 15));
+    }
+    return;
+  }
   const int64_t dg = (int64_t)target - (int64_t)start;
   for (uint32_t f = 0; f < frames; ++f) {
-    const int32_t gain = dg == 0 ? target :
+    const int32_t gain =
         start + (int32_t)((dg * (int64_t)(f + 1U)) / (int64_t)frames);
     for (uint32_t ch = 0; ch < 2U; ++ch) {
       const uint32_t i = f * 2U + ch;
@@ -1416,9 +1448,32 @@ static bool playout_flush_checked(const char *reason) {
     return true;
   }
   __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
+  media_control_wake();
   ESP_LOGE(TAG, "PLAYOUT FLUSH failed (%s): %s",
            reason ? reason : "unknown", esp_err_to_name(err));
   return false;
+}
+
+/* Compare media maps only when the sender publishes a new buffered anchor.
+ * Same-GM remote times exclude local PTP filter movement from this decision.
+ * Across GMs compare the qualified local maps. At most one DMA block of phase
+ * adjustment stays with the servo; a larger cursor move needs fresh PRIME. */
+static bool buffered_anchor_moved(const timing_snapshot_t *previous,
+                                   const timing_snapshot_t *current) {
+  const bool same_clock = previous->anchor_clock_id == current->anchor_clock_id;
+  const uint64_t before = same_clock ? previous->anchor_ptp_ns
+                                     : previous->anchor_local_ns;
+  const uint64_t after = same_clock ? current->anchor_ptp_ns
+                                    : current->anchor_local_ns;
+  const int64_t time_delta_us = after >= before
+      ? (int64_t)((after - before) / 1000ULL)
+      : -(int64_t)((before - after) / 1000ULL);
+  const int sr = current->format.sample_rate > 0 ? current->format.sample_rate : 44100;
+  const int64_t media_delta_us =
+      ((int64_t)rtp_delta(current->anchor_rtp, previous->anchor_rtp) * 1000000LL) / sr;
+  const int64_t shift_us = time_delta_us - media_delta_us;
+  const int64_t block_us = ((int64_t)AUDIO_PLAYOUT_FRAMES * 1000000LL) / sr;
+  return shift_us > block_us || shift_us < -block_us;
 }
 
 static void ap2_playout_task(void *arg) {
@@ -1444,6 +1499,7 @@ static void ap2_playout_task(void *arg) {
 
   uint32_t cursor_rtp = 0; /* next block to submit after two preloaded blocks */
   uint32_t cursor_generation = 0;
+  timing_snapshot_t cursor_timing = {0};
   int32_t volume_current_q15 = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
   playout_state_t state = PLAYOUT_STOPPED;
   int32_t servo_ppm = 0;
@@ -1497,7 +1553,8 @@ static void ap2_playout_task(void *arg) {
       state = PLAYOUT_STOPPED;
     }
 
-    if (__atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL)) {
+    if (__atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL) ||
+        audio_playout_has_fault()) {
       if (!playout_flush_checked("control")) {
         vTaskDelay(1);
         continue;
@@ -1523,7 +1580,7 @@ static void ap2_playout_task(void *arg) {
     }
 
     timing_snapshot_t snap;
-    snapshot_state(&snap);
+    refresh_timing_snapshot(&snap);
     process_i2s_completions(&snap);
 
     uint32_t desired_rtp = 0;
@@ -1535,8 +1592,15 @@ static void ap2_playout_task(void *arg) {
 
     if (!timeline_ok) {
       state = PLAYOUT_STOPPED;
-      vTaskDelay(1);
+      (void)xSemaphoreTake(s.playout_wake, 1);
       continue;
+    }
+
+    if (state == PLAYOUT_RUNNING && snap.stream_type == AUDIO_STREAM_BUFFERED &&
+        cursor_generation == snap.generation &&
+        cursor_timing.media_revision != snap.media_revision) {
+      if (buffered_anchor_moved(&cursor_timing, &snap)) state = PLAYOUT_STOPPED;
+      cursor_timing = snap;
     }
 
     if (cursor_generation != snap.generation || state == PLAYOUT_STOPPED) {
@@ -1585,7 +1649,7 @@ static void ap2_playout_task(void *arg) {
       }
       if (!pcm_rtp_ring_has_range(s.pcm_ring, guard_start, guard_frames,
                                   snap.pcm_generation)) {
-        vTaskDelay(1);
+        (void)xSemaphoreTake(s.playout_wake, 1);
         continue;
       }
 
@@ -1650,15 +1714,15 @@ static void ap2_playout_task(void *arg) {
       audio_playout_completion_t probe_done;
       bool have_probe = false;
       while (esp_timer_get_time() < align_deadline) {
-        if (audio_playout_poll_completion(&probe_done)) {
+        if (audio_playout_wait_completion(&probe_done, 1U)) {
           if (probe_done.generation == 0U && probe_done.rtp == silence_rtp) {
             have_probe = true;
             break;
           }
           /* No real-generation completion can exist yet. Ignore any
            * stale completion left over from a prior disabled epoch. */
-        } else {
-          taskYIELD();
+        } else if (audio_playout_has_fault()) {
+          break;
         }
       }
       if (!have_probe) {
@@ -1782,6 +1846,7 @@ static void ap2_playout_task(void *arg) {
       }
 
       cursor_rtp = real_start_rtp + AUDIO_PLAYOUT_FRAMES;
+      cursor_timing = commit_snap;
       state = PLAYOUT_RUNNING;
       continue;
     }
@@ -1984,8 +2049,17 @@ static void ap2_playout_task(void *arg) {
 
 esp_err_t audio_receiver_init(void) {
   if (!s.publish_mutex) s.publish_mutex = xSemaphoreCreateMutex();
-  if (!s.status_stop_sem) s.status_stop_sem = xSemaphoreCreateBinary();
-  if (!s.publish_mutex || !s.status_stop_sem) return ESP_ERR_NO_MEM;
+  if (!s.status_wake) s.status_wake = xSemaphoreCreateBinary();
+  if (!s.playout_wake) s.playout_wake = xSemaphoreCreateBinary();
+  if (!s.publish_mutex || !s.status_wake || !s.playout_wake) return ESP_ERR_NO_MEM;
+  if (!s.playout_timer) {
+    const esp_timer_create_args_t timer_args = {
+        .callback = playout_timer_callback,
+        .name = "audio_start",
+    };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&timer_args, &s.playout_timer), TAG,
+                        "playout timer create failed");
+  }
 
   AUDIO_DIAG_BUFFER_PSRAM(
       AUDIO_DIAG_PSRAM_BEFORE_AUDIO,
@@ -2014,10 +2088,10 @@ esp_err_t audio_receiver_init(void) {
     }
   }
   if (!s.decrypt_buf) {
-    s.decrypt_buf = heap_caps_malloc(AP2_PACKET_MAX,
+    s.decrypt_buf = heap_caps_malloc(AP2_PACKET_MAX + AAC_DECODER_INPUT_HEADROOM,
                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s.decrypt_buf) {
-      s.decrypt_buf = malloc(AP2_PACKET_MAX);
+      s.decrypt_buf = malloc(AP2_PACKET_MAX + AAC_DECODER_INPUT_HEADROOM);
     }
   }
   if (!s.decode_pcm) {
@@ -2102,6 +2176,12 @@ esp_err_t audio_receiver_init(void) {
 
   ESP_RETURN_ON_ERROR(audio_playout_init(), TAG, "I2S playout init failed");
   s.engine_running = true;
+  if (!s.status_task &&
+      xTaskCreatePinnedToCore(audio_status_task, "audio_status", AP2_STATUS_STACK,
+                              NULL, AP2_STATUS_PRIORITY, &s.status_task,
+                              AP2_STATUS_CORE) != pdPASS) {
+    ESP_LOGW(TAG, "audio status task create failed");
+  }
   if (xTaskCreatePinnedToCore(ap2_playout_task, "ap2_playout",
                               AP2_PLAYOUT_STACK, NULL, AP2_PLAYOUT_PRIORITY,
                               &s.playout_task, AP2_DECODE_CORE) != pdPASS) {
@@ -2167,7 +2247,7 @@ void audio_receiver_set_stream_type(audio_stream_type_t t) {
   changed = s.stream_type != t;
   s.stream_type = t;
   taskEXIT_CRITICAL(&s.state_mux);
-  if (changed) (void)audio_status_stop_and_wait();
+  if (changed) audio_status_notify();
 }
 
 esp_err_t audio_receiver_start_buffered(uint16_t port) {
@@ -2208,6 +2288,7 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
                               AP2_PROCESS_STACK, NULL, AP2_DECODE_PRIORITY,
                               &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE) != pdPASS) {
     s.rx_running = false;
+    ap2_buffered_transport_notify_media(s.transport);
     ap2_buffered_transport_stop(s.transport);
     return ESP_FAIL;
   }
@@ -2339,13 +2420,14 @@ void audio_receiver_stop(void) {
   s.realtime_stage_cursor_valid = false;
   taskEXIT_CRITICAL(&s.state_mux);
   s.rx_running = false;
+  ap2_buffered_transport_notify_media(s.transport);
 
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);
   status_invalidate_sync();
-  (void)audio_status_stop_and_wait();
   mark_timeline_discontinuity();
+  audio_status_notify();
   __atomic_store_n(&s.playout_servo_reset_requested, true, __ATOMIC_RELEASE);
   const uint32_t quiesce_request =
       __atomic_add_fetch(&s.playout_quiesce_req, 1U, __ATOMIC_ACQ_REL);
@@ -2461,6 +2543,7 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
    * against the same sender timeline and waits until desired_rtp reaches
    * flush_rtp. */
   __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
+  media_control_wake();
   if (old_cursor_valid) {
     ESP_LOGI(TAG,
              "REALTIME FLUSH preserve timing rtp=%" PRIu32
@@ -2561,8 +2644,8 @@ void audio_receiver_pause(void) {
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);
   status_invalidate_sync();
-  (void)audio_status_stop_and_wait();
   mark_timeline_discontinuity();
+  audio_status_notify();
 }
 
 void audio_receiver_set_playout_latency_samples(uint32_t v) {
@@ -2573,18 +2656,15 @@ void audio_receiver_set_playout_latency_samples(uint32_t v) {
 uint32_t audio_receiver_get_hardware_latency_us(void) { return audio_playout_hardware_latency_us(); }
 
 void audio_receiver_set_playing(bool p) {
-  audio_stream_type_t stream_type;
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = p;
-  stream_type = s.stream_type;
   taskEXIT_CRITICAL(&s.state_mux);
-  if (p) {
-    audio_status_start(stream_type);
-  } else {
+  media_control_wake();
+  if (!p) {
     status_invalidate_sync();
-    (void)audio_status_stop_and_wait();
     mark_timeline_discontinuity();
   }
+  audio_status_notify();
 }
 
 bool audio_receiver_is_playing(void) {
@@ -2609,6 +2689,15 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   if (clock_id) {
     ptp_clock_set_master_clock_id(clock_id);
   }
+  ptp_clock_snapshot_t ps = {0};
+  ptp_clock_get_snapshot(&ps);
+  uint64_t local_ns = 0;
+  const bool local_valid = !ps.realtime_mode && ps.valid && ps.locked &&
+      ps.grandmaster_clock_id != 0 && ps.grandmaster_clock_id == clock_id &&
+      ps.mastership_age_ms >= 400U &&
+      ptp_clock_engine_remote_to_local(ptp_ns, ps.filtered_offset_ns, &local_ns) &&
+      local_ns != 0;
+  const uint64_t local_update_us = local_valid ? (uint64_t)esp_timer_get_time() : 0;
   uint32_t gen;
   uint32_t revision;
   bool committed;
@@ -2619,9 +2708,11 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   revision = s.media_revision = next_generation(s.media_revision);
   s.anchor_clock_id = clock_id;
   s.anchor_ptp_ns = ptp_ns;
-  s.anchor_local_ns = 0; /* established after the anchor GM is PTP-locked */
-  s.anchor_local_update_us = 0;
-  s.anchor_local_valid = false;
+  /* Publish both sides of the map together. No transient clock loss for a
+   * qualified same-GM refresh, including while AAC is publishing an AU. */
+  s.anchor_local_ns = local_valid ? local_ns : 0;
+  s.anchor_local_update_us = local_update_us;
+  s.anchor_local_valid = local_valid;
   s.anchor_rtp = rtp;
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;
@@ -2629,13 +2720,9 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.rt_media_rebase_bias_ns = 0;
   s.anchor_valid = true;
   taskEXIT_CRITICAL(&s.state_mux);
-  ap2_buffered_transport_end_media_update(s.transport, revision);
-  if (committed && s.transport) {
-    /* Rules describe the previous control timeline. Matching packets already
-     * marked INVALID stay invalid; only the rule table is retired so new
-     * timeline traffic is not judged by an old FLUSHBUFFERED range. */
-    ap2_buffered_transport_clear_invalidation_rules(s.transport);
-  }
+  /* Publish revision and retire old rules before TCP can acquire the store. */
+  ap2_buffered_transport_end_media_update(s.transport, revision, committed);
+  playout_wake();
   realtime_stage_kick();
 
   timing_snapshot_t anchor_snap;
@@ -2749,6 +2836,7 @@ bool audio_receiver_set_realtime_anchor_local(
   taskEXIT_CRITICAL(&s.state_mux);
 
   if (accepted) {
+    playout_wake();
     realtime_stage_kick();
   }
 

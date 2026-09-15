@@ -49,6 +49,12 @@ esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
  * esp_timer_get_time() inside the TX ISR. */
 bool audio_playout_poll_completion(audio_playout_completion_t *out);
 
+/* Sticky until a successful flush. Never use completions after a FIFO fault. */
+bool audio_playout_has_fault(void);
+/* Single playout owner only; timeout is in FreeRTOS ticks. */
+bool audio_playout_wait_completion(audio_playout_completion_t *out,
+                                    uint32_t timeout_ticks);
+
 bool audio_playout_is_enabled(void);
 uint32_t audio_playout_hardware_latency_us(void);
 
