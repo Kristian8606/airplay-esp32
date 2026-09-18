@@ -115,6 +115,7 @@ static struct {
   bool awaiting_followup;
   int64_t last_sync_correction_ns;
   uint64_t last_sync_source_clock_id;
+  uint32_t last_sync_source_ip;
   int64_t last_sync_process_lag_ns;
 
   /* NQPTP-derived buffered clock estimator. Socket admission / pairing stays
@@ -127,6 +128,8 @@ static struct {
    * these fields and continues through the legacy path above. */
   bool realtime_mode;
   uint32_t timing_peer_ip;        // network byte order; 0 = accept any source
+  ptp_clock_peer_t peers[PTP_CLOCK_MAX_PEERS];
+  size_t peer_count;
   uint64_t source_clock_id;       // PTP sourcePortIdentity clock id
   uint64_t grandmaster_clock_id;  // Announce grandmasterIdentity
 
@@ -366,6 +369,7 @@ static void fill_domain_step_locked(const char *reason,
   ptp.last_sync_local_ns = 0;
   ptp.last_sync_correction_ns = 0;
   ptp.last_sync_source_clock_id = 0;
+  ptp.last_sync_source_ip = 0;
   ptp.last_sync_process_lag_ns = 0;
 
   if (!preserve_holdover) {
@@ -379,13 +383,28 @@ static void fill_domain_step_locked(const char *reason,
   }
 }
 
+static bool peer_list_has_ipv4_locked(void);
+static bool peer_ipv4_matches_locked(uint32_t source_ip);
+
 /* Realtime source selection follows Shairport/NQPTP: the RTSP client IP is
  * the timing peer. sourcePortIdentity is diagnostic; Announce tells us which
  * grandmaster that peer is currently forwarding. Caller holds ptp_state_mux. */
 static bool realtime_source_matches_locked(uint32_t source_ip) {
-  if (ptp.timing_peer_ip == 0 || source_ip == ptp.timing_peer_ip) return true;
-  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
-  return false;
+  /* timingPeerInfo from SETUP is authoritative for realtime AirPlay. Do not
+   * broaden an already-selected peer merely because SETPEERS lists every
+   * member of a multiroom group. The advertised peer set is only a fallback
+   * when SETUP did not provide a timing peer. */
+  if (ptp.timing_peer_ip != 0) {
+    if (source_ip == ptp.timing_peer_ip) return true;
+    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
+    return false;
+  }
+  if (peer_list_has_ipv4_locked()) {
+    if (peer_ipv4_matches_locked(source_ip)) return true;
+    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
+    return false;
+  }
+  return true;
 }
 
 /* Reset only the estimator that belongs to one remote grandmaster. Audio
@@ -497,16 +516,44 @@ static void legacy_note_source_locked(uint64_t source_clock_id) {
   }
 }
 
+static bool peer_list_has_ipv4_locked(void) {
+  for (size_t i = 0; i < ptp.peer_count; ++i) {
+    if (ptp.peers[i].ipv4_addr != 0) return true;
+  }
+  return false;
+}
+
+static bool peer_ipv4_matches_locked(uint32_t source_ip) {
+  if (source_ip == 0) return false;
+  for (size_t i = 0; i < ptp.peer_count; ++i) {
+    if (ptp.peers[i].ipv4_addr != 0 && ptp.peers[i].ipv4_addr == source_ip)
+      return true;
+  }
+  return false;
+}
+
 /* Buffered mode follows one PTP source. Before SETRATEANCHORTIME gives us the
  * expected source, lock onto the first observed source and mark any competing
  * source as mixed rather than letting estimators alternate between clocks. */
-static bool legacy_source_admitted_locked(uint64_t source_clock_id) {
+static bool legacy_source_admitted_locked(uint64_t source_clock_id,
+                                          uint32_t source_ip) {
   if (source_clock_id == 0) return false;
   if (ptp.expected_clock_id != 0) {
+    /* D7/networkTimeTimelineID is authoritative. An incomplete peer list must
+     * never block the already-confirmed timing domain. */
     if (source_clock_id == ptp.expected_clock_id) return true;
     AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
     return false;
   }
+
+  /* Before the anchor arrives, use the AirPlay-advertised IPv4 peer set to
+   * avoid locking onto unrelated multicast PTP traffic. Fail open when the
+   * peer list has no usable IPv4 entries (for example IPv6-only SETPEERSX). */
+  if (peer_list_has_ipv4_locked() && !peer_ipv4_matches_locked(source_ip)) {
+    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
+    return false;
+  }
+
   if (ptp.legacy_engine.source_clock_id == 0 ||
       ptp.legacy_engine.source_clock_id == source_clock_id)
     return true;
@@ -517,6 +564,7 @@ static bool legacy_source_admitted_locked(uint64_t source_clock_id) {
 }
 
 static void process_announce_legacy(const uint8_t *data, size_t len,
+                                    uint32_t source_ip,
                                     int64_t reception_ns) {
   if (len < PTP_HEADER_SIZE) return;
   const uint64_t source_clock = parse_ptp_clock_id(data);
@@ -526,7 +574,7 @@ static void process_announce_legacy(const uint8_t *data, size_t len,
   ptp_step_log_t step_ev = {0};
   taskENTER_CRITICAL(&ptp_state_mux);
   AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_ANNOUNCE);
-  if (legacy_source_admitted_locked(source_clock)) {
+  if (legacy_source_admitted_locked(source_clock, source_ip)) {
     legacy_note_source_locked(source_clock);
     ptp_clock_engine_domain_event_t de = {0};
     if (ptp_clock_engine_set_domain(&ptp.legacy_engine, source_clock, gm, &de)) {
@@ -546,7 +594,7 @@ static void process_announce_legacy(const uint8_t *data, size_t len,
 }
 
 static void process_sync_legacy(const uint8_t *data, size_t len, uint16_t seq,
-                                int64_t reception_ns) {
+                                uint32_t source_ip, int64_t reception_ns) {
   if (len < PTP_HEADER_SIZE || reception_ns <= 0) return;
   const int64_t processing_lag_ns = get_local_time_ns() - reception_ns;
   const uint64_t source_clock = parse_ptp_clock_id(data);
@@ -554,7 +602,7 @@ static void process_sync_legacy(const uint8_t *data, size_t len, uint16_t seq,
   ptp_step_log_t step_ev = {0};
 
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (!legacy_source_admitted_locked(source_clock)) {
+  if (!legacy_source_admitted_locked(source_clock, source_ip)) {
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
@@ -577,6 +625,7 @@ static void process_sync_legacy(const uint8_t *data, size_t len, uint16_t seq,
   ptp.last_sync_local_ns = reception_ns;
   ptp.last_sync_correction_ns = sync_correction_ns;
   ptp.last_sync_source_clock_id = source_clock;
+  ptp.last_sync_source_ip = source_ip;
   ptp.last_sync_process_lag_ns = processing_lag_ns > 0 ? processing_lag_ns : 0;
   ptp.awaiting_followup = true;
 
@@ -598,7 +647,8 @@ static void process_sync_legacy(const uint8_t *data, size_t len, uint16_t seq,
 }
 
 static void process_followup_legacy(const uint8_t *data, size_t len,
-                                    uint16_t seq, int64_t reception_ns) {
+                                    uint16_t seq, uint32_t source_ip,
+                                    int64_t reception_ns) {
   if (len < PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE) return;
   const uint64_t followup_source = parse_ptp_clock_id(data);
   const int64_t followup_correction_ns = parse_ptp_correction_ns(data, len);
@@ -608,7 +658,7 @@ static void process_followup_legacy(const uint8_t *data, size_t len,
 
   ptp_step_log_t step_ev = {0};
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (!legacy_source_admitted_locked(followup_source)) {
+  if (!legacy_source_admitted_locked(followup_source, source_ip)) {
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
@@ -619,7 +669,7 @@ static void process_followup_legacy(const uint8_t *data, size_t len,
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
-  if (seq != ptp.last_sync_seq ||
+  if (seq != ptp.last_sync_seq || source_ip != ptp.last_sync_source_ip ||
       followup_source != ptp.last_sync_source_clock_id) {
     AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_PAIR_MISMATCH);
     taskEXIT_CRITICAL(&ptp_state_mux);
@@ -818,13 +868,16 @@ static void process_ptp_message(const uint8_t *data, size_t len,
   if (!realtime) {
     switch (msg_type) {
     case PTP_MSG_SYNC:
-      if (is_event_port) process_sync_legacy(data, len, seq, reception_ns);
+      if (is_event_port)
+        process_sync_legacy(data, len, seq, source_ip, reception_ns);
       break;
     case PTP_MSG_FOLLOW_UP:
-      if (!is_event_port) process_followup_legacy(data, len, seq, reception_ns);
+      if (!is_event_port)
+        process_followup_legacy(data, len, seq, source_ip, reception_ns);
       break;
     case PTP_MSG_ANNOUNCE:
-      if (!is_event_port) process_announce_legacy(data, len, reception_ns);
+      if (!is_event_port)
+        process_announce_legacy(data, len, source_ip, reception_ns);
       break;
     default:
       break;
@@ -1061,6 +1114,10 @@ void ptp_clock_clear(void) {
   ptp.mastership_start_ms = 0;
   ptp.last_sync_seq = 0;
   ptp.last_sync_local_ns = 0;
+  ptp.last_sync_correction_ns = 0;
+  ptp.last_sync_source_clock_id = 0;
+  ptp.last_sync_source_ip = 0;
+  ptp.last_sync_process_lag_ns = 0;
   ptp.awaiting_followup = false;
   ptp.expected_clock_id = 0;
   ptp.legacy_sample_clock_id = 0;
@@ -1087,6 +1144,55 @@ void ptp_clock_clear(void) {
   ptp.rt_sync_source_ip = 0;
   ptp.rt_awaiting_followup = false;
   taskEXIT_CRITICAL(&ptp_state_mux);
+}
+
+void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count) {
+  ptp_clock_peer_t normalized[PTP_CLOCK_MAX_PEERS] = {0};
+  size_t normalized_count = 0;
+
+  if (peers) {
+    for (size_t i = 0; i < count && normalized_count < PTP_CLOCK_MAX_PEERS;
+         ++i) {
+      if (peers[i].ipv4_addr == 0 && peers[i].clock_id == 0) continue;
+
+      bool duplicate = false;
+      for (size_t j = 0; j < normalized_count; ++j) {
+        if (normalized[j].ipv4_addr == peers[i].ipv4_addr &&
+            normalized[j].clock_id == peers[i].clock_id) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate) continue;
+
+      normalized[normalized_count].ipv4_addr = peers[i].ipv4_addr;
+      normalized[normalized_count].clock_id = peers[i].clock_id;
+      normalized_count++;
+    }
+  }
+
+  bool changed = false;
+  taskENTER_CRITICAL(&ptp_state_mux);
+  if (ptp.peer_count != normalized_count) {
+    changed = true;
+  } else {
+    for (size_t i = 0; i < normalized_count; ++i) {
+      if (ptp.peers[i].ipv4_addr != normalized[i].ipv4_addr ||
+          ptp.peers[i].clock_id != normalized[i].clock_id) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (changed) {
+    memset(ptp.peers, 0, sizeof(ptp.peers));
+    if (normalized_count > 0)
+      memcpy(ptp.peers, normalized,
+             normalized_count * sizeof(normalized[0]));
+    ptp.peer_count = normalized_count;
+  }
+  taskEXIT_CRITICAL(&ptp_state_mux);
+
 }
 
 void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
@@ -1246,6 +1352,10 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.mastership_start_ms = 0;
     ptp.last_sync_seq = 0;
     ptp.last_sync_local_ns = 0;
+    ptp.last_sync_correction_ns = 0;
+    ptp.last_sync_source_clock_id = 0;
+    ptp.last_sync_source_ip = 0;
+    ptp.last_sync_process_lag_ns = 0;
     ptp.awaiting_followup = false;
     ptp.expected_clock_id = 0;
     ptp.legacy_sample_clock_id = 0;
@@ -1372,6 +1482,7 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
         ptp.last_sync_local_ns = 0;
         ptp.last_sync_correction_ns = 0;
         ptp.last_sync_source_clock_id = 0;
+        ptp.last_sync_source_ip = 0;
         ptp.last_sync_process_lag_ns = 0;
         ptp.awaiting_followup = false;
         ptp.legacy_sample_clock_id = clock_id;

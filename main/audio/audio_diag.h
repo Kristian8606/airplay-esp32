@@ -139,15 +139,6 @@ void audio_diag_transport_aac_store_wait_begin(void);
 void audio_diag_transport_aac_store_wait_end(void);
 /* Decoder-cursor diagnostics. Normal exact hits stay O(1); these hooks only
  * count why the cursor waited or entered the recovery-only descriptor scan. */
-void audio_diag_transport_cursor_exact_hit(void);
-void audio_diag_transport_cursor_exact_miss(uint32_t too_early);
-void audio_diag_transport_cursor_guard_wait(void);
-void audio_diag_transport_cursor_recovery_scan(uint32_t flush_forced);
-void audio_diag_transport_cursor_recovery_result(uint32_t hit,
-                                                 uint32_t selected_rtp,
-                                                 int32_t distance_frames,
-                                                 uint32_t recovery_class);
-void audio_diag_transport_cursor_no_ready(void);
 #define AUDIO_DIAG_TRANSPORT_SOCKET_BUFFER(...) \
   audio_diag_transport_socket_buffer(__VA_ARGS__)
 #define AUDIO_DIAG_TRANSPORT_PORTS(...) audio_diag_transport_ports(__VA_ARGS__)
@@ -161,18 +152,6 @@ void audio_diag_transport_cursor_no_ready(void);
   audio_diag_transport_aac_store_wait_begin()
 #define AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_END() \
   audio_diag_transport_aac_store_wait_end()
-#define AUDIO_DIAG_TRANSPORT_CURSOR_EXACT_HIT() \
-  audio_diag_transport_cursor_exact_hit()
-#define AUDIO_DIAG_TRANSPORT_CURSOR_EXACT_MISS(...) \
-  audio_diag_transport_cursor_exact_miss(__VA_ARGS__)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_GUARD_WAIT() \
-  audio_diag_transport_cursor_guard_wait()
-#define AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_SCAN(...) \
-  audio_diag_transport_cursor_recovery_scan(__VA_ARGS__)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_RESULT(...) \
-  audio_diag_transport_cursor_recovery_result(__VA_ARGS__)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_NO_READY() \
-  audio_diag_transport_cursor_no_ready()
 #else
 #define AUDIO_DIAG_TRANSPORT_SOCKET_BUFFER(...) do {} while (0)
 #define AUDIO_DIAG_TRANSPORT_PORTS(...) do {} while (0)
@@ -181,12 +160,6 @@ void audio_diag_transport_cursor_no_ready(void);
 #define AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK(...) do {} while (0)
 #define AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_BEGIN() do {} while (0)
 #define AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_END() do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_EXACT_HIT() do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_EXACT_MISS(...) do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_GUARD_WAIT() do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_SCAN(...) do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_RECOVERY_RESULT(...) do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_CURSOR_NO_READY() do {} while (0)
 #endif
 
 #if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC

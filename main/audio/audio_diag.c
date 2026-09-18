@@ -589,21 +589,6 @@ typedef struct {
   uint32_t wait_events;
   uint32_t wait_total_us;
   uint32_t wait_max_us;
-  uint32_t cursor_exact_hit;
-  uint32_t cursor_exact_miss;
-  uint32_t cursor_exact_too_early;
-  uint32_t cursor_guard_wait;
-  uint32_t cursor_recovery_scan;
-  uint32_t cursor_recovery_hit;
-  uint32_t cursor_recovery_miss;
-  uint32_t cursor_flush_recovery;
-  uint32_t cursor_no_ready;
-  uint32_t cursor_recovery_class0;
-  uint32_t cursor_recovery_class1;
-  uint32_t cursor_recovery_class2;
-  uint32_t cursor_max_recovery_distance;
-  uint32_t cursor_last_recovery_rtp;
-  int32_t cursor_last_recovery_distance;
   int64_t last_block_us;
   int64_t wait_start_us;
   int64_t window_start_us;
@@ -675,62 +660,6 @@ void audio_diag_transport_aac_store_wait_end(void) {
   portEXIT_CRITICAL(&s_transport_aac_mux);
 }
 
-void audio_diag_transport_cursor_exact_hit(void) {
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  s_transport_aac.cursor_exact_hit++;
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
-void audio_diag_transport_cursor_exact_miss(uint32_t too_early) {
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  s_transport_aac.cursor_exact_miss++;
-  if (too_early) s_transport_aac.cursor_exact_too_early++;
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
-void audio_diag_transport_cursor_guard_wait(void) {
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  s_transport_aac.cursor_guard_wait++;
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
-void audio_diag_transport_cursor_recovery_scan(uint32_t flush_forced) {
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  s_transport_aac.cursor_recovery_scan++;
-  if (flush_forced) s_transport_aac.cursor_flush_recovery++;
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
-void audio_diag_transport_cursor_recovery_result(uint32_t hit,
-                                                 uint32_t selected_rtp,
-                                                 int32_t distance_frames,
-                                                 uint32_t recovery_class) {
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  if (hit) {
-    s_transport_aac.cursor_recovery_hit++;
-    if (recovery_class == 0U) s_transport_aac.cursor_recovery_class0++;
-    else if (recovery_class == 1U) s_transport_aac.cursor_recovery_class1++;
-    else if (recovery_class == 2U) s_transport_aac.cursor_recovery_class2++;
-    s_transport_aac.cursor_last_recovery_rtp = selected_rtp;
-    s_transport_aac.cursor_last_recovery_distance = distance_frames;
-    const uint32_t abs_distance =
-        distance_frames < 0 ? (uint32_t)(-(int64_t)distance_frames)
-                            : (uint32_t)distance_frames;
-    if (abs_distance > s_transport_aac.cursor_max_recovery_distance) {
-      s_transport_aac.cursor_max_recovery_distance = abs_distance;
-    }
-  } else {
-    s_transport_aac.cursor_recovery_miss++;
-  }
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
-void audio_diag_transport_cursor_no_ready(void) {
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  s_transport_aac.cursor_no_ready++;
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
 static void diag_transport_poll(void) {
   const int64_t now_us = esp_timer_get_time();
   uint32_t blocks;
@@ -739,21 +668,6 @@ static void diag_transport_poll(void) {
   uint32_t wait_events;
   uint32_t wait_total_us;
   uint32_t wait_max_us;
-  uint32_t cursor_exact_hit;
-  uint32_t cursor_exact_miss;
-  uint32_t cursor_exact_too_early;
-  uint32_t cursor_guard_wait;
-  uint32_t cursor_recovery_scan;
-  uint32_t cursor_recovery_hit;
-  uint32_t cursor_recovery_miss;
-  uint32_t cursor_flush_recovery;
-  uint32_t cursor_no_ready;
-  uint32_t cursor_recovery_class0;
-  uint32_t cursor_recovery_class1;
-  uint32_t cursor_recovery_class2;
-  uint32_t cursor_max_recovery_distance;
-  uint32_t cursor_last_recovery_rtp;
-  int32_t cursor_last_recovery_distance;
   uint32_t blocked_now_us = 0U;
   int64_t window_start_us;
 
@@ -764,21 +678,6 @@ static void diag_transport_poll(void) {
   wait_events = s_transport_aac.wait_events;
   wait_total_us = s_transport_aac.wait_total_us;
   wait_max_us = s_transport_aac.wait_max_us;
-  cursor_exact_hit = s_transport_aac.cursor_exact_hit;
-  cursor_exact_miss = s_transport_aac.cursor_exact_miss;
-  cursor_exact_too_early = s_transport_aac.cursor_exact_too_early;
-  cursor_guard_wait = s_transport_aac.cursor_guard_wait;
-  cursor_recovery_scan = s_transport_aac.cursor_recovery_scan;
-  cursor_recovery_hit = s_transport_aac.cursor_recovery_hit;
-  cursor_recovery_miss = s_transport_aac.cursor_recovery_miss;
-  cursor_flush_recovery = s_transport_aac.cursor_flush_recovery;
-  cursor_no_ready = s_transport_aac.cursor_no_ready;
-  cursor_recovery_class0 = s_transport_aac.cursor_recovery_class0;
-  cursor_recovery_class1 = s_transport_aac.cursor_recovery_class1;
-  cursor_recovery_class2 = s_transport_aac.cursor_recovery_class2;
-  cursor_max_recovery_distance = s_transport_aac.cursor_max_recovery_distance;
-  cursor_last_recovery_rtp = s_transport_aac.cursor_last_recovery_rtp;
-  cursor_last_recovery_distance = s_transport_aac.cursor_last_recovery_distance;
   window_start_us = s_transport_aac.window_start_us;
   if (s_transport_aac.wait_start_us > 0 && now_us > s_transport_aac.wait_start_us) {
     const int64_t blocked = now_us - s_transport_aac.wait_start_us;
@@ -790,21 +689,6 @@ static void diag_transport_poll(void) {
   s_transport_aac.wait_events = 0U;
   s_transport_aac.wait_total_us = 0U;
   s_transport_aac.wait_max_us = 0U;
-  s_transport_aac.cursor_exact_hit = 0U;
-  s_transport_aac.cursor_exact_miss = 0U;
-  s_transport_aac.cursor_exact_too_early = 0U;
-  s_transport_aac.cursor_guard_wait = 0U;
-  s_transport_aac.cursor_recovery_scan = 0U;
-  s_transport_aac.cursor_recovery_hit = 0U;
-  s_transport_aac.cursor_recovery_miss = 0U;
-  s_transport_aac.cursor_flush_recovery = 0U;
-  s_transport_aac.cursor_no_ready = 0U;
-  s_transport_aac.cursor_recovery_class0 = 0U;
-  s_transport_aac.cursor_recovery_class1 = 0U;
-  s_transport_aac.cursor_recovery_class2 = 0U;
-  s_transport_aac.cursor_max_recovery_distance = 0U;
-  s_transport_aac.cursor_last_recovery_rtp = 0U;
-  s_transport_aac.cursor_last_recovery_distance = 0;
   s_transport_aac.window_start_us = now_us;
   portEXIT_CRITICAL(&s_transport_aac_mux);
 
@@ -812,43 +696,7 @@ static void diag_transport_poll(void) {
     double window_s = 2.0;
     if (window_start_us > 0 && now_us > window_start_us) {
       window_s = (double)(now_us - window_start_us) / 1000000.0;
-      if (window_s < 0.001) window_s = 0.001;
     }
-    ESP_LOGI(TAG,
-             "TRANSPORT AAC/2s blocks=%lu rate=%.1f/s rx=%.1fKiB/s maxGap=%.2fms storeWait=%.2fms waits=%lu maxWait=%.2fms blocked=%.2fms",
-             (unsigned long)blocks, (double)blocks / window_s,
-             ((double)payload_bytes / 1024.0) / window_s,
-             (double)max_gap_us / 1000.0,
-             (double)wait_total_us / 1000.0,
-             (unsigned long)wait_events,
-             (double)wait_max_us / 1000.0,
-             (double)blocked_now_us / 1000.0);
-  }
-  if (cursor_exact_hit || cursor_exact_miss || cursor_recovery_scan ||
-      cursor_no_ready) {
-    const uint32_t cursor_exact_absent =
-        cursor_exact_miss >= cursor_exact_too_early
-            ? cursor_exact_miss - cursor_exact_too_early
-            : 0U;
-    ESP_LOGI(TAG,
-             "TRANSPORT CURSOR/2s exactReady=%lu absent=%lu paced=%lu guard=%lu recovery=%lu/%lu/%lu flush=%lu noReady=%lu class=%lu/%lu/%lu lastRtp=%lu lastDist=%ldf maxDist=%luf",
-             (unsigned long)cursor_exact_hit,
-             (unsigned long)cursor_exact_absent,
-             (unsigned long)cursor_exact_too_early,
-             (unsigned long)cursor_guard_wait,
-             (unsigned long)cursor_recovery_scan,
-             (unsigned long)cursor_recovery_hit,
-             (unsigned long)cursor_recovery_miss,
-             (unsigned long)cursor_flush_recovery,
-             (unsigned long)cursor_no_ready,
-             (unsigned long)cursor_recovery_class0,
-             (unsigned long)cursor_recovery_class1,
-             (unsigned long)cursor_recovery_class2,
-             (unsigned long)cursor_last_recovery_rtp,
-             (long)cursor_last_recovery_distance,
-             (unsigned long)cursor_max_recovery_distance);
-  }
-}
 #endif
 
 #if defined(CONFIG_AIRPLAY_DIAG_LIFECYCLE) && CONFIG_AIRPLAY_DIAG_LIFECYCLE

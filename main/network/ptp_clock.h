@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
@@ -26,6 +27,29 @@ void ptp_clock_stop(void);
  * Called during TEARDOWN to allow re-sync on new session.
  */
 void ptp_clock_clear(void);
+
+#define PTP_CLOCK_MAX_PEERS 16
+
+typedef struct {
+  /* IPv4 address in network byte order. Zero means no usable IPv4 address was
+   * advertised for this peer (for example an IPv6-only SETPEERSX entry). */
+  uint32_t ipv4_addr;
+  /* Optional SETPEERSX ClockID. It is tracked for identity/diagnostics but is
+   * not trusted as a hard admission key because observed senders disagree on
+   * whether it names the PTP source port identity or the selected GM. */
+  uint64_t clock_id;
+} ptp_clock_peer_t;
+
+/**
+ * Atomically replace the AirPlay-advertised PTP peer set.
+ *
+ * This never resets the active estimator and never changes audio timing. The
+ * peer list is used to reject unrelated IPv4 PTP sources while the buffered
+ * path does not yet have an authoritative D7/networkTimeTimelineID clock id,
+ * and to broaden the realtime timing-peer admission to explicitly advertised
+ * group peers. Passing NULL/0 clears the tracked list.
+ */
+void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count);
 
 /**
  * Get current PTP time in nanoseconds.

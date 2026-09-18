@@ -4,11 +4,7 @@ set(SRC_FILES
     "settings.c"
     "led.c"
     "audio/audio_receiver.c"
-<<<<<<< Updated upstream
-    "audio/ap2_buffered_transport.c"
-=======
     "audio/ap2_buffered_fifo.c"
->>>>>>> Stashed changes
     "audio/audio_eq.c"
     "audio/aac_decoder.c"
     "audio/alac_decoder.c"

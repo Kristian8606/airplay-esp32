@@ -118,6 +118,11 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->event_port = 0;
   conn->buffered_port = 0;
 
+  // Connection teardown ends the lifetime of SETPEERS/SETPEERSX metadata.
+  // Stream-level TEARDOWN keeps the RTSP connection alive and therefore does
+  // not come through this cleanup path until the session actually closes.
+  ptp_clock_set_peers(NULL, 0);
+
   // Clear PTP clock for fresh sync on next connection
   ptp_clock_clear();
 
