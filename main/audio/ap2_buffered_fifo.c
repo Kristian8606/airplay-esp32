@@ -31,7 +31,6 @@ typedef struct {
 
 struct ap2_buffered_fifo {
   uint8_t *buffer;
-  bool owns_buffer;
   size_t capacity;
   size_t read_pos;
   size_t write_pos;
@@ -48,7 +47,6 @@ struct ap2_buffered_fifo {
   uint32_t immediate_until_rtp;
   deferred_flush_t deferred[AP2_BUFFERED_FIFO_MAX_DEFERRED];
 
-  bool reader_waiting_for_space;
   bool connected;
 
   int listen_sock;
@@ -104,7 +102,6 @@ static void fifo_discard_all(ap2_buffered_fifo_t *fifo) {
   xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
-  fifo->reader_waiting_for_space = false;
   /* Change epoch while the FIFO lock is held. An in-flight recv() captured
    * the old epoch before blocking; when it returns it must not commit those
    * pre-flush bytes into the newly-cleared FIFO. */
@@ -144,7 +141,6 @@ static bool fifo_read_exact(ap2_buffered_fifo_t *fifo, uint8_t *dst,
     fifo->read_pos += n;
     if (fifo->read_pos == fifo->capacity) fifo->read_pos = 0;
     fifo->occupancy -= n;
-    fifo->reader_waiting_for_space = false;
     xSemaphoreGive(fifo->fifo_mutex);
     copied += n;
     xSemaphoreGive(fifo->not_full);
@@ -189,7 +185,6 @@ static void tcp_reader_task(void *arg) {
     fifo->read_pos = 0;
     fifo->write_pos = 0;
     fifo->occupancy = 0;
-    fifo->reader_waiting_for_space = false;
     fifo->connected = true;
     xSemaphoreGive(fifo->fifo_mutex);
     (void)next_epoch(fifo);
@@ -210,13 +205,11 @@ static void tcp_reader_task(void *arg) {
 
       xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
       if (fifo->occupancy == fifo->capacity) {
-        fifo->reader_waiting_for_space = true;
         xSemaphoreGive(fifo->fifo_mutex);
         (void)xSemaphoreTake(fifo->not_full, pdMS_TO_TICKS(100));
         continue;
       }
 
-      fifo->reader_waiting_for_space = false;
       const size_t free_bytes = fifo->capacity - fifo->occupancy;
       request = free_bytes < FIFO_RECV_CHUNK ? free_bytes : FIFO_RECV_CHUNK;
       const size_t to_end = fifo->capacity - fifo->write_pos;
@@ -251,7 +244,6 @@ static void tcp_reader_task(void *arg) {
     fifo->connected = false;
     fifo->read_pos = fifo->write_pos;
     fifo->occupancy = 0;
-    fifo->reader_waiting_for_space = false;
     xSemaphoreGive(fifo->fifo_mutex);
     (void)next_epoch(fifo);
     signal_all(fifo);
@@ -311,7 +303,6 @@ void ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo) {
   if (fifo->not_full) vSemaphoreDelete(fifo->not_full);
   if (fifo->control_mutex) vSemaphoreDelete(fifo->control_mutex);
   if (fifo->control_wake) vSemaphoreDelete(fifo->control_wake);
-  if (fifo->owns_buffer) free(fifo->buffer);
   free(fifo);
 }
 
@@ -350,7 +341,6 @@ void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
   fifo->connected = false;
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
-  fifo->reader_waiting_for_space = false;
   xSemaphoreGive(fifo->fifo_mutex);
   (void)next_epoch(fifo);
   signal_all(fifo);
@@ -395,9 +385,6 @@ void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
   xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
   out->capacity_bytes = fifo->capacity;
   out->used_bytes = fifo->occupancy;
-  out->free_bytes = fifo->capacity - fifo->occupancy;
-  out->connected = fifo->connected;
-  out->reader_waiting_for_space = fifo->reader_waiting_for_space;
   xSemaphoreGive(fifo->fifo_mutex);
 
   xSemaphoreTake(fifo->control_mutex, portMAX_DELAY);
@@ -437,7 +424,6 @@ esp_err_t ap2_buffered_fifo_read_packet(ap2_buffered_fifo_t *fifo,
 
     packet->seq = be32_local(packet_storage) & FIFO_SEQ_MASK;
     packet->rtp = be32_local(packet_storage + 4);
-    packet->ssrc = be32_local(packet_storage + 8);
     packet->len = body_len;
     packet->stream_epoch = epoch;
 
@@ -494,9 +480,7 @@ void ap2_buffered_fifo_classify_packet(
       if (decision->activation_count < AP2_BUFFERED_FIFO_MAX_ACTIVATIONS) {
         ap2_buffered_flush_activation_t *a =
             &decision->activations[decision->activation_count++];
-        a->from_seq = r->from_seq;
         a->from_rtp = r->from_rtp;
-        a->until_seq = r->until_seq;
         a->until_rtp = r->until_rtp;
       }
     }

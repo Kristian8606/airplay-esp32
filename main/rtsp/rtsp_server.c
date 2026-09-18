@@ -52,10 +52,6 @@ typedef struct {
 static client_slot_t clients[2] = {0}; // Current and old
 static int current_slot = 0;
 
-// Flag set by the play/pause button to tell the grace period loop
-// to send a DACP resume command and keep waiting for reconnect.
-static volatile bool s_resume_requested = false;
-
 // Public API for volume control
 void airplay_set_volume(float volume_db) {
   client_slot_t *c = &clients[current_slot];
@@ -70,10 +66,6 @@ int32_t airplay_get_volume_q15(void) {
     return rtsp_conn_get_volume_q15(c->conn);
   }
   return 16384; // 50% volume for new clients
-}
-
-void rtsp_server_request_resume(void) {
-  s_resume_requested = true;
 }
 
 // Helper to grow buffer

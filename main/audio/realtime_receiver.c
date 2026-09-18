@@ -1146,14 +1146,8 @@ void realtime_receiver_get_usage(realtime_receiver_usage_t *out) {
   if (!out) return;
   memset(out, 0, sizeof(*out));
   out->work_queue_capacity = RT_WORK_QUEUE_SLOTS;
-  out->data_pool_capacity = RT_DATA_POOL_SLOTS;
-  out->rtx_pool_capacity = RT_RTX_POOL_SLOTS;
   if (s_rt.work_q)
     out->work_queue_depth = (uint32_t)uxQueueMessagesWaiting(s_rt.work_q);
-  if (s_rt.data_free_q)
-    out->data_pool_free = (uint32_t)uxQueueMessagesWaiting(s_rt.data_free_q);
-  if (s_rt.rtx_free_q)
-    out->rtx_pool_free = (uint32_t)uxQueueMessagesWaiting(s_rt.rtx_free_q);
 }
 
 bool realtime_receiver_is_running(void) { return rt_running(); }

@@ -25,10 +25,6 @@ typedef bool (*realtime_deadline_cb_t)(uint32_t rtp,
 typedef struct {
   uint32_t work_queue_depth;
   uint32_t work_queue_capacity;
-  uint32_t data_pool_free;
-  uint32_t data_pool_capacity;
-  uint32_t rtx_pool_free;
-  uint32_t rtx_pool_capacity;
 } realtime_receiver_usage_t;
 
 typedef struct {

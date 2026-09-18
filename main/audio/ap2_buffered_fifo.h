@@ -21,15 +21,12 @@ typedef struct {
 typedef struct {
   uint32_t seq;
   uint32_t rtp;
-  uint32_t ssrc;
   size_t len;
   uint32_t stream_epoch;
 } ap2_buffered_packet_t;
 
 typedef struct {
-  uint32_t from_seq;
   uint32_t from_rtp;
-  uint32_t until_seq;
   uint32_t until_rtp;
 } ap2_buffered_flush_activation_t;
 
@@ -46,9 +43,6 @@ typedef struct {
 typedef struct {
   size_t capacity_bytes;
   size_t used_bytes;
-  size_t free_bytes;
-  bool connected;
-  bool reader_waiting_for_space;
   bool immediate_flush_active;
   uint32_t immediate_target_seq;
   uint32_t deferred_requests;
