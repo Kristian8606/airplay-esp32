@@ -13,7 +13,11 @@
 #include "audio_eq.h"
 #include "audio_crypto.h"
 #include "audio_diag.h"
+<<<<<<< Updated upstream
 #include "ap2_buffered_transport.h"
+=======
+#include "ap2_buffered_fifo.h"
+>>>>>>> Stashed changes
 #include "pcm_rtp_ring.h"
 #include "audio_playout.h"
 #include "realtime_receiver.h"
@@ -85,9 +89,12 @@
 #define AP2_RT_GM_REBASE_SETTLE_MS  1000U
 #define AP2_BUFFERED_STORE_REQUEST_BYTES AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES
 #define AP2_BUFFERED_LEAD_MS       (AP2_PCM_TARGET_MS + 100U)
+<<<<<<< Updated upstream
 #define AP2_CSTORE_DECODE_BURST          8U
 #define AP2_CSTORE_REORDER_GUARD_MS    300U
 #define AP2_DECODE_IDLE_TICKS            1U
+=======
+>>>>>>> Stashed changes
 #define AP2_PHASE_HISTORY_SAMPLES        32U
 
 /* ALAC reorder release point. Missing PCM stays absent in the raw RTP ring
@@ -143,7 +150,11 @@ typedef struct {
   volatile bool rx_running;
 
   SemaphoreHandle_t publish_mutex; /* producers/FLUSH only; never I2S */
+<<<<<<< Updated upstream
   ap2_buffered_transport_t *transport;
+=======
+  ap2_buffered_fifo_t *transport;
+>>>>>>> Stashed changes
   TaskHandle_t processor_task;
   TaskHandle_t playout_task;
   TaskHandle_t realtime_stage_task;
@@ -151,7 +162,11 @@ typedef struct {
   SemaphoreHandle_t status_wake;
   SemaphoreHandle_t playout_wake;
   esp_timer_handle_t playout_timer;
+<<<<<<< Updated upstream
   uint8_t *packet;
+=======
+  uint8_t *buffered_packet;
+>>>>>>> Stashed changes
   uint8_t *decrypt_buf;
   int16_t *decode_pcm;
   int16_t *realtime_stage_pcm;
@@ -199,7 +214,10 @@ typedef struct {
    * unprocessed I2S flush/reset. */
   volatile uint32_t playout_quiesce_req;
   volatile uint32_t playout_quiesce_ack;
+<<<<<<< Updated upstream
 
+=======
+>>>>>>> Stashed changes
   output_sync_state_t output_sync;
 
   /* Only the existing 1 Hz PID loop publishes these. The 2 s status
@@ -222,6 +240,10 @@ static ap2_state_t s = {
     .realtime_stage_idle = true,
 };
 
+<<<<<<< Updated upstream
+=======
+
+>>>>>>> Stashed changes
 static inline void realtime_stage_kick(void) {
   TaskHandle_t task = s.realtime_stage_task;
   if (task) {
@@ -269,7 +291,11 @@ static void playout_timer_callback(void *arg) {
 }
 
 static void media_control_wake(void) {
+<<<<<<< Updated upstream
   ap2_buffered_transport_notify_media(s.transport);
+=======
+  ap2_buffered_fifo_notify(s.transport);
+>>>>>>> Stashed changes
   playout_wake();
 }
 
@@ -444,7 +470,11 @@ static void refresh_timing_snapshot(timing_snapshot_t *out) {
   /* Return the committed map, including any control change during lookup. */
   snapshot_state(out);
   if (!was_local_valid && out->anchor_local_valid)
+<<<<<<< Updated upstream
     ap2_buffered_transport_notify_media(s.transport);
+=======
+    ap2_buffered_fifo_notify(s.transport);
+>>>>>>> Stashed changes
 }
 
 static uint32_t next_generation(uint32_t generation) {
@@ -469,10 +499,16 @@ static uint32_t reset_buffered_pcm_store(void) {
   return new_gen;
 }
 
+<<<<<<< Updated upstream
 /* Pause/immediate FLUSH ends the current presentation timeline now, but it does
  * not by itself destroy buffered AAC media. TCP keeps arriving while the
  * anchor is invalid; FLUSH rules decide media validity and the next anchor only
  * commits a fresh timing/playout epoch. */
+=======
+/* Pause/immediate FLUSH ends the current presentation timing now. TCP keeps
+ * arriving into the raw FIFO while the anchor is invalid; the sequential
+ * consumer alone decides whether each framed packet is discarded or decoded. */
+>>>>>>> Stashed changes
 static void mark_timeline_discontinuity(void) {
   taskENTER_CRITICAL(&s.state_mux);
   s.anchor_valid = false;
@@ -648,6 +684,7 @@ static void audio_status_task(void *arg) {
     const double ptp_delta_ms = (double)ps.raw_filter_delta_ns / 1000000.0;
 
     if (task_stream == AUDIO_STREAM_BUFFERED) {
+<<<<<<< Updated upstream
       ap2_buffered_transport_usage_t usage = {0};
       ap2_buffered_transport_get_usage(s.transport, &usage);
       if (sync_valid && phase_valid && ps.valid) {
@@ -657,11 +694,32 @@ static void audio_status_task(void *arg) {
                  (double)sync_us / 1000.0, (double)phase_us / 1000.0,
                  (long)correction_ppm, ptp_delta_ms,
                  (unsigned long)gm_short, (unsigned long)ps.epoch,
+=======
+      ap2_buffered_fifo_usage_t usage = {0};
+      ap2_buffered_fifo_get_usage(s.transport, &usage);
+
+      char control_suffix[80] = "";
+      if (usage.immediate_flush_active) {
+        snprintf(control_suffix, sizeof(control_suffix),
+                 " | flush=%lu", (unsigned long)usage.immediate_target_seq);
+      } else if (usage.deferred_requests > 0) {
+        snprintf(control_suffix, sizeof(control_suffix),
+                 " | defer=%lu", (unsigned long)usage.deferred_requests);
+      }
+
+      if (sync_valid && ps.valid) {
+        ESP_LOGI(STATUS_TAG,
+                 "AAC | sync=%+.2fms | i2s=%+ldppm | ptpD=%+.2fms | "
+                 "gm=%08lx%s | fifo=%u/%uKiB | pcm=%.0fms",
+                 (double)sync_us / 1000.0, (long)correction_ppm,
+                 ptp_delta_ms, (unsigned long)gm_short, control_suffix,
+>>>>>>> Stashed changes
                  (unsigned)(usage.used_bytes / 1024U),
                  (unsigned)(usage.capacity_bytes / 1024U),
                  status_frames_to_ms(pcm_frames, sr));
       } else {
         ESP_LOGI(STATUS_TAG,
+<<<<<<< Updated upstream
                  "AAC | sync=%s | phase=%s | i2s=%+ldppm | ptpD=%s | "
                  "gm=%08lx | epoch=%lu | cbuf=%u/%uKiB | pcm=%.0fms",
                  sync_valid ? "valid" : "n/a",
@@ -669,6 +727,13 @@ static void audio_status_task(void *arg) {
                  (long)correction_ppm, ps.valid ? "valid" : "n/a",
                  (unsigned long)gm_short, (unsigned long)ps.epoch,
                  (unsigned)(usage.used_bytes / 1024U),
+=======
+                 "AAC | sync=%s | i2s=%+ldppm | ptpD=%s | "
+                 "gm=%08lx%s | fifo=%u/%uKiB | pcm=%.0fms",
+                 sync_valid ? "valid" : "n/a", (long)correction_ppm,
+                 ps.valid ? "valid" : "n/a", (unsigned long)gm_short,
+                 control_suffix, (unsigned)(usage.used_bytes / 1024U),
+>>>>>>> Stashed changes
                  (unsigned)(usage.capacity_bytes / 1024U),
                  status_frames_to_ms(pcm_frames, sr));
       }
@@ -779,8 +844,9 @@ static void wait_until_presentation_ns(const timing_snapshot_t *snap,
   (void)esp_timer_stop(s.playout_timer);
 }
 
-/* Buffered AirPlay 2 addressable model: transport arrival, media validity,
- * decoder chronology and presentation timing are separate concerns. */
+/* Buffered AirPlay 2 packet sequence arithmetic is used only for FLUSH and
+ * decoder-continuity checks. Compressed media itself is consumed strictly
+ * forward from the raw TCP byte FIFO. */
 static inline int32_t seq23_delta(uint32_t a, uint32_t b) {
   uint32_t d = (a - b) & 0x007fffffU;
   if (d & 0x00400000U) d |= 0xff800000U;
@@ -795,53 +861,82 @@ static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
   audio_eq_process(pcm, frames, channels, sample_rate);
 }
 
-/* Lock order: publish_mutex -> transport or PCM writer mutex -> state_mux.
- * Never sleep for backpressure with publish_mutex held. I2S remains lock-free. */
+/* The buffered AAC side now follows Shairport Sync's topology: the TCP task
+ * owns only a raw byte FIFO, while this single consumer owns packet framing,
+ * FLUSH decisions, timing, decrypt/decode and publication into the existing
+ * RTP-addressed PCM ring. There is no compressed-media search or rebind. */
 typedef enum {
   PCM_STORE_DROPPED = 0,
   PCM_STORE_PUBLISHED,
   PCM_STORE_RESELECT,
 } pcm_store_result_t;
 
+<<<<<<< Updated upstream
 static pcm_store_result_t pcm_store_with_backpressure(uint32_t rtp, const int16_t *pcm,
                                         size_t frames, int channels,
                                         uint32_t pcm_generation,
                                         const ap2_buffered_packet_ref_t *pkt) {
   if (!pcm || !pkt || channels != 2 || frames == 0 ||
       frames > PCM_RTP_SLOT_FRAMES) return PCM_STORE_DROPPED;
+=======
+static pcm_store_result_t pcm_store_with_backpressure(
+    uint32_t rtp, const int16_t *pcm, size_t frames, int channels,
+    uint32_t pcm_generation) {
+  if (!pcm || channels != 2 || frames == 0 || frames > PCM_RTP_SLOT_FRAMES)
+    return PCM_STORE_DROPPED;
+
+>>>>>>> Stashed changes
   while (s.rx_running) {
     xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
     timing_snapshot_t snap;
     snapshot_state(&snap);
+<<<<<<< Updated upstream
     if (!s.rx_running || snap.pcm_generation != pcm_generation ||
         snap.stream_type != AUDIO_STREAM_BUFFERED ||
         ap2_buffered_transport_ref_is_invalid(s.transport, pkt)) {
+=======
+    if (!s.rx_running || snap.stream_type != AUDIO_STREAM_BUFFERED ||
+        snap.pcm_generation != pcm_generation || snap.timeline_reset_pending) {
+>>>>>>> Stashed changes
       xSemaphoreGive(s.publish_mutex);
       return PCM_STORE_DROPPED;
     }
-    if (snap.playing && snap.anchor_valid && !snap.timeline_reset_pending &&
-        !timing_clock_ready(&snap)) {
+    if (!snap.playing || !snap.anchor_valid || !timing_clock_ready(&snap)) {
       xSemaphoreGive(s.publish_mutex);
+<<<<<<< Updated upstream
       ap2_buffered_transport_wait_media(s.transport, 10U);
+=======
+      ap2_buffered_fifo_wait(s.transport, 10U);
+>>>>>>> Stashed changes
       continue;
     }
+
     uint32_t wanted = 0;
     const bool wanted_valid = wanted_rtp_now(&snap, &wanted);
     const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
-    const int32_t max_lead = (int32_t)(((int64_t)sr * AP2_BUFFERED_LEAD_MS) / 1000LL);
+    const int32_t max_lead =
+        (int32_t)(((int64_t)sr * AP2_BUFFERED_LEAD_MS) / 1000LL);
     if (!wanted_valid || rtp_delta(rtp, wanted) > max_lead) {
+<<<<<<< Updated upstream
       /* A pause/backward seek can move this already-decoded AU out of the
        * live window. Return its compressed ref to READY instead of pinning
        * the only decoder behind a protected PCM page from the new window. */
       xSemaphoreGive(s.publish_mutex);
       return PCM_STORE_RESELECT;
+=======
+      xSemaphoreGive(s.publish_mutex);
+      ap2_buffered_fifo_wait(s.transport, 10U);
+      continue;
+>>>>>>> Stashed changes
     }
     if (rtp_delta(rtp + (uint32_t)frames, wanted) <= 0) {
       xSemaphoreGive(s.publish_mutex);
       return PCM_STORE_DROPPED;
     }
-    const bool stored = pcm_rtp_ring_write(s.pcm_ring, rtp, pcm, frames, channels,
-                                           pcm_generation, wanted, wanted_valid);
+
+    const bool stored = pcm_rtp_ring_write(s.pcm_ring, rtp, pcm, frames,
+                                           channels, pcm_generation, wanted,
+                                           wanted_valid);
     xSemaphoreGive(s.publish_mutex);
     if (stored) {
       playout_wake();
@@ -852,7 +947,40 @@ static pcm_store_result_t pcm_store_with_backpressure(uint32_t rtp, const int16_
   return PCM_STORE_DROPPED;
 }
 
+static void apply_deferred_flush_activations(
+    const ap2_buffered_packet_decision_t *decision,
+    uint32_t pcm_generation) {
+  if (!decision || decision->activation_count == 0 || !s.pcm_ring) return;
+  xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  if (snap.stream_type == AUDIO_STREAM_BUFFERED &&
+      snap.pcm_generation == pcm_generation) {
+    for (uint8_t i = 0; i < decision->activation_count; ++i) {
+      const ap2_buffered_flush_activation_t *a = &decision->activations[i];
+      pcm_rtp_ring_invalidate_range(s.pcm_ring, a->from_rtp, a->until_rtp,
+                                    pcm_generation);
+    }
+  }
+  xSemaphoreGive(s.publish_mutex);
+  playout_wake();
+}
 
+static void reset_aac_decode_history(aac_decoder_t **decoder,
+                                     uint32_t *decoder_format_generation,
+                                     bool *have_sequence,
+                                     uint32_t *expected_timestamp,
+                                     uint32_t *expected_seq) {
+  if (*decoder && !aac_decoder_reset(*decoder)) {
+    aac_decoder_destroy(*decoder);
+    *decoder = NULL;
+    *decoder_format_generation = 0;
+  }
+  audio_eq_reset_state();
+  *have_sequence = false;
+  *expected_timestamp = 0;
+  *expected_seq = 0;
+}
 
 static void ap2_buffered_processor_task(void *arg) {
   (void)arg;
@@ -861,17 +989,24 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t expected_timestamp = 0;
   uint32_t expected_seq = 0;
   bool have_decoded_sequence = false;
+<<<<<<< Updated upstream
   bool decoder_history_dirty = false;
 
   /* EQ/AAC history belongs to media chronology, not to the PTP presentation
    * epoch.  Start a fresh codec-session history once here; later resets happen
    * only when the media cursor itself becomes discontinuous. */
-  audio_eq_reset_state();
+=======
+  bool decoder_history_dirty = true;
+  bool have_packet = false;
+  ap2_buffered_packet_t packet = {0};
 
+>>>>>>> Stashed changes
+  audio_eq_reset_state();
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_AAC_PROCESSOR,
                                     xPortGetCoreID(), AP2_DECODE_PRIORITY, 0U);
 
   while (s.rx_running) {
+<<<<<<< Updated upstream
     bool made_progress = false;
     timing_snapshot_t state_snap;
     snapshot_state(&state_snap);
@@ -1008,16 +1143,136 @@ static void ap2_buffered_processor_task(void *arg) {
         if (!decoder) {
           ap2_buffered_transport_release(s.transport, &pkt);
           vTaskDelay(1);
+=======
+    timing_snapshot_t snap;
+    snapshot_state(&snap);
+    const bool normal_consume_ready =
+        snap.stream_type == AUDIO_STREAM_BUFFERED && snap.playing &&
+        snap.anchor_valid && !snap.timeline_reset_pending &&
+        timing_clock_ready(&snap);
+
+    /* Match Shairport's separation: while normal playback is paused the raw
+     * TCP reader keeps filling the FIFO, but the packet consumer does not walk
+     * forward unless an immediate FLUSH explicitly requires sequential drain.
+     * Avoid even reading the FLUSH mutex on the normal hot path. */
+    if (!have_packet) {
+      const bool flush_draining = normal_consume_ready
+          ? false
+          : ap2_buffered_fifo_immediate_flush_active(s.transport);
+      if (!normal_consume_ready && !flush_draining) {
+        ap2_buffered_fifo_wait(s.transport, 10U);
+        continue;
+      }
+
+      const esp_err_t read_err = ap2_buffered_fifo_read_packet(
+          s.transport, s.buffered_packet, AP2_PACKET_MAX, &packet);
+      if (read_err != ESP_OK) {
+        if (s.rx_running) ap2_buffered_fifo_wait(s.transport, 10U);
+        continue;
+      }
+      have_packet = true;
+      AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK((uint32_t)packet.len);
+    }
+
+    /* Re-evaluate control state even while this same packet is being held for
+     * presentation time. A new FLUSH therefore acts on the current packet
+     * directly, exactly as in Shairport's new_audio_block_needed loop. */
+    ap2_buffered_packet_decision_t decision = {0};
+    ap2_buffered_fifo_classify_packet(s.transport, &packet, &decision);
+    if (decision.activation_count) {
+      apply_deferred_flush_activations(&decision, snap.pcm_generation);
+    }
+    if (decision.discontinuity) decoder_history_dirty = true;
+    if (decision.immediate_completed) {
+      ESP_LOGI(TAG, "AAC FLUSH complete target=%" PRIu32 " at seq=%" PRIu32 "%s",
+               decision.immediate_target_seq, packet.seq,
+               decision.immediate_overshoot ? " overshoot" : "");
+    }
+    if (decision.drop) {
+      have_packet = false;
+      continue;
+    }
+
+    snapshot_state(&snap);
+    if (snap.stream_type != AUDIO_STREAM_BUFFERED || !snap.playing ||
+        !snap.anchor_valid || snap.timeline_reset_pending ||
+        !timing_clock_ready(&snap)) {
+      ap2_buffered_fifo_wait(s.transport, 10U);
+      continue;
+    }
+
+    uint32_t wanted = 0;
+    if (!wanted_rtp_now(&snap, &wanted)) {
+      ap2_buffered_fifo_wait(s.transport, 10U);
+      continue;
+    }
+    const uint32_t frame_samples = snap.format.frame_size > 0
+                                       ? (uint32_t)snap.format.frame_size
+                                       : 1024U;
+    const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+    const int32_t max_lead =
+        (int32_t)(((int64_t)sr * AP2_BUFFERED_LEAD_MS) / 1000LL);
+    const int32_t lead = rtp_delta(packet.rtp, wanted);
+
+    if ((int64_t)lead + (int64_t)frame_samples <= 0) {
+      /* Sequential stream, but this block is already entirely behind the
+       * presentation point. Consume it and rebuild decoder history at the next
+       * usable AAC block; never search ahead. */
+      decoder_history_dirty = true;
+      have_packet = false;
+      continue;
+    }
+    if (lead > max_lead) {
+      /* Shairport holds one compressed packet outside its raw FIFO until it is
+       * close enough to the decoded-buffer target. TCP ingress keeps filling
+       * independently and naturally backpressures when the FIFO is full. */
+      ap2_buffered_fifo_wait(s.transport, 10U);
+      continue;
+    }
+
+    if (decoder_history_dirty) {
+      reset_aac_decode_history(&decoder, &decoder_format_generation,
+                               &have_decoded_sequence, &expected_timestamp,
+                               &expected_seq);
+      decoder_history_dirty = false;
+    }
+
+    if (!decoder || decoder_format_generation != snap.format_generation) {
+      if (decoder) aac_decoder_destroy(decoder);
+      decoder = NULL;
+      aac_decoder_config_t cfg = {
+          .sample_rate = snap.format.sample_rate,
+          .channels = snap.format.channels,
+          .bits_per_sample = snap.format.bits_per_sample,
+      };
+      decoder = aac_decoder_create(&cfg);
+      if (!decoder) {
+        vTaskDelay(1);
+        continue;
+      }
+      decoder_format_generation = snap.format_generation;
+      have_decoded_sequence = false;
+      expected_timestamp = 0;
+      expected_seq = 0;
+      audio_eq_reset_state();
+      AUDIO_DIAG_CODEC_AAC_READY((uint32_t)snap.format.sample_rate,
+                                 (uint32_t)snap.format.channels);
+    }
+
+    if (have_decoded_sequence) {
+      const int32_t timestamp_gap = rtp_delta(packet.rtp, expected_timestamp);
+      const int32_t sequence_gap = seq23_delta(packet.seq, expected_seq);
+      if (timestamp_gap != 0 || sequence_gap != 0) {
+        reset_aac_decode_history(&decoder, &decoder_format_generation,
+                                 &have_decoded_sequence, &expected_timestamp,
+                                 &expected_seq);
+        if (!decoder) {
+          have_packet = false;
+>>>>>>> Stashed changes
           continue;
         }
-        decoder_format_generation = snap.format_generation;
-        have_decoded_sequence = false;
-        expected_timestamp = 0;
-        expected_seq = 0;
-        audio_eq_reset_state();
-        AUDIO_DIAG_CODEC_AAC_READY((uint32_t)snap.format.sample_rate,
-                                   (uint32_t)snap.format.channels);
       }
+<<<<<<< Updated upstream
 
       int32_t timestamp_gap = 0;
       int32_t sequence_gap = 0;
@@ -1100,6 +1355,41 @@ static void ap2_buffered_processor_task(void *arg) {
      * backlog this worker must yield after every bounded decode burst. */
     if (made_progress) vTaskDelay(AP2_DECODE_IDLE_TICKS);
     else ap2_buffered_transport_wait_media(s.transport, 10U);
+=======
+    }
+
+    const int dec_len = audio_crypto_decrypt_buffered(
+        &s.encrypt, s.buffered_packet, packet.len,
+        s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
+    if (dec_len <= 0) {
+      decoder_history_dirty = true;
+      have_packet = false;
+      continue;
+    }
+
+    aac_decode_info_t info = {0};
+    const int frames = aac_decoder_decode(
+        decoder, s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM,
+        (size_t)dec_len, s.decode_pcm, AP2_PCM_CAPACITY_FRAMES, &info);
+    if (frames <= 0) {
+      decoder_history_dirty = true;
+      have_packet = false;
+      continue;
+    }
+
+    expected_timestamp = packet.rtp + (uint32_t)frames;
+    expected_seq = (packet.seq + 1U) & 0x007fffffU;
+    have_decoded_sequence = true;
+
+    pcm_process_common_eq(s.decode_pcm, (size_t)frames, info.channels,
+                          snap.format.sample_rate);
+
+    const pcm_store_result_t stored = pcm_store_with_backpressure(
+        packet.rtp, s.decode_pcm, (size_t)frames, info.channels,
+        snap.pcm_generation);
+    if (stored != PCM_STORE_PUBLISHED) decoder_history_dirty = true;
+    have_packet = false;
+>>>>>>> Stashed changes
   }
 
   if (decoder) aac_decoder_destroy(decoder);
@@ -2080,6 +2370,7 @@ esp_err_t audio_receiver_init(void) {
     if (!s.codec_workspace) return ESP_ERR_NO_MEM;
   }
 
+<<<<<<< Updated upstream
   if (!s.packet) {
     s.packet = heap_caps_malloc(AP2_PACKET_MAX,
                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2087,6 +2378,14 @@ esp_err_t audio_receiver_init(void) {
       s.packet = malloc(AP2_PACKET_MAX);
     }
   }
+=======
+  if (!s.buffered_packet) {
+    s.buffered_packet = heap_caps_malloc(AP2_PACKET_MAX,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s.buffered_packet) s.buffered_packet = malloc(AP2_PACKET_MAX);
+  }
+
+>>>>>>> Stashed changes
   if (!s.decrypt_buf) {
     s.decrypt_buf = heap_caps_malloc(AP2_PACKET_MAX + AAC_DECODER_INPUT_HEADROOM,
                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2110,16 +2409,25 @@ esp_err_t audio_receiver_init(void) {
   }
 
   if (!s.transport) {
+<<<<<<< Updated upstream
     ap2_buffered_transport_config_t tcfg = {
         .store_bytes = AP2_BUFFERED_STORE_REQUEST_BYTES,
+=======
+    ap2_buffered_fifo_config_t tcfg = {
+        .buffer_bytes = AP2_BUFFERED_STORE_REQUEST_BYTES,
+>>>>>>> Stashed changes
         .task_core = AP2_NETWORK_CORE,
         .task_priority = AP2_RX_PRIORITY,
         .task_stack = AP2_RX_STACK,
     };
+<<<<<<< Updated upstream
     ESP_RETURN_ON_ERROR(ap2_buffered_transport_create_with_payload_storage(
+=======
+    ESP_RETURN_ON_ERROR(ap2_buffered_fifo_create_with_storage(
+>>>>>>> Stashed changes
                             &s.transport, &tcfg, s.codec_workspace,
                             s.codec_workspace_size),
-                        TAG, "buffered transport create failed");
+                        TAG, "buffered FIFO create failed");
   }
 
   if (!s.pcm_ring && pcm_rtp_ring_create(&s.pcm_ring) != ESP_OK) {
@@ -2150,8 +2458,13 @@ esp_err_t audio_receiver_init(void) {
         TAG, "ALAC shared packet workspace bind failed");
     s.realtime_workspace_bound = true;
   }
+<<<<<<< Updated upstream
   if (!s.packet || !s.decrypt_buf || !s.decode_pcm || !s.realtime_stage_pcm || !s.pcm_ring ||
       !s.realtime_stage_ring) {
+=======
+  if (!s.buffered_packet || !s.decrypt_buf || !s.decode_pcm ||
+      !s.realtime_stage_pcm || !s.pcm_ring || !s.realtime_stage_ring) {
+>>>>>>> Stashed changes
     return ESP_ERR_NO_MEM;
   }
 
@@ -2165,14 +2478,22 @@ esp_err_t audio_receiver_init(void) {
       0U);
   AUDIO_DIAG_BUFFER_WORKSPACE(
       (uint32_t)(s.codec_workspace_size / 1024U),
+<<<<<<< Updated upstream
       (uint32_t)(ap2_buffered_transport_capacity(s.transport) / 1024U),
+=======
+      (uint32_t)(ap2_buffered_fifo_capacity(s.transport) / 1024U),
+>>>>>>> Stashed changes
       (uint32_t)((rt_stage_bytes + rt_pool_bytes) / 1024U));
   AUDIO_DIAG_BUFFER_PSRAM(
       AUDIO_DIAG_PSRAM_AFTER_STORES,
       (uint32_t)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
       (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
       (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
+<<<<<<< Updated upstream
       (uint32_t)(ap2_buffered_transport_capacity(s.transport) / 1024U));
+=======
+      (uint32_t)(ap2_buffered_fifo_capacity(s.transport) / 1024U));
+>>>>>>> Stashed changes
 
   ESP_RETURN_ON_ERROR(audio_playout_init(), TAG, "I2S playout init failed");
   s.engine_running = true;
@@ -2276,20 +2597,34 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
 
   /* New buffered codec session: both compressed and decoded media storage are
    * hard-reset. This is deliberately stronger than a seek/anchor change. */
+<<<<<<< Updated upstream
   ap2_buffered_transport_clear(s.transport);
   reset_buffered_pcm_store();
 
   uint16_t bound = port;
   ESP_RETURN_ON_ERROR(ap2_buffered_transport_start(s.transport, port, &bound),
                       TAG, "buffered transport start failed");
+=======
+  ap2_buffered_fifo_clear(s.transport);
+  reset_buffered_pcm_store();
+
+  uint16_t bound = port;
+  ESP_RETURN_ON_ERROR(ap2_buffered_fifo_start(s.transport, port, &bound),
+                      TAG, "buffered FIFO start failed");
+>>>>>>> Stashed changes
   s.port = bound;
   s.rx_running = true;
   if (xTaskCreatePinnedToCore(ap2_buffered_processor_task, "ap2_buf_proc",
                               AP2_PROCESS_STACK, NULL, AP2_DECODE_PRIORITY,
                               &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE) != pdPASS) {
     s.rx_running = false;
+<<<<<<< Updated upstream
     ap2_buffered_transport_notify_media(s.transport);
     ap2_buffered_transport_stop(s.transport);
+=======
+    ap2_buffered_fifo_notify(s.transport);
+    ap2_buffered_fifo_stop(s.transport);
+>>>>>>> Stashed changes
     return ESP_FAIL;
   }
   ESP_LOGI(TAG, "AP2 buffered listener port=%u", (unsigned)s.port);
@@ -2336,12 +2671,20 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
     /* AAC compressed payload pages and ALAC large realtime buffers are the
      * same physical PSRAM. Never let ALAC reuse those bytes until the TCP
      * reader and buffered decoder have completely released their ownership. */
+<<<<<<< Updated upstream
     if (s.transport && !ap2_buffered_transport_is_idle(s.transport)) {
+=======
+    if (s.transport && !ap2_buffered_fifo_is_idle(s.transport)) {
+>>>>>>> Stashed changes
       ESP_LOGE(TAG,
                "realtime start refused: buffered transport still owns shared codec workspace");
       return ESP_ERR_INVALID_STATE;
     }
+<<<<<<< Updated upstream
     if (s.transport) ap2_buffered_transport_clear(s.transport);
+=======
+    if (s.transport) ap2_buffered_fifo_clear(s.transport);
+>>>>>>> Stashed changes
 
     /* SETUP may be followed by RECORD for the same live stream. Preserve
      * its anchor, cursor and EQ history; only a stopped stream needs startup. */
@@ -2420,7 +2763,11 @@ void audio_receiver_stop(void) {
   s.realtime_stage_cursor_valid = false;
   taskEXIT_CRITICAL(&s.state_mux);
   s.rx_running = false;
+<<<<<<< Updated upstream
   ap2_buffered_transport_notify_media(s.transport);
+=======
+  ap2_buffered_fifo_notify(s.transport);
+>>>>>>> Stashed changes
 
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
@@ -2448,7 +2795,11 @@ void audio_receiver_stop(void) {
   }
 
   if (s.transport) {
+<<<<<<< Updated upstream
     ap2_buffered_transport_stop(s.transport);
+=======
+    ap2_buffered_fifo_stop(s.transport);
+>>>>>>> Stashed changes
   }
 
   /* The buffered processor exits when rx_running becomes false. Wait only on
@@ -2463,7 +2814,11 @@ void audio_receiver_stop(void) {
   }
 
   if (s.transport) {
+<<<<<<< Updated upstream
     ap2_buffered_transport_clear(s.transport);
+=======
+    ap2_buffered_fifo_clear(s.transport);
+>>>>>>> Stashed changes
   }
 
   /* Do not reset the stateful EQ asynchronously from the control core. AAC
@@ -2475,7 +2830,11 @@ void audio_receiver_stop_buffered_only(void) { audio_receiver_stop(); }
 uint16_t audio_receiver_get_buffered_port(void) { return s.port; }
 
 size_t audio_receiver_get_buffered_audio_buffer_size(void) {
+<<<<<<< Updated upstream
   return ap2_buffered_transport_capacity(s.transport);
+=======
+  return ap2_buffered_fifo_capacity(s.transport);
+>>>>>>> Stashed changes
 }
 
 uint16_t audio_receiver_get_stream_port(void) { return s.port; }
@@ -2570,6 +2929,7 @@ esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t fr
   from_seq &= 0x007fffffU;
   until_seq &= 0x007fffffU;
 
+<<<<<<< Updated upstream
   /* In the addressable model FLUSHBUFFERED is declarative invalidation, not a
    * packet-order state machine. Install [fromSeq, untilSeq) in the compressed
    * store so it applies retroactively and to later arrivals, and invalidate the
@@ -2579,6 +2939,14 @@ esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t fr
   if (s.transport) {
     esp_err_t err = ap2_buffered_transport_add_invalid_seq_range(
         s.transport, from_seq, until_seq);
+=======
+  /* Shairport semantics: register a future sequential cut only. The raw TCP
+   * FIFO is untouched here; the single packet consumer activates the rule when
+   * it actually encounters fromSeq and discards until untilSeq/overshoot. */
+  if (s.transport) {
+    esp_err_t err = ap2_buffered_fifo_add_deferred_flush(
+        s.transport, from_seq, from_ts, until_seq, until_ts);
+>>>>>>> Stashed changes
     if (err != ESP_OK) {
       xSemaphoreGive(s.publish_mutex);
       return err;
@@ -2605,6 +2973,7 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
   mark_timeline_discontinuity();
 
   if (s.transport) {
+<<<<<<< Updated upstream
     if (has_endpoint) {
       /* Declarative endpoint: everything before untilSeq belongs to the old
        * timeline. The rule remains active for future TCP arrivals until the
@@ -2617,6 +2986,10 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
        * INVALID until the next anchor retires this rule. */
       (void)ap2_buffered_transport_invalidate_all(s.transport);
     }
+=======
+    ap2_buffered_fifo_set_immediate_flush(s.transport, until_seq,
+                                                       until_ts, has_endpoint);
+>>>>>>> Stashed changes
   }
   AUDIO_DIAG_FLUSH_IMMEDIATE_TRANSPORT_DONE();
 
@@ -2699,13 +3072,12 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
       local_ns != 0;
   const uint64_t local_update_us = local_valid ? (uint64_t)esp_timer_get_time() : 0;
   uint32_t gen;
-  uint32_t revision;
   bool committed;
   ap2_buffered_transport_begin_media_update(s.transport);
   taskENTER_CRITICAL(&s.state_mux);
   committed = s.timeline_reset_pending;
   gen = commit_anchor_epoch_locked();
-  revision = s.media_revision = next_generation(s.media_revision);
+  s.media_revision = next_generation(s.media_revision);
   s.anchor_clock_id = clock_id;
   s.anchor_ptp_ns = ptp_ns;
   /* Publish both sides of the map together. No transient clock loss for a
@@ -2720,8 +3092,14 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.rt_media_rebase_bias_ns = 0;
   s.anchor_valid = true;
   taskEXIT_CRITICAL(&s.state_mux);
+<<<<<<< Updated upstream
   /* Publish revision and retire old rules before TCP can acquire the store. */
   ap2_buffered_transport_end_media_update(s.transport, revision, committed);
+=======
+  /* Shairport-style separation: SETRATEANCHORTIME updates presentation timing
+   * only. The compressed FIFO has no RTP cursor to search or rebind. */
+  if (s.transport) ap2_buffered_fifo_notify(s.transport);
+>>>>>>> Stashed changes
   playout_wake();
   realtime_stage_kick();
 
