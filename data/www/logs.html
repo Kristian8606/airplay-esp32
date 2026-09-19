@@ -83,11 +83,24 @@ function colorize(text){
   if(follow)log.scrollTop=log.scrollHeight;
   else if(trimmed)log.scrollTop=Math.max(0,log.scrollTop-trimmed);
 }
+var ws=null,retryTimer=null,retryMs=2000;
+function schedule_reconnect(){
+  if(document.hidden||!navigator.onLine||retryTimer)return;
+  retryTimer=setTimeout(function(){retryTimer=null;connect();},retryMs);
+  retryMs=Math.min(retryMs*2,15000);
+}
 function connect(){
-  var ws=new WebSocket('ws://'+location.host+'/ws/logs');
-  ws.onopen=function(){dot.classList.add('ok');};
-  ws.onclose=function(){dot.classList.remove('ok');setTimeout(connect,2000);};
+  if(document.hidden||!navigator.onLine)return;
+  if(ws&&(ws.readyState===WebSocket.OPEN||ws.readyState===WebSocket.CONNECTING))return;
+  ws=new WebSocket('ws://'+location.host+'/ws/logs');
+  ws.onopen=function(){retryMs=2000;dot.classList.add('ok');};
+  ws.onclose=function(){dot.classList.remove('ok');ws=null;schedule_reconnect();};
+  ws.onerror=function(){if(ws)ws.close();};
   ws.onmessage=function(e){colorize(e.data);};
 }
+document.addEventListener('visibilitychange',function(){if(!document.hidden)connect();});
+window.addEventListener('online',connect);
+window.addEventListener('offline',function(){if(ws)ws.close();});
+window.addEventListener('pagehide',function(){if(retryTimer){clearTimeout(retryTimer);retryTimer=null;}if(ws)ws.close();});
 connect();
 </script></body></html>

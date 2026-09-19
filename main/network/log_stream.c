@@ -24,9 +24,12 @@
 #define LOG_RING_SIZE 8192
 #define LOG_RING_MASK (LOG_RING_SIZE - 1)
 
-#define BROADCAST_TASK_STACK  4096
-#define BROADCAST_INTERVAL_MS 100
-#define MAX_SEND_CHUNK        1024
+#define BROADCAST_TASK_STACK          4096
+#define BROADCAST_TASK_PRIORITY       2
+#define BROADCAST_ACTIVE_INTERVAL_MS  100
+#define BROADCAST_IDLE_INTERVAL_MS    1000
+#define MAX_SEND_CHUNK                1024
+#define WS_RX_MAX_PAYLOAD             128
 
 static char *s_ring;
 static volatile size_t s_head; /* next write position  */
@@ -105,31 +108,60 @@ static int log_vprintf_hook(const char *fmt, va_list args) {
 /*  WebSocket handler                                                  */
 /* ------------------------------------------------------------------ */
 
+static void close_ws_session(int fd, const char *reason) {
+  if (!s_server || fd < 0) {
+    return;
+  }
+
+  esp_err_t err = httpd_sess_trigger_close(s_server, fd);
+  if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+    ESP_LOGD("log_stream", "WS close fd=%d (%s) failed: %s", fd,
+             reason ? reason : "unknown", esp_err_to_name(err));
+  }
+}
+
 static esp_err_t ws_log_handler(httpd_req_t *req) {
   /* The server completes the WebSocket handshake internally; depending on the
-   * IDF build the handshake GET may or may not reach here.  Return OK for it
-   * and do nothing — clients are tracked by the broadcast task, not here. */
+   * IDF build the handshake GET may or may not reach here. Return OK for it. */
   if (req->method == HTTP_GET) {
     return ESP_OK;
   }
 
-  /* A log viewer only receives, but browsers still send frames here (notably
-   * CLOSE on tab close/reconnect).  Probe the length, then CONSUME the
-   * payload: reading only the header (max_len 0) leaves the 4-byte mask key
-   * and payload in the socket, so the next frame is parsed mid-stream and
-   * misreported as "not properly masked", failing the handler.  Fully
-   * draining each frame keeps the framing aligned; ignore recv errors instead
-   * of returning them (which httpd logs as "uri handler execution failed"). */
+  const int fd = httpd_req_to_sockfd(req);
   httpd_ws_frame_t frame = {0};
-  if (httpd_ws_recv_frame(req, &frame, 0) != ESP_OK) {
+
+  /* First call only parses the WS header and reports the payload length. */
+  esp_err_t err = httpd_ws_recv_frame(req, &frame, 0);
+  if (err != ESP_OK) {
+    /* A dead/stale browser socket must not remain in the HTTPD session list;
+     * otherwise the broadcast task keeps sending to it and HTTPD repeatedly
+     * attempts to parse a stream which is no longer a valid WebSocket. */
+    close_ws_session(fd, "recv-header");
     return ESP_OK;
   }
+
+  /* /ws/logs is receive-only from the browser's point of view. Normal browser
+   * control frames are tiny. If a client sends a larger payload, close the
+   * session rather than leaving an unconsumed frame in the socket. */
+  if (frame.len > WS_RX_MAX_PAYLOAD) {
+    ESP_LOGD("log_stream", "Closing WS fd=%d: unexpected payload %u bytes",
+             fd, (unsigned)frame.len);
+    close_ws_session(fd, "oversize-frame");
+    return ESP_OK;
+  }
+
   if (frame.len > 0) {
-    uint8_t buf[128];
-    if (frame.len <= sizeof(buf)) {
-      frame.payload = buf;
-      httpd_ws_recv_frame(req, &frame, sizeof(buf));
+    uint8_t buf[WS_RX_MAX_PAYLOAD];
+    frame.payload = buf;
+    err = httpd_ws_recv_frame(req, &frame, frame.len);
+    if (err != ESP_OK) {
+      close_ws_session(fd, "recv-payload");
+      return ESP_OK;
     }
+  }
+
+  if (frame.type == HTTPD_WS_TYPE_CLOSE) {
+    close_ws_session(fd, "peer-close");
   }
   return ESP_OK;
 }
@@ -141,17 +173,23 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
 static void broadcast_task(void *arg) {
   (void)arg;
   char buf[MAX_SEND_CHUNK];
+  TickType_t interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
 
   while (1) {
-    vTaskDelay(pdMS_TO_TICKS(BROADCAST_INTERVAL_MS));
+    vTaskDelay(interval);
 
-    /* Discover active WebSocket sessions fresh each tick.  No connect-time
-     * registration (see ws_log_handler) and no stale-fd list: a client
-     * that disconnected simply stops appearing here, so log frames can
-     * never be sent to a reused fd now serving an unrelated request. */
+    if (!s_server) {
+      interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
+      continue;
+    }
+
+    /* Discover active WebSocket sessions fresh each pass. With no viewer the
+     * task wakes only once per second; while a viewer is connected it returns
+     * to the 100 ms cadence used for live log streaming. */
     int fds[CONFIG_LWIP_MAX_SOCKETS];
     size_t fd_count = CONFIG_LWIP_MAX_SOCKETS;
     if (httpd_get_client_list(s_server, &fd_count, fds) != ESP_OK) {
+      interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
       continue;
     }
 
@@ -163,8 +201,10 @@ static void broadcast_task(void *arg) {
       }
     }
     if (ws_count == 0) {
+      interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
       continue; /* leave data in the ring as backlog for the next viewer */
     }
+    interval = pdMS_TO_TICKS(BROADCAST_ACTIVE_INTERVAL_MS);
 
     size_t len = 0;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -184,10 +224,9 @@ static void broadcast_task(void *arg) {
     for (size_t i = 0; i < ws_count; i++) {
       esp_err_t err = httpd_ws_send_frame_async(s_server, ws_fds[i], &frame);
       if (err != ESP_OK) {
-        /* Session is closing; httpd cleans it up and it will no longer
-         * be listed on the next tick. */
-        ESP_LOGD("log_stream", "WS send to fd=%d failed: %s", ws_fds[i],
-                 esp_err_to_name(err));
+        /* Do not keep a dead browser session around. It otherwise remains in
+         * the client list long enough to generate repeated send/recv warnings. */
+        close_ws_session(ws_fds[i], "send-failed");
       }
     }
   }
@@ -238,7 +277,7 @@ esp_err_t log_stream_register(httpd_handle_t server) {
   }
 
   task_create_pinned_spiram(broadcast_task, "log_ws", BROADCAST_TASK_STACK,
-                            NULL, 3, NULL, 0, NULL);
+                            NULL, BROADCAST_TASK_PRIORITY, NULL, 0, NULL);
   ESP_LOGI("log_stream", "Log streaming on /ws/logs");
   return ESP_OK;
 }

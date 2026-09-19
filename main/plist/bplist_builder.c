@@ -492,7 +492,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 5: model
-  if (!bplist_write_ascii_string(out, capacity, &pos, "AudioAccessory5,1")) {
+  if (!bplist_write_ascii_string(out, capacity, &pos, "AudioAccessory6,1")) {
     return 0;
   }
   ADD_OFFSET(); // 6: "protovers"

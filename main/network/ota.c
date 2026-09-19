@@ -3,6 +3,7 @@
 #include "esp_app_format.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_ota_ops.h"
 #include <string.h>
 #include <sys/param.h>
@@ -12,6 +13,7 @@ static const char *TAG = "ota";
 #define OTA_STREAM_BUF_BYTES 4096U
 #define OTA_STREAM_FALLBACK_BUF_BYTES 1024U
 #define OTA_PROGRESS_STEP_BYTES (256U * 1024U)
+#define OTA_HTTP_IDLE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 
 static void ota_log_memory(const char *where) {
   ESP_LOGI(TAG,
@@ -95,10 +97,18 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
   /* Read enough bytes to validate the ESP image header before touching flash. */
   size_t first_len = 0;
   size_t remaining = fw_size;
+  int64_t idle_deadline = esp_timer_get_time() + OTA_HTTP_IDLE_TIMEOUT_US;
   while (first_len < sizeof(esp_image_header_t) && remaining > 0) {
     size_t want = MIN(remaining, buf_size - first_len);
     int recv_len = httpd_req_recv(req, (char *)buf + first_len, want);
-    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+      if (esp_timer_get_time() >= idle_deadline) {
+        ESP_LOGE(TAG, "OTA receive timed out before image header");
+        heap_caps_free(buf);
+        return ESP_ERR_TIMEOUT;
+      }
+      continue;
+    }
     if (recv_len <= 0) {
       ESP_LOGE(TAG, "Receive error before image header: %d", recv_len);
       heap_caps_free(buf);
@@ -106,6 +116,7 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
     }
     first_len += (size_t)recv_len;
     remaining -= (size_t)recv_len;
+    idle_deadline = esp_timer_get_time() + OTA_HTTP_IDLE_TIMEOUT_US;
   }
 
   esp_err_t err = ota_validate_header(buf, first_len);
@@ -139,11 +150,21 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
   }
 
   size_t next_progress = OTA_PROGRESS_STEP_BYTES;
+  idle_deadline = esp_timer_get_time() + OTA_HTTP_IDLE_TIMEOUT_US;
   while (remaining > 0) {
     size_t want = MIN(remaining, buf_size);
     int recv_len = httpd_req_recv(req, (char *)buf, want);
 
-    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (recv_len == HTTPD_SOCK_ERR_TIMEOUT) {
+      if (esp_timer_get_time() >= idle_deadline) {
+        ESP_LOGE(TAG, "OTA receive timed out after %zu/%zu bytes", written,
+                 fw_size);
+        esp_ota_abort(ota_handle);
+        heap_caps_free(buf);
+        return ESP_ERR_TIMEOUT;
+      }
+      continue;
+    }
     if (recv_len <= 0) {
       ESP_LOGE(TAG, "Receive error: %d after %zu/%zu bytes", recv_len,
                written, fw_size);
@@ -163,6 +184,7 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
 
     written += (size_t)recv_len;
     remaining -= (size_t)recv_len;
+    idle_deadline = esp_timer_get_time() + OTA_HTTP_IDLE_TIMEOUT_US;
 
     if (written >= next_progress) {
       ESP_LOGI(TAG, "OTA progress: %zu/%zu bytes", written, fw_size);

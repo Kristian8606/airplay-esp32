@@ -23,6 +23,8 @@ static httpd_handle_t s_server = NULL;
 #define FILE_CHUNK 1024
 #define SPEEDTEST_CHUNK 2048
 #define SPEEDTEST_MAX_BYTES ((size_t)16 * 1024 * 1024)
+#define HTTP_SERVER_TASK_PRIORITY 3
+#define HTTP_BODY_IDLE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 
 static esp_err_t serve_file(httpd_req_t *req, const char *path, const char *type) {
   FILE *f = fopen(path, "r");
@@ -86,9 +88,21 @@ static esp_err_t recv_json(httpd_req_t *req, char *buf, size_t cap){
   if (req->content_len <= 0 || req->content_len >= cap) {
     return ESP_ERR_INVALID_SIZE;
   }
+
   size_t got = 0;
-  while(got<(size_t)req->content_len){ int n=httpd_req_recv(req,buf+got,req->content_len-got); if(n==HTTPD_SOCK_ERR_TIMEOUT) continue; if(n<=0)return ESP_FAIL; got+=n; }
-  buf[got]=0; return ESP_OK;
+  int64_t idle_deadline = esp_timer_get_time() + HTTP_BODY_IDLE_TIMEOUT_US;
+  while (got < (size_t)req->content_len) {
+    int n = httpd_req_recv(req, buf + got, req->content_len - got);
+    if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+      if (esp_timer_get_time() >= idle_deadline) return ESP_ERR_TIMEOUT;
+      continue;
+    }
+    if (n <= 0) return ESP_FAIL;
+    got += (size_t)n;
+    idle_deadline = esp_timer_get_time() + HTTP_BODY_IDLE_TIMEOUT_US;
+  }
+  buf[got] = 0;
+  return ESP_OK;
 }
 static esp_err_t wifi_config_handler(httpd_req_t *req){
   char b[512]; if(recv_json(req,b,sizeof(b))!=ESP_OK){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid body");return ESP_FAIL;} cJSON *j=cJSON_Parse(b); cJSON *s=j?cJSON_GetObjectItem(j,"ssid"):NULL; cJSON *p=j?cJSON_GetObjectItem(j,"password"):NULL; cJSON *r=cJSON_CreateObject();
@@ -259,9 +273,26 @@ static esp_err_t system_info_handler(httpd_req_t *req){
 static esp_err_t restart_handler(httpd_req_t *req){httpd_resp_sendstr(req,"Restarting\n");vTaskDelay(pdMS_TO_TICKS(200));esp_restart();return ESP_OK;}
 static esp_err_t speed_ping(httpd_req_t *req){httpd_resp_set_type(req,"text/plain");httpd_resp_set_hdr(req,"Cache-Control","no-store");return httpd_resp_send(req,"ok",2);}
 static esp_err_t speed_download(httpd_req_t *req){size_t bytes=1024*1024;char q[64],v[16];if(httpd_req_get_url_query_str(req,q,sizeof(q))==ESP_OK&&httpd_query_key_value(q,"bytes",v,sizeof(v))==ESP_OK){long x=strtol(v,NULL,10);if(x>0)bytes=x;}if(bytes>SPEEDTEST_MAX_BYTES)bytes=SPEEDTEST_MAX_BYTES;static uint8_t filler[SPEEDTEST_CHUNK];static bool init=false;if(!init){for(size_t i=0;i<sizeof(filler);i++)filler[i]=(uint8_t)(i*37);init=true;}httpd_resp_set_type(req,"application/octet-stream");httpd_resp_set_hdr(req,"Cache-Control","no-store");while(bytes){size_t n=bytes<sizeof(filler)?bytes:sizeof(filler);if(httpd_resp_send_chunk(req,(char*)filler,n)!=ESP_OK)return ESP_FAIL;bytes-=n;}return httpd_resp_send_chunk(req,NULL,0);}
-static esp_err_t speed_upload(httpd_req_t *req){size_t got=0,total=req->content_len;uint8_t b[SPEEDTEST_CHUNK];while(got<total){size_t want=total-got;if(want>sizeof(b))want=sizeof(b);int n=httpd_req_recv(req,(char*)b,want);if(n==HTTPD_SOCK_ERR_TIMEOUT)continue;if(n<=0)return ESP_FAIL;got+=n;}char out[64];snprintf(out,sizeof(out),"received=%u",(unsigned)got);httpd_resp_set_type(req,"text/plain");return httpd_resp_sendstr(req,out);}
+static esp_err_t speed_upload(httpd_req_t *req){
+  size_t got=0,total=req->content_len;
+  uint8_t b[SPEEDTEST_CHUNK];
+  int64_t idle_deadline=esp_timer_get_time()+HTTP_BODY_IDLE_TIMEOUT_US;
+  while(got<total){
+    size_t want=total-got;if(want>sizeof(b))want=sizeof(b);
+    int n=httpd_req_recv(req,(char*)b,want);
+    if(n==HTTPD_SOCK_ERR_TIMEOUT){
+      if(esp_timer_get_time()>=idle_deadline)return ESP_ERR_TIMEOUT;
+      continue;
+    }
+    if(n<=0)return ESP_FAIL;
+    got+=(size_t)n;
+    idle_deadline=esp_timer_get_time()+HTTP_BODY_IDLE_TIMEOUT_US;
+  }
+  char out[64];snprintf(out,sizeof(out),"received=%u",(unsigned)got);
+  httpd_resp_set_type(req,"text/plain");return httpd_resp_sendstr(req,out);
+}
 
-esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=24;c.stack_size=8192;c.lru_purge_enable=true;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
+esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=24;c.stack_size=8192;c.lru_purge_enable=true;c.task_priority=HTTP_SERVER_TASK_PRIORITY;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
 #define REG(U,M,H) do{httpd_uri_t x={.uri=U,.method=M,.handler=H};ESP_ERROR_CHECK(httpd_register_uri_handler(s_server,&x));}while(0)
   REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);
   ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
