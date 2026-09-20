@@ -26,9 +26,9 @@
 <p class='hint' style='margin-top:12px'>Up to 24 filters per output. PK uses Frequency/Gain/Q. LP, HP, BP and Notch use Frequency/Q. LS and HS use Frequency/Gain.</p>
 </div>
 <div class='card'>
-<h2>Apply</h2>
-<p class='hint'>Settings are not changed live. Save writes the complete configuration to NVS, then the ESP restarts and builds both filter chains from clean state.</p>
-<div class='actions'><button class='btn btn-primary' id='save-btn' onclick='saveEq()'>Save & Restart</button><a href='/' class='btn btn-secondary'>Back</a></div>
+<h2>Apply & Save</h2>
+<p class='hint'>Applies the EQ live and saves the complete configuration to NVS. No restart is required. Because EQ remains before the PCM buffer, the audible change follows the already-decoded ~1.1 s PCM lead.</p>
+<div class='actions'><button class='btn btn-primary' id='apply-save-btn' onclick='postEq()'>Apply &amp; Save</button><a href='/' class='btn btn-secondary'>Back</a></div>
 <div id='eq-msg'></div>
 </div>
 </div><script>
@@ -50,6 +50,6 @@ function updateFilterUi(sel){var row=sel.closest('.filter'),type=sel.value;row.q
 function collectSide(side){return [...box(side).querySelectorAll('.filter')].map(el=>({enabled:el.querySelector('.f-enabled').checked,type:el.querySelector('.f-type').value,frequency_hz:Number(el.querySelector('.f-freq').value),gain_db:Number(el.querySelector('.f-gain').value),q:Number(el.querySelector('.f-q').value)}));}
 async function loadEq(){try{var r=await fetch('/api/eq');var d=await r.json();if(!d.success)throw new Error();document.getElementById('eq-enabled').checked=!!d.enabled;document.getElementById('channel-mode').value=d.channel_mode||'stereo';document.getElementById('preamp').value=d.preamp_db??0;box('left').innerHTML='';box('right').innerHTML='';(d.left_filters||[]).forEach(f=>addFilter('left',f));(d.right_filters||[]).forEach(f=>addFilter('right',f));renumber('left');renumber('right');}catch(e){msg('Failed to load EQ settings.','err');}}
 function collect(){return{enabled:document.getElementById('eq-enabled').checked,channel_mode:document.getElementById('channel-mode').value,preamp_db:Number(document.getElementById('preamp').value),left_filters:collectSide('left'),right_filters:collectSide('right')};}
-async function saveEq(){var b=document.getElementById('save-btn');b.disabled=true;msg('Saving settings...','info');try{var r=await fetch('/api/eq',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});if(!r.ok){var t=await r.text();throw new Error(t||'Invalid settings');}var d=await r.json();if(d.success){msg('Saved. Device is restarting...','ok');setTimeout(()=>location.href='/',5000);}else throw new Error('Save failed');}catch(e){b.disabled=false;msg('Save failed: '+esc(e.message),'err');}}
+async function postEq(){var b=document.getElementById('apply-save-btn');b.disabled=true;msg('Applying EQ live and saving to NVS...','info');try{var r=await fetch('/api/eq?action=both',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});if(!r.ok){var t=await r.text();throw new Error(t||'Invalid settings');}var d=await r.json();if(!d.success||!d.applied||!d.saved)throw new Error('Apply & Save failed');msg('Applied live and saved to NVS. No restart performed.','ok');}catch(e){msg('Apply & Save failed: '+esc(e.message),'err');}finally{b.disabled=false;}}
 window.onload=loadEq;
 </script></body></html>

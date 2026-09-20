@@ -37,7 +37,7 @@
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
 #define AP2_STATUS_STACK             3072U
-#define AP2_NETWORK_CORE           0
+#define AP2_NETWORK_CORE           1
 #define AP2_DECODE_CORE            1
 #define AP2_BUFFERED_PROCESSOR_CORE 0
 #define AP2_RX_PRIORITY            5
@@ -93,7 +93,7 @@
  * deadline is this close do we commit one frame of silence through EQ. */
 #define AP2_RT_STAGE_COMMIT_MARGIN_US REALTIME_RECOVERY_FINAL_MARGIN_US
 
-static const char *TAG = "audio_shairport";
+static const char *TAG = "audio_receiver";
 static const char *STATUS_TAG = "audio_status";
 
 /* Updated by RTSP control on Core0, consumed by playout on Core1. */
@@ -922,6 +922,7 @@ static void ap2_buffered_processor_task(void *arg) {
   bool have_decoded_sequence = false;
   bool decoder_history_dirty = true;
   bool have_packet = false;
+  uint8_t consecutive_decrypt_failures = 0;
   ap2_buffered_packet_t packet = {0};
 
   audio_eq_reset_state();
@@ -952,6 +953,13 @@ static void ap2_buffered_processor_task(void *arg) {
       const esp_err_t read_err = ap2_buffered_fifo_read_packet(
           s.transport, s.buffered_packet, AP2_PACKET_MAX, &packet);
       if (read_err != ESP_OK) {
+        if (read_err == ESP_ERR_INVALID_SIZE) {
+          /* A length error destroys byte-stream framing. The FIFO layer has
+           * already aborted this client so accept() can establish a clean
+           * stream; reset codec history as well. */
+          decoder_history_dirty = true;
+          consecutive_decrypt_failures = 0;
+        }
         if (s.rx_running) ap2_buffered_fifo_wait(s.transport, 10U);
         continue;
       }
@@ -1064,8 +1072,15 @@ static void ap2_buffered_processor_task(void *arg) {
     if (dec_len <= 0) {
       decoder_history_dirty = true;
       have_packet = false;
+      if (++consecutive_decrypt_failures >= 3U) {
+        ESP_LOGW(TAG,
+                 "AAC decrypt/auth failed 3 consecutive blocks; aborting buffered TCP client");
+        ap2_buffered_fifo_abort_client(s.transport);
+        consecutive_decrypt_failures = 0;
+      }
       continue;
     }
+    consecutive_decrypt_failures = 0;
 
     aac_decode_info_t info = {0};
     const int frames = aac_decoder_decode(

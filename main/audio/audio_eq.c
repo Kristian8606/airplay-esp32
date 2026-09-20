@@ -5,6 +5,8 @@
 #include <strings.h>
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "nvs.h"
 
 static const char *TAG = "audio_eq";
@@ -44,6 +46,15 @@ typedef struct {
 } audio_eq_runtime_t;
 
 static audio_eq_runtime_t s_eq;
+static SemaphoreHandle_t s_eq_mutex;
+
+static inline void eq_lock(void) {
+  if (s_eq_mutex) xSemaphoreTake(s_eq_mutex, portMAX_DELAY);
+}
+
+static inline void eq_unlock(void) {
+  if (s_eq_mutex) xSemaphoreGive(s_eq_mutex);
+}
 
 static bool eq_is_finite(float value) { return isfinite((double)value); }
 
@@ -247,9 +258,15 @@ static bool calc_biquad(audio_eq_filter_type_t type, float frequency_hz,
   return true;
 }
 
-void audio_eq_reset_state(void) {
+static void reset_state_unlocked(void) {
   memset(s_eq.state_l, 0, sizeof(s_eq.state_l));
   memset(s_eq.state_r, 0, sizeof(s_eq.state_r));
+}
+
+void audio_eq_reset_state(void) {
+  eq_lock();
+  reset_state_unlocked();
+  eq_unlock();
 }
 
 static bool prepare_output(const audio_eq_output_config_t *cfg,
@@ -273,7 +290,7 @@ static bool prepare_output(const audio_eq_output_config_t *cfg,
   return true;
 }
 
-static bool prepare_for_rate(int sample_rate) {
+static bool prepare_for_rate_unlocked(int sample_rate) {
   if (sample_rate <= 0) return false;
   if (s_eq.ready && s_eq.sample_rate == sample_rate) return true;
 
@@ -288,7 +305,7 @@ static bool prepare_for_rate(int sample_rate) {
   s_eq.preamp_gain = powf(10.0f, s_eq.config.preamp_db / 20.0f);
   s_eq.sample_rate = sample_rate;
   s_eq.ready = true;
-  audio_eq_reset_state();
+  reset_state_unlocked();
   ESP_LOGI(TAG,
            "Ready: enabled=%u mode=%s left=%u/%u right=%u/%u preamp=%.2fdB sr=%d",
            (unsigned)s_eq.config.enabled,
@@ -302,7 +319,70 @@ static bool prepare_for_rate(int sample_rate) {
   return true;
 }
 
+esp_err_t audio_eq_get_active_config(audio_eq_config_t *out) {
+  if (!out) return ESP_ERR_INVALID_ARG;
+  eq_lock();
+  *out = s_eq.config;
+  eq_unlock();
+  return ESP_OK;
+}
+
+esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
+  if (!audio_eq_validate_config(config)) return ESP_ERR_INVALID_ARG;
+
+  int sample_rate = 0;
+  eq_lock();
+  sample_rate = s_eq.sample_rate;
+  eq_unlock();
+
+  biquad_coeff_t coeff_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
+  biquad_coeff_t coeff_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
+  uint8_t active_l = 0;
+  uint8_t active_r = 0;
+  float preamp_gain = powf(10.0f, config->preamp_db / 20.0f);
+  bool prepared = false;
+
+  if (sample_rate > 0) {
+    if (!prepare_output(&config->left, coeff_l, &active_l, sample_rate, "left") ||
+        !prepare_output(&config->right, coeff_r, &active_r, sample_rate, "right")) {
+      return ESP_ERR_INVALID_ARG;
+    }
+    prepared = true;
+  }
+
+  eq_lock();
+  s_eq.config = *config;
+  if (prepared && s_eq.sample_rate == sample_rate) {
+    memcpy(s_eq.coeff_l, coeff_l, sizeof(coeff_l));
+    memcpy(s_eq.coeff_r, coeff_r, sizeof(coeff_r));
+    s_eq.active_l = active_l;
+    s_eq.active_r = active_r;
+    s_eq.preamp_gain = preamp_gain;
+    s_eq.ready = true;
+  } else {
+    /* A stream-rate transition raced the HTTP request, or no stream has run
+     * yet. Rebuild from the new config on the next decoded PCM block. */
+    s_eq.ready = false;
+  }
+  reset_state_unlocked();
+  eq_unlock();
+
+  ESP_LOGI(TAG,
+           "Live apply: enabled=%u mode=%s left=%u right=%u preamp=%.2fdB%s",
+           (unsigned)config->enabled,
+           audio_eq_channel_mode_name(
+               (audio_eq_channel_mode_t)config->channel_mode),
+           (unsigned)config->left.filter_count,
+           (unsigned)config->right.filter_count, config->preamp_db,
+           prepared ? "" : " (coefficients deferred until audio)" );
+  return ESP_OK;
+}
+
 esp_err_t audio_eq_init(void) {
+  if (!s_eq_mutex) {
+    s_eq_mutex = xSemaphoreCreateMutex();
+    if (!s_eq_mutex) return ESP_ERR_NO_MEM;
+  }
   memset(&s_eq, 0, sizeof(s_eq));
   esp_err_t err = audio_eq_load_config(&s_eq.config);
   if (err != ESP_OK) {
@@ -428,7 +508,11 @@ static inline void process_right_bypass(int16_t *pcm, size_t frames) {
 
 void audio_eq_process(int16_t *pcm, size_t frames, int channels,
                       int sample_rate) {
-  if (!pcm || frames == 0 || channels != 2 || !prepare_for_rate(sample_rate)) {
+  if (!pcm || frames == 0 || channels != 2) return;
+
+  eq_lock();
+  if (!prepare_for_rate_unlocked(sample_rate)) {
+    eq_unlock();
     return;
   }
 
@@ -439,35 +523,39 @@ void audio_eq_process(int16_t *pcm, size_t frames, int channels,
     switch (mode) {
       case AUDIO_EQ_CHANNEL_MONO:
         process_mono_bypass(pcm, frames);
-        return;
+        break;
       case AUDIO_EQ_CHANNEL_LEFT:
         process_left_bypass(pcm, frames);
-        return;
+        break;
       case AUDIO_EQ_CHANNEL_RIGHT:
         process_right_bypass(pcm, frames);
-        return;
+        break;
       case AUDIO_EQ_CHANNEL_STEREO:
       default:
-        return;
+        break;
     }
+    eq_unlock();
+    return;
   }
 
   switch (mode) {
     case AUDIO_EQ_CHANNEL_MONO:
       process_mono_eq(pcm, frames);
-      return;
+      break;
     case AUDIO_EQ_CHANNEL_LEFT:
       process_left_eq(pcm, frames);
-      return;
+      break;
     case AUDIO_EQ_CHANNEL_RIGHT:
       process_right_eq(pcm, frames);
-      return;
+      break;
     case AUDIO_EQ_CHANNEL_STEREO:
     default:
       process_stereo_eq(pcm, frames);
-      return;
+      break;
   }
+  eq_unlock();
 }
+
 
 const char *audio_eq_filter_type_name(audio_eq_filter_type_t type) {
   switch (type) {

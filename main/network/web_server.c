@@ -146,7 +146,7 @@ static void eq_config_to_json(const audio_eq_config_t *cfg, cJSON *root) {
 
 static esp_err_t eq_get_handler(httpd_req_t *req) {
   audio_eq_config_t cfg;
-  esp_err_t err = audio_eq_load_config(&cfg);
+  esp_err_t err = audio_eq_get_active_config(&cfg);
   if (err != ESP_OK) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                         esp_err_to_name(err));
@@ -248,19 +248,31 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
     return ESP_ERR_INVALID_ARG;
   }
 
-  esp_err_t err = audio_eq_save_config(&cfg);
+  char action[12] = "both";
+  char query[48];
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+    (void)httpd_query_key_value(query, "action", action, sizeof(action));
+  }
+
+  const bool do_apply = strcmp(action, "save") != 0;
+  const bool do_save = strcmp(action, "apply") != 0;
+  esp_err_t err = ESP_OK;
+  if (do_apply) err = audio_eq_apply_config(&cfg);
+  if (err == ESP_OK && do_save) err = audio_eq_save_config(&cfg);
   if (err != ESP_OK) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                         esp_err_to_name(err));
     return err;
   }
 
-  ESP_LOGI(TAG, "EQ settings saved; restarting to apply");
+  ESP_LOGI(TAG, "EQ %s%s", do_apply ? "applied" : "",
+           do_save ? (do_apply ? " + saved" : "saved") : "");
   httpd_resp_set_type(req, "application/json");
-  httpd_resp_sendstr(req, "{\"success\":true,\"restarting\":true}");
-  vTaskDelay(pdMS_TO_TICKS(750));
-  esp_restart();
-  return ESP_OK;
+  char response[96];
+  snprintf(response, sizeof(response),
+           "{\"success\":true,\"applied\":%s,\"saved\":%s,\"restarting\":false}",
+           do_apply ? "true" : "false", do_save ? "true" : "false");
+  return httpd_resp_sendstr(req, response);
 }
 
 static esp_err_t ota_handler(httpd_req_t *req){ if(req->content_len==0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"No firmware uploaded");return ESP_FAIL;} ESP_LOGI(TAG,"Stopping RTSP for OTA"); rtsp_server_stop(); esp_err_t e=ota_start_from_http(req); if(e!=ESP_OK){ ESP_LOGE(TAG,"OTA failed (%s); restarting RTSP",esp_err_to_name(e)); esp_err_t re=rtsp_server_start(); if(re!=ESP_OK){ESP_LOGE(TAG,"RTSP restart after OTA failure failed: %s",esp_err_to_name(re));} httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,esp_err_to_name(e));return e;} httpd_resp_sendstr(req,"Firmware update complete, rebooting now!\n"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK; }

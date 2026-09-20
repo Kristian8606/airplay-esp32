@@ -59,6 +59,10 @@ esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
 void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo);
 bool ap2_buffered_fifo_is_idle(ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_clear(ap2_buffered_fifo_t *fifo);
+/* Abort only the current buffered TCP client after a fatal framing/session
+ * error. The listener stays up so AirPlay can reconnect. This clears queued
+ * bytes, advances the stream epoch and wakes all waiters. */
+void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo);
 
 size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,

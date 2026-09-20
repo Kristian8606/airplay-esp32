@@ -372,6 +372,28 @@ void ap2_buffered_fifo_clear(ap2_buffered_fifo_t *fifo) {
   signal_all(fifo);
 }
 
+void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo) {
+  if (!fifo || !fifo->fifo_mutex) return;
+
+  int client = -1;
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  client = fifo->client_sock;
+  fifo->connected = false;
+  fifo->read_pos = fifo->write_pos;
+  fifo->occupancy = 0;
+  (void)next_epoch(fifo);
+  xSemaphoreGive(fifo->fifo_mutex);
+
+  xSemaphoreTake(fifo->control_mutex, portMAX_DELAY);
+  control_clear_locked(fifo);
+  xSemaphoreGive(fifo->control_mutex);
+
+  /* The reader task owns close(). shutdown() is enough to wake a blocking
+   * recv(); it will then close this client and return to accept(). */
+  if (client >= 0) (void)shutdown(client, SHUT_RDWR);
+  signal_all(fifo);
+}
+
 size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo) {
   return fifo ? fifo->capacity : 0U;
 }
@@ -412,7 +434,10 @@ esp_err_t ap2_buffered_fifo_read_packet(ap2_buffered_fifo_t *fifo,
       continue;
     const uint16_t wire_len = ((uint16_t)length_bytes[0] << 8) | length_bytes[1];
     if (wire_len < FIFO_MIN_WIRE_LEN || (size_t)wire_len > packet_capacity + 2U) {
-      ESP_LOGW(TAG, "invalid buffered block length=%u", (unsigned)wire_len);
+      ESP_LOGW(TAG,
+               "invalid buffered block length=%u; aborting client to restore framing",
+               (unsigned)wire_len);
+      ap2_buffered_fifo_abort_client(fifo);
       return ESP_ERR_INVALID_SIZE;
     }
 
