@@ -43,6 +43,9 @@ typedef struct {
 size_t realtime_receiver_packet_workspace_size(void);
 esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
                                                   size_t workspace_bytes);
+/* Detach caller-owned DATA/RTX packet storage before that shared workspace is
+ * freed. The realtime receiver must already be fully stopped. */
+esp_err_t realtime_receiver_clear_packet_workspace(void);
 
 esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
                                   const realtime_receiver_config_t *config);

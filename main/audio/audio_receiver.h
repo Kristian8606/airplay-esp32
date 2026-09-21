@@ -9,11 +9,11 @@
 /* Raw AirPlay-2 buffered TCP FIFO. The receiver stores bytes exactly in TCP
  * order; packet framing and FLUSH interpretation happen only in the single
  * sequential AAC consumer, following Shairport Sync's buffered path. */
-#define AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES (5U * 1024U * 1024U)
+#define AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES (6U * 1024U * 1024U)
 
 /* AirPlay type-103 capacity advertised to the sender. Keep this equal to the
- * physical 5 MiB raw FIFO so normal TCP backpressure bounds sender preload. */
-#define AP2_BUFFERED_AUDIO_ADVERTISED_BYTES (5U * 1024U * 1024U)
+ * physical 6 MiB raw FIFO so normal TCP backpressure bounds sender preload. */
+#define AP2_BUFFERED_AUDIO_ADVERTISED_BYTES (6U * 1024U * 1024U)
 
 /* AirPlay 2 audio receiver: buffered AAC plus realtime ALAC. */
 typedef struct {
@@ -44,6 +44,13 @@ typedef enum {
 } audio_stream_type_t;
 
 esp_err_t audio_receiver_init(void);
+bool audio_receiver_is_initialized(void);
+/* Wi-Fi scans need temporary heap headroom. This is a full audio-engine
+ * memory release (except for the already-created I2S driver itself): current
+ * media is stopped, audio worker tasks exit, all large codec/PCM stores are
+ * freed, and audio_receiver_init() may be called afterwards to restore the
+ * engine. Call only after the RTSP server has stopped accepting clients. */
+esp_err_t audio_receiver_release_for_wifi_scan(void);
 void audio_receiver_set_format(const audio_format_t *format);
 void audio_receiver_set_encryption(const audio_encrypt_t *encrypt);
 void audio_receiver_set_stream_type(audio_stream_type_t type);

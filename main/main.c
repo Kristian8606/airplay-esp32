@@ -63,10 +63,12 @@ void app_main(void) {
   ESP_ERROR_CHECK(spiffs_storage_init());
   ESP_ERROR_CHECK(log_stream_init());
 
+  const bool provisioning_only = !settings_has_wifi_credentials();
+
   wifi_init_apsta(NULL, NULL);
   ESP_ERROR_CHECK(web_server_start(80));
 
-  if (!settings_has_wifi_credentials() || !wifi_wait_connected(30000)) {
+  if (provisioning_only || !wifi_wait_connected(30000)) {
     ESP_LOGW(TAG,
              "STA not connected; captive WiFi setup remains available at 192.168.4.1");
     dns_server_start(AP_IP_ADDR);
@@ -81,11 +83,21 @@ void app_main(void) {
   (void)AUDIO_DIAG_INIT();
   ESP_ERROR_CHECK(ptp_clock_init());
   ESP_ERROR_CHECK(hap_init());
-  ESP_ERROR_CHECK(audio_receiver_init());
-  log_memory_state("post-audio-init");
   led_init();
-  mdns_airplay_init();
-  ESP_ERROR_CHECK(rtsp_server_start());
+
+  if (provisioning_only) {
+    /* First-time setup needs Wi-Fi scan headroom, not a dormant 6 MiB audio
+     * FIFO. Saving Wi-Fi already restarts the ESP, so defer the entire AirPlay
+     * runtime until that normal connected boot. */
+    ESP_LOGI(TAG,
+             "WiFi provisioning mode: audio engine deferred until credentials are saved and device restarts");
+    log_memory_state("setup-ready");
+  } else {
+    ESP_ERROR_CHECK(audio_receiver_init());
+    log_memory_state("post-audio-init");
+    mdns_airplay_init();
+    ESP_ERROR_CHECK(rtsp_server_start());
+  }
 
   const esp_app_desc_t *app = esp_app_get_description();
   const char *fw_version = app ? app->version : "unknown";

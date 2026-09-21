@@ -499,4 +499,14 @@ void rtsp_server_stop(void) {
       ESP_LOGW(TAG, "RTSP server task did not exit within timeout");
     }
   }
+
+  /* server_task asks every client to stop, but its fixed grace delay is not
+   * an ownership barrier. Callers that are about to free global audio memory
+   * must not return until client cleanup has completed audio_receiver_stop(). */
+  for (int i = 0; i < 2; ++i) {
+    if (clients[i].task != NULL &&
+        !wait_client_stopped(i, pdMS_TO_TICKS(3000))) {
+      ESP_LOGW(TAG, "RTSP client slot %d did not exit within stop timeout", i);
+    }
+  }
 }

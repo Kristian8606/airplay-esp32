@@ -115,6 +115,7 @@ typedef struct {
 
   rt_packet_slot_t *data_pool;
   rt_packet_slot_t *rtx_pool;
+  bool packet_workspace_external;
   uint8_t *control_packet;
   uint8_t *decrypt_buf;
   int16_t *pcm;
@@ -922,9 +923,23 @@ esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
 
   s_rt.data_pool = (rt_packet_slot_t *)aligned;
   s_rt.rtx_pool = (rt_packet_slot_t *)(aligned + data_bytes);
+  s_rt.packet_workspace_external = true;
   AUDIO_DIAG_BUFFER_PACKET_WORKSPACE(
       (uint32_t)(data_bytes / 1024U), (uint32_t)(rtx_bytes / 1024U),
       (uint32_t)((data_bytes + rtx_bytes) / 1024U));
+  return ESP_OK;
+}
+
+esp_err_t realtime_receiver_clear_packet_workspace(void) {
+  if (rt_running() || !all_tasks_stopped()) return ESP_ERR_INVALID_STATE;
+
+  /* Only detach caller-owned storage. If a future configuration lets the
+   * receiver allocate these pools itself, their ownership remains here. */
+  if (s_rt.packet_workspace_external) {
+    s_rt.data_pool = NULL;
+    s_rt.rtx_pool = NULL;
+    s_rt.packet_workspace_external = false;
+  }
   return ESP_OK;
 }
 

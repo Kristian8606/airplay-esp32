@@ -1,4 +1,5 @@
 #include "web_server.h"
+#include "audio_receiver.h"
 #include "audio_eq.h"
 #include "ota.h"
 #include "wifi.h"
@@ -7,6 +8,7 @@
 #include "rtsp_server.h"
 #include "esp_http_server.h"
 #include "esp_app_desc.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -25,6 +27,20 @@ static httpd_handle_t s_server = NULL;
 #define SPEEDTEST_MAX_BYTES ((size_t)16 * 1024 * 1024)
 #define HTTP_SERVER_TASK_PRIORITY 3
 #define HTTP_BODY_IDLE_TIMEOUT_US (15LL * 1000LL * 1000LL)
+
+static void log_wifi_scan_memory(const char *where) {
+  ESP_LOGI(TAG,
+           "WiFi scan MEM %s internal=%uKiB largest=%uKiB psram=%uKiB largest=%uKiB",
+           where,
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) /
+                      1024U),
+           (unsigned)(heap_caps_get_largest_free_block(
+                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) /
+                      1024U),
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) /
+                      1024U));
+}
 
 static esp_err_t serve_file(httpd_req_t *req, const char *path, const char *type) {
   FILE *f = fopen(path, "r");
@@ -55,6 +71,28 @@ static esp_err_t captive_404_handler(httpd_req_t *req, httpd_err_code_t error){
 static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   wifi_ap_record_t *ap_list = NULL;
   uint16_t ap_count = 0;
+  const bool restore_airplay = audio_receiver_is_initialized();
+
+  /* The 6 MiB compressed store is intentionally borrowed by provisioning.
+   * A normal connected device stops AirPlay only for the duration of this
+   * scan. On first boot the audio engine was never created, so the scan starts
+   * with essentially the full PSRAM headroom already available. */
+  if (restore_airplay) {
+    ESP_LOGI(TAG, "WiFi scan: pausing AirPlay and releasing audio memory");
+    rtsp_server_stop();
+    esp_err_t release_err = audio_receiver_release_for_wifi_scan();
+    if (release_err != ESP_OK) {
+      ESP_LOGE(TAG, "WiFi scan: audio memory release failed: %s",
+               esp_err_to_name(release_err));
+      (void)rtsp_server_start();
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "Audio engine could not pause for WiFi scan");
+      return ESP_FAIL;
+    }
+    log_wifi_scan_memory("after-audio-release");
+  } else {
+    log_wifi_scan_memory("setup-mode");
+  }
 
   cJSON *json = cJSON_CreateObject();
   esp_err_t err = wifi_scan(&ap_list, &ap_count);
@@ -70,18 +108,46 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
     }
     cJSON_AddItemToObject(json, "networks", networks);
     cJSON_AddBoolToObject(json, "success", true);
-    free(ap_list);
   } else {
     cJSON_AddBoolToObject(json, "success", false);
     cJSON_AddStringToObject(json, "error", esp_err_to_name(err));
   }
 
-  char *json_str = cJSON_Print(json);
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
-  free(json_str);
+  char *json_str = cJSON_PrintUnformatted(json);
+  free(ap_list);
+  ap_list = NULL;
   cJSON_Delete(json);
-  return ESP_OK;
+  log_wifi_scan_memory("after-scan-results-free");
+
+  if (!json_str) {
+    if (restore_airplay) {
+      esp_err_t restore_err = audio_receiver_init();
+      if (restore_err == ESP_OK) (void)rtsp_server_start();
+    }
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "Failed to encode WiFi scan results");
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  esp_err_t send_err = httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+
+  if (restore_airplay) {
+    esp_err_t restore_err = audio_receiver_init();
+    if (restore_err == ESP_OK) {
+      restore_err = rtsp_server_start();
+    }
+    if (restore_err != ESP_OK) {
+      ESP_LOGE(TAG, "WiFi scan: AirPlay restore failed: %s",
+               esp_err_to_name(restore_err));
+    } else {
+      ESP_LOGI(TAG, "WiFi scan: AirPlay ready again");
+      log_wifi_scan_memory("after-audio-restore");
+    }
+  }
+
+  return send_err;
 }
 
 static esp_err_t recv_json(httpd_req_t *req, char *buf, size_t cap){

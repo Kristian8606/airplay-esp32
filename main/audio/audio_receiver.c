@@ -623,14 +623,17 @@ static int32_t robust_phase_center_us(const output_sync_state_t *sync) {
 
 static void audio_status_task(void *arg) {
   (void)arg;
-  for (;;) {
+  while (s.engine_running) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
     const bool active = s.engine_running && snap.playing &&
         (snap.stream_type == AUDIO_STREAM_BUFFERED ||
          snap.stream_type == AUDIO_STREAM_REALTIME);
     if (xSemaphoreTake(s.status_wake, active ? pdMS_TO_TICKS(AP2_STATUS_PERIOD_MS)
-                                            : portMAX_DELAY) == pdTRUE) continue;
+                                            : portMAX_DELAY) == pdTRUE) {
+      if (!s.engine_running) break;
+      continue;
+    }
     snapshot_state(&snap);
     if (!s.engine_running || !snap.playing ||
         (snap.stream_type != AUDIO_STREAM_BUFFERED &&
@@ -742,6 +745,8 @@ static void audio_status_task(void *arg) {
     }
   }
 
+  s.status_task = NULL;
+  vTaskDelete(NULL);
 }
 
 static void audio_status_notify(void) {
@@ -2073,7 +2078,8 @@ esp_err_t audio_receiver_init(void) {
       0U);
 
   /* Allocate the one large codec backing store first while PSRAM is least
-   * fragmented. Buffered AAC uses all 5 MiB as its contiguous circular byte store.
+   * fragmented. Buffered AAC uses the full configured store as its contiguous
+   * circular byte buffer.
    * Realtime ALAC reuses the beginning of the same bytes for its raw PCM ring
    * and DATA/RTX pools, but only after the buffered transport is fully idle. */
   if (!s.codec_workspace) {
@@ -2185,20 +2191,104 @@ esp_err_t audio_receiver_init(void) {
                               AP2_STATUS_CORE) != pdPASS) {
     ESP_LOGW(TAG, "audio status task create failed");
   }
-  if (xTaskCreatePinnedToCore(ap2_playout_task, "ap2_playout",
-                              AP2_PLAYOUT_STACK, NULL, AP2_PLAYOUT_PRIORITY,
-                              &s.playout_task, AP2_DECODE_CORE) != pdPASS) {
-    return ESP_FAIL;
+  if (!s.playout_task) {
+    if (xTaskCreatePinnedToCore(ap2_playout_task, "ap2_playout",
+                                AP2_PLAYOUT_STACK, NULL, AP2_PLAYOUT_PRIORITY,
+                                &s.playout_task, AP2_DECODE_CORE) != pdPASS) {
+      return ESP_FAIL;
+    }
+    AUDIO_DIAG_LIFECYCLE_TASK_STARTED(
+        AUDIO_DIAG_TASK_PLAYOUT, AP2_DECODE_CORE, AP2_PLAYOUT_PRIORITY,
+        AUDIO_PLAYOUT_FRAMES);
   }
-  AUDIO_DIAG_LIFECYCLE_TASK_STARTED(
-      AUDIO_DIAG_TASK_PLAYOUT, AP2_DECODE_CORE, AP2_PLAYOUT_PRIORITY,
-      AUDIO_PLAYOUT_FRAMES);
-  if (xTaskCreatePinnedToCore(realtime_stage_task, "alac_stage",
-                              AP2_RT_STAGE_STACK, NULL, AP2_RT_STAGE_PRIORITY,
-                              &s.realtime_stage_task, AP2_DECODE_CORE) != pdPASS) {
-    return ESP_FAIL;
+  if (!s.realtime_stage_task) {
+    if (xTaskCreatePinnedToCore(realtime_stage_task, "alac_stage",
+                                AP2_RT_STAGE_STACK, NULL, AP2_RT_STAGE_PRIORITY,
+                                &s.realtime_stage_task, AP2_DECODE_CORE) != pdPASS) {
+      return ESP_FAIL;
+    }
   }
 
+  return ESP_OK;
+}
+
+bool audio_receiver_is_initialized(void) {
+  return s.engine_running && s.codec_workspace && s.transport && s.pcm_ring &&
+         s.realtime_stage_ring;
+}
+
+esp_err_t audio_receiver_release_for_wifi_scan(void) {
+  if (!audio_receiver_is_initialized()) return ESP_OK;
+
+  /* First reach the same hard media boundary used for codec/session changes.
+   * The RTSP server is stopped by the caller, so no new producer can appear
+   * while the stores are being dismantled. */
+  audio_receiver_stop();
+
+  if (s.processor_task || !realtime_receiver_is_idle()) {
+    ESP_LOGE(TAG, "WiFi scan release refused: media producer still active");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  /* Stop the long-lived workers before freeing any object they can observe. */
+  s.engine_running = false;
+  __atomic_store_n(&s.realtime_stage_running, false, __ATOMIC_RELEASE);
+  audio_status_notify();
+  playout_wake();
+  realtime_stage_kick();
+  if (s.playout_timer) (void)esp_timer_stop(s.playout_timer);
+
+  for (int i = 0; (s.playout_task || s.realtime_stage_task || s.status_task) &&
+                  i < 100; ++i) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  if (s.playout_task || s.realtime_stage_task || s.status_task) {
+    ESP_LOGE(TAG,
+             "WiFi scan release timed out: playout=%p stage=%p status=%p",
+             (void *)s.playout_task, (void *)s.realtime_stage_task,
+             (void *)s.status_task);
+    return ESP_ERR_TIMEOUT;
+  }
+
+  ESP_RETURN_ON_ERROR(realtime_receiver_clear_packet_workspace(), TAG,
+                      "failed to detach realtime shared workspace");
+  s.realtime_workspace_bound = false;
+
+  if (s.transport) {
+    ap2_buffered_fifo_destroy(s.transport);
+    s.transport = NULL;
+  }
+  if (s.realtime_stage_ring) {
+    pcm_rtp_ring_destroy(s.realtime_stage_ring);
+    s.realtime_stage_ring = NULL;
+  }
+  if (s.pcm_ring) {
+    pcm_rtp_ring_destroy(s.pcm_ring);
+    s.pcm_ring = NULL;
+  }
+
+  free(s.buffered_packet);
+  s.buffered_packet = NULL;
+  free(s.decrypt_buf);
+  s.decrypt_buf = NULL;
+  free(s.decode_pcm);
+  s.decode_pcm = NULL;
+  free(s.realtime_stage_pcm);
+  s.realtime_stage_pcm = NULL;
+  free(s.codec_workspace);
+  s.codec_workspace = NULL;
+  s.codec_workspace_size = 0;
+
+  taskENTER_CRITICAL(&s.state_mux);
+  s.playing = false;
+  s.anchor_valid = false;
+  s.anchor_local_valid = false;
+  s.realtime_stage_cursor_valid = false;
+  s.stream_type = AUDIO_STREAM_NONE;
+  s.port = 0;
+  taskEXIT_CRITICAL(&s.state_mux);
+
+  ESP_LOGI(TAG, "Audio memory released for WiFi scan");
   return ESP_OK;
 }
 
