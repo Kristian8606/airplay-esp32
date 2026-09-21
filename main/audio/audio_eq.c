@@ -351,6 +351,13 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
   }
 
   eq_lock();
+  const uint8_t old_active_l = s_eq.active_l;
+  const uint8_t old_active_r = s_eq.active_r;
+  const bool preserve_history =
+      prepared && s_eq.ready && s_eq.sample_rate == sample_rate &&
+      s_eq.config.enabled && config->enabled &&
+      s_eq.config.channel_mode == config->channel_mode &&
+      old_active_l == active_l && old_active_r == active_r;
   s_eq.config = *config;
   if (prepared && s_eq.sample_rate == sample_rate) {
     memcpy(s_eq.coeff_l, coeff_l, sizeof(coeff_l));
@@ -359,12 +366,20 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
     s_eq.active_r = active_r;
     s_eq.preamp_gain = preamp_gain;
     s_eq.ready = true;
+
+    /* Live apply happens between PCM blocks because audio_eq_process() holds
+     * this same mutex for a whole block.  For an in-place coefficient edit,
+     * preserve DF2T history: zeroing every z1/z2 at signal amplitude is a
+     * deterministic discontinuity/click. Topology/mode/on-off changes still
+     * start from clean state because old filter history no longer represents
+     * the new signal path. */
+    if (!preserve_history) reset_state_unlocked();
   } else {
     /* A stream-rate transition raced the HTTP request, or no stream has run
      * yet. Rebuild from the new config on the next decoded PCM block. */
     s_eq.ready = false;
+    reset_state_unlocked();
   }
-  reset_state_unlocked();
   eq_unlock();
 
   ESP_LOGI(TAG,

@@ -5,6 +5,7 @@
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -13,6 +14,7 @@
 
 #include "wifi.h"
 #include "settings.h"
+#include "dns_server.h"
 
 static const char *TAG = "wifi";
 
@@ -193,6 +195,10 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
 
+    /* Captive DNS is only useful while the setup AP is active. Stop it before
+     * dropping APSTA so its task/socket cannot linger in normal STA mode. */
+    dns_server_stop();
+
     // Disable AP mode when STA connects
     wifi_mode_t mode;
     if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_APSTA) {
@@ -225,15 +231,29 @@ static esp_err_t wifi_collect_scan_results(bool show_hidden,
 
   uint16_t number = 0;
   err = esp_wifi_scan_get_ap_num(&number);
-  if (err != ESP_OK) return err;
-  if (number == 0) return ESP_OK;
+  if (err != ESP_OK) {
+    (void)esp_wifi_clear_ap_list();
+    return err;
+  }
+  if (number == 0) {
+    (void)esp_wifi_clear_ap_list();
+    return ESP_OK;
+  }
 
-  wifi_ap_record_t *aps = malloc(sizeof(*aps) * number);
-  if (!aps) return ESP_ERR_NO_MEM;
+  /* Keep the temporary result array out of PSRAM. The web handler restores
+   * the 6 MiB contiguous audio workspace immediately after this function
+   * returns, so even a small scan allocation should not split that block. */
+  wifi_ap_record_t *aps = heap_caps_malloc(
+      sizeof(*aps) * number, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!aps) {
+    (void)esp_wifi_clear_ap_list();
+    return ESP_ERR_NO_MEM;
+  }
 
   err = esp_wifi_scan_get_ap_records(&number, aps);
   if (err != ESP_OK) {
     free(aps);
+    (void)esp_wifi_clear_ap_list();
     return err;
   }
 

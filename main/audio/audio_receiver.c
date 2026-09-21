@@ -36,7 +36,7 @@
 #define AP2_PROCESS_STACK          6144U
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
-#define AP2_STATUS_STACK             3072U
+#define AP2_STATUS_STACK             4096U
 #define AP2_NETWORK_CORE           1
 #define AP2_DECODE_CORE            1
 #define AP2_BUFFERED_PROCESSOR_CORE 0
@@ -47,7 +47,7 @@
 #define AP2_STATUS_PRIORITY          1
 #define AP2_STATUS_CORE              0
 #define AP2_STATUS_PERIOD_MS      2000U
-#define AP2_PCM_CAPACITY_FRAMES    4096U
+#define AP2_PCM_CAPACITY_FRAMES    1024U
 
 #define AP2_PID_CALC_PERIOD_US    1000000LL  /* PID math at 1 Hz */
 #define AP2_PID_TUNE_PERIOD_US    5000000LL  /* physical I2S retune <= 0.2 Hz */
@@ -68,7 +68,7 @@
 #define AP2_START_REAL_BOUNDARY_BLOCKS      (AP2_START_SILENCE_FUTURE_BLOCKS + 2U)
 #define AP2_START_ALIGN_TIMEOUT_US      30000LL
 #define AP2_START_PRIME_GUARD_BLOCKS        8U
-#define AP2_BUFFERED_START_RESERVE_MS      250U
+#define AP2_BUFFERED_START_RESERVE_MS      50U
 
 /* PID servo around tagged DMA-EOF phase.
  * P reacts to phase error, I learns the steady crystal/rate bias, D damps
@@ -623,6 +623,7 @@ static int32_t robust_phase_center_us(const output_sync_state_t *sync) {
 
 static void audio_status_task(void *arg) {
   (void)arg;
+  bool stack_headroom_warned = false;
   while (s.engine_running) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
@@ -742,6 +743,20 @@ static void audio_status_task(void *arg) {
                  status_frames_to_ms(raw_frames, sr),
                  status_frames_to_ms(pcm_frames, sr));
       }
+    }
+
+    /* Keep this diagnostic cheap and rate-limited. On ESP-IDF the task stack
+     * watermark is reported in bytes. Warn once while headroom is below 1 KiB
+     * and re-arm only after there is comfortable margin again. */
+    const UBaseType_t stack_headroom = uxTaskGetStackHighWaterMark(NULL);
+    if (stack_headroom < 1024U) {
+      if (!stack_headroom_warned) {
+        ESP_LOGW(STATUS_TAG, "status task stack headroom low: %u bytes",
+                 (unsigned)stack_headroom);
+        stack_headroom_warned = true;
+      }
+    } else if (stack_headroom >= 1536U) {
+      stack_headroom_warned = false;
     }
   }
 
@@ -926,6 +941,8 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t expected_seq = 0;
   bool have_decoded_sequence = false;
   bool decoder_history_dirty = true;
+  bool mute_next_aac_block = true;
+  uint32_t decoder_timeline_generation = 0;
   bool have_packet = false;
   uint8_t consecutive_decrypt_failures = 0;
   ap2_buffered_packet_t packet = {0};
@@ -937,6 +954,16 @@ static void ap2_buffered_processor_task(void *arg) {
   while (s.rx_running) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
+    if (decoder_timeline_generation != snap.generation) {
+      /* A committed presentation timeline is a new AAC sequence.  Keep codec
+       * history aligned by decoding its first packet normally, but publish
+       * silence for that one AAC block just as Shairport-Sync does.  This
+       * prevents stale codec/filter history from becoming an audible startup
+       * transient without changing the RTP cursor. */
+      decoder_timeline_generation = snap.generation;
+      decoder_history_dirty = true;
+      mute_next_aac_block = true;
+    }
     const bool normal_consume_ready =
         snap.stream_type == AUDIO_STREAM_BUFFERED && snap.playing &&
         snap.anchor_valid && !snap.timeline_reset_pending &&
@@ -963,6 +990,7 @@ static void ap2_buffered_processor_task(void *arg) {
            * already aborted this client so accept() can establish a clean
            * stream; reset codec history as well. */
           decoder_history_dirty = true;
+          mute_next_aac_block = true;
           consecutive_decrypt_failures = 0;
         }
         if (s.rx_running) ap2_buffered_fifo_wait(s.transport, 10U);
@@ -980,7 +1008,10 @@ static void ap2_buffered_processor_task(void *arg) {
     if (decision.activation_count) {
       apply_deferred_flush_activations(&decision, snap.pcm_generation);
     }
-    if (decision.discontinuity) decoder_history_dirty = true;
+    if (decision.discontinuity) {
+      decoder_history_dirty = true;
+      mute_next_aac_block = true;
+    }
     if (decision.immediate_completed) {
       ESP_LOGI(TAG, "AAC FLUSH complete target=%" PRIu32 " at seq=%" PRIu32 "%s",
                decision.immediate_target_seq, packet.seq,
@@ -1017,6 +1048,7 @@ static void ap2_buffered_processor_task(void *arg) {
        * presentation point. Consume it and rebuild decoder history at the next
        * usable AAC block; never search ahead. */
       decoder_history_dirty = true;
+      mute_next_aac_block = true;
       have_packet = false;
       continue;
     }
@@ -1052,6 +1084,7 @@ static void ap2_buffered_processor_task(void *arg) {
       have_decoded_sequence = false;
       expected_timestamp = 0;
       expected_seq = 0;
+      mute_next_aac_block = true;
       audio_eq_reset_state();
       AUDIO_DIAG_CODEC_AAC_READY((uint32_t)snap.format.sample_rate,
                                  (uint32_t)snap.format.channels);
@@ -1064,6 +1097,7 @@ static void ap2_buffered_processor_task(void *arg) {
         reset_aac_decode_history(&decoder, &decoder_format_generation,
                                  &have_decoded_sequence, &expected_timestamp,
                                  &expected_seq);
+        mute_next_aac_block = true;
         if (!decoder) {
           have_packet = false;
           continue;
@@ -1076,6 +1110,7 @@ static void ap2_buffered_processor_task(void *arg) {
         s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
     if (dec_len <= 0) {
       decoder_history_dirty = true;
+      mute_next_aac_block = true;
       have_packet = false;
       if (++consecutive_decrypt_failures >= 3U) {
         ESP_LOGW(TAG,
@@ -1093,6 +1128,7 @@ static void ap2_buffered_processor_task(void *arg) {
         (size_t)dec_len, s.decode_pcm, AP2_PCM_CAPACITY_FRAMES, &info);
     if (frames <= 0) {
       decoder_history_dirty = true;
+      mute_next_aac_block = true;
       have_packet = false;
       continue;
     }
@@ -1104,10 +1140,22 @@ static void ap2_buffered_processor_task(void *arg) {
     pcm_process_common_eq(s.decode_pcm, (size_t)frames, info.channels,
                           snap.format.sample_rate);
 
+    if (mute_next_aac_block) {
+      /* Preserve decoder and EQ history, but never expose the first AAC block
+       * of a new/discontinuous sequence to the PCM ring.  1024 samples at
+       * 44.1 kHz is ~23 ms and the RTP duration is deliberately preserved. */
+      memset(s.decode_pcm, 0,
+             (size_t)frames * (size_t)info.channels * sizeof(int16_t));
+      mute_next_aac_block = false;
+    }
+
     const pcm_store_result_t stored = pcm_store_with_backpressure(
         packet.rtp, s.decode_pcm, (size_t)frames, info.channels,
         snap.pcm_generation);
-    if (stored != PCM_STORE_PUBLISHED) decoder_history_dirty = true;
+    if (stored != PCM_STORE_PUBLISHED) {
+      decoder_history_dirty = true;
+      mute_next_aac_block = true;
+    }
     have_packet = false;
   }
 
@@ -2225,9 +2273,10 @@ esp_err_t audio_receiver_release_for_wifi_scan(void) {
    * while the stores are being dismantled. */
   audio_receiver_stop();
 
-  if (s.processor_task || !realtime_receiver_is_idle()) {
+  if (s.processor_task || !realtime_receiver_is_idle() ||
+      (s.transport && !ap2_buffered_fifo_is_idle(s.transport))) {
     ESP_LOGE(TAG, "WiFi scan release refused: media producer still active");
-    return ESP_ERR_INVALID_STATE;
+    return ESP_ERR_TIMEOUT;
   }
 
   /* Stop the long-lived workers before freeing any object they can observe. */
@@ -2247,15 +2296,33 @@ esp_err_t audio_receiver_release_for_wifi_scan(void) {
              "WiFi scan release timed out: playout=%p stage=%p status=%p",
              (void *)s.playout_task, (void *)s.realtime_stage_task,
              (void *)s.status_task);
+    /* No large allocation has been freed yet. Restore the normal engine
+     * lifecycle rather than returning a half-stopped receiver to the web
+     * server. */
+    (void)audio_receiver_init();
     return ESP_ERR_TIMEOUT;
   }
 
-  ESP_RETURN_ON_ERROR(realtime_receiver_clear_packet_workspace(), TAG,
-                      "failed to detach realtime shared workspace");
+  esp_err_t err = realtime_receiver_clear_packet_workspace();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "failed to detach realtime shared workspace: %s",
+             esp_err_to_name(err));
+    (void)audio_receiver_init();
+    return err;
+  }
   s.realtime_workspace_bound = false;
 
   if (s.transport) {
-    ap2_buffered_fifo_destroy(s.transport);
+    err = ap2_buffered_fifo_destroy(s.transport);
+    if (err != ESP_OK) {
+      /* destroy() leaves the FIFO object intact when its reader still owns
+       * the shared backing store. Rebind/restart the engine and, critically,
+       * do not free codec_workspace underneath that reader. */
+      ESP_LOGE(TAG, "WiFi scan release: FIFO destroy failed: %s",
+               esp_err_to_name(err));
+      (void)audio_receiver_init();
+      return err;
+    }
     s.transport = NULL;
   }
   if (s.realtime_stage_ring) {

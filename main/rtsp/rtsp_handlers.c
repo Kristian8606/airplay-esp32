@@ -1190,8 +1190,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
                "103/AAC/44100/1024)",
                (long long)stream_type, (long long)codec_type,
                (long long)sample_rate, (long long)samples_per_frame);
-      conn->stream_type = AUDIO_STREAM_NONE;
-      audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
+      /* Reject only this SETUP dictionary.  A malformed/unsupported request
+       * must not clobber a stream that is already owned by the control
+       * session; the sender may retry with a supported stream immediately. */
       rtsp_send_response(socket, conn, 400, "Unsupported Audio Format",
                          req->cseq, NULL, NULL, 0);
       return;
@@ -1378,22 +1379,11 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   if (is_bplist) {
     ptp_clock_set_realtime_mode(!buffered,
                                 !buffered ? conn->client_ip : 0);
-
-    /* A new AP2 stream is a hard timing boundary. TEARDOWN already clears
-     * the estimator once, but the always-running PTP task can receive fresh
-     * multicast samples in the gap before the next SETUP. Discard that gap
-     * history here, after selecting the new mode/timing peer, so AAC and ALAC
-     * always start from samples observed for this stream. ptp_clock_clear()
-     * deliberately preserves only the selected mode/timing-peer configuration;
-     * all lock/filter/source/GM estimator history is reset. */
-    ptp_clock_clear();
-
-    /* A stream-level TEARDOWN may leave the control session alive for minutes.
-     * During that gap the PTP task can reacquire and retain smoothing history
-     * from the old sender epoch. The project already has explicit long-pause
-     * recovery in ptp_clock_notify_resume(); wire it to the actual stream
-     * resume path after selecting the new stream's PTP mode. */
-    notify_timing_resume(conn);
+    /* PTP is a control-session clock, not an audio-stream buffer.  Preserve a
+     * healthy same-session estimator across stream TEARDOWN/SETUP, exactly as
+     * the sender preserves its clock timeline. set_realtime_mode() already
+     * resets the estimator when the timing mode/peer really changes; a full
+     * RTSP disconnect still clears it in connection cleanup. */
   }
 
   if (buffered) {
@@ -1516,14 +1506,21 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   }
 
 
-  audio_receiver_set_playing(true);
-  conn->stream_paused = false;
   conn->stream_active = true;
   amp_session_activate_once(conn);
-  // RECORD emits PLAYING on the initial connection only; a resume after a
-  // stream TEARDOWN sends just a new SETUP, so emit it here too or the DAC
-  // stays in the standby it entered on pause and the stream plays silent.
-  rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
+
+  const bool ap2_realtime =
+      is_bplist && stream_type == AUDIO_STREAM_REALTIME;
+  if (!is_bplist || ap2_realtime) {
+    /* AirPlay 1 enters PLAYING after SETUP as before.  AP2 realtime ALAC
+     * (type 96) also needs the play gate open here: in this transport the
+     * presentation mapping can arrive through D7 and the sender may never
+     * send SETRATEANCHORTIME rate=1.  Buffered AP2 AAC (type 103) remains
+     * gated exclusively by SETRATEANCHORTIME rate=1. */
+    audio_receiver_set_playing(true);
+    conn->stream_paused = false;
+    rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
+  }
 }
 
 static void handle_record(int socket, rtsp_conn_t *conn,
@@ -1531,6 +1528,20 @@ static void handle_record(int socket, rtsp_conn_t *conn,
                           size_t raw_len) {
   (void)raw;
   (void)raw_len;
+
+  /* AirPlay 2 RECORD is a control-plane acknowledgement.  The buffered
+   * transport may not even have been SETUP yet, and there is no presentation
+   * anchor here.  Do not change playing/paused state here: buffered AP2 is
+   * opened by SETRATEANCHORTIME, while realtime AP2 is opened by stream SETUP
+   * and remains blocked downstream until D7/PTP timing becomes valid. */
+  if (conn->protocol_version == 2) {
+    char headers[128];
+    snprintf(headers, sizeof(headers),
+             "Audio-Latency: 0\r\n"
+             "Audio-Jack-Status: connected\r\n");
+    rtsp_send_response(socket, conn, 200, "OK", req->cseq, headers, NULL, 0);
+    return;
+  }
 
   ESP_LOGI(TAG, "RECORD received - starting playback, stream_paused was %d",
            conn->stream_paused);
@@ -2015,11 +2026,15 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   }
   audio_receiver_stop();
   /* no PCM/output path in AirPlay receiver build */
-  // Drop PTP lock + offset history.  AirPlay group rejoins reuse the same
-  // PTP master clock_id; without this, ptp_clock_set_master_clock_id() on
-  // the next session early-returns and reuses stale samples accumulated
-  // (or missed) while we were detached from the group.
-  ptp_clock_clear();
+  /* A stream-level TEARDOWN preserves the control session and its PTP clock.
+   * Clearing it here needlessly forces a new PTP STEP/relock before the next
+   * buffered stream can produce PCM.  Only a full session boundary owns a
+   * full PTP reset. */
+  if (!has_streams) {
+    ptp_clock_clear();
+    audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
+    audio_receiver_set_encryption(NULL);
+  }
   conn->stream_active = false;
   conn->stream_paused =
       has_streams; // Keep session ready if only streams torn down
@@ -2060,6 +2075,8 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
   uint64_t network_time_secs = 0;
   uint64_t network_time_frac = 0;
   uint64_t rtp_time = 0;
+  bool have_network_time_secs = false;
+  bool have_rtp_time = false;
 
   if (body && body_len > 0 && body_len >= 8 &&
       memcmp(body, "bplist00", 8) == 0) {
@@ -2076,12 +2093,14 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
     }
     if (bplist_find_int(body, body_len, "networkTimeSecs", &value)) {
       network_time_secs = (uint64_t)value;
+      have_network_time_secs = true;
     }
     if (bplist_find_int(body, body_len, "networkTimeFrac", &value)) {
       network_time_frac = (uint64_t)value;
     }
     if (bplist_find_int(body, body_len, "rtpTime", &value)) {
       rtp_time = (uint64_t)value;
+      have_rtp_time = true;
     }
 
     ESP_LOGI(TAG,
@@ -2093,7 +2112,21 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
              (unsigned long long)clock_id, rate,
              (long long)conn->stream_type);
 
-    if (network_time_secs != 0 && rtp_time != 0) {
+    /* Pause first.  Do not publish an anchor from a rate=0 message and wake a
+     * processor immediately before closing the play gate. */
+    if (rate == 0.0) {
+      ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
+      note_stream_pause_started(conn);
+      conn->stream_paused = true;
+      audio_receiver_pause();
+      rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+      rtsp_send_ok(socket, conn, req->cseq);
+      return;
+    }
+
+    /* RTP is a wrapping 32-bit timeline. rtpTime==0 is therefore perfectly
+     * valid; validity comes from key presence, not from the numeric value. */
+    if (have_network_time_secs && have_rtp_time) {
       uint64_t frac = network_time_frac >> 32;
       frac = (frac * 1000000000ULL) >> 32;
       uint64_t network_time_ns = network_time_secs * 1000000000ULL + frac;
@@ -2147,22 +2180,12 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
     }
   }
 
-  if (rate == 0.0) {
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
-    note_stream_pause_started(conn);
-    // Mute the DAC first via the synchronous event so audio stops now.
-    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
-    conn->stream_paused = true;
-    audio_receiver_pause();
-    /* no PCM/output path in AirPlay receiver build */
-  } else {
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
-             rate, conn->stream_paused);
-    if (conn->stream_paused) notify_timing_resume(conn);
-    conn->stream_paused = false;
-    audio_receiver_set_playing(true);
-    rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
-  }
+  ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
+           rate, conn->stream_paused);
+  if (conn->stream_paused) notify_timing_resume(conn);
+  conn->stream_paused = false;
+  audio_receiver_set_playing(true);
+  rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
 
   rtsp_send_ok(socket, conn, req->cseq);
 }

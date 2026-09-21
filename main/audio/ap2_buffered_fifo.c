@@ -186,9 +186,9 @@ static void tcp_reader_task(void *arg) {
     fifo->write_pos = 0;
     fifo->occupancy = 0;
     fifo->connected = true;
+    fifo->client_sock = c;
     xSemaphoreGive(fifo->fifo_mutex);
     (void)next_epoch(fifo);
-    fifo->client_sock = c;
 
     xSemaphoreTake(fifo->control_mutex, portMAX_DELAY);
     control_clear_locked(fifo);
@@ -236,15 +236,18 @@ static void tcp_reader_task(void *arg) {
       xSemaphoreGive(fifo->not_empty);
     }
 
-    shutdown(c, SHUT_RDWR);
-    close(c);
-    fifo->client_sock = -1;
-
+    /* Detach the shared descriptor before close(). Stop/abort may run on a
+     * different core; never leave a closed descriptor in client_sock where it
+     * could be reused by lwIP and then shutdown() by a stale control path. */
     xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+    if (fifo->client_sock == c) fifo->client_sock = -1;
     fifo->connected = false;
     fifo->read_pos = fifo->write_pos;
     fifo->occupancy = 0;
     xSemaphoreGive(fifo->fifo_mutex);
+
+    (void)shutdown(c, SHUT_RDWR);
+    close(c);
     (void)next_epoch(fifo);
     signal_all(fifo);
     ESP_LOGI(TAG, "buffered TCP disconnected");
@@ -278,15 +281,15 @@ esp_err_t ap2_buffered_fifo_create_with_storage(
   fifo->control_wake = xSemaphoreCreateBinary();
   if (!fifo->fifo_mutex || !fifo->not_empty || !fifo->not_full ||
       !fifo->control_mutex || !fifo->control_wake) {
-    ap2_buffered_fifo_destroy(fifo);
+    (void)ap2_buffered_fifo_destroy(fifo);
     return ESP_ERR_NO_MEM;
   }
   *out = fifo;
   return ESP_OK;
 }
 
-void ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo) {
-  if (!fifo) return;
+esp_err_t ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo) {
+  if (!fifo) return ESP_OK;
   /* create_with_storage() may call destroy after only some synchronization
    * objects were allocated. Do not enter stop() through a NULL FIFO mutex. */
   if (fifo->fifo_mutex) {
@@ -295,8 +298,11 @@ void ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo) {
     fifo->running = false;
   }
   if (__atomic_load_n(&fifo->reader_task, __ATOMIC_ACQUIRE)) {
-    ESP_LOGE(TAG, "destroy deferred: TCP reader still active");
-    return;
+    /* The backing store belongs to audio_receiver. Returning an error is
+     * essential: the caller must not free that store while recv() can still
+     * write into it. */
+    ESP_LOGE(TAG, "destroy refused: TCP reader still active");
+    return ESP_ERR_TIMEOUT;
   }
   if (fifo->fifo_mutex) vSemaphoreDelete(fifo->fifo_mutex);
   if (fifo->not_empty) vSemaphoreDelete(fifo->not_empty);
@@ -304,6 +310,7 @@ void ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo) {
   if (fifo->control_mutex) vSemaphoreDelete(fifo->control_mutex);
   if (fifo->control_wake) vSemaphoreDelete(fifo->control_wake);
   free(fifo);
+  return ESP_OK;
 }
 
 esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
@@ -337,7 +344,10 @@ esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
 void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
   if (!fifo) return;
   fifo->running = false;
+  int client = -1;
   xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  client = fifo->client_sock;
+  fifo->client_sock = -1;
   fifo->connected = false;
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
@@ -345,7 +355,7 @@ void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
   (void)next_epoch(fifo);
   signal_all(fifo);
 
-  if (fifo->client_sock >= 0) shutdown(fifo->client_sock, SHUT_RDWR);
+  if (client >= 0) (void)shutdown(client, SHUT_RDWR);
   if (fifo->listen_sock >= 0) {
     shutdown(fifo->listen_sock, SHUT_RDWR);
     close(fifo->listen_sock);
@@ -378,6 +388,7 @@ void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo) {
   int client = -1;
   xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
   client = fifo->client_sock;
+  fifo->client_sock = -1;
   fifo->connected = false;
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
@@ -569,10 +580,17 @@ void ap2_buffered_fifo_set_immediate_flush(ap2_buffered_fifo_t *fifo,
                                            bool has_endpoint) {
   if (!fifo) return;
   if (!has_endpoint) {
+    /* A live buffered connection is a framed byte stream. Never move read_pos
+     * to write_pos here: recv() can be in the middle of [length][body], so a
+     * byte-level purge destroys framing. A full FLUSH invalidates presentation
+     * state/PCM in audio_receiver; compressed blocks remain sequential and are
+     * consumed as complete frames after the next valid anchor, where stale RTP
+     * blocks are discarded naturally. TEARDOWN/stop is the only operation that
+     * may clear the raw FIFO because it first terminates the TCP stream. */
     xSemaphoreTake(fifo->control_mutex, portMAX_DELAY);
     control_clear_locked(fifo);
     xSemaphoreGive(fifo->control_mutex);
-    fifo_discard_all(fifo);
+    signal_all(fifo);
     return;
   }
 
