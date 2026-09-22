@@ -20,6 +20,13 @@
 /* Fast discard works under fifo_mutex; release it this often so the TCP
  * reader (other core) is never starved while megabytes are skipped. */
 #define FIFO_FAST_SKIP_BATCH 256U
+/* v4.1.19: a deferred FLUSH whose fromSeq the consumer has ALREADY passed is
+ * still honoured if it passed it by at most this many packets (~1.5 s of AAC,
+ * i.e. what can still sit decoded-but-unplayed in the ~1.1 s PCM lead). The
+ * old exact-match rule ignored such a late request completely: the old tail
+ * kept playing and the sender's replacement audio (AutoMix crossfade, whose
+ * RTP restarts at fromTS) then arrived "behind" the playhead. */
+#define FIFO_LATE_DEFER_MAX_PKTS 64
 
 static const char *TAG = "aac_fifo";
 
@@ -684,7 +691,12 @@ void ap2_buffered_fifo_classify_packet(
     deferred_flush_t *r = &fifo->deferred[i];
     if (!r->in_use) continue;
 
-    if (r->from_seq == packet->seq && r->until_seq != packet->seq) {
+    /* Activate at fromSeq, or late if fromSeq was passed only recently
+     * (see FIFO_LATE_DEFER_MAX_PKTS). Never activate a rule twice. */
+    const int32_t past_from = seq23_delta(packet->seq, r->from_seq);
+    if (!r->active && r->until_seq != packet->seq &&
+        seq23_delta(packet->seq, r->until_seq) < 0 && past_from >= 0 &&
+        past_from <= FIFO_LATE_DEFER_MAX_PKTS) {
       r->active = true;
       decision->discontinuity = true;
       if (decision->activation_count < AP2_BUFFERED_FIFO_MAX_ACTIVATIONS) {

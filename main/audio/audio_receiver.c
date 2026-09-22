@@ -42,6 +42,7 @@
 #define AP2_BUFFERED_PROCESSOR_CORE 0
 #define AP2_RX_PRIORITY            5
 #define AP2_DECODE_PRIORITY        6
+#define AP2_DECODE_YIELD_EVERY     8U  /* v4.1.19: 1 tick per 8 AAC blocks */
 #define AP2_PLAYOUT_PRIORITY       8
 #define AP2_RT_STAGE_PRIORITY      7
 #define AP2_STATUS_PRIORITY          1
@@ -119,8 +120,8 @@
  * 1 ppm of I2S rate change = 1 us/s of sync slope. */
 #define AP2_CENTER_WINDOW_US         15000000LL /* slope measurement window */
 #define AP2_CENTER_QUIET_US               200    /* |sync| below: aim for 0 slope */
-#define AP2_CENTER_TIME_S                60.0   /* approach time constant */
-#define AP2_CENTER_MAX_SLOPE_US_S        10.0   /* max wanted approach speed */
+#define AP2_CENTER_TIME_S                20.0   /* approach time constant (v4.1.19: was 60) */
+#define AP2_CENTER_MAX_SLOPE_US_S        40.0   /* max wanted approach speed (v4.1.19: was 10) */
 #define AP2_CENTER_MAX_STEP_PPM            40    /* max frequency step per window */
 /* v4.1.18 hysteresis: centring mode is entered inside +/-1 ms and is kept
  * through brief excursions. It hands back to the PID only when |sync| stays
@@ -129,6 +130,16 @@
 #define AP2_CENTER_EXIT_US               1500
 #define AP2_CENTER_EXIT_HOLD_US       3000000LL
 #define AP2_CENTER_EXIT_HARD_US          3000
+/* v4.1.19: a PTP filter step moves sync by >1 ms between two 1 s samples,
+ * while real drift is < 0.1 ms/s. A window that contains such a jump gave a
+ * false slope (-83 us/s in the board log). The jump is now subtracted from the
+ * following samples of the window, so the slope stays the true drift and the
+ * end-of-window phase still includes the step. */
+#define AP2_CENTER_JUMP_US                400
+/* Fraction of the computed correction applied per window. 0.5 was tried in
+ * simulation for v4.1.19 and made phase recovery slower without reducing
+ * retunes, so the full step is kept. */
+#define AP2_CENTER_GAIN                   1.0
 #define AP2_PCM_TARGET_MS           1000U
 #define AP2_REALTIME_PRIME_MS        100U
 #define AP2_RT_GM_REBASE_SETTLE_MS  1000U
@@ -1165,7 +1176,7 @@ static int32_t servo_center_step(int32_t sync_us, double slope_us_s) {
     if (wanted_slope < -AP2_CENTER_MAX_SLOPE_US_S)
       wanted_slope = -AP2_CENTER_MAX_SLOPE_US_S;
   }
-  double step = wanted_slope - slope_us_s; /* +1 ppm -> +1 us/s */
+  double step = AP2_CENTER_GAIN * (wanted_slope - slope_us_s); /* +1 ppm -> +1 us/s */
   if (step > AP2_CENTER_MAX_STEP_PPM) step = AP2_CENTER_MAX_STEP_PPM;
   if (step < -AP2_CENTER_MAX_STEP_PPM) step = -AP2_CENTER_MAX_STEP_PPM;
   const int32_t out = (int32_t)(step >= 0.0 ? step + 0.5 : step - 0.5);
@@ -1198,6 +1209,7 @@ static void ap2_buffered_processor_task(void *arg) {
   bool have_decoded_sequence = false;
   bool decoder_history_dirty = true;
   bool mute_next_aac_block = true;
+  uint32_t decode_burst = 0;
   /* After the muted block, ramp the next one in: jumping from digital zero
    * straight to full-scale signal is itself a click. */
   bool fade_in_next_aac_block = false;
@@ -1420,6 +1432,14 @@ static void ap2_buffered_processor_task(void *arg) {
       mute_next_aac_block = true;
     }
     have_packet = false;
+    /* v4.1.19: after a new anchor this task (core 0, prio 6) refills the whole
+     * ~1.1 s PCM lead back-to-back and starved the RTSP task (core 0, prio 5)
+     * for 0.3-0.4 s on every track change. Give up the CPU for one tick every
+     * few blocks; in steady state one block is decoded per ~23 ms anyway. */
+    if (++decode_burst >= AP2_DECODE_YIELD_EVERY) {
+      decode_burst = 0;
+      vTaskDelay(1);
+    }
   }
 
   if (decoder) aac_decoder_destroy(decoder);
@@ -1863,6 +1883,9 @@ static void ap2_playout_task(void *arg) {
   uint32_t resync_count = 0;
   uint32_t start_logged_gen = 0;
   bool center_active = false;
+  int32_t center_prev_sync_us = 0;
+  bool center_prev_valid = false;
+  int32_t center_jump_us = 0; /* sum of reference steps inside this window */
   int64_t center_out_since_us = 0;
   int64_t center_start_us = 0;
   /* Least-squares line through the 1 Hz sync samples of the window:
@@ -2006,6 +2029,7 @@ static void ap2_playout_task(void *arg) {
       pid_d_filtered_ms_s = 0.0;
       servo_target_ppm = servo_ppm;
       center_active = false; /* new timeline: restart slope measurement */
+      center_prev_valid = false;
       s.output_sync.valid = false;
       status_invalidate_sync();
       state = PLAYOUT_PRIMING;
@@ -2441,8 +2465,14 @@ static void ap2_playout_task(void *arg) {
              * slope only once the clock really runs at the new rate. */
             restart_window = true;
           } else {
+            if (center_prev_valid &&
+                (s.output_sync.us - center_prev_sync_us > AP2_CENTER_JUMP_US ||
+                 center_prev_sync_us - s.output_sync.us > AP2_CENTER_JUMP_US)) {
+              /* A reference step, not drift: keep it out of the slope. */
+              center_jump_us += s.output_sync.us - center_prev_sync_us;
+            }
             const double t_s = (double)(pid_now_us - center_start_us) / 1000000.0;
-            const double y = (double)s.output_sync.us;
+            const double y = (double)(s.output_sync.us - center_jump_us);
             center_n += 1.0; center_st += t_s; center_sy += y;
             center_stt += t_s * t_s; center_sty += t_s * y;
           }
@@ -2452,7 +2482,8 @@ static void ap2_playout_task(void *arg) {
             const double slope_us_s = (center_n * center_sty - center_st * center_sy) / den;
             const double icpt = (center_sy - slope_us_s * center_st) / center_n;
             const double t_end = (double)(pid_now_us - center_start_us) / 1000000.0;
-            const int32_t sync_fit_us = (int32_t)(icpt + slope_us_s * t_end);
+            const int32_t sync_fit_us =
+                (int32_t)(icpt + slope_us_s * t_end) + center_jump_us;
             const int32_t step = servo_center_step(sync_fit_us, slope_us_s);
             if (step != 0) {
               int32_t t = servo_ppm + step;
@@ -2475,7 +2506,10 @@ static void ap2_playout_task(void *arg) {
         if (restart_window) {
           center_start_us = pid_now_us;
           center_n = center_st = center_sy = center_stt = center_sty = 0.0;
+          center_jump_us = 0;
         }
+        center_prev_sync_us = s.output_sync.us;
+        center_prev_valid = true;
       }
       servo_target_ppm = next_target;
       status_publish_sync(s.output_sync.us, robust_phase_center_us(&s.output_sync),
