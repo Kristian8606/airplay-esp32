@@ -42,6 +42,44 @@ static void log_wifi_scan_memory(const char *where) {
                       1024U));
 }
 
+static esp_err_t restore_airplay_after_wifi_scan(void) {
+  esp_err_t last_err = ESP_FAIL;
+
+  for (int attempt = 1; attempt <= 2; ++attempt) {
+    last_err = audio_receiver_init();
+    if (last_err == ESP_OK) {
+      last_err = rtsp_server_start();
+      if (last_err == ESP_OK) {
+        if (attempt > 1) {
+          ESP_LOGI(TAG, "WiFi scan: AirPlay restore succeeded on retry");
+        }
+        return ESP_OK;
+      }
+      ESP_LOGE(TAG, "WiFi scan: RTSP restore attempt %d failed: %s",
+               attempt, esp_err_to_name(last_err));
+      /* A failed server start should not leave a partially created listener
+       * around when we retry. audio_receiver_init() itself is idempotent. */
+      rtsp_server_stop();
+    } else {
+      ESP_LOGE(TAG, "WiFi scan: audio restore attempt %d failed: %s",
+               attempt, esp_err_to_name(last_err));
+    }
+
+    if (attempt == 1) {
+      log_wifi_scan_memory("restore-retry");
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+
+  return last_err;
+}
+
+static void reboot_after_wifi_scan_restore_failure(void) {
+  ESP_LOGE(TAG, "WiFi scan: AirPlay restore failed twice; rebooting to recover");
+  vTaskDelay(pdMS_TO_TICKS(250));
+  esp_restart();
+}
+
 static esp_err_t serve_file(httpd_req_t *req, const char *path, const char *type) {
   FILE *f = fopen(path, "r");
   if (!f) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found"); return ESP_FAIL; }
@@ -84,7 +122,16 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
     if (release_err != ESP_OK) {
       ESP_LOGE(TAG, "WiFi scan: audio memory release failed: %s",
                esp_err_to_name(release_err));
-      (void)rtsp_server_start();
+      /* A refused release means the scan must not proceed. Restore the normal
+       * service before returning; if even the retry cannot recover it, a clean
+       * reboot is safer than leaving a half-stopped audio engine advertised. */
+      esp_err_t recover_err = restore_airplay_after_wifi_scan();
+      if (recover_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "AirPlay recovery failed; rebooting");
+        reboot_after_wifi_scan_restore_failure();
+        return ESP_FAIL;
+      }
       httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                           "Audio engine could not pause for WiFi scan");
       return ESP_FAIL;
@@ -94,8 +141,33 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
     log_wifi_scan_memory("setup-mode");
   }
 
-  cJSON *json = cJSON_CreateObject();
   esp_err_t err = wifi_scan(&ap_list, &ap_count);
+
+  /* esp_wifi_scan_get_ap_records() has already released the driver's scan
+   * list at this point. Reclaim the large contiguous 6 MiB codec workspace
+   * immediately, before cJSON/string allocations have a chance to fragment
+   * the freshly available PSRAM. */
+  if (restore_airplay) {
+    const esp_err_t restore_err = restore_airplay_after_wifi_scan();
+    if (restore_err != ESP_OK) {
+      free(ap_list);
+      ap_list = NULL;
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "AirPlay could not restart after WiFi scan; rebooting");
+      reboot_after_wifi_scan_restore_failure();
+      return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "WiFi scan: AirPlay ready again");
+    log_wifi_scan_memory("after-audio-restore");
+  }
+
+  cJSON *json = cJSON_CreateObject();
+  if (!json) {
+    free(ap_list);
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                        "Failed to encode WiFi scan results");
+    return ESP_FAIL;
+  }
 
   if (err == ESP_OK) {
     cJSON *networks = cJSON_CreateArray();
@@ -120,10 +192,6 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   log_wifi_scan_memory("after-scan-results-free");
 
   if (!json_str) {
-    if (restore_airplay) {
-      esp_err_t restore_err = audio_receiver_init();
-      if (restore_err == ESP_OK) (void)rtsp_server_start();
-    }
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                         "Failed to encode WiFi scan results");
     return ESP_FAIL;
@@ -132,20 +200,6 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json");
   esp_err_t send_err = httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
   free(json_str);
-
-  if (restore_airplay) {
-    esp_err_t restore_err = audio_receiver_init();
-    if (restore_err == ESP_OK) {
-      restore_err = rtsp_server_start();
-    }
-    if (restore_err != ESP_OK) {
-      ESP_LOGE(TAG, "WiFi scan: AirPlay restore failed: %s",
-               esp_err_to_name(restore_err));
-    } else {
-      ESP_LOGI(TAG, "WiFi scan: AirPlay ready again");
-      log_wifi_scan_memory("after-audio-restore");
-    }
-  }
 
   return send_err;
 }

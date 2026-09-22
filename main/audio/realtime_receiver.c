@@ -20,7 +20,7 @@
 #include "network/ptp_clock.h"
 
 #define RT_PACKET_MAX             8192U
-#define RT_PCM_CAPACITY_FRAMES    4096U
+#define RT_PCM_CAPACITY_FRAMES    1024U
 
 /* Realtime ingress is intentionally split. The DATA task does no crypto or
  * decode work; it only drains lwIP into a preallocated packet pool. CONTROL

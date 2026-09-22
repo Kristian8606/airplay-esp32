@@ -266,6 +266,10 @@ cleanup:
 
   // Immediate: stop audio and NTP
   audio_receiver_stop();
+  /* Unexpected socket loss is a full AirPlay session boundary.  Do not let
+   * the next client inherit the previous stream selector or session key. */
+  audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
+  audio_receiver_set_encryption(NULL);
 
   // Stop the AirPlay 2 event listener before rtsp_conn_free() closes its
   // listening socket.  Closing it first can wake select()/accept() on a

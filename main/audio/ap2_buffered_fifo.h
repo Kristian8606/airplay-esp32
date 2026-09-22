@@ -23,6 +23,9 @@ typedef struct {
   uint32_t rtp;
   size_t len;
   uint32_t stream_epoch;
+  /* Absolute byte offset of this packet's 2-byte length prefix inside the
+   * current TCP connection. Used for packet-aligned FLUSH discards. */
+  uint64_t stream_offset;
 } ap2_buffered_packet_t;
 
 typedef struct {
@@ -51,7 +54,7 @@ typedef struct {
 esp_err_t ap2_buffered_fifo_create_with_storage(
     ap2_buffered_fifo_t **out, const ap2_buffered_fifo_config_t *cfg,
     void *storage, size_t storage_bytes);
-void ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo);
+esp_err_t ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo);
 
 esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
                                   uint16_t requested_port,

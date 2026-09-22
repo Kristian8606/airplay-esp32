@@ -125,6 +125,7 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
 
   // Clear PTP clock for fresh sync on next connection
   ptp_clock_clear();
+  conn->ptp_session_fresh = false;
 
   // Reset encryption state
   conn->encrypted_mode = false;

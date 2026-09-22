@@ -29,6 +29,9 @@ struct rtsp_conn {
   // Audio streaming state
   bool stream_active;
   bool stream_paused;
+  // v4.1.14: set once the first stream SETUP of this RTSP connection has
+  // started PTP from a clean estimator (later stream SETUPs keep it).
+  bool ptp_session_fresh;
   bool amp_session_active;
   int64_t pause_started_us;
   int64_t stream_type;    // 96=UDP realtime, 103=TCP buffered

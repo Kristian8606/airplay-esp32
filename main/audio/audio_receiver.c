@@ -36,7 +36,7 @@
 #define AP2_PROCESS_STACK          6144U
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
-#define AP2_STATUS_STACK             3072U
+#define AP2_STATUS_STACK             4096U
 #define AP2_NETWORK_CORE           1
 #define AP2_DECODE_CORE            1
 #define AP2_BUFFERED_PROCESSOR_CORE 0
@@ -47,7 +47,36 @@
 #define AP2_STATUS_PRIORITY          1
 #define AP2_STATUS_CORE              0
 #define AP2_STATUS_PERIOD_MS      2000U
-#define AP2_PCM_CAPACITY_FRAMES    4096U
+/* v4.1.14 buffered timing watchdog: anchor + play but the PTP mapping never
+ * qualifies. Normal lock takes < 1 s; give it 5 s, then log why and restart
+ * the PTP estimator. At most AP2_TIMING_WD_MAX_RESETS per anchor timeline. */
+/* Buffered start gate (v4.1.16).
+ * v4.1.15 started at Shairport's 400 ms mastership without our lock. On the
+ * board that produced a -10 ms start error: the nqptp-style filter
+ * (ptp_clock_engine.c) still jumps to better samples during its first
+ * PTP_ENGINE_STARTUP_NS = 1 s, and our fine correction (APLL servo) is too slow
+ * to absorb such a step (Shairport absorbs it by frame stuffing). The PID then
+ * wound up to +160 ppm and needed minutes to settle.
+ * Now the FIRST mapping of an anchor needs the lock AND >= 1 s mastership, so
+ * the filter's startup jumps happen before audio starts. Later anchors (skip,
+ * pause, next track) are far past 1 s and start as fast as before.
+ * Refreshes while playing: lock + 400 ms, as in v4.1.14. */
+#define AP2_PTP_START_MASTERSHIP_MS 1000U
+#define AP2_PTP_MASTERSHIP_MIN_MS   400U
+#define AP2_PTP_SAMPLE_MAX_AGE_MS  5000U
+/* v4.1.15 hard resync, Shairport "resync_threshold" semantics: if the output
+ * is out of sync by more than this for AP2_RESYNC_HOLD_US, stop and re-prime
+ * at the exact presentation point (brief silence), keeping the learned I2S
+ * clock correction. Shairport uses 50 ms, but it also corrects small errors
+ * quickly by frame stuffing; our fine correction is a slow APLL servo
+ * (<= 160 ppm), so the threshold is lower. */
+#define AP2_RESYNC_THRESHOLD_US      20000
+#define AP2_RESYNC_HOLD_US         1500000LL
+#define AP2_RESYNC_MIN_INTERVAL_US 5000000LL
+#define AP2_TIMING_WD_TIMEOUT_MS  5000U
+#define AP2_TIMING_WD_RETRY_MS    6000U
+#define AP2_TIMING_WD_MAX_RESETS     3U
+#define AP2_PCM_CAPACITY_FRAMES    1024U
 
 #define AP2_PID_CALC_PERIOD_US    1000000LL  /* PID math at 1 Hz */
 #define AP2_PID_TUNE_PERIOD_US    5000000LL  /* physical I2S retune <= 0.2 Hz */
@@ -299,6 +328,24 @@ static void snapshot_state(timing_snapshot_t *out) {
   taskEXIT_CRITICAL(&s.state_mux);
 }
 
+/* Buffered AAC: may this PTP snapshot map the anchor's remote time to local
+ * time? `initial` = the anchor has no local mapping yet (start/new anchor). */
+static bool buffered_ptp_qualified(const ptp_clock_snapshot_t *ps,
+                                   uint64_t anchor_clock_id, bool initial) {
+  if (!ps || ps->realtime_mode || !ps->valid) return false;
+  if (ps->grandmaster_clock_id == 0 ||
+      ps->grandmaster_clock_id != anchor_clock_id)
+    return false;
+  if (!ps->locked) return false;
+  if (ps->sample_age_ms > AP2_PTP_SAMPLE_MAX_AGE_MS) return false;
+  return ps->mastership_age_ms >=
+         (initial ? AP2_PTP_START_MASTERSHIP_MS : AP2_PTP_MASTERSHIP_MIN_MS);
+}
+
+/* First-audio measurement (v4.1.15): anchor commit time per generation. */
+static volatile int64_t s_anchor_commit_us = 0;
+static volatile uint32_t s_anchor_commit_gen = 0;
+
 /* Single writer for PTP refresh; control still owns anchor publication. */
 static void refresh_timing_snapshot(timing_snapshot_t *out) {
   uint64_t clock_id;
@@ -321,8 +368,8 @@ static void refresh_timing_snapshot(timing_snapshot_t *out) {
       const uint64_t now_us = (uint64_t)esp_timer_get_time();
       const bool same_master = ps.grandmaster_clock_id != 0 &&
                                ps.grandmaster_clock_id == out->anchor_clock_id;
-      const bool qualified_master =
-          ps.valid && ps.locked && ps.mastership_age_ms >= 400U;
+      const bool qualified_master = buffered_ptp_qualified(
+          &ps, out->anchor_clock_id, !out->anchor_local_valid);
 
       if (same_master && qualified_master) {
         /* Shairport Sync semantics: while the advertised master is the same
@@ -621,8 +668,72 @@ static int32_t robust_phase_center_us(const output_sync_state_t *sync) {
   return (int32_t)(((int64_t)sorted[1] + (int64_t)sorted[n - 2U]) / 2LL);
 }
 
+/* Buffered AAC timing watchdog, run from the low-priority status task.
+ * Decoding is gated on anchor_local_valid, which needs a LOCKED PTP estimator
+ * on the anchor's master for >= 400 ms. If that never happens the stream is
+ * silent while the FIFO fills (first session after boot in v4.1.13 logs).
+ * Log the exact failing condition and reset the estimator. */
+static void buffered_timing_watchdog(const timing_snapshot_t *snap) {
+  static uint32_t wd_generation = 0;
+  static int64_t wd_since_us = 0;
+  static int64_t wd_last_reset_us = 0;
+  static uint32_t wd_resets = 0;
+
+  const bool waiting = snap->stream_type == AUDIO_STREAM_BUFFERED &&
+                       snap->playing && snap->anchor_valid &&
+                       !snap->timeline_reset_pending &&
+                       !snap->anchor_local_valid;
+  const int64_t now_us = esp_timer_get_time();
+  if (!waiting) {
+    wd_since_us = 0;
+    if (snap->generation != wd_generation) wd_resets = 0;
+    wd_generation = snap->generation;
+    return;
+  }
+  if (snap->generation != wd_generation || wd_since_us == 0) {
+    if (snap->generation != wd_generation) wd_resets = 0;
+    wd_generation = snap->generation;
+    wd_since_us = now_us;
+    wd_last_reset_us = 0;
+    return;
+  }
+  const int64_t waited_ms = (now_us - wd_since_us) / 1000LL;
+  if (waited_ms < (int64_t)AP2_TIMING_WD_TIMEOUT_MS) return;
+  if (wd_last_reset_us != 0 &&
+      (now_us - wd_last_reset_us) / 1000LL < (int64_t)AP2_TIMING_WD_RETRY_MS)
+    return;
+  if (wd_resets >= AP2_TIMING_WD_MAX_RESETS) return;
+
+  ptp_clock_snapshot_t ps = {0};
+  ptp_clock_get_snapshot(&ps);
+  const char *reason =
+      ps.realtime_mode ? "ptp-in-realtime-mode"
+      : !ps.valid ? "no-ptp-samples"
+      : ps.source_mixed ? "ptp-source-mixed"
+      : ps.grandmaster_clock_id != snap->anchor_clock_id ? "gm-differs-from-anchor"
+      : !ps.locked ? "ptp-not-locked"
+      : ps.sample_age_ms > AP2_PTP_SAMPLE_MAX_AGE_MS ? "ptp-samples-stale"
+      : ps.mastership_age_ms < AP2_PTP_START_MASTERSHIP_MS ? "mastership-too-young"
+      : "anchor-map-failed";
+  ESP_LOGW(TAG,
+           "TIMING WATCHDOG: anchor waiting %lld ms, reason=%s | valid=%d locked=%d "
+           "mixed=%d rt=%d src=%016llx gm=%016llx anchor=%016llx age=%lums "
+           "samples=%lu sampleAge=%lums peers=%lu -> PTP reset %lu/%u",
+           (long long)waited_ms, reason, ps.valid, ps.locked, ps.source_mixed,
+           ps.realtime_mode, (unsigned long long)ps.source_clock_id,
+           (unsigned long long)ps.grandmaster_clock_id,
+           (unsigned long long)snap->anchor_clock_id,
+           (unsigned long)ps.mastership_age_ms, (unsigned long)ps.sample_count,
+           (unsigned long)ps.sample_age_ms, (unsigned long)ps.peer_count,
+           (unsigned long)(wd_resets + 1U), (unsigned)AP2_TIMING_WD_MAX_RESETS);
+  ptp_clock_clear();
+  wd_resets++;
+  wd_last_reset_us = now_us;
+}
+
 static void audio_status_task(void *arg) {
   (void)arg;
+  bool stack_headroom_warned = false;
   while (s.engine_running) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
@@ -639,6 +750,7 @@ static void audio_status_task(void *arg) {
         (snap.stream_type != AUDIO_STREAM_BUFFERED &&
          snap.stream_type != AUDIO_STREAM_REALTIME)) continue;
     const audio_stream_type_t task_stream = snap.stream_type;
+    buffered_timing_watchdog(&snap);
 
     const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
     uint32_t wanted = 0;
@@ -742,6 +854,20 @@ static void audio_status_task(void *arg) {
                  status_frames_to_ms(raw_frames, sr),
                  status_frames_to_ms(pcm_frames, sr));
       }
+    }
+
+    /* Keep this diagnostic cheap and rate-limited. On ESP-IDF the task stack
+     * watermark is reported in bytes. Warn once while headroom is below 1 KiB
+     * and re-arm only after there is comfortable margin again. */
+    const UBaseType_t stack_headroom = uxTaskGetStackHighWaterMark(NULL);
+    if (stack_headroom < 1024U) {
+      if (!stack_headroom_warned) {
+        ESP_LOGW(STATUS_TAG, "status task stack headroom low: %u bytes",
+                 (unsigned)stack_headroom);
+        stack_headroom_warned = true;
+      }
+    } else if (stack_headroom >= 1536U) {
+      stack_headroom_warned = false;
     }
   }
 
@@ -918,6 +1044,21 @@ static void reset_aac_decode_history(aac_decoder_t **decoder,
   *expected_seq = 0;
 }
 
+/* Linear fade-in over the first AP2_FADE_IN_FRAMES of a block (~5.8 ms at
+ * 44.1 kHz). Used on the first audible block after a muted restart block. */
+#define AP2_FADE_IN_FRAMES 256U
+static void fade_in_pcm_block(int16_t *pcm, size_t frames, int channels) {
+  if (!pcm || frames == 0U || channels <= 0) return;
+  const size_t n = frames < AP2_FADE_IN_FRAMES ? frames : AP2_FADE_IN_FRAMES;
+  for (size_t f = 0; f < n; ++f) {
+    const int32_t g = (int32_t)(((f + 1U) * 32768U) / (n + 1U)); /* Q15 */
+    for (int ch = 0; ch < channels; ++ch) {
+      int16_t *x = &pcm[f * (size_t)channels + (size_t)ch];
+      *x = (int16_t)(((int32_t)*x * g) >> 15);
+    }
+  }
+}
+
 static void ap2_buffered_processor_task(void *arg) {
   (void)arg;
   aac_decoder_t *decoder = NULL;
@@ -926,6 +1067,11 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t expected_seq = 0;
   bool have_decoded_sequence = false;
   bool decoder_history_dirty = true;
+  bool mute_next_aac_block = true;
+  /* After the muted block, ramp the next one in: jumping from digital zero
+   * straight to full-scale signal is itself a click. */
+  bool fade_in_next_aac_block = false;
+  uint32_t decoder_timeline_generation = 0;
   bool have_packet = false;
   uint8_t consecutive_decrypt_failures = 0;
   ap2_buffered_packet_t packet = {0};
@@ -937,6 +1083,16 @@ static void ap2_buffered_processor_task(void *arg) {
   while (s.rx_running) {
     timing_snapshot_t snap;
     snapshot_state(&snap);
+    if (decoder_timeline_generation != snap.generation) {
+      /* A committed presentation timeline is a new AAC sequence.  Keep codec
+       * history aligned by decoding its first packet normally, but publish
+       * silence for that one AAC block just as Shairport-Sync does.  This
+       * prevents stale codec/filter history from becoming an audible startup
+       * transient without changing the RTP cursor. */
+      decoder_timeline_generation = snap.generation;
+      decoder_history_dirty = true;
+      mute_next_aac_block = true;
+    }
     const bool normal_consume_ready =
         snap.stream_type == AUDIO_STREAM_BUFFERED && snap.playing &&
         snap.anchor_valid && !snap.timeline_reset_pending &&
@@ -963,6 +1119,7 @@ static void ap2_buffered_processor_task(void *arg) {
            * already aborted this client so accept() can establish a clean
            * stream; reset codec history as well. */
           decoder_history_dirty = true;
+          mute_next_aac_block = true;
           consecutive_decrypt_failures = 0;
         }
         if (s.rx_running) ap2_buffered_fifo_wait(s.transport, 10U);
@@ -980,7 +1137,10 @@ static void ap2_buffered_processor_task(void *arg) {
     if (decision.activation_count) {
       apply_deferred_flush_activations(&decision, snap.pcm_generation);
     }
-    if (decision.discontinuity) decoder_history_dirty = true;
+    if (decision.discontinuity) {
+      decoder_history_dirty = true;
+      mute_next_aac_block = true;
+    }
     if (decision.immediate_completed) {
       ESP_LOGI(TAG, "AAC FLUSH complete target=%" PRIu32 " at seq=%" PRIu32 "%s",
                decision.immediate_target_seq, packet.seq,
@@ -1017,6 +1177,7 @@ static void ap2_buffered_processor_task(void *arg) {
        * presentation point. Consume it and rebuild decoder history at the next
        * usable AAC block; never search ahead. */
       decoder_history_dirty = true;
+      mute_next_aac_block = true;
       have_packet = false;
       continue;
     }
@@ -1052,6 +1213,7 @@ static void ap2_buffered_processor_task(void *arg) {
       have_decoded_sequence = false;
       expected_timestamp = 0;
       expected_seq = 0;
+      mute_next_aac_block = true;
       audio_eq_reset_state();
       AUDIO_DIAG_CODEC_AAC_READY((uint32_t)snap.format.sample_rate,
                                  (uint32_t)snap.format.channels);
@@ -1064,6 +1226,7 @@ static void ap2_buffered_processor_task(void *arg) {
         reset_aac_decode_history(&decoder, &decoder_format_generation,
                                  &have_decoded_sequence, &expected_timestamp,
                                  &expected_seq);
+        mute_next_aac_block = true;
         if (!decoder) {
           have_packet = false;
           continue;
@@ -1076,6 +1239,7 @@ static void ap2_buffered_processor_task(void *arg) {
         s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
     if (dec_len <= 0) {
       decoder_history_dirty = true;
+      mute_next_aac_block = true;
       have_packet = false;
       if (++consecutive_decrypt_failures >= 3U) {
         ESP_LOGW(TAG,
@@ -1093,6 +1257,7 @@ static void ap2_buffered_processor_task(void *arg) {
         (size_t)dec_len, s.decode_pcm, AP2_PCM_CAPACITY_FRAMES, &info);
     if (frames <= 0) {
       decoder_history_dirty = true;
+      mute_next_aac_block = true;
       have_packet = false;
       continue;
     }
@@ -1104,10 +1269,26 @@ static void ap2_buffered_processor_task(void *arg) {
     pcm_process_common_eq(s.decode_pcm, (size_t)frames, info.channels,
                           snap.format.sample_rate);
 
+    if (mute_next_aac_block) {
+      /* Preserve decoder and EQ history, but never expose the first AAC block
+       * of a new/discontinuous sequence to the PCM ring.  1024 samples at
+       * 44.1 kHz is ~23 ms and the RTP duration is deliberately preserved. */
+      memset(s.decode_pcm, 0,
+             (size_t)frames * (size_t)info.channels * sizeof(int16_t));
+      mute_next_aac_block = false;
+      fade_in_next_aac_block = true;
+    } else if (fade_in_next_aac_block) {
+      fade_in_pcm_block(s.decode_pcm, (size_t)frames, info.channels);
+      fade_in_next_aac_block = false;
+    }
+
     const pcm_store_result_t stored = pcm_store_with_backpressure(
         packet.rtp, s.decode_pcm, (size_t)frames, info.channels,
         snap.pcm_generation);
-    if (stored != PCM_STORE_PUBLISHED) decoder_history_dirty = true;
+    if (stored != PCM_STORE_PUBLISHED) {
+      decoder_history_dirty = true;
+      mute_next_aac_block = true;
+    }
     have_packet = false;
   }
 
@@ -1408,6 +1589,32 @@ static void process_i2s_completions(const timing_snapshot_t *snap) {
 
 
 
+/* Volume scaling is the LAST requantisation to 16 bit, so it is where TPDF
+ * dither belongs. The Q15 product carries 15 fractional bits; adding +-1 LSB
+ * triangular noise before rounding decorrelates the rounding error from the
+ * signal (no harmonic distortion on fades / quiet passages). Unity gain is
+ * bit-perfect and is never dithered; exact-zero input samples stay exactly
+ * zero (digital silence stays silent). Only the playout task calls this, so
+ * the PRNG state needs no locking. */
+static uint32_t s_vol_dither_state[2] = {0x9E3779B9U, 0x85EBCA6BU};
+
+static inline uint32_t vol_dither_rng(uint32_t *st) {
+  uint32_t x = *st;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  *st = x;
+  return x;
+}
+
+/* Difference of two independent uniform values in [0, 32767]: TPDF noise
+ * spanning (-1 LSB, +1 LSB) expressed in Q15 units. */
+static inline int32_t vol_dither_tpdf_q15(uint32_t *st) {
+  const int32_t a = (int32_t)(vol_dither_rng(st) >> 17);
+  const int32_t b = (int32_t)(vol_dither_rng(st) >> 17);
+  return a - b;
+}
+
 static void apply_output_volume(int16_t *pcm, uint32_t frames,
                                 int32_t *current_q15) {
   if (!pcm || !current_q15 || frames == 0U) return;
@@ -1422,9 +1629,13 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
       return;
     }
     for (uint32_t i = 0; i < frames * 2U; ++i) {
-      const int32_t y = (int32_t)pcm[i] * target;
-      pcm[i] = (int16_t)(y >= 0 ? (y + 16384) >> 15
-                                      : -(((-y) + 16384) >> 15));
+      const int32_t x = pcm[i];
+      if (x == 0) continue;
+      int32_t y = (x * target + vol_dither_tpdf_q15(&s_vol_dither_state[i & 1U]) +
+                   16384) >> 15;
+      if (y > INT16_MAX) y = INT16_MAX;
+      else if (y < INT16_MIN) y = INT16_MIN;
+      pcm[i] = (int16_t)y;
     }
     return;
   }
@@ -1434,9 +1645,10 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
         start + (int32_t)((dg * (int64_t)(f + 1U)) / (int64_t)frames);
     for (uint32_t ch = 0; ch < 2U; ++ch) {
       const uint32_t i = f * 2U + ch;
-      int64_t y = (int64_t)pcm[i] * (int64_t)gain;
-      if (y >= 0) y = (y + 16384) >> 15;
-      else y = -(((-y) + 16384) >> 15);
+      if (pcm[i] == 0) continue;
+      int64_t y = (int64_t)pcm[i] * (int64_t)gain +
+                  vol_dither_tpdf_q15(&s_vol_dither_state[ch]);
+      y = (y + 16384) >> 15;
       if (y > INT16_MAX) y = INT16_MAX;
       else if (y < INT16_MIN) y = INT16_MIN;
       pcm[i] = (int16_t)y;
@@ -1515,6 +1727,11 @@ static void ap2_playout_task(void *arg) {
   int32_t servo_target_ppm = 0;
   int64_t pid_last_calc_us = 0;
   int64_t pid_last_tune_us = 0;
+  uint32_t tune_fail_count = 0;
+  int64_t resync_over_since_us = 0;
+  int64_t resync_last_us = 0;
+  uint32_t resync_count = 0;
+  uint32_t start_logged_gen = 0;
   uint32_t servo_generation = 0;
   double pid_integral_ms_s = 0.0;
   double pid_prev_error_ms = 0.0;
@@ -1610,6 +1827,37 @@ static void ap2_playout_task(void *arg) {
         cursor_timing.media_revision != snap.media_revision) {
       if (buffered_anchor_moved(&cursor_timing, &snap)) state = PLAYOUT_STOPPED;
       cursor_timing = snap;
+    }
+
+    /* v4.1.15 hard resync (Shairport resync_threshold semantics). */
+    if (state == PLAYOUT_RUNNING && s.output_sync.valid &&
+        s.output_sync.generation == snap.generation) {
+      const int32_t err_us = s.output_sync.us;
+      const int32_t abs_err_us = err_us < 0 ? -err_us : err_us;
+      const int64_t now_us = esp_timer_get_time();
+      if (abs_err_us > AP2_RESYNC_THRESHOLD_US) {
+        if (resync_over_since_us == 0) {
+          resync_over_since_us = now_us;
+        } else if (now_us - resync_over_since_us >= AP2_RESYNC_HOLD_US &&
+                   (resync_last_us == 0 ||
+                    now_us - resync_last_us >= AP2_RESYNC_MIN_INTERVAL_US)) {
+          resync_count++;
+          ESP_LOGW(TAG,
+                   "RESYNC #%lu: sync error %+.2f ms beyond %.0f ms for %lld ms "
+                   "-> re-prime at presentation point (I2S servo %+ld ppm kept)",
+                   (unsigned long)resync_count, (double)err_us / 1000.0,
+                   (double)AP2_RESYNC_THRESHOLD_US / 1000.0,
+                   (long long)((now_us - resync_over_since_us) / 1000LL),
+                   (long)servo_ppm);
+          resync_last_us = now_us;
+          resync_over_since_us = 0;
+          state = PLAYOUT_STOPPED; /* re-prime below; servo_ppm is kept */
+        }
+      } else {
+        resync_over_since_us = 0;
+      }
+    } else if (state != PLAYOUT_RUNNING) {
+      resync_over_since_us = 0;
     }
 
     if (cursor_generation != snap.generation || state == PLAYOUT_STOPPED) {
@@ -1857,6 +2105,20 @@ static void ap2_playout_task(void *arg) {
       cursor_rtp = real_start_rtp + AUDIO_PLAYOUT_FRAMES;
       cursor_timing = commit_snap;
       state = PLAYOUT_RUNNING;
+      if (snap.stream_type == AUDIO_STREAM_BUFFERED &&
+          start_logged_gen != snap.generation &&
+          s_anchor_commit_gen == snap.generation && s_anchor_commit_us != 0) {
+        start_logged_gen = snap.generation;
+        ptp_clock_snapshot_t ps = {0};
+        ptp_clock_get_snapshot(&ps);
+        ESP_LOGI(TAG,
+                 "PLAYOUT START gen=%lu: first audio %lld ms after anchor "
+                 "(ptp locked=%d mastership=%lums samples=%lu)",
+                 (unsigned long)snap.generation,
+                 (long long)((esp_timer_get_time() - s_anchor_commit_us) / 1000LL),
+                 ps.locked, (unsigned long)ps.mastership_age_ms,
+                 (unsigned long)ps.sample_count);
+      }
       continue;
     }
 
@@ -2031,7 +2293,17 @@ static void ap2_playout_task(void *arg) {
         audio_playout_tune_info_t ti = {0};
         esp_err_t te = audio_playout_tune_ppm(next_ppm, &ti);
         pid_last_tune_us = pid_now_us;
-        if (te == ESP_OK) servo_ppm = next_ppm;
+        if (te == ESP_OK) {
+          servo_ppm = next_ppm;
+          tune_fail_count = 0;
+        } else if ((tune_fail_count++ % 12U) == 0U) {
+          /* Previously silent: a failing tune means drift is not corrected. */
+          ESP_LOGW(TAG,
+                   "I2S clock tune to %+ld ppm failed: %s (failures=%lu); "
+                   "drift is NOT being corrected",
+                   (long)next_ppm, esp_err_to_name(te),
+                   (unsigned long)tune_fail_count);
+        }
       }
     }
 
@@ -2225,9 +2497,10 @@ esp_err_t audio_receiver_release_for_wifi_scan(void) {
    * while the stores are being dismantled. */
   audio_receiver_stop();
 
-  if (s.processor_task || !realtime_receiver_is_idle()) {
+  if (s.processor_task || !realtime_receiver_is_idle() ||
+      (s.transport && !ap2_buffered_fifo_is_idle(s.transport))) {
     ESP_LOGE(TAG, "WiFi scan release refused: media producer still active");
-    return ESP_ERR_INVALID_STATE;
+    return ESP_ERR_TIMEOUT;
   }
 
   /* Stop the long-lived workers before freeing any object they can observe. */
@@ -2247,15 +2520,33 @@ esp_err_t audio_receiver_release_for_wifi_scan(void) {
              "WiFi scan release timed out: playout=%p stage=%p status=%p",
              (void *)s.playout_task, (void *)s.realtime_stage_task,
              (void *)s.status_task);
+    /* No large allocation has been freed yet. Restore the normal engine
+     * lifecycle rather than returning a half-stopped receiver to the web
+     * server. */
+    (void)audio_receiver_init();
     return ESP_ERR_TIMEOUT;
   }
 
-  ESP_RETURN_ON_ERROR(realtime_receiver_clear_packet_workspace(), TAG,
-                      "failed to detach realtime shared workspace");
+  esp_err_t err = realtime_receiver_clear_packet_workspace();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "failed to detach realtime shared workspace: %s",
+             esp_err_to_name(err));
+    (void)audio_receiver_init();
+    return err;
+  }
   s.realtime_workspace_bound = false;
 
   if (s.transport) {
-    ap2_buffered_fifo_destroy(s.transport);
+    err = ap2_buffered_fifo_destroy(s.transport);
+    if (err != ESP_OK) {
+      /* destroy() leaves the FIFO object intact when its reader still owns
+       * the shared backing store. Rebind/restart the engine and, critically,
+       * do not free codec_workspace underneath that reader. */
+      ESP_LOGE(TAG, "WiFi scan release: FIFO destroy failed: %s",
+               esp_err_to_name(err));
+      (void)audio_receiver_init();
+      return err;
+    }
     s.transport = NULL;
   }
   if (s.realtime_stage_ring) {
@@ -2768,9 +3059,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   ptp_clock_snapshot_t ps = {0};
   ptp_clock_get_snapshot(&ps);
   uint64_t local_ns = 0;
-  const bool local_valid = !ps.realtime_mode && ps.valid && ps.locked &&
-      ps.grandmaster_clock_id != 0 && ps.grandmaster_clock_id == clock_id &&
-      ps.mastership_age_ms >= 400U &&
+  const bool local_valid = buffered_ptp_qualified(&ps, clock_id, true) &&
       ptp_clock_engine_remote_to_local(ptp_ns, ps.filtered_offset_ns, &local_ns) &&
       local_ns != 0;
   const uint64_t local_update_us = local_valid ? (uint64_t)esp_timer_get_time() : 0;
@@ -2794,6 +3083,10 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.rt_media_rebase_bias_ns = 0;
   s.anchor_valid = true;
   taskEXIT_CRITICAL(&s.state_mux);
+  if (committed) {
+    s_anchor_commit_us = esp_timer_get_time();
+    s_anchor_commit_gen = gen;
+  }
   /* Shairport-style separation: SETRATEANCHORTIME updates presentation timing
    * only. The compressed FIFO has no RTP cursor to search or rebind. */
   if (s.transport) ap2_buffered_fifo_notify(s.transport);

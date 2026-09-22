@@ -79,6 +79,10 @@ typedef struct {
   uint32_t mastership_age_ms;
   uint32_t sample_count;
   uint32_t sample_age_ms; /* UINT32_MAX when no accepted timing sample exists. */
+  /* Diagnostics (v4.1.14): why a buffered anchor may never become usable. */
+  bool source_mixed;          /* packets from a second source were rejected */
+  uint64_t expected_clock_id; /* D7/timeline hint, 0 = none */
+  uint32_t peer_count;        /* SETPEERS entries currently tracked */
 } ptp_clock_snapshot_t;
 
 /* Coherent status/diagnostic snapshot for either buffered or realtime mode. */

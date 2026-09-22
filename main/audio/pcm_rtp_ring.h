@@ -9,7 +9,7 @@
 /*
  * Direct RTP-addressed PCM store.
  *
- * 256 slots x 1024 stereo frames = 262144 frames = 5.94 s @ 44.1 kHz.
+ * 128 slots x 1024 stereo frames = 131072 frames = 2.97 s @ 44.1 kHz.
  * A slot is keyed by absolute RTP page base (rtp & ~1023). RTP itself is the
  * address: no sorting, no scan, no linked list, no binary search.
  *
@@ -19,7 +19,7 @@
  */
 
 #define PCM_RTP_SLOT_FRAMES 1024U
-#define PCM_RTP_SLOT_COUNT  256U
+#define PCM_RTP_SLOT_COUNT  128U
 #define PCM_RTP_RING_FRAMES (PCM_RTP_SLOT_FRAMES * PCM_RTP_SLOT_COUNT)
 #define PCM_RTP_CHANNELS    2U
 

@@ -1102,8 +1102,8 @@ void ptp_clock_stop(void) {
   task_free_spiram(&ptp.task_mem);
 }
 
-void ptp_clock_clear(void) {
-  taskENTER_CRITICAL(&ptp_state_mux);
+/* Estimator reset without the lock; caller holds ptp_state_mux. */
+static void ptp_clear_estimators_locked(void) {
   ptp.locked = false;
   ptp.lock_candidate_start_ms = 0;
   ptp.last_sync_ms = 0;
@@ -1143,6 +1143,11 @@ void ptp_clock_clear(void) {
   ptp.rt_sync_source_clock_id = 0;
   ptp.rt_sync_source_ip = 0;
   ptp.rt_awaiting_followup = false;
+}
+
+void ptp_clock_clear(void) {
+  taskENTER_CRITICAL(&ptp_state_mux);
+  ptp_clear_estimators_locked();
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
@@ -1172,6 +1177,8 @@ void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count) {
   }
 
   bool changed = false;
+  bool reset_latch = false;
+  uint64_t dropped_source = 0;
   taskENTER_CRITICAL(&ptp_state_mux);
   if (ptp.peer_count != normalized_count) {
     changed = true;
@@ -1185,6 +1192,20 @@ void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count) {
     }
   }
   if (changed) {
+    /* v4.1.14: a session is starting (empty -> non-empty peer list). Before
+     * this point the task admitted ANY PTP source it heard on the network
+     * (boot, other AirPlay/HomeKit devices) and latched onto the first one.
+     * That latch was never undone, so the real sender's packets were rejected
+     * as a "mixed" source until the next full TEARDOWN: the first session
+     * after boot could stay silent forever. Drop the pre-session estimator so
+     * only the advertised peers can seed it. Mid-session peer changes (group
+     * edits) keep the estimator and its handover logic. */
+    if (ptp.peer_count == 0 && normalized_count > 0 && !ptp.realtime_mode &&
+        (ptp.legacy_engine.source_clock_id != 0 || ptp.legacy_source_mixed)) {
+      dropped_source = ptp.legacy_engine.source_clock_id;
+      ptp_clear_estimators_locked();
+      reset_latch = true;
+    }
     memset(ptp.peers, 0, sizeof(ptp.peers));
     if (normalized_count > 0)
       memcpy(ptp.peers, normalized,
@@ -1192,6 +1213,9 @@ void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count) {
     ptp.peer_count = normalized_count;
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
+  if (reset_latch)
+    ESP_LOGI(TAG, "SETPEERS: session start, dropped pre-session PTP source %016llx",
+             (unsigned long long)dropped_source);
 
 }
 
@@ -1284,6 +1308,9 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
 
   snapshot->realtime_mode = ptp.realtime_mode;
   snapshot->locked = ptp.locked;
+  snapshot->source_mixed = ptp.legacy_source_mixed;
+  snapshot->expected_clock_id = ptp.expected_clock_id;
+  snapshot->peer_count = (uint32_t)ptp.peer_count;
   if (ptp.realtime_mode) {
     snapshot->valid = ptp.rt_master_ready && ptp.rt_last_followup_rx_ns > 0;
     snapshot->source_clock_id = ptp.source_clock_id;
