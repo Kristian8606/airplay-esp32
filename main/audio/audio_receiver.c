@@ -110,6 +110,25 @@
 #define AP2_PID_KD_PPM_PER_MS_PER_S    55.0
 #define AP2_PID_D_ALPHA                  0.20
 #define AP2_PID_I_TERM_LIMIT_PPM       110.0
+
+/* v4.1.17 slow centring inside the +/-1 ms good zone (multiroom accuracy).
+ * The PID holds the clock inside the zone, so sync used to park near +/-1 ms
+ * and the crystal error was never learned precisely. Every window the
+ * centring loop measures the real phase slope and steers the frequency so
+ * that sync approaches 0 at <= AP2_CENTER_MAX_SLOPE_US_S and then stays flat.
+ * 1 ppm of I2S rate change = 1 us/s of sync slope. */
+#define AP2_CENTER_WINDOW_US         15000000LL /* slope measurement window */
+#define AP2_CENTER_QUIET_US               200    /* |sync| below: aim for 0 slope */
+#define AP2_CENTER_TIME_S                60.0   /* approach time constant */
+#define AP2_CENTER_MAX_SLOPE_US_S        10.0   /* max wanted approach speed */
+#define AP2_CENTER_MAX_STEP_PPM            40    /* max frequency step per window */
+/* v4.1.18 hysteresis: centring mode is entered inside +/-1 ms and is kept
+ * through brief excursions. It hands back to the PID only when |sync| stays
+ * above 1.5 ms for 3 s, or immediately above 3 ms. The old code dropped out on
+ * any momentary D-estimate spike, so a 15 s window never completed. */
+#define AP2_CENTER_EXIT_US               1500
+#define AP2_CENTER_EXIT_HOLD_US       3000000LL
+#define AP2_CENTER_EXIT_HARD_US          3000
 #define AP2_PCM_TARGET_MS           1000U
 #define AP2_REALTIME_PRIME_MS        100U
 #define AP2_RT_GM_REBASE_SETTLE_MS  1000U
@@ -731,10 +750,100 @@ static void buffered_timing_watchdog(const timing_snapshot_t *snap) {
   wd_last_reset_us = now_us;
 }
 
+/* v4.1.18: the playout task never logs. It posts numbers into these
+ * single-writer mailboxes (seqlock) and the low-priority audio_status_task
+ * formats and prints them. A log line can block on UART/USB for milliseconds;
+ * that must never happen on the task that feeds I2S. */
+typedef struct {
+  volatile uint32_t seq;   /* odd while the writer is updating */
+  volatile uint32_t count; /* events posted so far */
+  int32_t v[5];
+  const char *str;
+} playout_evt_t;
+
+enum {
+  PEVT_START = 0,
+  PEVT_RESYNC,
+  PEVT_CENTER,
+  PEVT_TUNE_FAIL,
+  PEVT_FLUSH_FAIL,
+  PEVT_SERVO_RESET_FAIL,
+  PEVT_COUNT
+};
+static playout_evt_t s_pevt[PEVT_COUNT];
+
+static void pevt_post(int kind, int32_t a, int32_t b, int32_t c, int32_t d,
+                      int32_t e, const char *str) {
+  playout_evt_t *ev = &s_pevt[kind];
+  const uint32_t q = ev->seq;
+  __atomic_store_n(&ev->seq, q + 1U, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  ev->v[0] = a; ev->v[1] = b; ev->v[2] = c; ev->v[3] = d; ev->v[4] = e;
+  ev->str = str;
+  ev->count = ev->count + 1U;
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  __atomic_store_n(&ev->seq, q + 2U, __ATOMIC_RELAXED);
+}
+
+/* Reader side (status task). Returns true once per new event; `missed` is the
+ * number of additional events of this kind since the previous report. */
+static bool pevt_take(int kind, uint32_t *last_count, int32_t v[5],
+                      const char **str, uint32_t *missed) {
+  playout_evt_t *ev = &s_pevt[kind];
+  for (int tries = 0; tries < 3; ++tries) {
+    const uint32_t q1 = __atomic_load_n(&ev->seq, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (q1 & 1U) continue;
+    const uint32_t count = ev->count;
+    for (int i = 0; i < 5; ++i) v[i] = ev->v[i];
+    const char *sp = ev->str;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&ev->seq, __ATOMIC_RELAXED) != q1) continue;
+    if (count == *last_count) return false;
+    *missed = count - *last_count - 1U;
+    *last_count = count;
+    if (str) *str = sp;
+    return true;
+  }
+  return false; /* writer busy; pick it up on the next cycle */
+}
+
+/* Format and print what the playout task posted (v4.1.18). */
+static void status_print_playout_events(void) {
+  static uint32_t last[PEVT_COUNT];
+  int32_t v[5];
+  const char *str = NULL;
+  uint32_t missed = 0;
+  if (pevt_take(PEVT_START, &last[PEVT_START], v, NULL, &missed))
+    ESP_LOGI(TAG, "PLAYOUT START gen=%ld: first audio %ld ms after anchor "
+                  "(ptp locked=%ld mastership=%ldms samples=%ld)",
+             (long)v[0], (long)v[1], (long)v[2], (long)v[3], (long)v[4]);
+  if (pevt_take(PEVT_RESYNC, &last[PEVT_RESYNC], v, NULL, &missed))
+    ESP_LOGW(TAG, "RESYNC #%ld: sync error %+.2f ms beyond %.0f ms for %ld ms "
+                  "-> re-prime at presentation point (I2S servo %+ld ppm kept)",
+             (long)v[0], (double)v[1] / 1000.0,
+             (double)AP2_RESYNC_THRESHOLD_US / 1000.0, (long)v[2], (long)v[3]);
+  if (pevt_take(PEVT_CENTER, &last[PEVT_CENTER], v, NULL, &missed))
+    ESP_LOGI(TAG, "SERVO CENTER: sync %+.2f ms, slope %+.1f us/s -> I2S %+ld ppm%s",
+             (double)v[0] / 1000.0, (double)v[1] / 10.0, (long)v[2],
+             missed ? " (+earlier steps)" : "");
+  if (pevt_take(PEVT_TUNE_FAIL, &last[PEVT_TUNE_FAIL], v, NULL, &missed))
+    ESP_LOGW(TAG, "I2S clock tune to %+ld ppm failed: %s (failures=%ld); "
+                  "drift is NOT being corrected",
+             (long)v[0], esp_err_to_name((esp_err_t)v[1]), (long)v[2]);
+  if (pevt_take(PEVT_FLUSH_FAIL, &last[PEVT_FLUSH_FAIL], v, &str, &missed))
+    ESP_LOGE(TAG, "PLAYOUT FLUSH failed (%s): %s (x%lu)", str ? str : "unknown",
+             esp_err_to_name((esp_err_t)v[0]), (unsigned long)(missed + 1U));
+  if (pevt_take(PEVT_SERVO_RESET_FAIL, &last[PEVT_SERVO_RESET_FAIL], v, NULL, &missed))
+    ESP_LOGW(TAG, "PLAYOUT SERVO RESET failed: %s (x%lu)",
+             esp_err_to_name((esp_err_t)v[0]), (unsigned long)(missed + 1U));
+}
+
 static void audio_status_task(void *arg) {
   (void)arg;
   bool stack_headroom_warned = false;
   while (s.engine_running) {
+    status_print_playout_events();
     timing_snapshot_t snap;
     snapshot_state(&snap);
     const bool active = s.engine_running && snap.playing &&
@@ -1042,6 +1151,27 @@ static void reset_aac_decode_history(aac_decoder_t **decoder,
   *have_sequence = false;
   *expected_timestamp = 0;
   *expected_seq = 0;
+}
+
+/* Pure centring decision (host-tested). Returns the frequency step in ppm to
+ * add to the current I2S correction, or 0. `slope_us_s` is the measured sync
+ * slope over the last window while the clock was NOT being retuned. */
+static int32_t servo_center_step(int32_t sync_us, double slope_us_s) {
+  double wanted_slope = 0.0;
+  if (sync_us > AP2_CENTER_QUIET_US || sync_us < -AP2_CENTER_QUIET_US) {
+    wanted_slope = -(double)sync_us / AP2_CENTER_TIME_S;
+    if (wanted_slope > AP2_CENTER_MAX_SLOPE_US_S)
+      wanted_slope = AP2_CENTER_MAX_SLOPE_US_S;
+    if (wanted_slope < -AP2_CENTER_MAX_SLOPE_US_S)
+      wanted_slope = -AP2_CENTER_MAX_SLOPE_US_S;
+  }
+  double step = wanted_slope - slope_us_s; /* +1 ppm -> +1 us/s */
+  if (step > AP2_CENTER_MAX_STEP_PPM) step = AP2_CENTER_MAX_STEP_PPM;
+  if (step < -AP2_CENTER_MAX_STEP_PPM) step = -AP2_CENTER_MAX_STEP_PPM;
+  const int32_t out = (int32_t)(step >= 0.0 ? step + 0.5 : step - 0.5);
+  /* Below the physical retune threshold a step would never be applied. */
+  if (out < AP2_PID_MIN_TUNE_PPM && out > -AP2_PID_MIN_TUNE_PPM) return 0;
+  return out;
 }
 
 /* Linear fade-in over the first AP2_FADE_IN_FRAMES of a block (~5.8 ms at
@@ -1670,8 +1800,8 @@ static bool playout_flush_checked(const char *reason) {
   }
   __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
   media_control_wake();
-  ESP_LOGE(TAG, "PLAYOUT FLUSH failed (%s): %s",
-           reason ? reason : "unknown", esp_err_to_name(err));
+  pevt_post(PEVT_FLUSH_FAIL, (int32_t)err, 0, 0, 0, 0,
+            reason ? reason : "unknown");
   return false;
 }
 
@@ -1732,6 +1862,13 @@ static void ap2_playout_task(void *arg) {
   int64_t resync_last_us = 0;
   uint32_t resync_count = 0;
   uint32_t start_logged_gen = 0;
+  bool center_active = false;
+  int64_t center_out_since_us = 0;
+  int64_t center_start_us = 0;
+  /* Least-squares line through the 1 Hz sync samples of the window:
+   * robust slope and a de-noised end-of-window sync estimate. */
+  double center_n = 0.0, center_st = 0.0, center_sy = 0.0;
+  double center_stt = 0.0, center_sty = 0.0;
   uint32_t servo_generation = 0;
   double pid_integral_ms_s = 0.0;
   double pid_prev_error_ms = 0.0;
@@ -1759,7 +1896,7 @@ static void ap2_playout_task(void *arg) {
                          __ATOMIC_RELEASE);
         /* A hard boundary is not complete until the physical clock is back
          * at nominal.  Retry instead of ACKing a half-reset session. */
-        ESP_LOGW(TAG, "PLAYOUT SERVO RESET failed: %s", esp_err_to_name(re));
+        pevt_post(PEVT_SERVO_RESET_FAIL, (int32_t)re, 0, 0, 0, 0, NULL);
         vTaskDelay(1);
         continue;
       }
@@ -1767,6 +1904,7 @@ static void ap2_playout_task(void *arg) {
       servo_ppm = 0;
       servo_target_ppm = 0;
       servo_generation = 0;
+      center_active = false;
       pid_integral_ms_s = 0.0;
       pid_prev_error_ms = 0.0;
       pid_d_filtered_ms_s = 0.0;
@@ -1842,13 +1980,9 @@ static void ap2_playout_task(void *arg) {
                    (resync_last_us == 0 ||
                     now_us - resync_last_us >= AP2_RESYNC_MIN_INTERVAL_US)) {
           resync_count++;
-          ESP_LOGW(TAG,
-                   "RESYNC #%lu: sync error %+.2f ms beyond %.0f ms for %lld ms "
-                   "-> re-prime at presentation point (I2S servo %+ld ppm kept)",
-                   (unsigned long)resync_count, (double)err_us / 1000.0,
-                   (double)AP2_RESYNC_THRESHOLD_US / 1000.0,
-                   (long long)((now_us - resync_over_since_us) / 1000LL),
-                   (long)servo_ppm);
+          pevt_post(PEVT_RESYNC, (int32_t)resync_count, err_us,
+                    (int32_t)((now_us - resync_over_since_us) / 1000LL),
+                    servo_ppm, 0, NULL);
           resync_last_us = now_us;
           resync_over_since_us = 0;
           state = PLAYOUT_STOPPED; /* re-prime below; servo_ppm is kept */
@@ -1871,6 +2005,7 @@ static void ap2_playout_task(void *arg) {
       pid_prev_valid = false;
       pid_d_filtered_ms_s = 0.0;
       servo_target_ppm = servo_ppm;
+      center_active = false; /* new timeline: restart slope measurement */
       s.output_sync.valid = false;
       status_invalidate_sync();
       state = PLAYOUT_PRIMING;
@@ -2111,13 +2246,10 @@ static void ap2_playout_task(void *arg) {
         start_logged_gen = snap.generation;
         ptp_clock_snapshot_t ps = {0};
         ptp_clock_get_snapshot(&ps);
-        ESP_LOGI(TAG,
-                 "PLAYOUT START gen=%lu: first audio %lld ms after anchor "
-                 "(ptp locked=%d mastership=%lums samples=%lu)",
-                 (unsigned long)snap.generation,
-                 (long long)((esp_timer_get_time() - s_anchor_commit_us) / 1000LL),
-                 ps.locked, (unsigned long)ps.mastership_age_ms,
-                 (unsigned long)ps.sample_count);
+        pevt_post(PEVT_START, (int32_t)snap.generation,
+                  (int32_t)((esp_timer_get_time() - s_anchor_commit_us) / 1000LL),
+                  ps.locked ? 1 : 0, (int32_t)ps.mastership_age_ms,
+                  (int32_t)ps.sample_count, NULL);
       }
       continue;
     }
@@ -2197,7 +2329,9 @@ static void ap2_playout_task(void *arg) {
      * most every 5 s and only for a useful >=5 ppm change.  This separation
      * matters because IDF tuning needs disable->tune->enable, which can itself
      * perturb phase.  +/-1 ms is deliberately treated as GOOD: once there and
-     * phase velocity is modest, the clock is held instead of chasing 0.000 ms.
+     * phase velocity is modest, the PID stops acting and a slow centring loop
+     * (v4.1.17, AP2_CENTER_*) steers towards 0 ms with at most one small step
+     * per 15 s window, based on a least-squares slope of the measured sync.
      */
     const int64_t pid_now_us = esp_timer_get_time();
     if (write_err == ESP_OK && s.output_sync.valid &&
@@ -2271,8 +2405,77 @@ static void ap2_playout_task(void *arg) {
        * D still remains alive, so a clear passage through the band will be seen
        * on the next calculation rather than being hidden forever. */
       const double sync_slope_ms_s = -pid_d_filtered_ms_s;
-      if (in_deadband && sync_slope_ms_s > -0.080 && sync_slope_ms_s < 0.080) {
-        next_target = servo_ppm;
+      /* v4.1.18 hysteresis around the centring mode. */
+      if (center_active) {
+        if (abs_sync_us > AP2_CENTER_EXIT_HARD_US) {
+          center_active = false;
+        } else if (abs_sync_us > AP2_CENTER_EXIT_US) {
+          if (center_out_since_us == 0) {
+            center_out_since_us = pid_now_us;
+          } else if (pid_now_us - center_out_since_us >= AP2_CENTER_EXIT_HOLD_US) {
+            center_active = false;
+          }
+        } else {
+          center_out_since_us = 0;
+        }
+      }
+      const bool center_enter = !center_active && in_deadband &&
+          sync_slope_ms_s > -0.080 && sync_slope_ms_s < 0.080;
+      if (center_active || center_enter) {
+        /* Hold the learned clock, then centre slowly (v4.1.17/18). */
+        bool restart_window = false;
+        if (center_enter) {
+          next_target = servo_ppm; /* entering the zone: drop pending PID step */
+          center_active = true;
+          center_out_since_us = 0;
+          restart_window = true;
+          /* PID frequency memory = the clock we are now holding. */
+          pid_integral_ms_s = (double)servo_ppm / AP2_PID_KI_PPM_PER_MS_S;
+          const double i_lim = AP2_PID_I_TERM_LIMIT_PPM / AP2_PID_KI_PPM_PER_MS_S;
+          if (pid_integral_ms_s > i_lim) pid_integral_ms_s = i_lim;
+          if (pid_integral_ms_s < -i_lim) pid_integral_ms_s = -i_lim;
+        } else {
+          next_target = servo_target_ppm;
+          if (servo_target_ppm != servo_ppm) {
+            /* A step is still waiting for the 5 s retune slot: measure the
+             * slope only once the clock really runs at the new rate. */
+            restart_window = true;
+          } else {
+            const double t_s = (double)(pid_now_us - center_start_us) / 1000000.0;
+            const double y = (double)s.output_sync.us;
+            center_n += 1.0; center_st += t_s; center_sy += y;
+            center_stt += t_s * t_s; center_sty += t_s * y;
+          }
+          const double den = center_n * center_stt - center_st * center_st;
+          if (!restart_window && center_n >= 5.0 && den > 0.0 &&
+              pid_now_us - center_start_us >= AP2_CENTER_WINDOW_US) {
+            const double slope_us_s = (center_n * center_sty - center_st * center_sy) / den;
+            const double icpt = (center_sy - slope_us_s * center_st) / center_n;
+            const double t_end = (double)(pid_now_us - center_start_us) / 1000000.0;
+            const int32_t sync_fit_us = (int32_t)(icpt + slope_us_s * t_end);
+            const int32_t step = servo_center_step(sync_fit_us, slope_us_s);
+            if (step != 0) {
+              int32_t t = servo_ppm + step;
+              if (t > AP2_PID_MAX_PPM) t = AP2_PID_MAX_PPM;
+              if (t < -AP2_PID_MAX_PPM) t = -AP2_PID_MAX_PPM;
+              next_target = t;
+              /* Keep the PID's frequency memory consistent with the learned
+               * clock, so leaving the zone does not jump back. */
+              pid_integral_ms_s = (double)t / AP2_PID_KI_PPM_PER_MS_S;
+              const double i_limit_state = AP2_PID_I_TERM_LIMIT_PPM /
+                                           AP2_PID_KI_PPM_PER_MS_S;
+              if (pid_integral_ms_s > i_limit_state) pid_integral_ms_s = i_limit_state;
+              if (pid_integral_ms_s < -i_limit_state) pid_integral_ms_s = -i_limit_state;
+              pevt_post(PEVT_CENTER, sync_fit_us,
+                        (int32_t)(slope_us_s * 10.0), t, 0, 0, NULL);
+            }
+            restart_window = true;
+          }
+        }
+        if (restart_window) {
+          center_start_us = pid_now_us;
+          center_n = center_st = center_sy = center_stt = center_sty = 0.0;
+        }
       }
       servo_target_ppm = next_target;
       status_publish_sync(s.output_sync.us, robust_phase_center_us(&s.output_sync),
@@ -2296,13 +2499,11 @@ static void ap2_playout_task(void *arg) {
         if (te == ESP_OK) {
           servo_ppm = next_ppm;
           tune_fail_count = 0;
-        } else if ((tune_fail_count++ % 12U) == 0U) {
+        } else {
           /* Previously silent: a failing tune means drift is not corrected. */
-          ESP_LOGW(TAG,
-                   "I2S clock tune to %+ld ppm failed: %s (failures=%lu); "
-                   "drift is NOT being corrected",
-                   (long)next_ppm, esp_err_to_name(te),
-                   (unsigned long)tune_fail_count);
+          tune_fail_count++;
+          pevt_post(PEVT_TUNE_FAIL, next_ppm, (int32_t)te,
+                    (int32_t)tune_fail_count, 0, 0, NULL);
         }
       }
     }
