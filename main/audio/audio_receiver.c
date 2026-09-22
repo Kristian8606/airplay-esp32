@@ -30,6 +30,9 @@
 #include "network/ptp_clock.h"
 #include "network/ptp_clock_engine.h"
 #include "network/socket_utils.h"
+#include "latency_cal.h"
+#include "settings.h"
+#include "amp_control.h"
 
 #define AP2_PACKET_MAX             8192U
 #define AP2_RX_STACK               4096U
@@ -628,8 +631,22 @@ static uint64_t presentation_now_ns(const timing_snapshot_t *snap) {
   return (uint64_t)esp_timer_get_time() * 1000ULL;
 }
 
+/* v4.1.21 output latency after the ESP (DAC/DSP/amp), in microseconds.
+ * Positive = the chain delays the sound, so the ESP must output that much
+ * EARLIER. Applied here, the single point every presentation-time calculation
+ * (start, cursor, sync measurement, realtime deadlines) goes through; the PTP
+ * map (anchor_local_ns) itself is untouched. Like Shairport's
+ * audio_backend_latency_offset_in_seconds, with the opposite sign convention
+ * (ours is "how late the hardware is"). */
+#define AP2_OUTPUT_LATENCY_MIN_US  (-100000)
+#define AP2_OUTPUT_LATENCY_MAX_US  150000
+static volatile int32_t s_output_latency_us = 0;
+
 static uint64_t presentation_anchor_ns(const timing_snapshot_t *snap) {
-  return snap ? snap->anchor_local_ns : 0;
+  if (!snap) return 0;
+  const int64_t off_ns =
+      (int64_t)__atomic_load_n(&s_output_latency_us, __ATOMIC_RELAXED) * 1000LL;
+  return (uint64_t)((int64_t)snap->anchor_local_ns - off_ns);
 }
 
 static bool wanted_rtp_now(const timing_snapshot_t *snap, uint32_t *out) {
@@ -1847,6 +1864,83 @@ static bool buffered_anchor_moved(const timing_snapshot_t *previous,
   return shift_us > block_us || shift_us < -block_us;
 }
 
+/* ---- v4.1.21 wired latency measurement: the I2S side ----
+ * Runs inside the playout task (the only I2S owner) when the web UI asks and
+ * no AirPlay stream is playing. Plays silence + LATENCY_CAL_BURSTS chirps and
+ * records, from the tagged DMA completions, when each chirp started at the
+ * same reference point the sync servo uses. */
+#define CAL_GENERATION      0xCA1B0000U
+#define CAL_LEAD_BLOCKS     16U   /* ~93 ms silence before the first chirp */
+#define CAL_BURST_EVERY     20U   /* ~116 ms between chirps */
+#define CAL_TAIL_BLOCKS     20U   /* covers up to ~116 ms of chain latency */
+#define CAL_TOTAL_BLOCKS    (CAL_LEAD_BLOCKS + LATENCY_CAL_BURSTS * CAL_BURST_EVERY + CAL_TAIL_BLOCKS)
+#define CAL_I2S_RATE_HZ     44100U
+
+static struct {
+  volatile bool requested;
+  SemaphoreHandle_t done;
+  SemaphoreHandle_t lock;
+  esp_err_t status;
+  int64_t emit_us[LATENCY_CAL_BURSTS];
+  int n_emit;
+} s_cal;
+
+static bool cal_block_is_burst(uint32_t idx, uint32_t *burst) {
+  if (idx < CAL_LEAD_BLOCKS) return false;
+  const uint32_t rel = idx - CAL_LEAD_BLOCKS;
+  if ((rel % CAL_BURST_EVERY) != 0U) return false;
+  const uint32_t k = rel / CAL_BURST_EVERY;
+  if (k >= LATENCY_CAL_BURSTS) return false;
+  if (burst) *burst = k;
+  return true;
+}
+
+static void cal_take_completion(const audio_playout_completion_t *d) {
+  uint32_t k = 0;
+  if (d->generation != CAL_GENERATION || !cal_block_is_burst(d->rtp, &k)) return;
+  /* done_local_us marks the END of the block (the sync servo's reference);
+   * the chirp starts at the first sample of the block. */
+  s_cal.emit_us[k] = d->done_local_us -
+      ((int64_t)d->frames * 1000000LL) / (int64_t)CAL_I2S_RATE_HZ;
+  s_cal.n_emit++;
+}
+
+static esp_err_t playout_run_latency_calibration(void) {
+  static int16_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
+  static int16_t burst[AUDIO_PLAYOUT_FRAMES * 2U];
+  memset(silence, 0, sizeof(silence));
+  latency_cal_fill_burst(burst, AUDIO_PLAYOUT_FRAMES, CAL_I2S_RATE_HZ);
+  s_cal.n_emit = 0;
+  for (int k = 0; k < LATENCY_CAL_BURSTS; ++k) s_cal.emit_us[k] = 0;
+
+  if (!playout_flush_checked("latency-cal")) return ESP_FAIL;
+  if (audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES, 0U,
+                                   CAL_GENERATION) != ESP_OK ||
+      audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES, 1U,
+                                   CAL_GENERATION) != ESP_OK ||
+      audio_playout_enable() != ESP_OK) {
+    (void)playout_flush_checked("latency-cal-start");
+    return ESP_FAIL;
+  }
+  audio_playout_completion_t d;
+  for (uint32_t idx = 2U; idx < CAL_TOTAL_BLOCKS; ++idx) {
+    const int16_t *blk = cal_block_is_burst(idx, NULL) ? burst : silence;
+    if (audio_playout_write_tagged(blk, AUDIO_PLAYOUT_FRAMES, idx,
+                                   CAL_GENERATION) != ESP_OK ||
+        audio_playout_has_fault()) {
+      (void)playout_flush_checked("latency-cal-write");
+      return ESP_FAIL;
+    }
+    while (audio_playout_poll_completion(&d)) cal_take_completion(&d);
+  }
+  /* drain the last descriptors */
+  for (int i = 0; i < 10 && s_cal.n_emit < LATENCY_CAL_BURSTS; ++i) {
+    if (audio_playout_wait_completion(&d, pdMS_TO_TICKS(20))) cal_take_completion(&d);
+  }
+  (void)playout_flush_checked("latency-cal-end");
+  return s_cal.n_emit == LATENCY_CAL_BURSTS ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 static void ap2_playout_task(void *arg) {
   (void)arg;
   int16_t *block = heap_caps_malloc(
@@ -1964,6 +2058,24 @@ static void ap2_playout_task(void *arg) {
         !__atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) &&
         !__atomic_load_n(&s.playout_servo_reset_requested, __ATOMIC_ACQUIRE)) {
       __atomic_store_n(&s.playout_quiesce_ack, quiesce_req, __ATOMIC_RELEASE);
+    }
+
+    if (__atomic_load_n(&s_cal.requested, __ATOMIC_ACQUIRE)) {
+      timing_snapshot_t cs;
+      snapshot_state(&cs);
+      if (cs.playing && cs.anchor_valid) {
+        s_cal.status = ESP_ERR_INVALID_STATE; /* AirPlay started meanwhile */
+      } else {
+        s_cal.status = playout_run_latency_calibration();
+      }
+      /* Back to a clean stopped state; any stream re-primes normally. */
+      state = PLAYOUT_STOPPED;
+      cursor_generation = 0;
+      s.output_sync.valid = false;
+      status_invalidate_sync();
+      __atomic_store_n(&s_cal.requested, false, __ATOMIC_RELEASE);
+      if (s_cal.done) xSemaphoreGive(s_cal.done);
+      continue;
     }
 
     timing_snapshot_t snap;
@@ -2564,6 +2676,13 @@ static void ap2_playout_task(void *arg) {
 
 
 esp_err_t audio_receiver_init(void) {
+  {
+    int32_t lat = 0;
+    if (settings_get_output_latency_us(&lat) == ESP_OK &&
+        lat >= AP2_OUTPUT_LATENCY_MIN_US && lat <= AP2_OUTPUT_LATENCY_MAX_US) {
+      __atomic_store_n(&s_output_latency_us, lat, __ATOMIC_RELAXED);
+    }
+  }
   if (!s.publish_mutex) s.publish_mutex = xSemaphoreCreateMutex();
   if (!s.status_wake) s.status_wake = xSemaphoreCreateBinary();
   if (!s.playout_wake) s.playout_wake = xSemaphoreCreateBinary();
@@ -3256,6 +3375,109 @@ void audio_receiver_set_playout_latency_samples(uint32_t v) {
   taskEXIT_CRITICAL(&s.state_mux);
 }
 uint32_t audio_receiver_get_hardware_latency_us(void) { return audio_playout_hardware_latency_us(); }
+
+int32_t audio_receiver_get_output_latency_us(void) {
+  return __atomic_load_n(&s_output_latency_us, __ATOMIC_RELAXED);
+}
+
+esp_err_t audio_receiver_set_output_latency_us(int32_t us, bool persist) {
+  if (us < AP2_OUTPUT_LATENCY_MIN_US || us > AP2_OUTPUT_LATENCY_MAX_US)
+    return ESP_ERR_INVALID_ARG;
+  const int32_t old = __atomic_exchange_n(&s_output_latency_us, us, __ATOMIC_ACQ_REL);
+  const int32_t delta = us > old ? us - old : old - us;
+  if (delta >= 500 && s.engine_running) {
+    /* A larger shift is applied like a resync: stop and re-prime at the new
+     * presentation point (brief silence). Small shifts go through the servo. */
+    __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
+    media_control_wake();
+  }
+  ESP_LOGI(TAG, "OUTPUT LATENCY %+ld us (was %+ld us)%s", (long)us, (long)old,
+           persist ? ", saved" : "");
+  return persist ? settings_set_output_latency_us(us) : ESP_OK;
+}
+
+esp_err_t audio_receiver_measure_output_latency(latency_cal_result_t *res,
+                                                bool audible) {
+  if (!res) return ESP_ERR_INVALID_ARG;
+  memset(res, 0, sizeof(*res));
+  (void)audible;
+#if !CONFIG_AIRPLAY_LATENCY_CAL
+  res->error = "measurement not built in (CONFIG_AIRPLAY_LATENCY_CAL)";
+  return ESP_ERR_NOT_SUPPORTED;
+#else
+  if (!s.engine_running || !s.playout_task) {
+    res->error = "audio engine not running";
+    return ESP_ERR_INVALID_STATE;
+  }
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  if (snap.playing && snap.anchor_valid) {
+    res->error = "AirPlay is playing - pause or disconnect first";
+    return ESP_ERR_INVALID_STATE;
+  }
+  /* v4.1.22: a browser may silently re-send the pending request after the
+   * device rebooted; never start a measurement in the first seconds. */
+  if (esp_timer_get_time() < 20000000LL) {
+    res->error = "device just started - try again in a few seconds";
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (!s_cal.lock) s_cal.lock = xSemaphoreCreateMutex();
+  if (!s_cal.done) s_cal.done = xSemaphoreCreateBinary();
+  if (!s_cal.lock || !s_cal.done) return ESP_ERR_NO_MEM;
+  if (xSemaphoreTake(s_cal.lock, 0) != pdTRUE) {
+    res->error = "a measurement is already running";
+    return ESP_ERR_INVALID_STATE;
+  }
+  (void)xSemaphoreTake(s_cal.done, 0);
+
+  /* v4.1.22: the amplifier is normally OFF while no AirPlay session exists.
+   * "audible" switches it on for the test (the usual 300 s off-delay applies
+   * afterwards), so the chirps can be heard. It does not change a line-level
+   * measurement taken before the amplifier. */
+  if (audible) {
+    amp_control_session_connected();
+    vTaskDelay(pdMS_TO_TICKS(400)); /* amplifier start-up / anti-pop time */
+  }
+
+  esp_err_t err = latency_cal_capture_start();
+  if (err != ESP_OK) {
+    res->error = "ADC capture could not start (pin/memory)";
+    if (audible) amp_control_session_disconnected();
+    xSemaphoreGive(s_cal.lock);
+    return err;
+  }
+  vTaskDelay(pdMS_TO_TICKS(30)); /* ADC settles, lead silence follows */
+  __atomic_store_n(&s_cal.requested, true, __ATOMIC_RELEASE);
+  playout_wake();
+  if (xSemaphoreTake(s_cal.done, pdMS_TO_TICKS(4000)) != pdTRUE) {
+    __atomic_store_n(&s_cal.requested, false, __ATOMIC_RELEASE);
+    s_cal.status = ESP_ERR_TIMEOUT;
+  }
+  vTaskDelay(pdMS_TO_TICKS(20));
+  if (s_cal.status == ESP_OK) {
+    latency_cal_capture_finish(s_cal.emit_us, s_cal.n_emit, res);
+    err = res->ok ? ESP_OK : ESP_FAIL;
+  } else {
+    latency_cal_result_t dummy;
+    latency_cal_capture_finish(s_cal.emit_us, 0, &dummy);
+    res->error = s_cal.status == ESP_ERR_INVALID_STATE
+                     ? "AirPlay started during the measurement"
+                     : "I2S test playback failed";
+    err = s_cal.status;
+  }
+  if (audible) amp_control_session_disconnected();
+  xSemaphoreGive(s_cal.lock);
+  if (res->ok) {
+    ESP_LOGI(TAG, "LATENCY MEASURED %ld us (spread %ld us, %u/%u bursts, corr %.2f%s)",
+             (long)res->latency_us, (long)res->spread_us, res->valid_bursts,
+             (unsigned)LATENCY_CAL_BURSTS, (double)res->corr,
+             res->inverted ? ", polarity inverted" : "");
+  } else {
+    ESP_LOGW(TAG, "LATENCY MEASUREMENT FAILED: %s", res->error ? res->error : "?");
+  }
+  return err;
+#endif
+}
 
 void audio_receiver_set_playing(bool p) {
   taskENTER_CRITICAL(&s.state_mux);

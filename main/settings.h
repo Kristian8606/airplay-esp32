@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 #include "esp_err.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -26,3 +27,9 @@ esp_err_t settings_set_device_name(const char *name);
 esp_err_t settings_get_volume(float *volume_db);
 esp_err_t settings_set_volume(float volume_db);
 esp_err_t settings_persist_volume(void);
+/* v4.1.21 output latency after the ESP (us). Returns the Kconfig default
+ * CONFIG_AIRPLAY_OUTPUT_LATENCY_US when nothing was saved. */
+esp_err_t settings_get_output_latency_us(int32_t *us);
+esp_err_t settings_set_output_latency_us(int32_t us);
+/* Forget the saved value (back to the Kconfig default). */
+esp_err_t settings_clear_output_latency(void);

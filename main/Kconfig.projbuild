@@ -132,6 +132,34 @@ menu "I2S Playout"
     config I2S_DO_IO
         int "I2S DATA OUT GPIO"
         default 12
+
+    config AIRPLAY_OUTPUT_LATENCY_US
+        int "Default output latency after the ESP (microseconds)"
+        default 0
+        range -100000 150000
+        help
+            Delay added by the hardware after the ESP I2S output (DAC digital
+            filter, DSP, digital-input amplifier). The ESP plays this much
+            earlier so the sound leaves the speaker on time in multiroom.
+            Typical: PCM5102A ~450, DSP with a linear-phase FIR = half its
+            length (1024 taps @48 kHz ~10700). The web UI can override it and
+            the wired measurement saves the real value; this is only the
+            default when nothing has been saved.
+
+    config AIRPLAY_LATENCY_CAL
+        bool "Enable wired output-latency measurement (ADC loopback)"
+        default y
+        help
+            Adds a "Measure" button to the web UI. With a wire (through a
+            coupling capacitor and bias divider) from the DAC/DSP line output
+            to the ADC pin below, the ESP plays short test chirps and measures
+            the real output latency. Uses nothing until the button is pressed.
+
+    config AIRPLAY_LATENCY_CAL_GPIO
+        int "Loopback ADC input GPIO (ADC1: 1-10)"
+        default 4
+        range 1 10
+        depends on AIRPLAY_LATENCY_CAL
 endmenu
 
 menu "RGB Audio/VU LED"

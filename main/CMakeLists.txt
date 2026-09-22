@@ -48,6 +48,13 @@ if(CONFIG_AIRPLAY_DIAG_ACTIVE)
     list(APPEND SRC_FILES "audio/audio_diag.c")
 endif()
 
+# v4.1.21 output latency: the pure analysis is always built (tiny), the ADC
+# capture only with the wired measurement option.
+list(APPEND SRC_FILES "audio/latency_cal_dsp.c")
+if(CONFIG_AIRPLAY_LATENCY_CAL)
+    list(APPEND SRC_FILES "audio/latency_cal.c")
+endif()
+
 idf_component_register(
     SRCS ${SRC_FILES}
     INCLUDE_DIRS "." "audio" "rtsp" "plist" "hap" "network"
@@ -63,4 +70,5 @@ idf_component_register(
         mbedtls
         json
         spiffs_storage
+        esp_adc
 )

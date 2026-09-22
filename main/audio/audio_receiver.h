@@ -118,3 +118,14 @@ void audio_receiver_set_client_control(uint32_t client_ip,
 /* RTSP compatibility: buffered AP2 uses zero extra playout latency here. */
 void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
 uint32_t audio_receiver_get_hardware_latency_us(void);
+
+/* v4.1.21 output latency after the ESP (DAC/DSP), microseconds. Positive =
+ * the chain delays the sound, so the ESP plays that much earlier. Applied
+ * live; persist=true also stores it in NVS. Range -100000..150000. */
+#include "latency_cal.h"
+int32_t audio_receiver_get_output_latency_us(void);
+esp_err_t audio_receiver_set_output_latency_us(int32_t us, bool persist);
+/* Wired ADC loopback measurement. Only while AirPlay is not playing. Blocks
+ * ~2-3 s. Does NOT apply the result; the caller decides. */
+esp_err_t audio_receiver_measure_output_latency(latency_cal_result_t *res,
+                                                bool audible);
