@@ -230,6 +230,97 @@ static esp_err_t wifi_config_handler(httpd_req_t *req){
   else { cJSON_AddBoolToObject(r,"success",false); cJSON_AddStringToObject(r,"error","Invalid SSID"); }
   char *out=cJSON_PrintUnformatted(r); httpd_resp_set_type(req,"application/json"); httpd_resp_sendstr(req,out); free(out); cJSON_Delete(r); if(j)cJSON_Delete(j); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK;
 }
+/* ---- v4.1.21 output latency (manual value + optional wired measurement) ---- */
+#ifndef CONFIG_AIRPLAY_OUTPUT_LATENCY_US
+#define CONFIG_AIRPLAY_OUTPUT_LATENCY_US 0
+#endif
+static void send_json_obj(httpd_req_t *req, cJSON *r) {
+  char *out = cJSON_PrintUnformatted(r);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, out ? out : "{}");
+  free(out);
+  cJSON_Delete(r);
+}
+static void add_latency_state(cJSON *r) {
+  cJSON_AddNumberToObject(r, "latency_us", audio_receiver_get_output_latency_us());
+  cJSON_AddNumberToObject(r, "default_us", CONFIG_AIRPLAY_OUTPUT_LATENCY_US);
+#if CONFIG_AIRPLAY_LATENCY_CAL
+  cJSON_AddBoolToObject(r, "measure_available", true);
+  cJSON_AddNumberToObject(r, "measure_gpio", CONFIG_AIRPLAY_LATENCY_CAL_GPIO);
+#else
+  cJSON_AddBoolToObject(r, "measure_available", false);
+#endif
+}
+static esp_err_t latency_get_handler(httpd_req_t *req) {
+  cJSON *r = cJSON_CreateObject();
+  cJSON_AddBoolToObject(r, "success", true);
+  add_latency_state(r);
+  send_json_obj(req, r);
+  return ESP_OK;
+}
+static esp_err_t latency_post_handler(httpd_req_t *req) {
+  char b[128];
+  if (recv_json(req, b, sizeof(b)) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+    return ESP_FAIL;
+  }
+  cJSON *j = cJSON_Parse(b);
+  cJSON *r = cJSON_CreateObject();
+  esp_err_t e = ESP_ERR_INVALID_ARG;
+  cJSON *reset = j ? cJSON_GetObjectItem(j, "reset") : NULL;
+  cJSON *v = j ? cJSON_GetObjectItem(j, "latency_us") : NULL;
+  if (reset && cJSON_IsTrue(reset)) {
+    e = settings_clear_output_latency();
+    if (e == ESP_OK)
+      e = audio_receiver_set_output_latency_us(CONFIG_AIRPLAY_OUTPUT_LATENCY_US, false);
+  } else if (v && cJSON_IsNumber(v)) {
+    e = audio_receiver_set_output_latency_us((int32_t)v->valuedouble, true);
+  }
+  cJSON_AddBoolToObject(r, "success", e == ESP_OK);
+  if (e != ESP_OK)
+    cJSON_AddStringToObject(r, "error", e == ESP_ERR_INVALID_ARG
+                                            ? "value out of range (-100000..150000 us)"
+                                            : esp_err_to_name(e));
+  add_latency_state(r);
+  if (j) cJSON_Delete(j);
+  send_json_obj(req, r);
+  return ESP_OK;
+}
+static esp_err_t latency_measure_handler(httpd_req_t *req) {
+  /* optional body {"audible":false}; default: switch the amplifier on */
+  bool audible = true;
+  if (req->content_len > 0 && req->content_len < 64) {
+    char b[64];
+    if (recv_json(req, b, sizeof(b)) == ESP_OK) {
+      cJSON *j = cJSON_Parse(b);
+      cJSON *a = j ? cJSON_GetObjectItem(j, "audible") : NULL;
+      if (a && cJSON_IsBool(a)) audible = cJSON_IsTrue(a);
+      if (j) cJSON_Delete(j);
+    }
+  }
+  latency_cal_result_t res;
+  esp_err_t e = audio_receiver_measure_output_latency(&res, audible);
+  cJSON *r = cJSON_CreateObject();
+  cJSON_AddBoolToObject(r, "success", e == ESP_OK && res.ok);
+  if (e == ESP_OK && res.ok) {
+    /* A successful measurement becomes the saved value. */
+    esp_err_t se = audio_receiver_set_output_latency_us(res.latency_us, true);
+    cJSON_AddBoolToObject(r, "saved", se == ESP_OK);
+  }
+  cJSON_AddNumberToObject(r, "measured_us", res.latency_us);
+  cJSON_AddNumberToObject(r, "spread_us", res.spread_us);
+  cJSON_AddNumberToObject(r, "valid_bursts", res.valid_bursts);
+  cJSON_AddNumberToObject(r, "bursts_total", LATENCY_CAL_BURSTS);
+  cJSON_AddNumberToObject(r, "correlation", res.corr);
+  cJSON_AddNumberToObject(r, "amplitude", res.amplitude);
+  cJSON_AddBoolToObject(r, "inverted", res.inverted);
+  if (!(e == ESP_OK && res.ok))
+    cJSON_AddStringToObject(r, "error", res.error ? res.error : esp_err_to_name(e));
+  add_latency_state(r);
+  send_json_obj(req, r);
+  return ESP_OK;
+}
+
 static esp_err_t device_name_handler(httpd_req_t *req){
   char b[256]; if(recv_json(req,b,sizeof(b))!=ESP_OK){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid body");return ESP_FAIL;} cJSON *j=cJSON_Parse(b); cJSON *n=j?cJSON_GetObjectItem(j,"name"):NULL; cJSON *r=cJSON_CreateObject();
   if(n&&cJSON_IsString(n)){ esp_err_t e=settings_set_device_name(n->valuestring); if(e==ESP_OK)wifi_set_hostname(n->valuestring); cJSON_AddBoolToObject(r,"success",e==ESP_OK); if(e!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(e)); } else {cJSON_AddBoolToObject(r,"success",false);cJSON_AddStringToObject(r,"error","Invalid name");}
@@ -424,9 +515,9 @@ static esp_err_t speed_upload(httpd_req_t *req){
   httpd_resp_set_type(req,"text/plain");return httpd_resp_sendstr(req,out);
 }
 
-esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=24;c.stack_size=8192;c.lru_purge_enable=true;c.task_priority=HTTP_SERVER_TASK_PRIORITY;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
+esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=30;c.stack_size=8192;c.lru_purge_enable=true;c.task_priority=HTTP_SERVER_TASK_PRIORITY;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
 #define REG(U,M,H) do{httpd_uri_t x={.uri=U,.method=M,.handler=H};ESP_ERROR_CHECK(httpd_register_uri_handler(s_server,&x));}while(0)
-  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);
+  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);REG("/api/audio/latency",HTTP_GET,latency_get_handler);REG("/api/audio/latency",HTTP_POST,latency_post_handler);REG("/api/audio/latency/measure",HTTP_POST,latency_measure_handler);
   ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
 #undef REG
   e=log_stream_register(s_server);if(e!=ESP_OK)ESP_LOGW(TAG,"log stream register failed: %s",esp_err_to_name(e));ESP_LOGI(TAG,"Web UI started on port %u",port);return ESP_OK; }

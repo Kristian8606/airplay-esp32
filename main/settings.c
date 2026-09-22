@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -300,6 +301,39 @@ esp_err_t settings_get_volume(float *volume_db) {
   return e;
 }
 esp_err_t settings_set_volume(float volume_db) { s_volume_db = volume_db; return ESP_OK; }
+
+#ifndef CONFIG_AIRPLAY_OUTPUT_LATENCY_US
+#define CONFIG_AIRPLAY_OUTPUT_LATENCY_US 0
+#endif
+esp_err_t settings_get_output_latency_us(int32_t *us) {
+  if (!us) return ESP_ERR_INVALID_ARG;
+  *us = CONFIG_AIRPLAY_OUTPUT_LATENCY_US;
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;
+  int32_t v = 0;
+  if (nvs_get_i32(h, "out_lat_us", &v) == ESP_OK) *us = v;
+  nvs_close(h);
+  return ESP_OK;
+}
+esp_err_t settings_set_output_latency_us(int32_t us) {
+  nvs_handle_t h;
+  esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
+  if (e != ESP_OK) return e;
+  e = nvs_set_i32(h, "out_lat_us", us);
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  return e;
+}
+esp_err_t settings_clear_output_latency(void) {
+  nvs_handle_t h;
+  esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
+  if (e != ESP_OK) return e;
+  e = nvs_erase_key(h, "out_lat_us");
+  if (e == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  return e;
+}
 esp_err_t settings_persist_volume(void) {
   nvs_handle_t h;
   esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
