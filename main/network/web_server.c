@@ -14,6 +14,9 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "cJSON.h"
+#include "mbedtls/base64.h"
+#include "sdkconfig.h"
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -224,11 +227,45 @@ static esp_err_t recv_json(httpd_req_t *req, char *buf, size_t cap){
   buf[got] = 0;
   return ESP_OK;
 }
+/* v4.1.28 optional admin password (menuconfig AIRPLAY_WEB_ADMIN_PASSWORD).
+ * Empty = no check (default, unchanged behaviour). When set, firmware update,
+ * restart, Wi-Fi/name changes and the latency test require HTTP Basic auth
+ * (user "admin"); the browser shows its own login prompt once. */
+#ifndef CONFIG_AIRPLAY_WEB_ADMIN_PASSWORD
+#define CONFIG_AIRPLAY_WEB_ADMIN_PASSWORD ""
+#endif
+static bool admin_ok(httpd_req_t *req) {
+  const char *pw = CONFIG_AIRPLAY_WEB_ADMIN_PASSWORD;
+  if (!pw[0]) return true;
+  char hdr[160];
+  if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) == ESP_OK &&
+      strncmp(hdr, "Basic ", 6) == 0) {
+    unsigned char dec[112]; size_t dl = 0;
+    if (mbedtls_base64_decode(dec, sizeof(dec) - 1, &dl, (const unsigned char *)hdr + 6,
+                              strlen(hdr + 6)) == 0) {
+      dec[dl] = 0;
+      const char *colon = strchr((const char *)dec, ':');
+      if (colon && strncmp((const char *)dec, "admin", (size_t)(colon - (const char *)dec)) == 0 &&
+          (colon - (const char *)dec) == 5 && strcmp(colon + 1, pw) == 0)
+        return true;
+    }
+  }
+  httpd_resp_set_status(req, "401 Unauthorized");
+  httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"AirPlay ESP32\"");
+  httpd_resp_sendstr(req, "Authentication required\n");
+  return false;
+}
+
 static esp_err_t wifi_config_handler(httpd_req_t *req){
+  if(!admin_ok(req)) return ESP_OK;
   char b[512]; if(recv_json(req,b,sizeof(b))!=ESP_OK){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid body");return ESP_FAIL;} cJSON *j=cJSON_Parse(b); cJSON *s=j?cJSON_GetObjectItem(j,"ssid"):NULL; cJSON *p=j?cJSON_GetObjectItem(j,"password"):NULL; cJSON *r=cJSON_CreateObject();
   if(s&&cJSON_IsString(s)){ esp_err_t e=settings_set_wifi_credentials(s->valuestring,(p&&cJSON_IsString(p))?p->valuestring:""); cJSON_AddBoolToObject(r,"success",e==ESP_OK); if(e!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(e)); }
   else { cJSON_AddBoolToObject(r,"success",false); cJSON_AddStringToObject(r,"error","Invalid SSID"); }
-  char *out=cJSON_PrintUnformatted(r); httpd_resp_set_type(req,"application/json"); httpd_resp_sendstr(req,out); free(out); cJSON_Delete(r); if(j)cJSON_Delete(j); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK;
+  /* v4.1.28: restart ONLY after the new credentials were really saved. */
+  cJSON *ok_item=cJSON_GetObjectItem(r,"success"); const bool saved=ok_item&&cJSON_IsTrue(ok_item);
+  char *out=cJSON_PrintUnformatted(r); httpd_resp_set_type(req,"application/json"); httpd_resp_sendstr(req,out); free(out); cJSON_Delete(r); if(j)cJSON_Delete(j);
+  if(saved){ vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); }
+  return ESP_OK;
 }
 /* ---- v4.1.21 output latency (manual value + optional wired measurement) ---- */
 #ifndef CONFIG_AIRPLAY_OUTPUT_LATENCY_US
@@ -259,6 +296,7 @@ static esp_err_t latency_get_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 static esp_err_t latency_post_handler(httpd_req_t *req) {
+  if (!admin_ok(req)) return ESP_OK;
   char b[128];
   if (recv_json(req, b, sizeof(b)) != ESP_OK) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
@@ -287,6 +325,7 @@ static esp_err_t latency_post_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 static esp_err_t latency_measure_handler(httpd_req_t *req) {
+  if (!admin_ok(req)) return ESP_OK;
   /* optional body {"audible":false}; default: switch the amplifier on */
   bool audible = true;
   if (req->content_len > 0 && req->content_len < 64) {
@@ -298,8 +337,38 @@ static esp_err_t latency_measure_handler(httpd_req_t *req) {
       if (j) cJSON_Delete(j);
     }
   }
+  /* v4.1.23: same lifecycle as the Wi-Fi scan: stop AirPlay, release its
+   * memory, measure, restore AirPlay. */
+  const bool restore_airplay = audio_receiver_is_initialized();
+  if (restore_airplay) {
+    ESP_LOGI(TAG, "Latency test: pausing AirPlay and releasing audio memory");
+    rtsp_server_stop();
+    const esp_err_t rel = audio_receiver_release_for_wifi_scan();
+    if (rel != ESP_OK) {
+      ESP_LOGE(TAG, "Latency test: audio release failed: %s", esp_err_to_name(rel));
+      if (restore_airplay_after_wifi_scan() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "AirPlay recovery failed; rebooting");
+        reboot_after_wifi_scan_restore_failure();
+        return ESP_FAIL;
+      }
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "Audio engine could not pause for the latency test");
+      return ESP_FAIL;
+    }
+    log_wifi_scan_memory("latency-test-released");
+  }
   latency_cal_result_t res;
   esp_err_t e = audio_receiver_measure_output_latency(&res, audible);
+  if (restore_airplay) {
+    if (restore_airplay_after_wifi_scan() != ESP_OK) {
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                          "AirPlay could not restart after the latency test; rebooting");
+      reboot_after_wifi_scan_restore_failure();
+      return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "Latency test: AirPlay ready again");
+  }
   cJSON *r = cJSON_CreateObject();
   cJSON_AddBoolToObject(r, "success", e == ESP_OK && res.ok);
   if (e == ESP_OK && res.ok) {
@@ -322,6 +391,7 @@ static esp_err_t latency_measure_handler(httpd_req_t *req) {
 }
 
 static esp_err_t device_name_handler(httpd_req_t *req){
+  if(!admin_ok(req)) return ESP_OK;
   char b[256]; if(recv_json(req,b,sizeof(b))!=ESP_OK){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid body");return ESP_FAIL;} cJSON *j=cJSON_Parse(b); cJSON *n=j?cJSON_GetObjectItem(j,"name"):NULL; cJSON *r=cJSON_CreateObject();
   if(n&&cJSON_IsString(n)){ esp_err_t e=settings_set_device_name(n->valuestring); if(e==ESP_OK)wifi_set_hostname(n->valuestring); cJSON_AddBoolToObject(r,"success",e==ESP_OK); if(e!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(e)); } else {cJSON_AddBoolToObject(r,"success",false);cJSON_AddStringToObject(r,"error","Invalid name");}
   char *out=cJSON_PrintUnformatted(r); httpd_resp_set_type(req,"application/json"); httpd_resp_sendstr(req,out); free(out); cJSON_Delete(r); if(j)cJSON_Delete(j); return ESP_OK;
@@ -486,14 +556,14 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
   return httpd_resp_sendstr(req, response);
 }
 
-static esp_err_t ota_handler(httpd_req_t *req){ if(req->content_len==0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"No firmware uploaded");return ESP_FAIL;} ESP_LOGI(TAG,"Stopping RTSP for OTA"); rtsp_server_stop(); esp_err_t e=ota_start_from_http(req); if(e!=ESP_OK){ ESP_LOGE(TAG,"OTA failed (%s); restarting RTSP",esp_err_to_name(e)); esp_err_t re=rtsp_server_start(); if(re!=ESP_OK){ESP_LOGE(TAG,"RTSP restart after OTA failure failed: %s",esp_err_to_name(re));} httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,esp_err_to_name(e));return e;} httpd_resp_sendstr(req,"Firmware update complete, rebooting now!\n"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK; }
+static esp_err_t ota_handler(httpd_req_t *req){ if(!admin_ok(req)) return ESP_OK; if(req->content_len==0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"No firmware uploaded");return ESP_FAIL;} ESP_LOGI(TAG,"Stopping RTSP for OTA"); rtsp_server_stop(); esp_err_t e=ota_start_from_http(req); if(e!=ESP_OK){ ESP_LOGE(TAG,"OTA failed (%s); restarting RTSP",esp_err_to_name(e)); esp_err_t re=rtsp_server_start(); if(re!=ESP_OK){ESP_LOGE(TAG,"RTSP restart after OTA failure failed: %s",esp_err_to_name(re));} httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,esp_err_to_name(e));return e;} httpd_resp_sendstr(req,"Firmware update complete, rebooting now!\n"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK; }
 static const char *reset_reason_str(esp_reset_reason_t r){switch(r){case ESP_RST_POWERON:return"poweron";case ESP_RST_EXT:return"external";case ESP_RST_SW:return"software";case ESP_RST_PANIC:return"panic";case ESP_RST_INT_WDT:return"int_wdt";case ESP_RST_TASK_WDT:return"task_wdt";case ESP_RST_WDT:return"other_wdt";case ESP_RST_DEEPSLEEP:return"deepsleep";case ESP_RST_BROWNOUT:return"brownout";case ESP_RST_SDIO:return"sdio";default:return"unknown";}}
 static esp_err_t system_info_handler(httpd_req_t *req){
   cJSON *root=cJSON_CreateObject(),*i=cJSON_CreateObject(); char ip[16]={0},mac[18]={0},name[65]={0}; bool connected=wifi_is_connected(); wifi_get_ip_str(ip,sizeof(ip)); wifi_get_mac_str(mac,sizeof(mac)); settings_get_device_name(name,sizeof(name)); cJSON_AddStringToObject(i,"ip",ip);cJSON_AddStringToObject(i,"mac",mac);cJSON_AddStringToObject(i,"device_name",name);cJSON_AddBoolToObject(i,"wifi_connected",connected);cJSON_AddNumberToObject(i,"free_heap",esp_get_free_heap_size());
   if(connected){wifi_ap_record_t ap;if(esp_wifi_sta_get_ap_info(&ap)==ESP_OK){char ssid[33]={0},bssid[18];memcpy(ssid,ap.ssid,32);snprintf(bssid,sizeof(bssid),"%02x:%02x:%02x:%02x:%02x:%02x",ap.bssid[0],ap.bssid[1],ap.bssid[2],ap.bssid[3],ap.bssid[4],ap.bssid[5]);const char *phy=ap.phy_11n?"11n":ap.phy_11g?"11g":ap.phy_11b?"11b":ap.phy_lr?"LR":"?";cJSON_AddStringToObject(i,"wifi_ssid",ssid);cJSON_AddStringToObject(i,"wifi_bssid",bssid);cJSON_AddNumberToObject(i,"wifi_rssi",ap.rssi);cJSON_AddNumberToObject(i,"wifi_channel",ap.primary);cJSON_AddStringToObject(i,"wifi_phy",phy);}}
   const esp_app_desc_t *d=esp_app_get_description();cJSON_AddStringToObject(i,"firmware_version",d->version);cJSON_AddStringToObject(i,"reset_reason",reset_reason_str(esp_reset_reason()));cJSON_AddNumberToObject(i,"uptime_s",(double)(esp_timer_get_time()/1000000));cJSON_AddItemToObject(root,"info",i);cJSON_AddBoolToObject(root,"success",true);char *out=cJSON_PrintUnformatted(root);httpd_resp_set_type(req,"application/json");httpd_resp_sendstr(req,out);free(out);cJSON_Delete(root);return ESP_OK;
 }
-static esp_err_t restart_handler(httpd_req_t *req){httpd_resp_sendstr(req,"Restarting\n");vTaskDelay(pdMS_TO_TICKS(200));esp_restart();return ESP_OK;}
+static esp_err_t restart_handler(httpd_req_t *req){if(!admin_ok(req)) return ESP_OK;httpd_resp_sendstr(req,"Restarting\n");vTaskDelay(pdMS_TO_TICKS(200));esp_restart();return ESP_OK;}
 static esp_err_t speed_ping(httpd_req_t *req){httpd_resp_set_type(req,"text/plain");httpd_resp_set_hdr(req,"Cache-Control","no-store");return httpd_resp_send(req,"ok",2);}
 static esp_err_t speed_download(httpd_req_t *req){size_t bytes=1024*1024;char q[64],v[16];if(httpd_req_get_url_query_str(req,q,sizeof(q))==ESP_OK&&httpd_query_key_value(q,"bytes",v,sizeof(v))==ESP_OK){long x=strtol(v,NULL,10);if(x>0)bytes=x;}if(bytes>SPEEDTEST_MAX_BYTES)bytes=SPEEDTEST_MAX_BYTES;static uint8_t filler[SPEEDTEST_CHUNK];static bool init=false;if(!init){for(size_t i=0;i<sizeof(filler);i++)filler[i]=(uint8_t)(i*37);init=true;}httpd_resp_set_type(req,"application/octet-stream");httpd_resp_set_hdr(req,"Cache-Control","no-store");while(bytes){size_t n=bytes<sizeof(filler)?bytes:sizeof(filler);if(httpd_resp_send_chunk(req,(char*)filler,n)!=ESP_OK)return ESP_FAIL;bytes-=n;}return httpd_resp_send_chunk(req,NULL,0);}
 static esp_err_t speed_upload(httpd_req_t *req){

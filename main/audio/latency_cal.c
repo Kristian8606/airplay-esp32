@@ -35,6 +35,7 @@ typedef struct {
   volatile uint32_t cb_n;
   volatile uint32_t conv_total;
   uint8_t *rdbuf;             /* reader buffer (heap, NOT on the task stack) */
+  bool started;               /* adc_continuous_start() succeeded */
 } cap_t;
 
 static cap_t s_cap;
@@ -92,7 +93,8 @@ static void reader_task(void *arg) {
 
 static void cap_free(void) {
   if (s_cap.adc) {
-    (void)adc_continuous_stop(s_cap.adc);
+    if (s_cap.started) (void)adc_continuous_stop(s_cap.adc);
+    s_cap.started = false;
     (void)adc_continuous_deinit(s_cap.adc);
     s_cap.adc = NULL;
   }
@@ -126,6 +128,16 @@ esp_err_t latency_cal_capture_start(void) {
   s_cap.rdbuf = heap_caps_malloc(READ_CHUNK_BYTES,
                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!s_cap.samples || !s_cap.cb_count || !s_cap.cb_t || !s_cap.rdbuf) {
+    cap_free();
+    return ESP_ERR_NO_MEM;
+  }
+
+  /* v4.1.23: the IDF driver aborts inside its own error path when it cannot
+   * get internal DMA memory (seen with an AirPlay session open). Check first
+   * and fail cleanly instead. */
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL) <
+      READ_CHUNK_BYTES * 16 + 8192) {
+    ESP_LOGE(TAG, "not enough internal DMA memory for the ADC");
     cap_free();
     return ESP_ERR_NO_MEM;
   }
@@ -164,6 +176,7 @@ esp_err_t latency_cal_capture_start(void) {
    * and hit "driver is already stopped" on every read. */
   err = adc_continuous_start(s_cap.adc);
   if (err != ESP_OK) { cap_free(); return err; }
+  s_cap.started = true;
   s_cap.running = true;
   /* 4 KiB: the IDF driver may log from inside adc_continuous_read(), and the
    * log path (vsnprintf + web log stream hook) needs real stack. */
@@ -184,7 +197,8 @@ void latency_cal_capture_finish(const int64_t *emit_us, int n_emit,
   if (!s_cap.adc) { res->error = "capture not running"; return; }
   s_cap.running = false;
   for (int i = 0; s_cap.reader && i < 100; ++i) vTaskDelay(pdMS_TO_TICKS(10));
-  (void)adc_continuous_stop(s_cap.adc);
+  if (s_cap.started) (void)adc_continuous_stop(s_cap.adc);
+  s_cap.started = false;
 
   if (s_cap.overflow) {
     res->error = "ADC buffer overflow (CPU too busy)";

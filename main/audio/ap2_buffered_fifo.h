@@ -22,6 +22,9 @@ typedef struct {
   uint32_t seq;
   uint32_t rtp;
   size_t len;
+  /* RTP SSRC: Apple uses it to announce the payload format (see
+   * AP2_SSRC_* in audio_receiver.c). */
+  uint32_t ssrc;
   uint32_t stream_epoch;
   /* Absolute byte offset of this packet's 2-byte length prefix inside the
    * current TCP connection. Used for packet-aligned FLUSH discards. */
@@ -39,6 +42,11 @@ typedef struct {
   bool immediate_completed;
   bool immediate_overshoot;
   uint32_t immediate_target_seq;
+  /* Identity of the exact immediate FLUSH request that classified this
+   * packet. A target sequence alone is not enough: rapid scrubbing can issue
+   * a newer FLUSH with the same untilSeq while the processor is deciding
+   * whether the old request is stale. */
+  uint32_t immediate_request_id;
   uint8_t activation_count;
   ap2_buffered_flush_activation_t activations[AP2_BUFFERED_FIFO_MAX_ACTIVATIONS];
 } ap2_buffered_packet_decision_t;
@@ -48,7 +56,16 @@ typedef struct {
   size_t used_bytes;
   bool immediate_flush_active;
   uint32_t immediate_target_seq;
+  uint32_t immediate_request_id;
   uint32_t deferred_requests;
+  uint64_t bytes_received;   /* v4.1.32: TCP bytes received on this session */
+  /* v4.1.36 TCP diagnostics */
+  uint32_t rd_loops;         /* reader loop passes (heartbeat) */
+  bool rd_in_recv;           /* reader currently blocked inside recv() */
+  int64_t rd_last_recv_us;   /* time of the last recv() return */
+  int32_t rd_last_recv_n;    /* its result */
+  int32_t rd_last_errno;
+  int32_t sock_pending;      /* bytes waiting in the lwIP socket (FIONREAD), -1 n/a */
 } ap2_buffered_fifo_usage_t;
 
 esp_err_t ap2_buffered_fifo_create_with_storage(
@@ -93,9 +110,23 @@ void ap2_buffered_fifo_classify_packet(
 esp_err_t ap2_buffered_fifo_add_deferred_flush(
     ap2_buffered_fifo_t *fifo, uint32_t from_seq, uint32_t from_rtp,
     uint32_t until_seq, uint32_t until_rtp);
-void ap2_buffered_fifo_set_immediate_flush(ap2_buffered_fifo_t *fifo,
+/* Returns true when the sequence endpoint was used, false when the request
+ * became a full flush (no endpoint, or an implausible one). */
+bool ap2_buffered_fifo_set_immediate_flush(ap2_buffered_fifo_t *fifo,
                                            uint32_t until_seq,
                                            uint32_t until_rtp,
                                            bool has_endpoint);
+/* True only for a seq-bounded immediate FLUSH request. Unlike
+ * ap2_buffered_fifo_immediate_flush_active(), this does not include the
+ * packet-aligned full-flush discard marker. */
+bool ap2_buffered_fifo_seq_flush_active(ap2_buffered_fifo_t *fifo);
 bool ap2_buffered_fifo_immediate_flush_active(ap2_buffered_fifo_t *fifo);
+void ap2_buffered_fifo_end_immediate_flush(ap2_buffered_fifo_t *fifo);
+/* End an immediate FLUSH only if it is still the same request observed by
+ * the packet consumer. This prevents a stale-RTP rescue from cancelling a
+ * newer FLUSHBUFFERED that arrived concurrently on the RTSP task. */
+bool ap2_buffered_fifo_end_immediate_flush_if_request(
+    ap2_buffered_fifo_t *fifo, uint32_t expected_request_id,
+    uint32_t expected_until_seq);
+void ap2_buffered_fifo_set_fast_skip(ap2_buffered_fifo_t *fifo, bool allowed);
 

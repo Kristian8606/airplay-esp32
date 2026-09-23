@@ -160,6 +160,15 @@ menu "I2S Playout"
         default 4
         range 1 10
         depends on AIRPLAY_LATENCY_CAL
+
+    config AIRPLAY_WEB_ADMIN_PASSWORD
+        string "Web UI admin password (empty = no password)"
+        default ""
+        help
+            When set, firmware update, restart, Wi-Fi / device name changes and
+            the latency test in the web UI require HTTP Basic authentication
+            with user "admin" and this password. Leave empty to keep the web
+            UI open (default).
 endmenu
 
 menu "RGB Audio/VU LED"

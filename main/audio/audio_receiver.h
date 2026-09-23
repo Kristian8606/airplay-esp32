@@ -125,7 +125,8 @@ uint32_t audio_receiver_get_hardware_latency_us(void);
 #include "latency_cal.h"
 int32_t audio_receiver_get_output_latency_us(void);
 esp_err_t audio_receiver_set_output_latency_us(int32_t us, bool persist);
-/* Wired ADC loopback measurement. Only while AirPlay is not playing. Blocks
- * ~2-3 s. Does NOT apply the result; the caller decides. */
+/* Wired ADC loopback measurement. The caller must first stop RTSP and call
+ * audio_receiver_release_for_wifi_scan() (exactly like the Wi-Fi scan) and
+ * restore AirPlay afterwards. Blocks ~2-3 s. Does NOT apply the result. */
 esp_err_t audio_receiver_measure_output_latency(latency_cal_result_t *res,
                                                 bool audible);

@@ -1961,7 +1961,11 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     bool got_until_ts =
         bplist_find_int(body, body_len, "flushUntilTS", &flush_until_ts);
 
-    if (got_from_seq && got_from_ts && got_until_seq && got_until_ts) {
+    /* v4.1.29 Shairport handle_flushbuffered(): deferred iff flushFromSeq is
+     * present (the other fields default to 0 when missing). */
+    (void)got_from_ts;
+    (void)got_until_ts;
+    if (got_from_seq) {
       has_deferred = true;
       ESP_LOGI(TAG,
                "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
@@ -1971,16 +1975,22 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
           (uint32_t)flush_from_seq, (uint32_t)flush_from_ts,
           (uint32_t)flush_until_seq, (uint32_t)flush_until_ts);
       if (flush_err != ESP_OK) {
-        rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq,
-                           NULL, NULL, 0);
-        return;
+        /* Shairport: "no more room for deferred flush request records" is
+         * only logged; the reply is still 200. */
+        ESP_LOGW(TAG, "FLUSHBUFFERED deferred not stored (%s)",
+                 esp_err_to_name(flush_err));
       }
     } else {
       /* FLUSHBUFFERED sequence values are protocol 23-bit sequence numbers,
        * not raw packet-header words. Sequence zero is therefore a valid wrap
        * endpoint. Match Shairport Sync: endpoint validity is determined by
        * field presence, never by the numeric value of flushUntilSeq. */
-      bool has_endpoint = got_until_seq && got_until_ts;
+      /* Shairport's immediate/deferred choice depends only on flushFromSeq.
+       * The immediate endpoint itself is the 23-bit flushUntilSeq; untilTS is
+       * metadata and must not decide whether a sequence endpoint exists.
+       * A malformed plist with no flushUntilSeq is treated as our safe full
+       * flush extension rather than inventing sequence zero. */
+      bool has_endpoint = got_until_seq;
       if (has_endpoint) {
         ESP_LOGI(TAG,
                  "FLUSHBUFFERED immediate: untilSeq=%" PRId64
@@ -1995,9 +2005,8 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     }
   }
 
-  if (!has_deferred && !(body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)) {
-    audio_receiver_set_immediate_flush(0, 0, false);
-  }
+  /* v4.1.29 Shairport: a FLUSHBUFFERED without a plist does nothing (200). */
+  (void)has_deferred;
 
   rtsp_send_ok(socket, conn, req->cseq);
 }
@@ -2021,6 +2030,12 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
 
   // TEARDOWN with streams = stream teardown (may be followed by new SETUP)
   // TEARDOWN without streams = full session teardown (disconnect)
+  /* v4.1.29 Shairport handle_teardown_2(): "has no plist -- nothing done". */
+  if (!(body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)) {
+    ESP_LOGW(TAG, "TEARDOWN without plist - nothing done (as Shairport)");
+    rtsp_send_ok(socket, conn, req->cseq);
+    return;
+  }
   ESP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
            stream_count);
   // Stream-level teardown is a pause: freeze playout immediately so audio
@@ -2081,6 +2096,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
   size_t body_len = req->body_len;
 
   double rate = 1.0;
+  bool have_rate = false;
   uint64_t clock_id = 0;
   uint64_t network_time_secs = 0;
   uint64_t network_time_frac = 0;
@@ -2090,10 +2106,13 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 
   if (body && body_len > 0 && body_len >= 8 &&
       memcmp(body, "bplist00", 8) == 0) {
-    if (!bplist_find_real(body, body_len, "rate", &rate)) {
+    if (bplist_find_real(body, body_len, "rate", &rate)) {
+      have_rate = true;
+    } else {
       int64_t rate_int;
       if (bplist_find_int(body, body_len, "rate", &rate_int)) {
         rate = (double)rate_int;
+        have_rate = true;
       }
     }
 
@@ -2124,7 +2143,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 
     /* Pause first.  Do not publish an anchor from a rate=0 message and wake a
      * processor immediately before closing the play gate. */
-    if (rate == 0.0) {
+    if (have_rate && rate == 0.0) {
       ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
       note_stream_pause_started(conn);
       conn->stream_paused = true;
@@ -2136,7 +2155,10 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 
     /* RTP is a wrapping 32-bit timeline. rtpTime==0 is therefore perfectly
      * valid; validity comes from key presence, not from the numeric value. */
-    if (have_network_time_secs && have_rtp_time) {
+    /* v4.1.29 Shairport: the anchor is set whenever networkTimeSecs is
+     * present; rtpTime defaults to 0 if missing. */
+    (void)have_rtp_time;
+    if (have_network_time_secs) {
       uint64_t frac = network_time_frac >> 32;
       frac = (frac * 1000000000ULL) >> 32;
       uint64_t network_time_ns = network_time_secs * 1000000000ULL + frac;
@@ -2190,6 +2212,14 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
     }
   }
 
+  /* v4.1.29 Shairport handle_setrateanchori(): the play state changes only
+   * when "rate" is present (rate & 1 -> play). No plist / no rate: anchor
+   * (if any) is updated, play state unchanged. */
+  if (!have_rate) {
+    ESP_LOGI(TAG, "SETRATEANCHORTIME: no rate -> play state unchanged");
+    rtsp_send_ok(socket, conn, req->cseq);
+    return;
+  }
   ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
            rate, conn->stream_paused);
   if (conn->stream_paused) notify_timing_resume(conn);
