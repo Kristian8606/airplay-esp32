@@ -39,7 +39,7 @@
 #define AP2_PROCESS_STACK          6144U
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
-#define AP2_STATUS_STACK             4096U
+#define AP2_STATUS_STACK             6144U
 #define AP2_NETWORK_CORE           1
 #define AP2_DECODE_CORE            1
 #define AP2_BUFFERED_PROCESSOR_CORE 0
