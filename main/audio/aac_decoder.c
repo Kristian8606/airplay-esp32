@@ -98,10 +98,6 @@ void aac_decoder_destroy(aac_decoder_t *d) {
   free(d);
 }
 
-bool aac_decoder_reset(aac_decoder_t *d) {
-  return d && open_decoder(d);
-}
-
 int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
                        size_t input_len, int16_t *output,
                        size_t output_capacity_frames,
@@ -139,10 +135,10 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
 
   esp_audio_err_t err = esp_aac_dec_decode(d->handle, &raw, &frame, &dec_info);
   if (err != ESP_AUDIO_ERR_OK) {
-    // A corrupt access unit can poison the codec state. Reset once here; the
-    // caller simply drops this frame. This is an error path, not a hot-path log.
-    ESP_LOGW(TAG, "decode error=%d; resetting AAC decoder", err);
-    open_decoder(d);
+    /* Shairport keeps the AAC decoding chain alive across a bad access unit.
+     * Dropping the AU here lets the codec preserve/recover its overlap history
+     * on the following block instead of manufacturing a new decoder epoch. */
+    ESP_LOGW(TAG, "decode error=%d; dropping AAC block without decoder reset", err);
     return -1;
   }
 

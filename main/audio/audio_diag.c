@@ -367,7 +367,7 @@ void audio_diag_flush_immediate_publish_acquired(void) { flush_op_mark(1); }
 void audio_diag_flush_immediate_transport_done(void) { flush_op_mark(2); }
 void audio_diag_flush_immediate_pcm_done(void) { flush_op_mark(3); }
 
-void audio_diag_flush_immediate_end(uint32_t has_endpoint) {
+void audio_diag_flush_immediate_end(void) {
   const int64_t now_us = esp_timer_get_time();
   const TaskHandle_t task = xTaskGetCurrentTaskHandle();
   int64_t begin_us = 0;
@@ -389,8 +389,8 @@ void audio_diag_flush_immediate_end(uint32_t has_endpoint) {
   const uint32_t transport_us = clamp_elapsed_us(acquired_us, transport_done_us);
   const uint32_t pcm_us = clamp_elapsed_us(transport_done_us, pcm_done_us);
   const uint32_t total_us = clamp_elapsed_us(begin_us, now_us);
-  diag_emit(DIAG_EVENT_FLUSH_IMMEDIATE, has_endpoint ? 1U : 0U,
-            mutex_us, transport_us, pcm_us, total_us);
+  diag_emit(DIAG_EVENT_FLUSH_IMMEDIATE, 1U, mutex_us, transport_us, pcm_us,
+            total_us);
 }
 #endif
 

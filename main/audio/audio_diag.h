@@ -188,7 +188,7 @@ void audio_diag_flush_immediate_begin(void);
 void audio_diag_flush_immediate_publish_acquired(void);
 void audio_diag_flush_immediate_transport_done(void);
 void audio_diag_flush_immediate_pcm_done(void);
-void audio_diag_flush_immediate_end(uint32_t has_endpoint);
+void audio_diag_flush_immediate_end(void);
 #define AUDIO_DIAG_FLUSH_RTSP_SESSION_RESET(...) \
   audio_diag_flush_rtsp_session_reset(__VA_ARGS__)
 #define AUDIO_DIAG_FLUSH_RTSP_BEGIN(...) \

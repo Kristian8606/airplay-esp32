@@ -426,19 +426,22 @@ static bool bplist_read_string_array(const uint8_t *plist, size_t plist_len,
         plist, plist_len, offset_table_offset, offset_size, obj_idx);
     if (obj_offset == UINT64_MAX) return false;
 
+    char scratch[BPLIST_PEER_ADDRESS_MAX];
+    char *dst = written < out_capacity ? out[written] : scratch;
+    size_t dst_capacity = written < out_capacity ? BPLIST_PEER_ADDRESS_MAX
+                                                 : sizeof(scratch);
+
+    // Shairport Sync 5.5+: malformed/non-string elements in
+    // timingPeerInfo.Addresses are ignored individually. A bad entry must
+    // not invalidate the remaining usable timing peers.
+    if (!bplist_read_string(plist, plist_len, obj_offset, dst, dst_capacity)) {
+      continue;
+    }
     if (written < out_capacity) {
-      if (!bplist_read_string(plist, plist_len, obj_offset, out[written],
-                              BPLIST_PEER_ADDRESS_MAX))
-        return false;
       written++;
-    } else {
-      char scratch[BPLIST_PEER_ADDRESS_MAX];
-      if (!bplist_read_string(plist, plist_len, obj_offset, scratch,
-                              sizeof(scratch)))
-        return false;
     }
   }
-  *out_count = count;
+  *out_count = written;
   return true;
 }
 
@@ -1532,7 +1535,10 @@ bool bplist_find_stream_crypto(const uint8_t *plist, size_t plist_len,
                            &temp_len)) {
         size_t copy_len = temp_len < shk_capacity ? temp_len : shk_capacity;
         memcpy(shk, temp_buf, copy_len);
-        *shk_len = copy_len;
+        // Report the actual plist data length, not the truncated copy length.
+        // The SETUP handler must be able to reject an shk that is not exactly
+        // 32 bytes, including an oversized value.
+        *shk_len = temp_len;
         found = true;
       }
     }

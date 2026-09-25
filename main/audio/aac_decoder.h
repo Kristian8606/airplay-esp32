@@ -20,9 +20,6 @@ typedef struct {
 
 aac_decoder_t *aac_decoder_create(const aac_decoder_config_t *config);
 void aac_decoder_destroy(aac_decoder_t *decoder);
-/* Reset codec overlap/history without reallocating the decoder object.  Used only for a real media-cursor discontinuity, not
- * for a presentation-clock/anchor update. */
-bool aac_decoder_reset(aac_decoder_t *decoder);
 /* input points to payload with AAC_DECODER_INPUT_HEADROOM writable bytes
  * immediately before it. Raw AU input receives an ADTS header there; payload
  * is never moved. Input that already has ADTS is passed through unchanged. */

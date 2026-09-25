@@ -32,6 +32,13 @@ static const char *TAG = "rtsp_server";
 #define CLIENT_STACK_SIZE 8192
 #define SERVER_STACK_SIZE 4096
 
+/* RTSP control must run immediately after lwIP has delivered socket data.
+ * ESP-IDF keeps the TCP/IP task above application code (prio 18 on ESP32-S3),
+ * so place the active RTSP client directly below it.  The accept/listen task is
+ * not latency-critical and stays at the normal application priority. */
+#define RTSP_CLIENT_TASK_PRIORITY 17
+#define RTSP_SERVER_TASK_PRIORITY 5
+
 static int server_socket = -1;
 static TaskHandle_t server_task_handle = NULL;
 static bool server_running = false;
@@ -132,6 +139,14 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     buffer[total_len] = saved;
     free(header_str);
 
+    if (slot->conn->close_after_response) {
+      // Shairport handle_teardown_2() sets conn->stop after returning the
+      // TEARDOWN response. Do not process any pipelined request belonging to
+      // the connection that has just been torn down.
+      *buf_len = 0;
+      return;
+    }
+
     if (*buf_len > total_len) {
       memmove(buffer, buffer + total_len, *buf_len - total_len);
     }
@@ -227,6 +242,9 @@ static void client_task(void *pvParameters) {
 
         buf_len += (size_t)block_len;
         process_rtsp_buffer(slot, buffer, &buf_len);
+        if (conn->close_after_response) {
+          goto cleanup;
+        }
       }
       goto cleanup;
     }
@@ -256,6 +274,9 @@ static void client_task(void *pvParameters) {
     }
     buf_len += (size_t)recv_len;
     process_rtsp_buffer(slot, buffer, &buf_len);
+    if (conn->close_after_response) {
+      goto cleanup;
+    }
   }
 
 cleanup:
@@ -428,7 +449,7 @@ static void server_task(void *pvParameters) {
     clients[new_slot].task = NULL;
     BaseType_t task_ret =
         xTaskCreatePinnedToCore(client_task, "rtsp_client", CLIENT_STACK_SIZE,
-                                (void *)(intptr_t)new_slot, 5,
+                                (void *)(intptr_t)new_slot, RTSP_CLIENT_TASK_PRIORITY,
                                 &clients[new_slot].task, 0);
     if (task_ret != pdPASS || clients[new_slot].task == NULL) {
       ESP_LOGE(TAG, "Failed to create client task");
@@ -480,8 +501,8 @@ esp_err_t rtsp_server_start(void) {
   }
 
   BaseType_t task_ret =
-      xTaskCreatePinnedToCore(server_task, "rtsp_server", SERVER_STACK_SIZE, NULL, 5,
-                              &server_task_handle, 0);
+      xTaskCreatePinnedToCore(server_task, "rtsp_server", SERVER_STACK_SIZE, NULL,
+                              RTSP_SERVER_TASK_PRIORITY, &server_task_handle, 0);
   if (task_ret != pdPASS || server_task_handle == NULL) {
     return ESP_FAIL;
   }

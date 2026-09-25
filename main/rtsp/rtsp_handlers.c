@@ -1209,7 +1209,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     size_t ekey_len = 0;
     uint8_t eiv[16];
     size_t eiv_len = 0;
-    uint8_t shk[32];
+    uint8_t shk[crypto_aead_chacha20poly1305_ietf_KEYBYTES];
     size_t shk_len = 0;
 
     int64_t crypto_stream_type = conn->stream_type > 0 ? conn->stream_type : 96;
@@ -1228,15 +1228,21 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     audio_encrypt_t audio_encrypt = {0};
     bool encryption_set = false;
 
-    if (shk_len >= 16) {
+    if (shk_len == crypto_aead_chacha20poly1305_ietf_KEYBYTES) {
+      // Shairport Sync 5.5+: "shk" is a ChaCha20-Poly1305-IETF key and
+      // must be exactly crypto_aead_chacha20poly1305_ietf_KEYBYTES bytes.
       audio_encrypt.type = AUDIO_ENCRYPT_CHACHA20_POLY1305;
-      memcpy(audio_encrypt.key, shk, shk_len > 32 ? 32 : shk_len);
-      audio_encrypt.key_len = shk_len > 32 ? 32 : shk_len;
+      memcpy(audio_encrypt.key, shk, sizeof(shk));
+      audio_encrypt.key_len = sizeof(shk);
       if (eiv_len >= 16) {
         memcpy(audio_encrypt.iv, eiv, 16);
       }
       audio_receiver_set_encryption(&audio_encrypt);
       encryption_set = true;
+    } else if (shk_len != 0) {
+      ESP_LOGW(TAG, "SETUP: ignoring invalid shk length %zu (expected %u)",
+               shk_len,
+               (unsigned)crypto_aead_chacha20poly1305_ietf_KEYBYTES);
     } else if (ekey_len > 16 && conn->hap_session &&
                conn->hap_session->session_established) {
       uint8_t nonce[12] = {0};
@@ -1948,7 +1954,6 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
   //   until it reaches/overshoots flushUntilSeq.
   // - flushFromSeq present: register a deferred [from, until) discard rule.
   // The raw TCP byte FIFO is never searched or rebound by a FLUSH command.
-  bool has_deferred = false;
   if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
     int64_t flush_from_seq = 0, flush_from_ts = 0;
     int64_t flush_until_seq = 0, flush_until_ts = 0;
@@ -1961,12 +1966,22 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     bool got_until_ts =
         bplist_find_int(body, body_len, "flushUntilTS", &flush_until_ts);
 
-    /* v4.1.29 Shairport handle_flushbuffered(): deferred iff flushFromSeq is
+    /* Diagnostic only: an explicit zero endpoint is unusual enough to call
+     * out separately, but it does not change the Shairport-compatible
+     * sequential FLUSH semantics below. Keep this distinct from a missing
+     * flushUntilSeq, which also defaults to zero. */
+    if (got_until_seq && flush_until_seq == 0) {
+      ESP_LOGW(TAG,
+               "FLUSHBUFFERED explicit untilSeq=0 (%s); "
+               "using normal Shairport sequential semantics",
+               got_from_seq ? "deferred" : "immediate");
+    }
+
+    /* Shairport Sync 5.5.2 handle_flushbuffered(): deferred iff flushFromSeq is
      * present (the other fields default to 0 when missing). */
     (void)got_from_ts;
     (void)got_until_ts;
     if (got_from_seq) {
-      has_deferred = true;
       ESP_LOGI(TAG,
                "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
                " untilSeq=%" PRId64 " untilTS=%" PRId64,
@@ -1981,32 +1996,24 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
                  esp_err_to_name(flush_err));
       }
     } else {
-      /* FLUSHBUFFERED sequence values are protocol 23-bit sequence numbers,
-       * not raw packet-header words. Sequence zero is therefore a valid wrap
-       * endpoint. Match Shairport Sync: endpoint validity is determined by
-       * field presence, never by the numeric value of flushUntilSeq. */
-      /* Shairport's immediate/deferred choice depends only on flushFromSeq.
-       * The immediate endpoint itself is the 23-bit flushUntilSeq; untilTS is
-       * metadata and must not decide whether a sequence endpoint exists.
-       * A malformed plist with no flushUntilSeq is treated as our safe full
-       * flush extension rather than inventing sequence zero. */
-      bool has_endpoint = got_until_seq;
-      if (has_endpoint) {
-        ESP_LOGI(TAG,
-                 "FLUSHBUFFERED immediate: untilSeq=%" PRId64
-                 " untilTS=%" PRId64,
-                 flush_until_seq, flush_until_ts);
-      } else {
-        ESP_LOGI(TAG, "FLUSHBUFFERED immediate: full");
+      /* Match Shairport 5.5.2 exactly: the absence of flushFromSeq selects
+       * immediate mode. flushUntilSeq defaults to zero if the plist omitted
+       * it; there is no separate "full flush" transport operation. */
+      if (!got_until_seq) {
+        ESP_LOGW(TAG,
+                 "FLUSHBUFFERED immediate without flushUntilSeq; "
+                 "Shairport-compatible endpoint defaults to seq=0");
       }
+      ESP_LOGI(TAG,
+               "FLUSHBUFFERED immediate: untilSeq=%" PRId64
+               " untilTS=%" PRId64,
+               flush_until_seq, flush_until_ts);
       audio_receiver_set_immediate_flush((uint32_t)flush_until_seq,
-                                         (uint32_t)flush_until_ts,
-                                         has_endpoint);
+                                         (uint32_t)flush_until_ts);
     }
   }
 
-  /* v4.1.29 Shairport: a FLUSHBUFFERED without a plist does nothing (200). */
-  (void)has_deferred;
+  /* Shairport: a FLUSHBUFFERED without a plist does nothing and returns 200. */
 
   rtsp_send_ok(socket, conn, req->cseq);
 }
@@ -2030,7 +2037,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
 
   // TEARDOWN with streams = stream teardown (may be followed by new SETUP)
   // TEARDOWN without streams = full session teardown (disconnect)
-  /* v4.1.29 Shairport handle_teardown_2(): "has no plist -- nothing done". */
+  /* Shairport Sync 5.5.2 handle_teardown_2(): no plist -> nothing done. */
   if (!(body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)) {
     ESP_LOGW(TAG, "TEARDOWN without plist - nothing done (as Shairport)");
     rtsp_send_ok(socket, conn, req->cseq);
@@ -2081,6 +2088,16 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
     }
     /* NTP/AirPlay1 removed */
     conn->timing_port = 0;
+  }
+
+  if (!has_streams) {
+    // Shairport Sync 5.1+ handle_teardown_2(): a valid AP2 TEARDOWN plist
+    // without a streams item means terminate the RTSP connection. Send the
+    // response first, advertise the close, then let the client task unwind.
+    rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                       "Connection: close\r\n", NULL, 0);
+    conn->close_after_response = true;
+    return;
   }
 
   rtsp_send_ok(socket, conn, req->cseq);
@@ -2155,7 +2172,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 
     /* RTP is a wrapping 32-bit timeline. rtpTime==0 is therefore perfectly
      * valid; validity comes from key presence, not from the numeric value. */
-    /* v4.1.29 Shairport: the anchor is set whenever networkTimeSecs is
+    /* Shairport Sync 5.5.2: the anchor is set whenever networkTimeSecs is
      * present; rtpTime defaults to 0 if missing. */
     (void)have_rtp_time;
     if (have_network_time_secs) {
@@ -2212,9 +2229,9 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
     }
   }
 
-  /* v4.1.29 Shairport handle_setrateanchori(): the play state changes only
-   * when "rate" is present (rate & 1 -> play). No plist / no rate: anchor
-   * (if any) is updated, play state unchanged. */
+  /* Shairport Sync 5.5.2 handle_setrateanchori(): play state changes only
+   * when "rate" is present. Without rate, update any supplied anchor and
+   * leave the play state unchanged. */
   if (!have_rate) {
     ESP_LOGI(TAG, "SETRATEANCHORTIME: no rate -> play state unchanged");
     rtsp_send_ok(socket, conn, req->cseq);

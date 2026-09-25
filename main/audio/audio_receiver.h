@@ -78,8 +78,7 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp);
 void audio_receiver_realtime_flush_wait_sender_anchor(void);
 esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
                                                    uint32_t until_seq, uint32_t until_ts);
-void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
-                                        bool has_endpoint);
+void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts);
 void audio_receiver_pause(void);
 void audio_receiver_set_playing(bool playing);
 bool audio_receiver_is_playing(void);

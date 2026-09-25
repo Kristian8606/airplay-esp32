@@ -6,9 +6,6 @@
 
 #include "esp_err.h"
 
-#define AP2_BUFFERED_FIFO_MAX_DEFERRED 16U
-#define AP2_BUFFERED_FIFO_MAX_ACTIVATIONS AP2_BUFFERED_FIFO_MAX_DEFERRED
-
 typedef struct ap2_buffered_fifo ap2_buffered_fifo_t;
 
 typedef struct {
@@ -19,53 +16,9 @@ typedef struct {
 } ap2_buffered_fifo_config_t;
 
 typedef struct {
-  uint32_t seq;
-  uint32_t rtp;
-  size_t len;
-  /* RTP SSRC: Apple uses it to announce the payload format (see
-   * AP2_SSRC_* in audio_receiver.c). */
-  uint32_t ssrc;
-  uint32_t stream_epoch;
-  /* Absolute byte offset of this packet's 2-byte length prefix inside the
-   * current TCP connection. Used for packet-aligned FLUSH discards. */
-  uint64_t stream_offset;
-} ap2_buffered_packet_t;
-
-typedef struct {
-  uint32_t from_rtp;
-  uint32_t until_rtp;
-} ap2_buffered_flush_activation_t;
-
-typedef struct {
-  bool drop;
-  bool discontinuity;
-  bool immediate_completed;
-  bool immediate_overshoot;
-  uint32_t immediate_target_seq;
-  /* Identity of the exact immediate FLUSH request that classified this
-   * packet. A target sequence alone is not enough: rapid scrubbing can issue
-   * a newer FLUSH with the same untilSeq while the processor is deciding
-   * whether the old request is stale. */
-  uint32_t immediate_request_id;
-  uint8_t activation_count;
-  ap2_buffered_flush_activation_t activations[AP2_BUFFERED_FIFO_MAX_ACTIVATIONS];
-} ap2_buffered_packet_decision_t;
-
-typedef struct {
   size_t capacity_bytes;
   size_t used_bytes;
-  bool immediate_flush_active;
-  uint32_t immediate_target_seq;
-  uint32_t immediate_request_id;
-  uint32_t deferred_requests;
-  uint64_t bytes_received;   /* v4.1.32: TCP bytes received on this session */
-  /* v4.1.36 TCP diagnostics */
-  uint32_t rd_loops;         /* reader loop passes (heartbeat) */
-  bool rd_in_recv;           /* reader currently blocked inside recv() */
-  int64_t rd_last_recv_us;   /* time of the last recv() return */
-  int32_t rd_last_recv_n;    /* its result */
-  int32_t rd_last_errno;
-  int32_t sock_pending;      /* bytes waiting in the lwIP socket (FIONREAD), -1 n/a */
+  uint64_t bytes_received;
 } ap2_buffered_fifo_usage_t;
 
 esp_err_t ap2_buffered_fifo_create_with_storage(
@@ -78,55 +31,29 @@ esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
                                   uint16_t *bound_port);
 void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo);
 bool ap2_buffered_fifo_is_idle(ap2_buffered_fifo_t *fifo);
+
+/* Hard session-boundary reset. Call only while the buffered transport is
+ * stopped/idle; live FLUSHBUFFERED never rewinds or purges this byte FIFO. */
 void ap2_buffered_fifo_clear(ap2_buffered_fifo_t *fifo);
-/* Abort only the current buffered TCP client after a fatal framing/session
- * error. The listener stays up so AirPlay can reconnect. This clears queued
- * bytes, advances the stream epoch and wakes all waiters. */
+
+/* Abort only the current buffered TCP client after fatal framing corruption.
+ * The listening socket remains available for the RTSP session. */
 void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo);
 
 size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
                                  ap2_buffered_fifo_usage_t *out);
 
+/* Wake the single packet consumer after a control-plane change. */
 void ap2_buffered_fifo_notify(ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_wait(ap2_buffered_fifo_t *fifo, uint32_t timeout_ms);
 
-/* Sequential Shairport-style packet reader. It consumes exactly one framed
- * block from the raw TCP byte FIFO: 2-byte big-endian length followed by the
- * packet body. No SEQ/RTP lookup exists in this layer. */
-esp_err_t ap2_buffered_fifo_read_packet(ap2_buffered_fifo_t *fifo,
-                                        uint8_t *packet_storage,
-                                        size_t packet_capacity,
-                                        ap2_buffered_packet_t *packet);
-
-/* Apply the current FLUSHBUFFERED control state to the packet currently held
- * by the sequential consumer. This may be called repeatedly while that packet
- * is being held for its RTP presentation time; newly-arrived control commands
- * are therefore observed without searching or rebinding the FIFO. */
-void ap2_buffered_fifo_classify_packet(
-    ap2_buffered_fifo_t *fifo, const ap2_buffered_packet_t *packet,
-    ap2_buffered_packet_decision_t *decision);
-
-esp_err_t ap2_buffered_fifo_add_deferred_flush(
-    ap2_buffered_fifo_t *fifo, uint32_t from_seq, uint32_t from_rtp,
-    uint32_t until_seq, uint32_t until_rtp);
-/* Returns true when the sequence endpoint was used, false when the request
- * became a full flush (no endpoint, or an implausible one). */
-bool ap2_buffered_fifo_set_immediate_flush(ap2_buffered_fifo_t *fifo,
-                                           uint32_t until_seq,
-                                           uint32_t until_rtp,
-                                           bool has_endpoint);
-/* True only for a seq-bounded immediate FLUSH request. Unlike
- * ap2_buffered_fifo_immediate_flush_active(), this does not include the
- * packet-aligned full-flush discard marker. */
-bool ap2_buffered_fifo_seq_flush_active(ap2_buffered_fifo_t *fifo);
-bool ap2_buffered_fifo_immediate_flush_active(ap2_buffered_fifo_t *fifo);
-void ap2_buffered_fifo_end_immediate_flush(ap2_buffered_fifo_t *fifo);
-/* End an immediate FLUSH only if it is still the same request observed by
- * the packet consumer. This prevents a stale-RTP rescue from cancelling a
- * newer FLUSHBUFFERED that arrived concurrently on the RTSP task. */
-bool ap2_buffered_fifo_end_immediate_flush_if_request(
-    ap2_buffered_fifo_t *fifo, uint32_t expected_request_id,
-    uint32_t expected_until_seq);
-void ap2_buffered_fifo_set_fast_skip(ap2_buffered_fifo_t *fifo, bool allowed);
-
+/* Shairport buffered_read.c boundary: consume exactly one framed block from
+ * [2-byte big-endian wire length][block bytes]. This layer does not parse RTP,
+ * sequence numbers, SSRC or FLUSH state. stream_epoch identifies the accepted
+ * TCP connection that supplied the block. */
+esp_err_t ap2_buffered_fifo_read_block(ap2_buffered_fifo_t *fifo,
+                                       uint8_t *block_storage,
+                                       size_t block_capacity,
+                                       size_t *block_len,
+                                       uint32_t *stream_epoch);

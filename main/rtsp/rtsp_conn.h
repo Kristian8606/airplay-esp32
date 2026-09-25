@@ -29,6 +29,9 @@ struct rtsp_conn {
   // Audio streaming state
   bool stream_active;
   bool stream_paused;
+  // Shairport AP2 TEARDOWN semantics: a valid plist without a streams item
+  // requests the RTSP connection itself to close after the 200 response.
+  bool close_after_response;
   // v4.1.14: set once the first stream SETUP of this RTSP connection has
   // started PTP from a clean estimator (later stream SETUPs keep it).
   bool ptp_session_fresh;
