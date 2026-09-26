@@ -1973,8 +1973,11 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     if (got_until_seq && flush_until_seq == 0) {
       ESP_LOGW(TAG,
                "FLUSHBUFFERED explicit untilSeq=0 (%s); "
-               "using normal Shairport sequential semantics",
-               got_from_seq ? "deferred" : "immediate");
+               "%s",
+               got_from_seq ? "deferred" : "immediate",
+               got_from_seq
+                   ? "deferred request keeps normal sequence semantics"
+                   : "consumer will wait for the next anchor, then resync RTP");
     }
 
     /* Shairport Sync 5.5.2 handle_flushbuffered(): deferred iff flushFromSeq is
@@ -1996,9 +1999,10 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
                  esp_err_to_name(flush_err));
       }
     } else {
-      /* Match Shairport 5.5.2 exactly: the absence of flushFromSeq selects
-       * immediate mode. flushUntilSeq defaults to zero if the plist omitted
-       * it; there is no separate "full flush" transport operation. */
+      /* The absence of flushFromSeq selects immediate mode. Non-zero
+       * flushUntilSeq follows Shairport sequence semantics. An explicit zero
+       * is handled by the receiver as a timeline transition: wait for the new
+       * anchor, then sequentially consume stale compressed packets. */
       if (!got_until_seq) {
         ESP_LOGW(TAG,
                  "FLUSHBUFFERED immediate without flushUntilSeq; "

@@ -295,7 +295,29 @@ Processor applies it to the one sequential packet stream.
 7. Overshooting packet also survives and completes the request.
 8. Immediate completion clears deferred FLUSH requests.
 
-Immediate FLUSH must not wait for a new anchor before draining.
+For a normal non-zero `flushUntilSeq`, immediate FLUSH must not wait for a new
+anchor before draining.
+
+### Explicit immediate `flushUntilSeq == 0`
+
+An explicit zero endpoint is treated as a timeline-transition sentinel rather
+than as literal 23-bit sequence number zero. This is a narrow, intentional
+deviation from Shairport Sync 5.5.2: its modulo-23 comparison assumes the two
+sequence numbers are within half the sequence space and can falsely complete a
+zero endpoint immediately.
+
+1. Disable playback and invalidate the old anchor exactly like normal immediate
+   FLUSH.
+2. Do **not** compare packets against sequence zero and do **not** drain before
+   a new anchor is known. TCP ingress may continue filling the raw FIFO.
+3. When the next buffered anchor is committed, resume the single sequential
+   consumer.
+4. Before decrypt/decode, compare each packet RTP with the old `flushUntilTS`
+   and the new anchor RTP using modulo-2^32 distance. Packets closer to the old
+   timeline are consumed/dropped.
+5. The first packet at least as close to the new anchor as to the old endpoint
+   ends resync and survives into the normal timing/decode path.
+6. No second cursor, FIFO search, rewind or physical byte purge is permitted.
 
 ### Deferred FLUSH
 
@@ -316,8 +338,8 @@ Forbidden:
 
 - FIFO fast skip;
 - FIFO RTP/sequence search;
-- stale-FLUSH rescue heuristics;
-- RTP plausibility windows used to guess a FLUSH endpoint;
+- stale-FLUSH rescue heuristics outside the explicit zero-sequence transition above;
+- fixed RTP plausibility windows used to guess a FLUSH endpoint;
 - raw-FIFO purge as normal FLUSHBUFFERED implementation.
 
 ---

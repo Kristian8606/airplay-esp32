@@ -364,6 +364,20 @@ typedef struct {
   bool immediate_active;
   uint32_t immediate_until_seq;
   uint32_t immediate_until_rtp;
+
+  /* Apple occasionally sends an immediate FLUSHBUFFERED with an explicit
+   * flushUntilSeq == 0 while switching to a new RTP timeline. Zero is not a
+   * usable 23-bit endpoint for Shairport-style sequence arithmetic: treating
+   * it literally can complete the flush immediately and leave a stale packet
+   * held forever against the next anchor. For that case only, stop the media
+   * consumer until the next anchor is committed, then drain packets that are
+   * still closer to the old flush RTP than to the new anchor RTP. */
+  bool zero_seq_wait_anchor;
+  bool zero_seq_resync_active;
+  uint32_t zero_seq_old_until_rtp;
+  uint32_t zero_seq_anchor_rtp;
+  uint32_t zero_seq_dropped;
+
   buffered_deferred_flush_t deferred[AP2_MAX_DEFERRED_FLUSH];
 } buffered_control_t;
 
@@ -399,6 +413,11 @@ static void buffered_control_reset(void) {
   s_buffered_control.immediate_active = false;
   s_buffered_control.immediate_until_seq = 0;
   s_buffered_control.immediate_until_rtp = 0;
+  s_buffered_control.zero_seq_wait_anchor = false;
+  s_buffered_control.zero_seq_resync_active = false;
+  s_buffered_control.zero_seq_old_until_rtp = 0;
+  s_buffered_control.zero_seq_anchor_rtp = 0;
+  s_buffered_control.zero_seq_dropped = 0;
   memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
   xSemaphoreGive(s_buffered_control.mutex);
 }
@@ -413,6 +432,87 @@ static void buffered_control_snapshot(buffered_control_snapshot_t *out) {
   for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i)
     if (s_buffered_control.deferred[i].in_use) out->deferred_requests++;
   xSemaphoreGive(s_buffered_control.mutex);
+}
+
+static inline uint32_t abs_rtp_delta(uint32_t a, uint32_t b) {
+  /* RTP timestamps use modulo-2^32 arithmetic. Interpreting the subtraction
+   * as signed gives the shortest directed distance around that ring. */
+  const int32_t d = (int32_t)(a - b);
+  return d < 0 ? (uint32_t)(-(int64_t)d) : (uint32_t)d;
+}
+
+static void buffered_control_anchor_committed(uint32_t anchor_rtp) {
+  if (!s_buffered_control.mutex) return;
+
+  bool armed = false;
+  uint32_t old_until_rtp = 0;
+  xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
+  if (s_buffered_control.zero_seq_wait_anchor) {
+    s_buffered_control.zero_seq_wait_anchor = false;
+    s_buffered_control.zero_seq_resync_active = true;
+    s_buffered_control.zero_seq_anchor_rtp = anchor_rtp;
+    s_buffered_control.zero_seq_dropped = 0;
+    old_until_rtp = s_buffered_control.zero_seq_old_until_rtp;
+    armed = true;
+  }
+  xSemaphoreGive(s_buffered_control.mutex);
+
+  if (armed) {
+    ESP_LOGI(TAG,
+             "AAC zero-seq resync armed: oldUntilTS=%" PRIu32
+             " newAnchorRTP=%" PRIu32,
+             old_until_rtp, anchor_rtp);
+  }
+}
+
+static bool buffered_control_zero_seq_classify(const buffered_packet_t *packet) {
+  if (!packet || !s_buffered_control.mutex) return false;
+
+  bool drop = false;
+  bool completed = false;
+  uint32_t old_until_rtp = 0;
+  uint32_t anchor_rtp = 0;
+  uint32_t old_dist = 0;
+  uint32_t new_dist = 0;
+  uint32_t dropped = 0;
+
+  xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
+  if (s_buffered_control.zero_seq_resync_active) {
+    old_until_rtp = s_buffered_control.zero_seq_old_until_rtp;
+    anchor_rtp = s_buffered_control.zero_seq_anchor_rtp;
+    old_dist = abs_rtp_delta(packet->rtp, old_until_rtp);
+    new_dist = abs_rtp_delta(packet->rtp, anchor_rtp);
+
+    if (old_dist < new_dist) {
+      drop = true;
+      dropped = ++s_buffered_control.zero_seq_dropped;
+    } else {
+      completed = true;
+      dropped = s_buffered_control.zero_seq_dropped;
+      s_buffered_control.zero_seq_resync_active = false;
+    }
+  }
+  xSemaphoreGive(s_buffered_control.mutex);
+
+  if (drop) {
+    if (dropped <= 3U || (dropped & 0xFFU) == 0U) {
+      ESP_LOGI(TAG,
+               "AAC zero-seq resync DROP seq=%" PRIu32 " rtp=%" PRIu32
+               " oldDist=%" PRIu32 " newDist=%" PRIu32
+               " dropped=%" PRIu32,
+               packet->seq, packet->rtp, old_dist, new_dist, dropped);
+    }
+    return true;
+  }
+
+  if (completed) {
+    ESP_LOGI(TAG,
+             "AAC zero-seq resync complete at seq=%" PRIu32
+             " rtp=%" PRIu32 " oldDist=%" PRIu32
+             " newDist=%" PRIu32 " dropped=%" PRIu32,
+             packet->seq, packet->rtp, old_dist, new_dist, dropped);
+  }
+  return false;
 }
 
 static bool buffered_control_must_drain(void) {
@@ -1545,6 +1645,16 @@ static void ap2_buffered_processor_task(void *arg) {
         audio_eq_reset_state();
       }
       seen_stream_epoch = packet.stream_epoch;
+    }
+
+    /* For an explicit immediate untilSeq=0, the consumer was stopped until a
+     * new anchor arrived. After that anchor, cheaply consume stale compressed
+     * packets until the stream crosses from the old RTP neighbourhood to the
+     * new one. No decrypt/decode is done for discarded blocks. */
+    if (buffered_control_zero_seq_classify(&packet)) {
+      have_packet = false;
+      early_hold_since_us = 0;
+      continue;
     }
 
     /* FLUSH state is applied to the one sequentially-held packet before any
@@ -3630,9 +3740,31 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
   xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
   xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
   AUDIO_DIAG_FLUSH_IMMEDIATE_PUBLISH_ACQUIRED();
-  s_buffered_control.immediate_active = true;
-  s_buffered_control.immediate_until_seq = until_seq & 0x007fffffU;
+  const uint32_t masked_until_seq = until_seq & 0x007fffffU;
+  s_buffered_control.immediate_until_seq = masked_until_seq;
   s_buffered_control.immediate_until_rtp = until_ts;
+
+  if (masked_until_seq == 0U) {
+    /* Zero is a transition sentinel here, not a literal sequence endpoint.
+     * Do not run seq23_delta(packet, 0). Stop the consumer until the next
+     * SETRATEANCHORTIME anchor, then resynchronise by consuming stale packets
+     * from the old RTP neighbourhood. A new immediate zero-seq request simply
+     * replaces any older pending/resync state. */
+    s_buffered_control.immediate_active = false;
+    s_buffered_control.zero_seq_wait_anchor = true;
+    s_buffered_control.zero_seq_resync_active = false;
+    s_buffered_control.zero_seq_old_until_rtp = until_ts;
+    s_buffered_control.zero_seq_anchor_rtp = 0;
+    s_buffered_control.zero_seq_dropped = 0;
+    memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
+  } else {
+    s_buffered_control.immediate_active = true;
+    s_buffered_control.zero_seq_wait_anchor = false;
+    s_buffered_control.zero_seq_resync_active = false;
+    s_buffered_control.zero_seq_old_until_rtp = 0;
+    s_buffered_control.zero_seq_anchor_rtp = 0;
+    s_buffered_control.zero_seq_dropped = 0;
+  }
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);
@@ -3642,6 +3774,13 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
   AUDIO_DIAG_FLUSH_IMMEDIATE_PCM_DONE();
   xSemaphoreGive(s.publish_mutex);
   xSemaphoreGive(s_buffered_control.mutex);
+
+  if (masked_until_seq == 0U) {
+    ESP_LOGI(TAG,
+             "AAC zero-seq FLUSH: consumer waiting for new anchor "
+             "oldUntilTS=%" PRIu32,
+             until_ts);
+  }
 
   media_control_wake();
   audio_status_notify();
@@ -3820,8 +3959,13 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
     s_anchor_commit_us = esp_timer_get_time();
     s_anchor_commit_gen = gen;
   }
+  /* An immediate FLUSHBUFFERED with explicit untilSeq=0 has no usable
+   * sequence endpoint. The new anchor is the point at which its media consumer
+   * may resume and classify old-vs-new RTP blocks. */
+  buffered_control_anchor_committed(rtp);
+
   /* Shairport-style separation: SETRATEANCHORTIME updates presentation timing
-   * only. The compressed FIFO has no RTP cursor to search or rebind. */
+   * only. The compressed FIFO itself has no RTP cursor to search or rebind. */
   if (s.transport) ap2_buffered_fifo_notify(s.transport);
   playout_wake();
   realtime_stage_kick();
