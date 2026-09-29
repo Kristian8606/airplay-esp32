@@ -10,15 +10,11 @@ extern "C" {
 typedef struct {
   bool source_changed;
   bool gm_changed;
-  bool first_domain;
-  uint64_t old_source_clock_id;
-  uint64_t old_grandmaster_clock_id;
   uint64_t new_source_clock_id;
   uint64_t new_grandmaster_clock_id;
   bool old_estimator_valid;
   int64_t old_raw_offset_ns;
   int64_t old_filtered_offset_ns;
-  uint32_t old_accepted_samples;
   uint32_t epoch;
 } ptp_clock_engine_domain_event_t;
 
@@ -30,7 +26,6 @@ typedef struct {
   int64_t filtered_step_ns;
   int64_t raw_filter_delta_ns;
   uint32_t accepted_samples;
-  uint32_t epoch;
 } ptp_clock_engine_sample_t;
 
 typedef struct {
@@ -62,7 +57,8 @@ bool ptp_clock_engine_set_domain(ptp_clock_engine_t *engine,
                                  ptp_clock_engine_domain_event_t *event_out);
 
 /* Reset smoothing/history while preserving the current source/GM identity.
- * Bumps the estimator epoch so readers can distinguish pre/post-reset state. */
+ * With bump_epoch, also advances the estimator epoch so readers can
+ * distinguish pre/post-reset state. */
 void ptp_clock_engine_reset_filter(ptp_clock_engine_t *engine,
                                    bool bump_epoch);
 

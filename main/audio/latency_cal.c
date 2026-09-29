@@ -40,9 +40,6 @@ typedef struct {
 
 static cap_t s_cap;
 
-bool latency_cal_available(void) { return true; }
-int latency_cal_gpio(void) { return CONFIG_AIRPLAY_LATENCY_CAL_GPIO; }
-
 static bool IRAM_ATTR on_conv_done(adc_continuous_handle_t handle,
                                    const adc_continuous_evt_data_t *edata,
                                    void *user_data) {
@@ -74,8 +71,8 @@ static void reader_task(void *arg) {
     const esp_err_t err = adc_continuous_read(c->adc, buf, READ_CHUNK_BYTES, &got, 20);
     if (err == ESP_ERR_TIMEOUT) continue;
     if (err != ESP_OK) {
-      /* v4.1.22: never spin on an error. The driver logs every failed read,
-       * and a tight loop of those logs overflowed this task's stack. */
+      /* Never spin on an error: the driver logs every failed read, and a
+       * tight loop of those logs would overflow this task's stack. */
       vTaskDelay(pdMS_TO_TICKS(5));
       continue;
     }
@@ -132,9 +129,9 @@ esp_err_t latency_cal_capture_start(void) {
     return ESP_ERR_NO_MEM;
   }
 
-  /* v4.1.23: the IDF driver aborts inside its own error path when it cannot
-   * get internal DMA memory (seen with an AirPlay session open). Check first
-   * and fail cleanly instead. */
+  /* The IDF driver aborts inside its own error path when it cannot get
+   * internal DMA memory (e.g. with an AirPlay session open). Check first and
+   * fail cleanly instead. */
   if (heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL) <
       READ_CHUNK_BYTES * 16 + 8192) {
     ESP_LOGE(TAG, "not enough internal DMA memory for the ADC");
@@ -172,8 +169,8 @@ esp_err_t latency_cal_capture_start(void) {
   }
   if (err != ESP_OK) { cap_free(); return err; }
 
-  /* v4.1.22: start the ADC BEFORE the reader. The reader used to run first
-   * and hit "driver is already stopped" on every read. */
+  /* Start the ADC before the reader task; otherwise every
+   * adc_continuous_read() fails with "driver is already stopped". */
   err = adc_continuous_start(s_cap.adc);
   if (err != ESP_OK) { cap_free(); return err; }
   s_cap.started = true;

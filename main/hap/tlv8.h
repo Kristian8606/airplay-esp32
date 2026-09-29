@@ -10,8 +10,7 @@
  * Longer values are split across multiple TLVs with same type
  */
 
-// HAP TLV types for pair-verify
-#define TLV_TYPE_METHOD         0x00
+// HAP TLV types
 #define TLV_TYPE_IDENTIFIER     0x01
 #define TLV_TYPE_SALT           0x02
 #define TLV_TYPE_PUBLIC_KEY     0x03
@@ -22,13 +21,7 @@
 #define TLV_TYPE_SIGNATURE      0x0A
 
 // HAP Error codes
-#define TLV_ERROR_UNKNOWN        0x01
 #define TLV_ERROR_AUTHENTICATION 0x02
-#define TLV_ERROR_BACKOFF        0x03
-#define TLV_ERROR_MAX_PEERS      0x04
-#define TLV_ERROR_MAX_TRIES      0x05
-#define TLV_ERROR_UNAVAILABLE    0x06
-#define TLV_ERROR_BUSY           0x07
 
 // Pair-verify states
 #define PAIR_VERIFY_STATE_M1 0x01
@@ -41,11 +34,6 @@ typedef struct {
   size_t size;
   size_t capacity;
 } tlv8_encoder_t;
-
-typedef struct {
-  const uint8_t *data;
-  size_t len;
-} tlv8_value_t;
 
 /**
  * Initialize TLV8 encoder

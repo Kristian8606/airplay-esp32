@@ -2,6 +2,7 @@
 #include "sdkconfig.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -10,20 +11,10 @@
 #include "freertos/task.h"
 #include "rtsp_events.h"
 
-static const char *TAG = "rgb_vu";
-
 #if CONFIG_ENABLE_RGB_AUDIO_LED
 #include "led_strip.h"
 
-#ifndef CONFIG_RGB_AUDIO_LED_GPIO
-#define CONFIG_RGB_AUDIO_LED_GPIO 38
-#endif
-#ifndef CONFIG_RGB_AUDIO_LED_BRIGHTNESS
-#define CONFIG_RGB_AUDIO_LED_BRIGHTNESS 96
-#endif
-#ifndef CONFIG_RGB_AUDIO_LED_UPDATE_HZ
-#define CONFIG_RGB_AUDIO_LED_UPDATE_HZ 30
-#endif
+static const char *TAG = "rgb_vu";
 
 #define SILENCE_THRESH 200.0f
 #define VU_FULL_SCALE 16000.0f
@@ -37,14 +28,12 @@ typedef enum {
   LED_STATE_STANDBY,
   LED_STATE_PAUSED,
   LED_STATE_PLAYING,
-  LED_STATE_ERROR,
 } led_state_t;
 
 static led_strip_handle_t s_strip;
 static TaskHandle_t s_led_task;
 static volatile uint32_t s_requested_state = LED_STATE_STANDBY;
-static volatile bool s_error_active;
-static volatile uint32_t s_brightness = CONFIG_RGB_AUDIO_LED_BRIGHTNESS;
+#if defined(CONFIG_RGB_AUDIO_LED_PLAYING_VU)
 static int64_t s_last_capture_us;
 
 /* Audio -> LED single-latest-frame mailbox. The high-priority playout task
@@ -53,16 +42,15 @@ static int64_t s_last_capture_us;
 static int16_t s_pcm_mailbox[LED_PCM_MAX_FRAMES * 2U];
 static volatile uint32_t s_pcm_frames;
 static volatile uint32_t s_pcm_seq;
+#endif
 
 static inline void led_wake(void) {
   TaskHandle_t task = __atomic_load_n(&s_led_task, __ATOMIC_ACQUIRE);
   if (task) xTaskNotifyGive(task);
 }
 
-static uint8_t scale_bright(uint8_t v) {
-  const uint32_t brightness =
-      __atomic_load_n(&s_brightness, __ATOMIC_ACQUIRE);
-  return (uint8_t)(((uint16_t)v * brightness) / 255U);
+static inline uint8_t scale_bright(uint8_t v) {
+  return (uint8_t)(((uint16_t)v * CONFIG_RGB_AUDIO_LED_BRIGHTNESS) / 255U);
 }
 
 /* These helpers are called only by led_task after init, making the RMT/strip
@@ -112,13 +100,10 @@ static void render_state(led_state_t state) {
       rgb_clear();
 #endif
       break;
-
-    case LED_STATE_ERROR:
-      rgb_refresh_color(scale_bright(0xC0), 0, 0);
-      break;
   }
 }
 
+#if defined(CONFIG_RGB_AUDIO_LED_PLAYING_VU)
 static bool pcm_mailbox_snapshot(int16_t *dst, uint32_t *frames_out) {
   if (!dst || !frames_out) return false;
   for (int attempt = 0; attempt < 3; ++attempt) {
@@ -141,7 +126,6 @@ static bool pcm_mailbox_snapshot(int16_t *dst, uint32_t *frames_out) {
 }
 
 static void render_vu(const int16_t *pcm, size_t stereo_frames) {
-#if defined(CONFIG_RGB_AUDIO_LED_PLAYING_VU)
   if (!pcm || stereo_frames == 0 || !s_strip) return;
 
   const size_t total_samples = stereo_frames * 2U;
@@ -175,8 +159,7 @@ static void render_vu(const int16_t *pcm, size_t stereo_frames) {
     if (norm > 1.0f) norm = 1.0f;
   }
 
-  const uint32_t brightness =
-      __atomic_load_n(&s_brightness, __ATOMIC_ACQUIRE);
+  const uint32_t brightness = CONFIG_RGB_AUDIO_LED_BRIGHTNESS;
   if (norm <= 0.0f || brightness == 0) {
     rgb_clear();
     return;
@@ -199,25 +182,22 @@ static void render_vu(const int16_t *pcm, size_t stereo_frames) {
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "VU refresh failed: %s", esp_err_to_name(err));
   }
-#else
-  (void)pcm;
-  (void)stereo_frames;
-#endif
 }
+#endif /* CONFIG_RGB_AUDIO_LED_PLAYING_VU */
 
 static void led_task(void *arg) {
   (void)arg;
+#if defined(CONFIG_RGB_AUDIO_LED_PLAYING_VU)
   int16_t pcm[LED_PCM_MAX_FRAMES * 2U];
+#endif
   led_state_t last_state = LED_STATE_STANDBY;
   bool have_rendered_state = false;
 
   while (1) {
     (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    const bool error = __atomic_load_n(&s_error_active, __ATOMIC_ACQUIRE);
-    led_state_t desired = error
-        ? LED_STATE_ERROR
-        : (led_state_t)__atomic_load_n(&s_requested_state, __ATOMIC_ACQUIRE);
+    led_state_t desired =
+        (led_state_t)__atomic_load_n(&s_requested_state, __ATOMIC_ACQUIRE);
 
     if (!have_rendered_state || desired != last_state) {
       if (have_rendered_state) {
@@ -227,8 +207,8 @@ static void led_task(void *arg) {
       have_rendered_state = true;
       render_state(desired);
     } else if (desired != LED_STATE_PLAYING) {
-      /* Brightness changes while paused/standby/error need a refresh even if
-       * the logical state did not change. */
+      /* Static states are re-rendered on every wake; this also retries a
+       * failed refresh. */
       render_state(desired);
     }
 
@@ -273,8 +253,7 @@ void led_audio_feed(const int16_t *pcm, size_t stereo_frames) {
 #if defined(CONFIG_RGB_AUDIO_LED_PLAYING_VU)
   if (!pcm || stereo_frames == 0 || !s_strip || !s_led_task ||
       __atomic_load_n(&s_requested_state, __ATOMIC_ACQUIRE) !=
-          LED_STATE_PLAYING ||
-      __atomic_load_n(&s_error_active, __ATOMIC_ACQUIRE)) {
+          LED_STATE_PLAYING) {
     return;
   }
 
@@ -332,25 +311,9 @@ void led_init(void) {
 
   ESP_LOGI(TAG,
            "WS2812 audio LED ready GPIO=%d brightness=%u update=%dHz task=core%d/prio%d",
-           CONFIG_RGB_AUDIO_LED_GPIO,
-           (unsigned)__atomic_load_n(&s_brightness, __ATOMIC_RELAXED),
+           CONFIG_RGB_AUDIO_LED_GPIO, (unsigned)CONFIG_RGB_AUDIO_LED_BRIGHTNESS,
            CONFIG_RGB_AUDIO_LED_UPDATE_HZ, LED_TASK_CORE, LED_TASK_PRIO);
   led_wake();
-}
-
-void led_set_error(bool error) {
-  __atomic_store_n(&s_error_active, error, __ATOMIC_RELEASE);
-  led_wake();
-}
-
-esp_err_t led_set_brightness(uint8_t brightness) {
-  __atomic_store_n(&s_brightness, brightness, __ATOMIC_RELEASE);
-  led_wake();
-  return ESP_OK;
-}
-
-uint8_t led_get_brightness(void) {
-  return (uint8_t)__atomic_load_n(&s_brightness, __ATOMIC_ACQUIRE);
 }
 
 #else  /* CONFIG_ENABLE_RGB_AUDIO_LED */
@@ -360,11 +323,5 @@ void led_audio_feed(const int16_t *pcm, size_t stereo_frames) {
   (void)pcm;
   (void)stereo_frames;
 }
-void led_set_error(bool error) { (void)error; }
-esp_err_t led_set_brightness(uint8_t brightness) {
-  (void)brightness;
-  return ESP_ERR_NOT_SUPPORTED;
-}
-uint8_t led_get_brightness(void) { return 0; }
 
 #endif

@@ -15,19 +15,6 @@ static const char *TAG = "ota";
 #define OTA_PROGRESS_STEP_BYTES (256U * 1024U)
 #define OTA_HTTP_IDLE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 
-static void ota_log_memory(const char *where) {
-  ESP_LOGI(TAG,
-           "MEM %s internalFree=%u KiB internalLargest=%u KiB internalMin=%u KiB "
-           "psramFree=%u KiB psramLargest=%u KiB psramMin=%u KiB",
-           where,
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
-           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
-           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024U));
-}
-
 static esp_err_t ota_validate_header(const uint8_t *image, size_t len) {
   if (!image || len < sizeof(esp_image_header_t)) {
     ESP_LOGE(TAG, "Image header too small (%zu bytes)", len);
@@ -84,8 +71,6 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
              fw_size, ota_partition->size);
     return ESP_ERR_INVALID_SIZE;
   }
-
-  ota_log_memory("before-stream");
 
   size_t buf_size = 0;
   uint8_t *buf = ota_alloc_stream_buffer(&buf_size);
@@ -206,7 +191,6 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
     return err;
   }
 
-  ota_log_memory("after-stream");
   ESP_LOGI(TAG, "OTA update successful (sequential streaming)");
   return ESP_OK;
 }

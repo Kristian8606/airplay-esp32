@@ -1,10 +1,10 @@
 menuconfig AIRPLAY_DIAGNOSTICS
-    bool "Enable temporary AirPlay diagnostics"
+    bool "Enable AirPlay diagnostics"
     default n
     help
-        Master compile-time switch for temporary AirPlay diagnostics.
-        The permanent 2-second audio_status log is independent and remains
-        available when this option is disabled.
+        Master compile-time switch for AirPlay debugging diagnostics.
+        The 2-second audio_status log is independent and remains available
+        when this option is disabled.
 
         When disabled, category counters, timestamps, arrays, buffers, helper
         functions and the low-priority audio_diag task are not compiled.
@@ -44,16 +44,6 @@ if AIRPLAY_DIAGNOSTICS
         default y if AIRPLAY_DIAG_TRANSPORT || AIRPLAY_DIAG_BUFFER || AIRPLAY_DIAG_FLUSH || AIRPLAY_DIAG_CODEC || AIRPLAY_DIAG_SYNC || AIRPLAY_DIAG_PLAYOUT || AIRPLAY_DIAG_LIFECYCLE
         default n
 
-    config AIRPLAY_DIAG_HIGH_RATE_TRACE
-        bool "Allow high-rate packet/sample/block tracing"
-        depends on AIRPLAY_DIAG_ACTIVE
-        default n
-        help
-            Enables diagnostics which may record every packet, sample block or
-            other high-frequency event. Use only for short targeted tests.
-            Audio must never block waiting for diagnostic output; trace data
-            may be dropped instead.
-
 endif
 
 menu "AirPlay Receiver"
@@ -67,14 +57,6 @@ menu "AirPlay Receiver"
         int "Setup AP channel"
         default 1
         range 1 13
-    config WIFI_PREFER_5GHZ
-        bool "Prefer 5 GHz when available"
-        default n
-    config WIFI_PREFER_5GHZ_MIN_RSSI
-        int "Minimum 5 GHz RSSI"
-        default -75
-        range -95 -30
-        depends on WIFI_PREFER_5GHZ
     config ENABLE_AIRPLAY_ARTWORK
         bool "Advertise artwork support"
         default n
@@ -166,9 +148,9 @@ menu "I2S Playout"
         default ""
         help
             When set, firmware update, restart, Wi-Fi / device name changes and
-            the latency test in the web UI require HTTP Basic authentication
-            with user "admin" and this password. Leave empty to keep the web
-            UI open (default).
+            output-latency changes/measurement in the web UI require HTTP
+            Basic authentication with user "admin" and this password. Leave
+            empty to keep the web UI open (default).
 endmenu
 
 menu "RGB Audio/VU LED"
@@ -201,8 +183,7 @@ menu "RGB Audio/VU LED"
         range 5 60
         depends on ENABLE_RGB_AUDIO_LED
         help
-            Limits RMS/bass calculation and WS2812 refresh frequency. The
-            upstream implementation uses approximately 30 Hz.
+            Limits RMS/bass calculation and WS2812 refresh frequency.
 
     choice RGB_AUDIO_LED_PLAYING_MODE
         prompt "LED mode while playing"

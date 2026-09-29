@@ -39,3 +39,20 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
  */
 int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
                             size_t data_len);
+
+/**
+ * Same framing as rtsp_crypto_write_frame() with explicit key and nonce
+ * counter (used for the AirPlay 2 event channel, which has its own keys).
+ * @return 0 on success, -1 on error
+ */
+int rtsp_crypto_seal_send(int socket, const uint8_t key[32], uint64_t *nonce,
+                          const uint8_t *data, size_t data_len);
+
+/**
+ * Decrypt one complete frame [2-byte LE length][ciphertext][16-byte tag].
+ * frame_len must be exactly 2 + length + 16. out needs length bytes.
+ * The nonce counter advances only on success.
+ * @return plaintext length, or -1 on error / authentication failure
+ */
+int rtsp_crypto_open(const uint8_t key[32], uint64_t *nonce,
+                     const uint8_t *frame, size_t frame_len, uint8_t *out);

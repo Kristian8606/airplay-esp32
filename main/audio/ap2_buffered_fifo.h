@@ -48,12 +48,25 @@ void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
 void ap2_buffered_fifo_notify(ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_wait(ap2_buffered_fifo_t *fifo, uint32_t timeout_ms);
 
-/* Shairport buffered_read.c boundary: consume exactly one framed block from
- * [2-byte big-endian wire length][block bytes]. This layer does not parse RTP,
- * sequence numbers, SSRC or FLUSH state. stream_epoch identifies the accepted
- * TCP connection that supplied the block. */
-esp_err_t ap2_buffered_fifo_read_block(ap2_buffered_fifo_t *fifo,
-                                       uint8_t *block_storage,
-                                       size_t block_capacity,
-                                       size_t *block_len,
-                                       uint32_t *stream_epoch);
+/* Sequential block access for the single buffered processor
+ * (Shairport buffered_read.c / read_sized_block boundary).
+ *
+ * The wire format is [2-byte big-endian length][block bytes]. This layer only
+ * frames bytes: it never parses RTP, sequence numbers, SSRC or FLUSH state.
+ *
+ * read_block_head() consumes the length prefix and the first `head_len` bytes
+ * of the next block (the RTP header) and returns the full block length.
+ * The caller then MUST finish that same block with read_block_rest(), either
+ * copying the remaining block_len - head_len bytes (dst != NULL) or consuming
+ * them without a copy (dst == NULL) after it decided to drop the block.
+ * stream_epoch identifies the byte stream that supplied it (a new accepted
+ * connection or any discard/abort/stop starts a new epoch); a different epoch
+ * at read_block_rest() time fails and the block is lost. */
+esp_err_t ap2_buffered_fifo_read_block_head(ap2_buffered_fifo_t *fifo,
+                                            uint8_t *head, size_t head_len,
+                                            size_t block_capacity,
+                                            size_t *block_len,
+                                            uint32_t *stream_epoch);
+esp_err_t ap2_buffered_fifo_read_block_rest(ap2_buffered_fifo_t *fifo,
+                                            uint8_t *dst, size_t len,
+                                            uint32_t stream_epoch);

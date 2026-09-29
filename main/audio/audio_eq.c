@@ -400,8 +400,8 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
        * old delay lines are stale: start from silence. */
       reset_state_unlocked();
     } else {
-      /* Live tweak while audio is playing. Zeroing the delay lines here used
-       * to inject a step into the signal (an audible click on every slider
+      /* Live tweak while audio is playing. Zeroing the delay lines would
+       * inject a step into the signal (an audible click on every slider
        * move). A biquad in transposed direct form II tolerates coefficient
        * changes, so keep the state of every filter whose slot and type are
        * unchanged and clear only slots that changed meaning. */

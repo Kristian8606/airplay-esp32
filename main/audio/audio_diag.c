@@ -57,7 +57,6 @@ typedef enum {
   DIAG_EVENT_RETRANSMIT_TARGET,
   DIAG_EVENT_FLUSH_RTSP,
   DIAG_EVENT_FLUSH_CONTROL_RX,
-  DIAG_EVENT_FLUSH_STATUS_WAIT,
   DIAG_EVENT_FLUSH_IMMEDIATE,
 } diag_event_kind_t;
 
@@ -86,12 +85,13 @@ static void diag_emit(diag_event_kind_t kind, uint16_t id,
 }
 #endif
 
-
-
 #if defined(CONFIG_AIRPLAY_DIAG_FLUSH) && CONFIG_AIRPLAY_DIAG_FLUSH
 #define AUDIO_DIAG_FLUSH_RTSP_SLOTS       2U
 #define AUDIO_DIAG_FLUSH_OP_SLOTS         2U
-#define AUDIO_DIAG_FLUSH_CONTROL_RX_SLOW_US 500000U
+/* Receiver-side time for one control message (payload after the length
+ * header + decrypt). The wait for the header is the sender's idle time between
+ * requests (e.g. /feedback every 2 s) and does not count. */
+#define AUDIO_DIAG_FLUSH_CONTROL_RX_SLOW_US 50000U
 #define AUDIO_DIAG_FLUSH_HANDLER_SLOW_US     50000U
 
 typedef enum {
@@ -131,7 +131,6 @@ typedef struct {
   int64_t publish_acquired_us;
   int64_t transport_done_us;
   int64_t pcm_done_us;
-  int64_t status_wait_start_us;
   bool in_use;
 } flush_op_slot_t;
 
@@ -303,37 +302,13 @@ void audio_diag_flush_control_rx_end(int socket, uint32_t plaintext_bytes) {
   }
   portEXIT_CRITICAL(&s_flush_diag_mux);
 
-  if (total_us >= AUDIO_DIAG_FLUSH_CONTROL_RX_SLOW_US) {
+  if (payload_us + decrypt_us >= AUDIO_DIAG_FLUSH_CONTROL_RX_SLOW_US) {
     const uint16_t bytes = plaintext_bytes > UINT16_MAX
                                ? UINT16_MAX
                                : (uint16_t)plaintext_bytes;
     diag_emit(DIAG_EVENT_FLUSH_CONTROL_RX, bytes, header_us, payload_us,
               decrypt_us, total_us);
   }
-}
-
-void audio_diag_flush_status_wait_begin(void) {
-  const int64_t now_us = esp_timer_get_time();
-  const TaskHandle_t task = xTaskGetCurrentTaskHandle();
-  portENTER_CRITICAL(&s_flush_diag_mux);
-  flush_op_slot_t *slot = flush_op_slot_locked(task, true);
-  if (slot) slot->status_wait_start_us = now_us;
-  portEXIT_CRITICAL(&s_flush_diag_mux);
-}
-
-void audio_diag_flush_status_wait_end(uint32_t timed_out) {
-  const int64_t now_us = esp_timer_get_time();
-  const TaskHandle_t task = xTaskGetCurrentTaskHandle();
-  int64_t start_us = 0;
-  portENTER_CRITICAL(&s_flush_diag_mux);
-  flush_op_slot_t *slot = flush_op_slot_locked(task, false);
-  if (slot) {
-    start_us = slot->status_wait_start_us;
-    slot->status_wait_start_us = 0;
-  }
-  portEXIT_CRITICAL(&s_flush_diag_mux);
-  diag_emit(DIAG_EVENT_FLUSH_STATUS_WAIT, 0U,
-            clamp_elapsed_us(start_us, now_us), timed_out, 0U, 0U);
 }
 
 void audio_diag_flush_immediate_begin(void) {
@@ -393,7 +368,6 @@ void audio_diag_flush_immediate_end(void) {
             total_us);
 }
 #endif
-
 
 #if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
 typedef struct {
@@ -586,11 +560,7 @@ typedef struct {
   uint32_t blocks;
   uint32_t payload_bytes;
   uint32_t max_gap_us;
-  uint32_t wait_events;
-  uint32_t wait_total_us;
-  uint32_t wait_max_us;
   int64_t last_block_us;
-  int64_t wait_start_us;
   int64_t window_start_us;
 } transport_aac_diag_state_t;
 
@@ -605,14 +575,6 @@ void audio_diag_transport_ports(uint32_t data_port, uint32_t control_port) {
 }
 void audio_diag_transport_retransmit_target(uint32_t ip_be, uint32_t port) {
   diag_emit(DIAG_EVENT_RETRANSMIT_TARGET, 0U, ip_be, port, 0U, 0U);
-}
-
-void audio_diag_transport_aac_session_reset(void) {
-  const int64_t now_us = esp_timer_get_time();
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  memset(&s_transport_aac, 0, sizeof(s_transport_aac));
-  s_transport_aac.window_start_us = now_us;
-  portEXIT_CRITICAL(&s_transport_aac_mux);
 }
 
 void audio_diag_transport_aac_rx_block(uint32_t payload_bytes) {
@@ -634,69 +596,35 @@ void audio_diag_transport_aac_rx_block(uint32_t payload_bytes) {
   portEXIT_CRITICAL(&s_transport_aac_mux);
 }
 
-void audio_diag_transport_aac_store_wait_begin(void) {
-  const int64_t now_us = esp_timer_get_time();
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  if (s_transport_aac.wait_start_us == 0) s_transport_aac.wait_start_us = now_us;
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
-void audio_diag_transport_aac_store_wait_end(void) {
-  const int64_t now_us = esp_timer_get_time();
-  portENTER_CRITICAL(&s_transport_aac_mux);
-  const int64_t start_us = s_transport_aac.wait_start_us;
-  s_transport_aac.wait_start_us = 0;
-  if (start_us > 0 && now_us > start_us) {
-    const int64_t waited = now_us - start_us;
-    const uint32_t wait_us = waited > UINT32_MAX ? UINT32_MAX : (uint32_t)waited;
-    s_transport_aac.wait_events++;
-    if (UINT32_MAX - s_transport_aac.wait_total_us < wait_us) {
-      s_transport_aac.wait_total_us = UINT32_MAX;
-    } else {
-      s_transport_aac.wait_total_us += wait_us;
-    }
-    if (wait_us > s_transport_aac.wait_max_us) s_transport_aac.wait_max_us = wait_us;
-  }
-  portEXIT_CRITICAL(&s_transport_aac_mux);
-}
-
 static void diag_transport_poll(void) {
   const int64_t now_us = esp_timer_get_time();
   uint32_t blocks;
   uint32_t payload_bytes;
   uint32_t max_gap_us;
-  uint32_t wait_events;
-  uint32_t wait_total_us;
-  uint32_t wait_max_us;
-  uint32_t blocked_now_us = 0U;
   int64_t window_start_us;
 
   portENTER_CRITICAL(&s_transport_aac_mux);
   blocks = s_transport_aac.blocks;
   payload_bytes = s_transport_aac.payload_bytes;
   max_gap_us = s_transport_aac.max_gap_us;
-  wait_events = s_transport_aac.wait_events;
-  wait_total_us = s_transport_aac.wait_total_us;
-  wait_max_us = s_transport_aac.wait_max_us;
   window_start_us = s_transport_aac.window_start_us;
-  if (s_transport_aac.wait_start_us > 0 && now_us > s_transport_aac.wait_start_us) {
-    const int64_t blocked = now_us - s_transport_aac.wait_start_us;
-    blocked_now_us = blocked > UINT32_MAX ? UINT32_MAX : (uint32_t)blocked;
-  }
   s_transport_aac.blocks = 0U;
   s_transport_aac.payload_bytes = 0U;
   s_transport_aac.max_gap_us = 0U;
-  s_transport_aac.wait_events = 0U;
-  s_transport_aac.wait_total_us = 0U;
-  s_transport_aac.wait_max_us = 0U;
   s_transport_aac.window_start_us = now_us;
   portEXIT_CRITICAL(&s_transport_aac_mux);
 
-  if (blocks || wait_events || blocked_now_us) {
+  if (blocks) {
     double window_s = 2.0;
     if (window_start_us > 0 && now_us > window_start_us) {
       window_s = (double)(now_us - window_start_us) / 1000000.0;
     }
+    ESP_LOGI(TAG,
+             "TRANSPORT AAC/%.1fs blocks=%lu (%.1f/s) bytes=%lu maxGap=%.1fms",
+             window_s, (unsigned long)blocks, (double)blocks / window_s,
+             (unsigned long)payload_bytes, (double)max_gap_us / 1000.0);
+  }
+}
 #endif
 
 #if defined(CONFIG_AIRPLAY_DIAG_LIFECYCLE) && CONFIG_AIRPLAY_DIAG_LIFECYCLE
@@ -825,10 +753,6 @@ static void log_event(const diag_event_t *ev) {
                (double)ev->a / 1000.0, (double)ev->b / 1000.0,
                (double)ev->c / 1000.0);
       break;
-    case DIAG_EVENT_FLUSH_STATUS_WAIT:
-      ESP_LOGI(TAG, "FLUSH statusStop wait=%.2fms timeout=%lu",
-               (double)ev->a / 1000.0, (unsigned long)ev->b);
-      break;
     case DIAG_EVENT_FLUSH_IMMEDIATE:
       ESP_LOGI(TAG,
                "FLUSH immediate endpoint=%u total=%.2fms mutex=%.2fms transport=%.2fms pcm=%.2fms",
@@ -907,11 +831,7 @@ static void poll_categories(void) {
 
 static void audio_diag_task(void *arg) {
   (void)arg;
-#if defined(CONFIG_AIRPLAY_DIAG_HIGH_RATE_TRACE) && CONFIG_AIRPLAY_DIAG_HIGH_RATE_TRACE
-  ESP_LOGW(TAG, "ENABLED:%s HIGH_RATE_TRACE", enabled_categories());
-#else
   ESP_LOGI(TAG, "ENABLED:%s", enabled_categories());
-#endif
 
   TickType_t last_poll = xTaskGetTickCount();
   for (;;) {

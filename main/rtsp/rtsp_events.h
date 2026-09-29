@@ -31,7 +31,6 @@ typedef struct {
   char genre[METADATA_STRING_MAX];  // Genre (DMAP asgn)
   uint32_t duration_secs;           // Total track duration in seconds
   uint32_t position_secs;           // Current playback position in seconds
-  bool has_artwork;                 // Whether artwork is available
 } rtsp_metadata_t;
 
 // ============================================================================
@@ -61,23 +60,9 @@ typedef void (*rtsp_event_callback_t)(rtsp_event_t event,
 int rtsp_events_register(rtsp_event_callback_t callback, void *user_data);
 
 /**
- * Unregister a previously registered listener.
- * @param callback The callback to remove
- */
-void rtsp_events_unregister(rtsp_event_callback_t callback);
-
-/**
  * Emit an event to all registered listeners.
  * Called internally by RTSP handlers.
  * @param event The event to emit
  * @param data  Event-specific data (NULL for events with no data)
  */
 void rtsp_events_emit(rtsp_event_t event, const rtsp_event_data_t *data);
-
-/**
- * Format seconds as mm:ss string.
- * @param seconds Time in seconds
- * @param out Output buffer (at least 8 bytes for "999:59\0")
- * @param out_size Size of output buffer
- */
-void rtsp_format_time_mmss(uint32_t seconds, char *out, size_t out_size);

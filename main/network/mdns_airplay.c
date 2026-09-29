@@ -6,6 +6,7 @@
 
 #include "hap.h"
 #include "mdns_airplay.h"
+#include "airplay_version.h"
 #include "rtsp_handlers.h"
 #include "wifi.h"
 #include "settings.h"
@@ -15,12 +16,7 @@ static const char *TAG = "mdns_airplay";
 // Feature flags are defined in rtsp_handlers.h (shared with /info handler)
 
 // Protocol version
-#ifdef CONFIG_AIRPLAY_FORCE_V1
-#define AIRPLAY_PROTOCOL_VERSION "1"
-#else
 #define AIRPLAY_PROTOCOL_VERSION "2"
-#endif
-#define AIRPLAY_SOURCE_VERSION "377.40.00"
 
 // Flags: 0x4 = audio receiver
 #define AIRPLAY_FLAGS "0x4"
@@ -37,13 +33,56 @@ static const char *TAG = "mdns_airplay";
 #define AIRPLAY_METADATA_TYPES "0,2"
 #endif
 
-// Model identifier - AudioAccessory for speaker appearance
-// AppleTV3,2 = Apple TV, AudioAccessory5,1 = HomePod mini (speaker)
-#define AIRPLAY_MODEL "AudioAccessory6,1"
+/* Values of the _airplay._tcp TXT record. One source for the mDNS
+ * advertisement and for "txtAirPlay" in the event-channel updateInfo. */
+typedef struct {
+  char device_id[18];
+  char features[32];
+  char pk[65]; // 32 bytes = 64 hex chars + null
+} airplay_txt_values_t;
+
+static void airplay_txt_values(airplay_txt_values_t *v) {
+  wifi_get_mac_str(v->device_id, sizeof(v->device_id));
+  const uint8_t *pk = hap_get_public_key();
+  for (int i = 0; i < 32; i++) {
+    snprintf(v->pk + (size_t)i * 2, 3, "%02x", pk[i]);
+  }
+  snprintf(v->features, sizeof(v->features), "0x%X,0x%X", AIRPLAY_FEATURES_LO,
+           AIRPLAY_FEATURES_HI);
+}
+
+#define AIRPLAY_TXT_ITEMS(v)                                             \
+  {                                                                      \
+    {"deviceid", (v).device_id}, {"features", (v).features},             \
+        {"flags", AIRPLAY_FLAGS}, {"model", AIRPLAY_MODEL},              \
+        {"pk", (v).pk},                                                  \
+        {"pi", "00000000-0000-0000-0000-000000000000"},                  \
+        {"srcvers", AIRPLAY_SOURCE_VERSION},                             \
+        {"vv", AIRPLAY_PROTOCOL_VERSION}, {"acl", "0"},                  \
+  }
+
+size_t mdns_airplay_txt_record_data(uint8_t *out, size_t capacity) {
+  if (!out) return 0;
+  airplay_txt_values_t v;
+  airplay_txt_values(&v);
+  const mdns_txt_item_t items[] = AIRPLAY_TXT_ITEMS(v);
+  size_t pos = 0;
+  for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); ++i) {
+    const size_t klen = strlen(items[i].key);
+    const size_t vlen = strlen(items[i].value);
+    const size_t len = klen + 1 + vlen;
+    if (len > 255 || pos + 1 + len > capacity) return 0;
+    out[pos++] = (uint8_t)len;
+    memcpy(out + pos, items[i].key, klen);
+    pos += klen;
+    out[pos++] = '=';
+    memcpy(out + pos, items[i].value, vlen);
+    pos += vlen;
+  }
+  return pos;
+}
 
 void mdns_airplay_init(void) {
-  char mac_str[18];
-  char device_id[18];
   char features_str[32];
   char service_name[80];
   char pk_str[65]; // 32 bytes = 64 hex chars + null
@@ -52,17 +91,13 @@ void mdns_airplay_init(void) {
   // Get device name from settings
   settings_get_device_name(device_name, sizeof(device_name));
 
-  // Get MAC address
-  wifi_get_mac_str(mac_str, sizeof(mac_str));
-  strncpy(device_id, mac_str, sizeof(device_id));
-
   // Get real Ed25519 public key from HAP module
   const uint8_t *pk = hap_get_public_key();
   for (int i = 0; i < 32; i++) {
     snprintf(pk_str + (size_t)i * 2, 3, "%02x", pk[i]);
   }
 
-  // Format features as "hi,lo" hex string
+  // Format features as "lo,hi" hex string
   snprintf(features_str, sizeof(features_str), "0x%X,0x%X", AIRPLAY_FEATURES_LO,
            AIRPLAY_FEATURES_HI);
 
@@ -78,22 +113,12 @@ void mdns_airplay_init(void) {
   // Set hostname
   ESP_ERROR_CHECK(mdns_hostname_set(device_name));
 
-#ifndef CONFIG_AIRPLAY_FORCE_V1
   // ========================================
   // _airplay._tcp service (port 7000)
-  // Only registered for AirPlay 2 mode
   // ========================================
-  mdns_txt_item_t airplay_txt[] = {
-      {"deviceid", device_id},
-      {"features", features_str},
-      {"flags", AIRPLAY_FLAGS},
-      {"model", AIRPLAY_MODEL},
-      {"pk", pk_str},
-      {"pi", "00000000-0000-0000-0000-000000000000"}, // Pairing identity UUID
-      {"srcvers", AIRPLAY_SOURCE_VERSION},
-      {"vv", AIRPLAY_PROTOCOL_VERSION},
-      {"acl", "0"},
-  };
+  airplay_txt_values_t txt_values;
+  airplay_txt_values(&txt_values);
+  mdns_txt_item_t airplay_txt[] = AIRPLAY_TXT_ITEMS(txt_values);
 
   esp_err_t err =
       mdns_service_add(device_name, "_airplay", "_tcp", 7000, airplay_txt,
@@ -102,32 +127,12 @@ void mdns_airplay_init(void) {
     ESP_LOGE(TAG, "Failed to add _airplay._tcp service: %s",
              esp_err_to_name(err));
   }
-#endif
 
   // ========================================
   // _raop._tcp service (port 7000)
   // RAOP = Remote Audio Output Protocol
   // Service name format: <MAC>@<DeviceName>
   // ========================================
-#ifdef CONFIG_AIRPLAY_FORCE_V1
-  // AirPlay v1 (classic RAOP): match squeezelite-esp32 txt record format.
-  // No features, no pk, no HAP pairing — just classic RAOP fields.
-  mdns_txt_item_t raop_txt[] = {
-      {"am", AIRPLAY_MODEL},
-      {"tp", "UDP"},                  // Transport protocol
-      {"sm", "false"},                // Sharing mode
-      {"sv", "false"},                // Server version (unused)
-      {"ek", "1"},                    // Encryption key available
-      {"et", "0,1"},                  // Encryption types: none, RSA
-      {"md", AIRPLAY_METADATA_TYPES}, // Metadata types
-      {"cn", "0,1"},                  // Audio codecs: PCM, ALAC
-      {"ch", "2"},                    // Channels
-      {"ss", "16"},                   // Sample size (bits)
-      {"sr", "44100"},                // Sample rate
-      {"vn", "3"},                    // Version number
-      {"txtvers", "1"},               // TXT record version
-  };
-#else
   // Dual-mode: include et=1 (RSA) so RAOP-only clients (TuneBlade, AirMusic,
   // shairtunes2, etc.) accept the advertisement, while keeping et=3,5 for
   // AirPlay 2 FairPlay/MFi-SAP. ek=1 advertises that an RSA-encrypted key
@@ -147,7 +152,6 @@ void mdns_airplay_init(void) {
       {"vs", AIRPLAY_SOURCE_VERSION},
       {"vv", AIRPLAY_PROTOCOL_VERSION},
   };
-#endif
 
   esp_err_t err_raop =
       mdns_service_add(service_name, "_raop", "_tcp", 7000, raop_txt,

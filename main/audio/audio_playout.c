@@ -222,9 +222,9 @@ static esp_err_t audio_playout_init_current_core(void) {
              esp_err_to_name(err), s_nominal_mclk_hz);
   }
 
-  /* Keep the channel READY/disabled. Preload both DMA descriptors before
-   * the exact PTP start edge, then enables the channel. This removes the
-   * zero-descriptor ambiguity that made earlier EOF counting unreliable. */
+  /* Keep the channel READY/disabled. The playout task preloads both DMA
+   * descriptors before the exact PTP start edge and then enables the channel,
+   * so no zero-filled descriptor is clocked out and every EOF has a tag. */
   AUDIO_DIAG_PLAYOUT_I2S(
       s_nominal_mclk_hz, (uint32_t)I2S_DMA_DESC_NUM,
       (uint32_t)I2S_DMA_FRAME_NUM,
@@ -296,9 +296,9 @@ esp_err_t audio_playout_flush(void) {
       return de;
     }
   } else if (s_preload_pending) {
-    /* There is no public "discard preload" API. A failed realtime timeline
-     * revalidation can happen after both silent descriptors were preloaded but
-     * before normal enable. Leaving them there makes every later preload append
+    /* There is no public "discard preload" API. A failed start revalidation
+     * (buffered or realtime) can happen after both silent descriptors were
+     * preloaded but before normal enable. Leaving them there makes every later preload append
      * into an already-full DMA cache and PRIME can then persist until reboot.
      * Cycle READY -> RUNNING -> READY with silence only; this consumes/resets
      * the driver's preloaded DMA state without exposing stale program audio. */
@@ -462,14 +462,6 @@ esp_err_t audio_playout_reset_tune(void) {
   return err;
 }
 
-int32_t audio_playout_get_tune_ppm(void) {
-  return s_tune_ppm;
-}
-
-uint32_t audio_playout_get_nominal_mclk_hz(void) {
-  return s_nominal_mclk_hz;
-}
-
 esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
                                  audio_playout_tune_info_t *out) {
   if (!s_tx || !s_enabled || s_nominal_mclk_hz == 0U) {
@@ -517,9 +509,4 @@ esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
     out->actual_delta_mclk_hz = info.delta_mclk_hz;
   }
   return err;
-}
-
-uint32_t audio_playout_hardware_latency_us(void) {
-  return (uint32_t)(((uint64_t)I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM *
-                     1000000ULL) / I2S_RATE_HZ);
 }

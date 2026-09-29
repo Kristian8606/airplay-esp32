@@ -2,6 +2,7 @@
 
 #include "audio_receiver.h"
 #include "plist.h"
+#include "airplay_version.h"
 
 static bool bplist_has_room(size_t pos, size_t need, size_t capacity) {
   return pos <= capacity && need <= capacity - pos;
@@ -27,11 +28,21 @@ static bool bplist_write_length(uint8_t *out, size_t capacity, size_t *pos,
     out[(*pos)++] = marker_base | (uint8_t)length;
     return true;
   }
-  if (length > UINT8_MAX || !bplist_has_room(*pos, 3, capacity)) {
+  if (length <= UINT8_MAX) {
+    if (!bplist_has_room(*pos, 3, capacity)) {
+      return false;
+    }
+    out[(*pos)++] = marker_base | 0x0F;
+    out[(*pos)++] = 0x10;
+    out[(*pos)++] = (uint8_t)length;
+    return true;
+  }
+  if (length > UINT16_MAX || !bplist_has_room(*pos, 4, capacity)) {
     return false;
   }
   out[(*pos)++] = marker_base | 0x0F;
-  out[(*pos)++] = 0x10;
+  out[(*pos)++] = 0x11;
+  out[(*pos)++] = (uint8_t)(length >> 8);
   out[(*pos)++] = (uint8_t)length;
   return true;
 }
@@ -442,189 +453,189 @@ size_t bplist_build_feedback_response(uint8_t *out, size_t capacity,
   return pos;
 }
 
-size_t bplist_build_info_response(uint8_t *out, size_t capacity,
-                                  const char *device_id,
-                                  const char *device_name,
-                                  const uint8_t *public_key,
-                                  size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version) {
-  if (!out || !device_id || !device_name || !public_key ||
-      public_key_len == 0 || capacity < 512) {
-    return 0;
-  }
+/* Object indices shared by the /info body and the updateInfo event. */
+#define INFO_OBJ_TYPE_KEY 21 /* "type" */
+#define INFO_OBJ_COUNT 39    /* objects 0..38, 38 = info dict */
+#define INFO_MAX_OBJECTS (INFO_OBJ_COUNT + 5)
 
-  size_t pos = 0;
-  size_t offsets[39];
-  size_t obj = 0;
+/* Writes the /info objects starting at object 0. With txt != NULL the info
+ * dict also carries "txtAirPlay" (Shairport generateInfoPlist() +
+ * generateTxtDataValueInfo()). On success *info_dict is the index of the info
+ * dict. The caller writes the header before and the trailer after. */
+static bool bplist_write_info_objects(uint8_t *out, size_t capacity,
+                                      size_t *pos_io, size_t *offsets,
+                                      size_t *obj_io, const char *device_id,
+                                      const char *device_name, const char *model,
+                                      const uint8_t *public_key,
+                                      size_t public_key_len, uint64_t features,
+                                      int64_t protocol_version,
+                                      const uint8_t *txt, size_t txt_len,
+                                      size_t *info_dict) {
+  size_t pos = *pos_io;
+  size_t obj = *obj_io;
 
-#define ADD_OFFSET()                                   \
-  do {                                                 \
-    if (obj >= sizeof(offsets) / sizeof(offsets[0])) { \
-      return 0;                                        \
-    }                                                  \
-    offsets[obj++] = pos;                              \
+#define ADD_OFFSET()                    \
+  do {                                  \
+    if (obj >= INFO_MAX_OBJECTS) {      \
+      return false;                     \
+    }                                   \
+    offsets[obj++] = pos;               \
   } while (0)
-
-  if (!bplist_has_room(pos, 8, capacity)) {
-    return 0;
-  }
-  memcpy(out + pos, "bplist00", 8);
-  pos += 8;
 
   ADD_OFFSET(); // 0: "deviceid"
   if (!bplist_write_ascii_string(out, capacity, &pos, "deviceid")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 1: device id
   if (!bplist_write_ascii_string(out, capacity, &pos, device_id)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 2: "features"
   if (!bplist_write_ascii_string(out, capacity, &pos, "features")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 3: features
   if (!bplist_write_int(out, capacity, &pos, features)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 4: "model"
   if (!bplist_write_ascii_string(out, capacity, &pos, "model")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 5: model
-  if (!bplist_write_ascii_string(out, capacity, &pos, "AudioAccessory6,1")) {
-    return 0;
+  if (!bplist_write_ascii_string(out, capacity, &pos, model)) {
+    return false;
   }
   ADD_OFFSET(); // 6: "protovers"
   if (!bplist_write_ascii_string(out, capacity, &pos, "protovers")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 7: protocol version string
   if (!bplist_write_ascii_string(out, capacity, &pos, "1.1")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 8: "srcvers"
   if (!bplist_write_ascii_string(out, capacity, &pos, "srcvers")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 9: source version string
-  if (!bplist_write_ascii_string(out, capacity, &pos, "377.40.00")) {
-    return 0;
+  if (!bplist_write_ascii_string(out, capacity, &pos, AIRPLAY_SOURCE_VERSION)) {
+    return false;
   }
   ADD_OFFSET(); // 10: "vv"
   if (!bplist_write_ascii_string(out, capacity, &pos, "vv")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 11: vv value
   if (!bplist_write_int(out, capacity, &pos, (uint64_t)protocol_version)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 12: "statusFlags"
   if (!bplist_write_ascii_string(out, capacity, &pos, "statusFlags")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 13: statusFlags value
   if (!bplist_write_int(out, capacity, &pos, 4)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 14: "pk"
   if (!bplist_write_ascii_string(out, capacity, &pos, "pk")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 15: public key
   if (!bplist_write_data(out, capacity, &pos, public_key, public_key_len)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 16: "pi"
   if (!bplist_write_ascii_string(out, capacity, &pos, "pi")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 17: pairing identifier
   if (!bplist_write_ascii_string(out, capacity, &pos,
                                  "00000000-0000-0000-0000-000000000000")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 18: "name"
   if (!bplist_write_ascii_string(out, capacity, &pos, "name")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 19: device name
   if (!bplist_write_ascii_string(out, capacity, &pos, device_name)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 20: "audioFormats"
   if (!bplist_write_ascii_string(out, capacity, &pos, "audioFormats")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 21: "type"
   if (!bplist_write_ascii_string(out, capacity, &pos, "type")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 22: "audioInputFormats"
   if (!bplist_write_ascii_string(out, capacity, &pos, "audioInputFormats")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 23: "audioOutputFormats"
   if (!bplist_write_ascii_string(out, capacity, &pos, "audioOutputFormats")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 24: stream type 96
   if (!bplist_write_int(out, capacity, &pos, 96)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 25: format mask
   if (!bplist_write_int(out, capacity, &pos, 0x01000000)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 26: audio format dict
   {
     const uint8_t keys[] = {21, 22, 23};
     const uint8_t values[] = {24, 25, 25};
     if (!bplist_write_dict(out, capacity, &pos, keys, values, 3)) {
-      return 0;
+      return false;
     }
   }
   ADD_OFFSET(); // 27: audioFormats array
   {
     const uint8_t refs[] = {26};
     if (!bplist_write_array(out, capacity, &pos, refs, 1)) {
-      return 0;
+      return false;
     }
   }
   ADD_OFFSET(); // 28: "audioLatencies"
   if (!bplist_write_ascii_string(out, capacity, &pos, "audioLatencies")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 29: "audioType"
   if (!bplist_write_ascii_string(out, capacity, &pos, "audioType")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 30: "inputLatencyMicros"
   if (!bplist_write_ascii_string(out, capacity, &pos, "inputLatencyMicros")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 31: "outputLatencyMicros"
   if (!bplist_write_ascii_string(out, capacity, &pos, "outputLatencyMicros")) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 32: stream type 103
   if (!bplist_write_int(out, capacity, &pos, 103)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 33: audio type
   if (!bplist_write_int(out, capacity, &pos, 0x64)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 34: zero latency
   if (!bplist_write_int(out, capacity, &pos, 0)) {
-    return 0;
+    return false;
   }
   ADD_OFFSET(); // 35: latency dict for realtime stream
   {
     const uint8_t keys[] = {21, 29, 30, 31};
     const uint8_t values[] = {24, 33, 34, 34};
     if (!bplist_write_dict(out, capacity, &pos, keys, values, 4)) {
-      return 0;
+      return false;
     }
   }
   ADD_OFFSET(); // 36: latency dict for buffered stream
@@ -632,31 +643,130 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     const uint8_t keys[] = {21, 29, 30, 31};
     const uint8_t values[] = {32, 33, 34, 34};
     if (!bplist_write_dict(out, capacity, &pos, keys, values, 4)) {
-      return 0;
+      return false;
     }
   }
   ADD_OFFSET(); // 37: audioLatencies array
   {
     const uint8_t refs[] = {35, 36};
     if (!bplist_write_array(out, capacity, &pos, refs, 2)) {
-      return 0;
+      return false;
     }
   }
   ADD_OFFSET(); // 38: top-level info dict
   {
-    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28};
-    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 12)) {
-      return 0;
+    uint8_t keys[13] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 0};
+    uint8_t values[13] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 0};
+    size_t count = 12;
+    if (txt) {
+      /* Objects 39/40 are written after the dict; references may point
+       * forward in a bplist. */
+      keys[count] = INFO_OBJ_COUNT;
+      values[count] = INFO_OBJ_COUNT + 1;
+      count++;
+    }
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, count)) {
+      return false;
+    }
+  }
+  if (txt) {
+    ADD_OFFSET(); // 39: "txtAirPlay"
+    if (!bplist_write_ascii_string(out, capacity, &pos, "txtAirPlay")) {
+      return false;
+    }
+    ADD_OFFSET(); // 40: TXT record data (length-prefixed "key=value" strings)
+    if (!bplist_write_data(out, capacity, &pos, txt, txt_len)) {
+      return false;
     }
   }
 
 #undef ADD_OFFSET
 
-  if (obj != sizeof(offsets) / sizeof(offsets[0]) ||
-      !bplist_finish(out, capacity, &pos, offsets, obj, 38)) {
+  *pos_io = pos;
+  *obj_io = obj;
+  *info_dict = INFO_OBJ_COUNT - 1;
+  return true;
+}
+
+size_t bplist_build_info_response(uint8_t *out, size_t capacity,
+                                  const char *device_id,
+                                  const char *device_name, const char *model,
+                                  const uint8_t *public_key,
+                                  size_t public_key_len, uint64_t features,
+                                  int64_t protocol_version) {
+  if (!out || !device_id || !device_name || !model || !public_key ||
+      public_key_len == 0 || capacity < 512) {
     return 0;
   }
+  size_t pos = 0;
+  size_t offsets[INFO_MAX_OBJECTS];
+  size_t obj = 0;
+  size_t info_dict = 0;
+  if (!bplist_has_room(pos, 8, capacity)) {
+    return 0;
+  }
+  memcpy(out + pos, "bplist00", 8);
+  pos += 8;
+  if (!bplist_write_info_objects(out, capacity, &pos, offsets, &obj, device_id,
+                                 device_name, model, public_key, public_key_len,
+                                 features, protocol_version, NULL, 0,
+                                 &info_dict) ||
+      obj != INFO_OBJ_COUNT ||
+      !bplist_finish(out, capacity, &pos, offsets, obj, info_dict)) {
+    return 0;
+  }
+  return pos;
+}
 
+size_t bplist_build_update_info(uint8_t *out, size_t capacity,
+                                const char *device_id, const char *device_name,
+                                const char *model, const uint8_t *public_key,
+                                size_t public_key_len, uint64_t features,
+                                int64_t protocol_version, const uint8_t *txt,
+                                size_t txt_len) {
+  if (!out || !device_id || !device_name || !model || !public_key ||
+      public_key_len == 0 || !txt || txt_len == 0 || capacity < 1024) {
+    return 0;
+  }
+  size_t pos = 0;
+  size_t offsets[INFO_MAX_OBJECTS];
+  size_t obj = 0;
+  size_t info_dict = 0;
+  if (!bplist_has_room(pos, 8, capacity)) {
+    return 0;
+  }
+  memcpy(out + pos, "bplist00", 8);
+  pos += 8;
+  if (!bplist_write_info_objects(out, capacity, &pos, offsets, &obj, device_id,
+                                 device_name, model, public_key, public_key_len,
+                                 features, protocol_version, txt, txt_len,
+                                 &info_dict) ||
+      obj != INFO_OBJ_COUNT + 2) {
+    return 0;
+  }
+  /* { "type": "updateInfo", "value": <info dict> } - Shairport
+   * ap2_event_send_update_info(). "type" reuses the /info key object. */
+  const size_t type_value = obj;
+  offsets[obj++] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "updateInfo")) {
+    return 0;
+  }
+  const size_t value_key = obj;
+  offsets[obj++] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "value")) {
+    return 0;
+  }
+  const size_t top = obj;
+  offsets[obj++] = pos;
+  {
+    const uint8_t keys[] = {INFO_OBJ_TYPE_KEY, (uint8_t)value_key};
+    const uint8_t values[] = {(uint8_t)type_value, (uint8_t)info_dict};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 2)) {
+      return 0;
+    }
+  }
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) {
+    return 0;
+  }
   return pos;
 }

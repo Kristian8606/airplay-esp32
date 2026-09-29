@@ -639,9 +639,7 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
 
     const uint32_t frame1 = read_be32(buf + 4);
     const uint64_t network_time_ns = read_be64(buf + 8);
-    const uint32_t frame2 = read_be32(buf + 16);
     const uint64_t clock_id = read_be64(buf + 20);
-    const uint32_t delta_frames = frame2 - frame1;
 
     s_rt.last_d7_frame1 = frame1;
     s_rt.last_d7_raw_ptp_ns = network_time_ns;
@@ -651,28 +649,6 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
     ptp_clock_note_realtime_d7(clock_id);
     service_d7_anchor();
 
-    if (s_rt.d7_packets == 1U) {
-      const int sr = s_rt.cfg.format.sample_rate > 0
-                         ? s_rt.cfg.format.sample_rate
-                         : 44100;
-      const double delta_ms = (double)delta_frames * 1000.0 / (double)sr;
-      ptp_realtime_snapshot_t ps = {0};
-      ptp_clock_get_realtime_snapshot(&ps);
-      uint64_t local_ns = 0;
-      (void)ptp_clock_realtime_snapshot_to_local(&ps, clock_id,
-                                                  network_time_ns, &local_ns);
-      ESP_LOGI(TAG,
-               "AP2 D7 n=%" PRIu32 " frame1=%" PRIu32
-               " frame2=%" PRIu32 " delta=%" PRIu32 "(%.2fms)"
-               " rawPTP=%" PRIu64 " clock=%016" PRIx64
-               " gm=%016" PRIx64 " src=%016" PRIx64
-               " ready=%d age=%lums samples=%lu local=%" PRIu64,
-               s_rt.d7_packets, frame1, frame2, delta_frames, delta_ms,
-               network_time_ns, clock_id, ps.master_clock_id,
-               ps.source_clock_id, ps.master_ready ? 1 : 0,
-               (unsigned long)ps.mastership_age_ms,
-               (unsigned long)ps.sample_count, local_ns);
-    }
     goto done;
   }
 
@@ -879,8 +855,8 @@ static void resend_task(void *arg) {
      * RT_RESEND_SCAN_MS. A MISSING event wakes this task immediately. */
     if (s_rt.active_missing_count == 0U) continue;
 
-    /* D7 state and continuous sender-anchor refreshes are owned by CTRL_RX. Keeping
-     * a single owner removes the former CTRL_RX/RESEND double-commit race. */
+    /* D7 state and sender-anchor refreshes are owned solely by CTRL_RX;
+     * RESEND only ages, requests and expires holes. */
     resend_giveup_expired();
     if (s_rt.active_missing_count != 0U) {
       resend_scan_due();
@@ -933,8 +909,8 @@ esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
 esp_err_t realtime_receiver_clear_packet_workspace(void) {
   if (rt_running() || !all_tasks_stopped()) return ESP_ERR_INVALID_STATE;
 
-  /* Only detach caller-owned storage. If a future configuration lets the
-   * receiver allocate these pools itself, their ownership remains here. */
+  /* Only detach caller-owned storage. Pools allocated by
+   * ensure_transport_resources() (no workspace bound) stay owned here. */
   if (s_rt.packet_workspace_external) {
     s_rt.data_pool = NULL;
     s_rt.rtx_pool = NULL;

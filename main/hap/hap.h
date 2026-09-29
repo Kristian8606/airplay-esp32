@@ -7,7 +7,7 @@
 
 /**
  * HAP (HomeKit Accessory Protocol) implementation for AirPlay 2
- * Handles pair-verify for transient pairing
+ * Handles pair-setup and pair-verify
  */
 
 // Key sizes
@@ -15,8 +15,6 @@
 #define HAP_ED25519_SECRET_KEY_SIZE 64
 #define HAP_X25519_KEY_SIZE         32
 #define HAP_CHACHA20_KEY_SIZE       32
-#define HAP_CHACHA20_NONCE_SIZE     12
-#define HAP_POLY1305_TAG_SIZE       16
 
 // Forward declaration
 struct srp_session;
@@ -44,6 +42,13 @@ typedef struct {
   // Encryption nonces (counters)
   uint64_t encrypt_nonce;
   uint64_t decrypt_nonce;
+
+  // AirPlay 2 event channel keys (HKDF "Events-Salt"), derived together with
+  // the control channel keys. The event channel has its own nonce counters,
+  // owned by whoever talks on that channel.
+  uint8_t event_encrypt_key[HAP_CHACHA20_KEY_SIZE];
+  uint8_t event_decrypt_key[HAP_CHACHA20_KEY_SIZE];
+  bool event_keys_valid;
 
   // Session state
   int pair_verify_state;
@@ -120,34 +125,20 @@ esp_err_t hap_pair_verify_m3_raw(hap_session_t *session, const uint8_t *input,
                                  size_t output_capacity, size_t *output_len);
 
 /**
- * Encrypt data using session keys
- * @param session HAP session (must be established)
- * @param plaintext Input data
- * @param plaintext_len Length of input
- * @param ciphertext Output buffer (must have room for plaintext_len + 16 tag)
- * @param ciphertext_len Actual output length
- * @return ESP_OK on success
+ * Derive the AirPlay 2 event channel keys from the same input keying material
+ * as the control channel. control_encrypt_is_read must say which control key
+ * this session encrypts with: true when encrypt_key is the
+ * "Control-Read-Encryption-Key" (accessory role, Shairport cipher channel 3).
+ * The event channel is then keyed like Shairport cipher channel 4: encrypt
+ * with "Events-Write-Encryption-Key", decrypt with "Events-Read-Encryption-Key"
+ * (and the other way round for the opposite control orientation).
  */
-esp_err_t hap_encrypt(hap_session_t *session, const uint8_t *plaintext,
-                      size_t plaintext_len, uint8_t *ciphertext,
-                      size_t *ciphertext_len);
+void hap_derive_event_keys(hap_session_t *session, const uint8_t *ikm,
+                           size_t ikm_len, bool control_encrypt_is_read);
 
 /**
- * Decrypt data using session keys
- * @param session HAP session (must be established)
- * @param ciphertext Input data (includes 16 byte tag)
- * @param ciphertext_len Length of input
- * @param plaintext Output buffer
- * @param plaintext_len Actual output length
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if auth fails
- */
-esp_err_t hap_decrypt(hap_session_t *session, const uint8_t *ciphertext,
-                      size_t ciphertext_len, uint8_t *plaintext,
-                      size_t *plaintext_len);
-
-/**
- * Derive audio encryption key from pair-verify shared secret
- * Uses HKDF-SHA512 with AirPlay 2 audio-specific parameters
+ * Derive audio encryption key from the session shared secret
+ * Uses HKDF-SHA512 with "Control-Salt" / "Control-Read-Encryption-Key"
  * @param session HAP session (must be established)
  * @param audio_key Output buffer for audio key
  * @param key_len Length of audio key to generate (typically 16 or 32 bytes)

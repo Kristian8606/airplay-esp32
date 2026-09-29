@@ -9,7 +9,6 @@
 #include "esp_log.h"
 
 #define ADTS_HEADER_LEN AAC_DECODER_INPUT_HEADROOM
-#define AAC_INPUT_MAX   8192U
 
 struct aac_decoder {
   aac_decoder_config_t config;
@@ -110,7 +109,7 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
   const uint8_t *decode_data = input;
   size_t decode_len = input_len;
   if (!has_adts(input, input_len)) {
-    if (input_len > AAC_INPUT_MAX || input_len > 8191U - ADTS_HEADER_LEN) {
+    if (input_len > 8191U - ADTS_HEADER_LEN) {
       return -1;
     }
     make_adts(input - ADTS_HEADER_LEN, input_len, d->config.sample_rate,

@@ -35,6 +35,7 @@
 #include "amp_control.h"
 
 #define AP2_PACKET_MAX             8192U
+#define AP2_RTP_HEADER_BYTES         12U /* seq/marker, timestamp, SSRC */
 #define AP2_RX_STACK               4096U
 #define AP2_PROCESS_STACK          6144U
 #define AP2_PLAYOUT_STACK          4096U
@@ -43,12 +44,12 @@
 #define AP2_NETWORK_CORE           1
 #define AP2_DECODE_CORE            1
 #define AP2_BUFFERED_PROCESSOR_CORE 0
-#define AP2_RX_PRIORITY            4  /* raw TCP reader; active RTSP control at prio 17 preempts it */
+#define AP2_RX_PRIORITY            4  /* raw TCP reader (core 1, beside playout at 8) */
 #define AP2_DECODE_PRIORITY        4  /* active RTSP control at prio 17 preempts AAC decode */
 #define AP2_NO_TIMING_WAIT_MS      20U /* Shairport: wait ~20 ms without valid timing */
 #define AP2_MAX_DEFERRED_FLUSH      10U /* Shairport MAX_DEFERRED_FLUSH_REQUESTS */
 
-/* v4.1.25: payload format announced in the RTP SSRC, as Shairport Sync reads
+/* Payload format announced in the RTP SSRC, as Shairport Sync reads
  * it (ap2_buffered_audio_processor.c / player.h). We can only play AAC-LC
  * 44100 stereo; the others are skipped with a clear message instead of being
  * fed to the decoder as noise. Unknown SSRC values are consumed without
@@ -106,24 +107,17 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 #define AP2_STATUS_PRIORITY          1
 #define AP2_STATUS_CORE              0
 #define AP2_STATUS_PERIOD_MS      2000U
-/* v4.1.14 buffered timing watchdog: anchor + play but the PTP mapping never
- * qualifies. Normal lock takes < 1 s; give it 5 s, then log why and restart
- * the PTP estimator. At most AP2_TIMING_WD_MAX_RESETS per anchor timeline. */
-/* Buffered start gate (v4.1.16).
- * v4.1.15 started at Shairport's 400 ms mastership without our lock. On the
- * board that produced a -10 ms start error: the nqptp-style filter
- * (ptp_clock_engine.c) still jumps to better samples during its first
- * PTP_ENGINE_STARTUP_NS = 1 s, and our fine correction (APLL servo) is too slow
- * to absorb such a step (Shairport absorbs it by frame stuffing). The PID then
- * wound up to +160 ppm and needed minutes to settle.
- * Now the FIRST mapping of an anchor needs the lock AND >= 1 s mastership, so
- * the filter's startup jumps happen before audio starts. Later anchors (skip,
- * pause, next track) are far past 1 s and start as fast as before.
- * Refreshes while playing: lock + 400 ms, as in v4.1.14. */
+/* Buffered start gate. The FIRST mapping of an anchor needs the PTP lock AND
+ * >= 1 s mastership: the nqptp-style filter (ptp_clock_engine.c) can still
+ * jump to better samples during its first PTP_ENGINE_STARTUP_NS = 1 s, and our
+ * fine correction (APLL servo) is too slow to absorb such a step (Shairport
+ * absorbs it by frame stuffing); starting at Shairport's 400 ms gave a ~-10 ms
+ * start error and PID wind-up. Later anchors (skip, pause, next track) are far
+ * past 1 s and start immediately. Refreshes while playing need lock + 400 ms. */
 #define AP2_PTP_START_MASTERSHIP_MS 1000U
 #define AP2_PTP_MASTERSHIP_MIN_MS   400U
 #define AP2_PTP_SAMPLE_MAX_AGE_MS  5000U
-/* v4.1.15 hard resync, Shairport "resync_threshold" semantics: if the output
+/* Hard resync, Shairport "resync_threshold" semantics: if the output
  * is out of sync by more than this for AP2_RESYNC_HOLD_US, stop and re-prime
  * at the exact presentation point (brief silence), keeping the learned I2S
  * clock correction. Shairport uses 50 ms, but it also corrects small errors
@@ -132,6 +126,9 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 #define AP2_RESYNC_THRESHOLD_US      20000
 #define AP2_RESYNC_HOLD_US         1500000LL
 #define AP2_RESYNC_MIN_INTERVAL_US 5000000LL
+/* Buffered timing watchdog: anchor + play but the PTP mapping never
+ * qualifies. Normal lock takes < 1 s; give it 5 s, then log why and restart
+ * the PTP estimator. At most AP2_TIMING_WD_MAX_RESETS per anchor timeline. */
 #define AP2_TIMING_WD_TIMEOUT_MS  5000U
 #define AP2_TIMING_WD_RETRY_MS    6000U
 #define AP2_TIMING_WD_MAX_RESETS     3U
@@ -162,41 +159,39 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
  * P reacts to phase error, I learns the steady crystal/rate bias, D damps
  * motion through zero.  The derivative is low-pass filtered because the PTP
  * timestamp itself has some jitter.  PID is evaluated more often than the
- * physical tune operation so control knowledge can evolve without repeatedly
- * disable/tune/enable cycling I2S. */
+ * physical tune operation so control knowledge can evolve without retuning
+ * the I2S MCLK on every calculation. */
 #define AP2_PID_KP_PPM_PER_MS          22.0
 #define AP2_PID_KI_PPM_PER_MS_S         0.55
 #define AP2_PID_KD_PPM_PER_MS_PER_S    55.0
 #define AP2_PID_D_ALPHA                  0.20
 #define AP2_PID_I_TERM_LIMIT_PPM       110.0
 
-/* v4.1.17 slow centring inside the +/-1 ms good zone (multiroom accuracy).
- * The PID holds the clock inside the zone, so sync used to park near +/-1 ms
- * and the crystal error was never learned precisely. Every window the
+/* Slow centring inside the +/-1 ms good zone (multiroom accuracy).
+ * The PID stops acting inside the zone, so without this sync would park near
+ * +/-1 ms and the crystal error would never be learned precisely. Every window the
  * centring loop measures the real phase slope and steers the frequency so
  * that sync approaches 0 at <= AP2_CENTER_MAX_SLOPE_US_S and then stays flat.
  * 1 ppm of I2S rate change = 1 us/s of sync slope. */
 #define AP2_CENTER_WINDOW_US         15000000LL /* slope measurement window */
 #define AP2_CENTER_QUIET_US               200    /* |sync| below: aim for 0 slope */
-#define AP2_CENTER_TIME_S                20.0   /* approach time constant (v4.1.19: was 60) */
-#define AP2_CENTER_MAX_SLOPE_US_S        40.0   /* max wanted approach speed (v4.1.19: was 10) */
+#define AP2_CENTER_TIME_S                20.0   /* approach time constant */
+#define AP2_CENTER_MAX_SLOPE_US_S        40.0   /* max wanted approach speed */
 #define AP2_CENTER_MAX_STEP_PPM            40    /* max frequency step per window */
-/* v4.1.18 hysteresis: centring mode is entered inside +/-1 ms and is kept
- * through brief excursions. It hands back to the PID only when |sync| stays
- * above 1.5 ms for 3 s, or immediately above 3 ms. The old code dropped out on
- * any momentary D-estimate spike, so a 15 s window never completed. */
+/* Hysteresis: centring mode is entered inside +/-1 ms and is kept through
+ * brief excursions, so a momentary D-estimate spike does not abort the 15 s
+ * window. It hands back to the PID only when |sync| stays above 1.5 ms for
+ * 3 s, or immediately above 3 ms. */
 #define AP2_CENTER_EXIT_US               1500
 #define AP2_CENTER_EXIT_HOLD_US       3000000LL
 #define AP2_CENTER_EXIT_HARD_US          3000
-/* v4.1.19: a PTP filter step moves sync by >1 ms between two 1 s samples,
- * while real drift is < 0.1 ms/s. A window that contains such a jump gave a
- * false slope (-83 us/s in the board log). The jump is now subtracted from the
- * following samples of the window, so the slope stays the true drift and the
- * end-of-window phase still includes the step. */
+/* A PTP filter step moves sync by >1 ms between two 1 s samples, while real
+ * drift is < 0.1 ms/s; left in, it gives a false slope. Such a jump is
+ * subtracted from the following samples of the window, so the slope stays the
+ * true drift and the end-of-window phase still includes the step. */
 #define AP2_CENTER_JUMP_US                400
-/* Fraction of the computed correction applied per window. 0.5 was tried in
- * simulation for v4.1.19 and made phase recovery slower without reducing
- * retunes, so the full step is kept. */
+/* Fraction of the computed correction applied per window. A gain of 0.5
+ * made phase recovery slower in simulation without reducing retunes. */
 #define AP2_CENTER_GAIN                   1.0
 /* Shairport Sync 5.5.2: audio_decoded_buffer_desired_length defaults to
  * 0.75 s; buffered blocks are decoded only inside target + 0.1 s. */
@@ -243,8 +238,8 @@ typedef struct {
   uint32_t generation;
   bool valid;
 
-  /* Passive Shairport-style robust phase observation. It is never fed into
-   * PID, cursor movement or playout decisions in this version. */
+  /* Passive Shairport-style robust phase observation, shown only in the
+   * status line; never fed into PID, cursor movement or playout decisions. */
   int32_t phase_samples[AP2_PHASE_HISTORY_SAMPLES];
   uint8_t phase_count;
   uint8_t phase_index;
@@ -362,35 +357,45 @@ typedef struct {
 typedef struct {
   SemaphoreHandle_t mutex;
   bool immediate_active;
+  /* ESP deviation from Shairport: immediate FLUSH without a usable
+   * flushUntilSeq (0 / missing). Shairport compares seq 0 modulo 2^23 and,
+   * when the session's sequence numbers are in the upper half (> 2^22),
+   * discards everything until the sequence wraps - minutes to hours of
+   * silence. Here the endpoint is found by timestamp instead; see
+   * buffered_control_classify(). */
+  bool immediate_by_ts;
   uint32_t immediate_until_seq;
   uint32_t immediate_until_rtp;
-
-  /* Apple occasionally sends an immediate FLUSHBUFFERED with an explicit
-   * flushUntilSeq == 0 while switching to a new RTP timeline. Zero is not a
-   * usable 23-bit endpoint for Shairport-style sequence arithmetic: treating
-   * it literally can complete the flush immediately and leave a stale packet
-   * held forever against the next anchor. For that case only, stop the media
-   * consumer until the next anchor is committed, then drain packets that are
-   * still closer to the old flush RTP than to the new anchor RTP. */
-  bool zero_seq_wait_anchor;
-  bool zero_seq_resync_active;
-  uint32_t zero_seq_old_until_rtp;
-  uint32_t zero_seq_anchor_rtp;
-  uint32_t zero_seq_dropped;
-
   buffered_deferred_flush_t deferred[AP2_MAX_DEFERRED_FLUSH];
 } buffered_control_t;
+
+typedef enum {
+  FLUSH_END_SEQ = 0,       /* untilSeq reached / overshot (Shairport) */
+  FLUSH_END_TS_MARKER = 1, /* untilSeq=0: block whose RTP == flushUntilTS */
+  FLUSH_END_TS_TIMELINE = 2, /* untilSeq=0: first block on the new anchor */
+} flush_end_kind_t;
 
 typedef struct {
   bool drop;
   bool immediate_completed;
   bool immediate_overshoot;
+  flush_end_kind_t immediate_end;
   uint32_t immediate_target_seq;
+  uint32_t immediate_target_rtp;
 } buffered_packet_decision_t;
+
+/* Position of a block relative to the new anchor, computed by the processor
+ * only while a timestamp-mode FLUSH is armed. */
+typedef struct {
+  bool valid;
+  int32_t lead; /* block RTP - anchor RTP, in samples */
+} buffered_timeline_hint_t;
 
 typedef struct {
   bool immediate_active;
+  bool immediate_by_ts;
   uint32_t immediate_target_seq;
+  uint32_t immediate_target_rtp;
   uint32_t deferred_requests;
 } buffered_control_snapshot_t;
 
@@ -411,15 +416,18 @@ static void buffered_control_reset(void) {
   if (!s_buffered_control.mutex) return;
   xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
   s_buffered_control.immediate_active = false;
+  s_buffered_control.immediate_by_ts = false;
   s_buffered_control.immediate_until_seq = 0;
   s_buffered_control.immediate_until_rtp = 0;
-  s_buffered_control.zero_seq_wait_anchor = false;
-  s_buffered_control.zero_seq_resync_active = false;
-  s_buffered_control.zero_seq_old_until_rtp = 0;
-  s_buffered_control.zero_seq_anchor_rtp = 0;
-  s_buffered_control.zero_seq_dropped = 0;
   memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
   xSemaphoreGive(s_buffered_control.mutex);
+}
+
+/* Lock-free hint for the processor: is a timestamp-mode FLUSH armed? Only
+ * decides whether the timeline hint is worth computing; the decision itself
+ * is taken under the mutex in buffered_control_classify(). */
+static inline bool buffered_control_ts_flush_armed(void) {
+  return __atomic_load_n(&s_buffered_control.immediate_by_ts, __ATOMIC_ACQUIRE);
 }
 
 static void buffered_control_snapshot(buffered_control_snapshot_t *out) {
@@ -428,91 +436,12 @@ static void buffered_control_snapshot(buffered_control_snapshot_t *out) {
   if (!s_buffered_control.mutex) return;
   xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
   out->immediate_active = s_buffered_control.immediate_active;
+  out->immediate_by_ts = s_buffered_control.immediate_by_ts;
   out->immediate_target_seq = s_buffered_control.immediate_until_seq;
+  out->immediate_target_rtp = s_buffered_control.immediate_until_rtp;
   for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i)
     if (s_buffered_control.deferred[i].in_use) out->deferred_requests++;
   xSemaphoreGive(s_buffered_control.mutex);
-}
-
-static inline uint32_t abs_rtp_delta(uint32_t a, uint32_t b) {
-  /* RTP timestamps use modulo-2^32 arithmetic. Interpreting the subtraction
-   * as signed gives the shortest directed distance around that ring. */
-  const int32_t d = (int32_t)(a - b);
-  return d < 0 ? (uint32_t)(-(int64_t)d) : (uint32_t)d;
-}
-
-static void buffered_control_anchor_committed(uint32_t anchor_rtp) {
-  if (!s_buffered_control.mutex) return;
-
-  bool armed = false;
-  uint32_t old_until_rtp = 0;
-  xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
-  if (s_buffered_control.zero_seq_wait_anchor) {
-    s_buffered_control.zero_seq_wait_anchor = false;
-    s_buffered_control.zero_seq_resync_active = true;
-    s_buffered_control.zero_seq_anchor_rtp = anchor_rtp;
-    s_buffered_control.zero_seq_dropped = 0;
-    old_until_rtp = s_buffered_control.zero_seq_old_until_rtp;
-    armed = true;
-  }
-  xSemaphoreGive(s_buffered_control.mutex);
-
-  if (armed) {
-    ESP_LOGI(TAG,
-             "AAC zero-seq resync armed: oldUntilTS=%" PRIu32
-             " newAnchorRTP=%" PRIu32,
-             old_until_rtp, anchor_rtp);
-  }
-}
-
-static bool buffered_control_zero_seq_classify(const buffered_packet_t *packet) {
-  if (!packet || !s_buffered_control.mutex) return false;
-
-  bool drop = false;
-  bool completed = false;
-  uint32_t old_until_rtp = 0;
-  uint32_t anchor_rtp = 0;
-  uint32_t old_dist = 0;
-  uint32_t new_dist = 0;
-  uint32_t dropped = 0;
-
-  xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
-  if (s_buffered_control.zero_seq_resync_active) {
-    old_until_rtp = s_buffered_control.zero_seq_old_until_rtp;
-    anchor_rtp = s_buffered_control.zero_seq_anchor_rtp;
-    old_dist = abs_rtp_delta(packet->rtp, old_until_rtp);
-    new_dist = abs_rtp_delta(packet->rtp, anchor_rtp);
-
-    if (old_dist < new_dist) {
-      drop = true;
-      dropped = ++s_buffered_control.zero_seq_dropped;
-    } else {
-      completed = true;
-      dropped = s_buffered_control.zero_seq_dropped;
-      s_buffered_control.zero_seq_resync_active = false;
-    }
-  }
-  xSemaphoreGive(s_buffered_control.mutex);
-
-  if (drop) {
-    if (dropped <= 3U || (dropped & 0xFFU) == 0U) {
-      ESP_LOGI(TAG,
-               "AAC zero-seq resync DROP seq=%" PRIu32 " rtp=%" PRIu32
-               " oldDist=%" PRIu32 " newDist=%" PRIu32
-               " dropped=%" PRIu32,
-               packet->seq, packet->rtp, old_dist, new_dist, dropped);
-    }
-    return true;
-  }
-
-  if (completed) {
-    ESP_LOGI(TAG,
-             "AAC zero-seq resync complete at seq=%" PRIu32
-             " rtp=%" PRIu32 " oldDist=%" PRIu32
-             " newDist=%" PRIu32 " dropped=%" PRIu32,
-             packet->seq, packet->rtp, old_dist, new_dist, dropped);
-  }
-  return false;
 }
 
 static bool buffered_control_must_drain(void) {
@@ -562,7 +491,18 @@ static esp_err_t buffered_control_add_deferred(uint32_t from_seq, uint32_t from_
   return ESP_OK;
 }
 
+/* Window, relative to the new anchor's RTP, in which the first block of the
+ * sender's new timeline is expected after a seek: the new content starts at
+ * (or just around) the anchor. Blocks outside it belong to the old timeline
+ * (every seek re-bases the sender's RTP clock) and are discarded. Measured
+ * against the anchor, not against the clock, so it does not matter how far in
+ * the future the sender placed the anchor or how fast the blocks arrive
+ * (observed: first new block 1.7 s after the anchor RTP). */
+#define AP2_TS_FLUSH_BEFORE_ANCHOR_SAMPLES (10 * 44100)
+#define AP2_TS_FLUSH_AFTER_ANCHOR_SAMPLES (10 * 44100)
+
 static void buffered_control_classify(const buffered_packet_t *packet,
+                                      const buffered_timeline_hint_t *hint,
                                       buffered_packet_decision_t *decision) {
   if (!decision) return;
   memset(decision, 0, sizeof(*decision));
@@ -586,14 +526,44 @@ static void buffered_control_classify(const buffered_packet_t *packet,
    * request and keeps the overshooting block. Completion cancels all deferred
    * requests. There is deliberately no RTP rescue, plausibility window or
    * byte-FIFO shortcut. */
-  if (s_buffered_control.immediate_active) {
+  if (s_buffered_control.immediate_active && !s_buffered_control.immediate_by_ts) {
     const int32_t d = seq23_delta(packet->seq,
                                   s_buffered_control.immediate_until_seq);
     decision->immediate_target_seq = s_buffered_control.immediate_until_seq;
     if (d >= 0) {
       decision->immediate_completed = true;
       decision->immediate_overshoot = d > 0;
+      decision->immediate_end = FLUSH_END_SEQ;
       s_buffered_control.immediate_active = false;
+      memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
+    } else {
+      decision->drop = true;
+    }
+  } else if (s_buffered_control.immediate_active) {
+    /* untilSeq=0 (ESP deviation, see buffered_control_t). Observed on
+     * HomePod/Apple TV senders: flushUntilTS is exactly the RTP timestamp of
+     * the first block of the new content (that block also ends the pending
+     * deferred ranges). If that block never comes, the first block that fits
+     * the new anchor's timeline ends the flush. Sequence numbers are ignored,
+     * so the result does not depend on which half of the 2^23 space the
+     * session happens to use. */
+    decision->immediate_target_seq = 0;
+    decision->immediate_target_rtp = s_buffered_control.immediate_until_rtp;
+    bool end = false;
+    if (packet->rtp == s_buffered_control.immediate_until_rtp) {
+      end = true;
+      decision->immediate_end = FLUSH_END_TS_MARKER;
+    } else if (hint && hint->valid &&
+               hint->lead >= -(int32_t)AP2_TS_FLUSH_BEFORE_ANCHOR_SAMPLES &&
+               hint->lead <= (int32_t)AP2_TS_FLUSH_AFTER_ANCHOR_SAMPLES) {
+      end = true;
+      decision->immediate_end = FLUSH_END_TS_TIMELINE;
+    }
+    if (end) {
+      decision->immediate_completed = true;
+      s_buffered_control.immediate_active = false;
+      __atomic_store_n(&s_buffered_control.immediate_by_ts, false,
+                       __ATOMIC_RELEASE);
       memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
     } else {
       decision->drop = true;
@@ -671,7 +641,7 @@ static TickType_t realtime_stage_wait_ticks(int64_t wait_us) {
 
 /* Remove a GM handover compensation at 50 us/second. This is phase
  * convergence, not another hardware-rate controller. The initial handover
- * stays continuous; a real old-epoch error is no longer preserved forever. */
+ * stays continuous, and a real old-epoch error is not preserved forever. */
 static int64_t realtime_remaining_bias(int64_t bias_ns, int64_t start_us,
                                         int64_t now_us) {
   if (bias_ns == 0 || now_us <= start_us) return bias_ns;
@@ -741,7 +711,7 @@ static bool buffered_ptp_qualified(const ptp_clock_snapshot_t *ps,
          (initial ? AP2_PTP_START_MASTERSHIP_MS : AP2_PTP_MASTERSHIP_MIN_MS);
 }
 
-/* First-audio measurement (v4.1.15): anchor commit time per generation. */
+/* Anchor commit time per generation, for the PLAYOUT START first-audio log. */
 static volatile int64_t s_anchor_commit_us = 0;
 static volatile uint32_t s_anchor_commit_gen = 0;
 
@@ -997,7 +967,7 @@ static uint64_t presentation_now_ns(const timing_snapshot_t *snap) {
   return (uint64_t)esp_timer_get_time() * 1000ULL;
 }
 
-/* v4.1.21 output latency after the ESP (DAC/DSP/amp), in microseconds.
+/* Output latency after the ESP (DAC/DSP/amp), in microseconds.
  * Positive = the chain delays the sound, so the ESP must output that much
  * EARLIER. Applied here, the single point every presentation-time calculation
  * (start, cursor, sync measurement, realtime deadlines) goes through; the PTP
@@ -1082,9 +1052,9 @@ static int32_t robust_phase_center_us(const output_sync_state_t *sync) {
 }
 
 /* Buffered AAC timing watchdog, run from the low-priority status task.
- * Decoding is gated on anchor_local_valid, which needs a LOCKED PTP estimator
- * on the anchor's master for >= 400 ms. If that never happens the stream is
- * silent while the FIFO fills (first session after boot in v4.1.13 logs).
+ * Decoding is gated on anchor_local_valid, whose first mapping needs a LOCKED
+ * PTP estimator on the anchor's master for >= AP2_PTP_START_MASTERSHIP_MS.
+ * If that never happens the stream is silent while the FIFO fills.
  * Log the exact failing condition and reset the estimator. */
 static void buffered_timing_watchdog(const timing_snapshot_t *snap) {
   static uint32_t wd_generation = 0;
@@ -1144,7 +1114,7 @@ static void buffered_timing_watchdog(const timing_snapshot_t *snap) {
   wd_last_reset_us = now_us;
 }
 
-/* v4.1.18: the playout task never logs. It posts numbers into these
+/* The playout task never logs. It posts numbers into these
  * single-writer mailboxes (seqlock) and the low-priority audio_status_task
  * formats and prints them. A log line can block on UART/USB for milliseconds;
  * that must never happen on the task that feeds I2S. */
@@ -1202,7 +1172,7 @@ static bool pevt_take(int kind, uint32_t *last_count, int32_t v[5],
   return false; /* writer busy; pick it up on the next cycle */
 }
 
-/* Format and print what the playout task posted (v4.1.18). */
+/* Format and print what the playout task posted. */
 static void status_print_playout_events(void) {
   static uint32_t last[PEVT_COUNT];
   int32_t v[5];
@@ -1302,7 +1272,11 @@ static void audio_status_task(void *arg) {
       rx_prev_us = rx_now;
 
       char control_suffix[80] = "";
-      if (control.immediate_active) {
+      if (control.immediate_active && control.immediate_by_ts) {
+        snprintf(control_suffix, sizeof(control_suffix),
+                 " | flush=ts:%lu",
+                 (unsigned long)control.immediate_target_rtp);
+      } else if (control.immediate_active) {
         snprintf(control_suffix, sizeof(control_suffix),
                  " | flush=%lu",
                  (unsigned long)control.immediate_target_seq);
@@ -1460,7 +1434,7 @@ static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
   audio_eq_process(pcm, frames, channels, sample_rate);
 }
 
-/* The buffered AAC side now follows Shairport Sync's topology: the TCP task
+/* The buffered AAC side follows Shairport Sync's topology: the TCP task
  * owns only a raw byte FIFO, while this single consumer owns packet framing,
  * FLUSH decisions, timing, decrypt/decode and publication into the existing
  * RTP-addressed PCM ring. There is no compressed-media search or rebind. */
@@ -1518,7 +1492,7 @@ static pcm_store_result_t pcm_store_with_backpressure(
   return PCM_STORE_DROPPED;
 }
 
-/* Pure centring decision (host-tested). Returns the frequency step in ppm to
+/* Pure centring decision. Returns the frequency step in ppm to
  * add to the current I2S correction, or 0. `slope_us_s` is the measured sync
  * slope over the last window while the clock was NOT being retuned. */
 static int32_t servo_center_step(int32_t sync_us, double slope_us_s) {
@@ -1540,6 +1514,41 @@ static int32_t servo_center_step(int32_t sync_us, double slope_us_s) {
 }
 
 
+static void log_flush_completion(const buffered_packet_decision_t *decision,
+                                 const buffered_packet_t *packet) {
+  if (!decision->immediate_completed) return;
+  if (decision->immediate_end == FLUSH_END_TS_MARKER) {
+    ESP_LOGI(TAG, "AAC FLUSH complete at untilTS marker rtp=%" PRIu32
+                  " seq=%" PRIu32 " (untilSeq=0)",
+             packet->rtp, packet->seq);
+  } else if (decision->immediate_end == FLUSH_END_TS_TIMELINE) {
+    ESP_LOGI(TAG, "AAC FLUSH complete on new anchor timeline at seq=%" PRIu32
+                  " rtp=%" PRIu32 " (untilSeq=0, untilTS=%" PRIu32 " not seen)",
+             packet->seq, packet->rtp, decision->immediate_target_rtp);
+  } else {
+    ESP_LOGI(TAG, "AAC FLUSH complete target=%" PRIu32 " at seq=%" PRIu32 "%s",
+             decision->immediate_target_seq, packet->seq,
+             decision->immediate_overshoot ? " overshoot" : "");
+  }
+}
+
+/* Timeline hint for a timestamp-mode FLUSH (see buffered_control_classify).
+ * The immediate FLUSH invalidated the anchor, so any valid anchor here is the
+ * one the sender published after it. */
+static void buffered_timeline_hint(uint32_t rtp, buffered_timeline_hint_t *hint) {
+  hint->valid = false;
+  hint->lead = 0;
+  if (!buffered_control_ts_flush_armed()) return;
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  if (snap.stream_type != AUDIO_STREAM_BUFFERED || !snap.anchor_valid ||
+      snap.timeline_reset_pending) {
+    return;
+  }
+  hint->valid = true;
+  hint->lead = rtp_delta(rtp, snap.anchor_rtp);
+}
+
 static void ap2_buffered_processor_task(void *arg) {
   (void)arg;
   aac_decoder_t *decoder = NULL;
@@ -1554,6 +1563,7 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t expected_timestamp = 0;
 
   bool have_packet = false;
+  bool draining = false;
   bool play_enabled = false;
   bool very_early_signalled = false;
   int64_t early_hold_since_us = 0;
@@ -1598,23 +1608,30 @@ static void ap2_buffered_processor_task(void *arg) {
     }
     play_enabled = snap.playing;
 
-    /* The packet consumer reads while playing, or while an immediate FLUSH is
-     * active. This is the key Shairport behaviour that lets FLUSH drain the
-     * compressed stream even though play and the anchor were stopped by the
-     * FLUSHBUFFERED request. Without either condition, keep any current packet
-     * held and let TCP ingress/backpressure operate independently. */
+    /* The packet consumer reads while playing, or while an immediate or active
+     * deferred FLUSH has to drain. This is the key Shairport behaviour that
+     * lets FLUSH drain the compressed stream even though play and the anchor
+     * were stopped by the FLUSHBUFFERED request. Otherwise keep any current
+     * packet held and let TCP ingress/backpressure operate independently.
+     * `draining` caches "the previous block was dropped by FLUSH" so a long
+     * drain does not take the control mutex twice per block. */
     if (!have_packet) {
-      if (!play_enabled && !buffered_control_must_drain()) {
+      if (!play_enabled && !draining && !buffered_control_must_drain()) {
         ap2_buffered_fifo_wait(s.transport, AP2_NO_TIMING_WAIT_MS);
         continue;
       }
 
+      /* Read only the 12-byte RTP head first. FLUSH and SSRC decisions need
+       * nothing else, so a dropped block's body is consumed without being
+       * copied out of the PSRAM FIFO (seek/next-track drains of a large
+       * backlog do not memcpy every discarded block). */
       size_t block_len = 0;
       uint32_t stream_epoch = 0;
-      const esp_err_t read_err = ap2_buffered_fifo_read_block(
-          s.transport, s.buffered_packet, AP2_PACKET_MAX, &block_len,
-          &stream_epoch);
+      const esp_err_t read_err = ap2_buffered_fifo_read_block_head(
+          s.transport, s.buffered_packet, AP2_RTP_HEADER_BYTES, AP2_PACKET_MAX,
+          &block_len, &stream_epoch);
       if (read_err != ESP_OK) {
+        draining = false;
         if (s.rx_running) ap2_buffered_fifo_wait(s.transport, AP2_NO_TIMING_WAIT_MS);
         continue;
       }
@@ -1627,8 +1644,8 @@ static void ap2_buffered_processor_task(void *arg) {
       packet.ssrc = read_be32_local(s.buffered_packet + 8);
       packet.len = block_len;
       packet.stream_epoch = stream_epoch;
-      have_packet = true;
       AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK((uint32_t)packet.len);
+      const size_t body_len = block_len - AP2_RTP_HEADER_BYTES;
 
       /* A new accepted TCP connection is a real compressed-stream boundary.
        * Shairport would have a fresh processor/decoder chain; reproduce that
@@ -1645,74 +1662,83 @@ static void ap2_buffered_processor_task(void *arg) {
         audio_eq_reset_state();
       }
       seen_stream_epoch = packet.stream_epoch;
-    }
 
-    /* For an explicit immediate untilSeq=0, the consumer was stopped until a
-     * new anchor arrived. After that anchor, cheaply consume stale compressed
-     * packets until the stream crosses from the old RTP neighbourhood to the
-     * new one. No decrypt/decode is done for discarded blocks. */
-    if (buffered_control_zero_seq_classify(&packet)) {
-      have_packet = false;
-      early_hold_since_us = 0;
-      continue;
-    }
-
-    /* FLUSH state is applied to the one sequentially-held packet before any
-     * timing/decrypt/decode work. Re-run this on every pass so a control command
-     * that arrives while an early packet is held acts on that exact packet. */
-    buffered_packet_decision_t decision = {0};
-    buffered_control_classify(&packet, &decision);
-    if (decision.immediate_completed) {
-      ESP_LOGI(TAG, "AAC FLUSH complete target=%" PRIu32 " at seq=%" PRIu32 "%s",
-               decision.immediate_target_seq, packet.seq,
-               decision.immediate_overshoot ? " overshoot" : "");
-    }
-    if (decision.drop) {
-      have_packet = false;
-      early_hold_since_us = 0;
-      continue;
-    }
-
-    /* Shairport never gives an unrecognised SSRC to the timing/decoder path;
-     * such a block is simply consumed. ESP32 additionally skips recognised
-     * encodings for which this build has no decoder. */
-    if (!ap2_ssrc_recognised(packet.ssrc)) {
-      have_packet = false;
-      early_hold_since_us = 0;
-      if ((++unrecognised_ssrc_skipped & 0xFFU) == 1U)
-        ESP_LOGI(TAG,
-                 "block seq=%lu with unrecognised SSRC 0x%08lx skipped (%lu so far)",
-                 (unsigned long)packet.seq, (unsigned long)packet.ssrc,
-                 (unsigned long)unrecognised_ssrc_skipped);
-      continue;
-    }
-
-    if (packet.ssrc != current_ssrc) {
-      ESP_LOGI(TAG, "incoming audio format%s \"%s\" (ssrc=0x%08lx) at seq=%lu",
-               current_ssrc == 0 ? "" : " switching to",
-               ap2_ssrc_name(packet.ssrc), (unsigned long)packet.ssrc,
-               (unsigned long)packet.seq);
-      current_ssrc = packet.ssrc;
-      unsupported_skipped = 0;
-      /* Shairport prepare_decoding_chain(): a recognised SSRC change rebuilds
-       * only the codec chain. It does not start a new play sequence or clear
-       * downstream filter history; RTP continuity still decides whether the
-       * first block after the format switch is muted. */
-      if (decoder) {
-        aac_decoder_destroy(decoder);
-        decoder = NULL;
+      /* First FLUSH decision for this block (Shairport order: every block
+       * read, whatever its SSRC, takes part in FLUSH bookkeeping). */
+      buffered_packet_decision_t decision = {0};
+      buffered_timeline_hint_t hint;
+      buffered_timeline_hint(packet.rtp, &hint);
+      buffered_control_classify(&packet, &hint, &decision);
+      log_flush_completion(&decision, &packet);
+      draining = decision.drop;
+      if (decision.drop) {
+        (void)ap2_buffered_fifo_read_block_rest(s.transport, NULL, body_len,
+                                                packet.stream_epoch);
+        continue;
       }
-      decoder_format_generation = 0;
-    }
 
-    if (ap2_ssrc_unsupported(current_ssrc)) {
-      have_packet = false;
-      early_hold_since_us = 0;
-      if ((++unsupported_skipped & 0xFFU) == 1U)
-        ESP_LOGW(TAG, "unsupported payload format \"%s\"; skipping (%lu blocks)",
-                 ap2_ssrc_name(current_ssrc),
-                 (unsigned long)unsupported_skipped);
-      continue;
+      /* Shairport never gives an unrecognised SSRC to the timing/decoder
+       * path; such a block is simply consumed. ESP32 additionally skips
+       * recognised encodings for which this build has no decoder. */
+      if (!ap2_ssrc_recognised(packet.ssrc)) {
+        (void)ap2_buffered_fifo_read_block_rest(s.transport, NULL, body_len,
+                                                packet.stream_epoch);
+        if ((++unrecognised_ssrc_skipped & 0xFFU) == 1U)
+          ESP_LOGI(TAG,
+                   "block seq=%lu with unrecognised SSRC 0x%08lx skipped (%lu so far)",
+                   (unsigned long)packet.seq, (unsigned long)packet.ssrc,
+                   (unsigned long)unrecognised_ssrc_skipped);
+        continue;
+      }
+
+      if (packet.ssrc != current_ssrc) {
+        ESP_LOGI(TAG, "incoming audio format%s \"%s\" (ssrc=0x%08lx) at seq=%lu",
+                 current_ssrc == 0 ? "" : " switching to",
+                 ap2_ssrc_name(packet.ssrc), (unsigned long)packet.ssrc,
+                 (unsigned long)packet.seq);
+        current_ssrc = packet.ssrc;
+        unsupported_skipped = 0;
+        /* Shairport prepare_decoding_chain(): a recognised SSRC change
+         * rebuilds only the codec chain. It does not start a new play
+         * sequence or clear downstream filter history; RTP continuity still
+         * decides whether the first block after the switch is muted. */
+        if (decoder) {
+          aac_decoder_destroy(decoder);
+          decoder = NULL;
+        }
+        decoder_format_generation = 0;
+      }
+
+      if (ap2_ssrc_unsupported(current_ssrc)) {
+        (void)ap2_buffered_fifo_read_block_rest(s.transport, NULL, body_len,
+                                                packet.stream_epoch);
+        if ((++unsupported_skipped & 0xFFU) == 1U)
+          ESP_LOGW(TAG, "unsupported payload format \"%s\"; skipping (%lu blocks)",
+                   ap2_ssrc_name(current_ssrc),
+                   (unsigned long)unsupported_skipped);
+        continue;
+      }
+
+      if (ap2_buffered_fifo_read_block_rest(
+              s.transport, s.buffered_packet + AP2_RTP_HEADER_BYTES, body_len,
+              packet.stream_epoch) != ESP_OK) {
+        continue; /* connection ended mid-block: the block is incomplete */
+      }
+      have_packet = true;
+    } else {
+      /* A held (early / waiting-for-timing) packet is re-classified on every
+       * pass, so a FLUSH that arrives while it is held acts on it directly. */
+      buffered_packet_decision_t decision = {0};
+      buffered_timeline_hint_t hint;
+      buffered_timeline_hint(packet.rtp, &hint);
+      buffered_control_classify(&packet, &hint, &decision);
+      log_flush_completion(&decision, &packet);
+      if (decision.drop) {
+        have_packet = false;
+        draining = true;
+        early_hold_since_us = 0;
+        continue;
+      }
     }
 
     snapshot_state(&snap);
@@ -1877,8 +1903,9 @@ static void ap2_buffered_processor_task(void *arg) {
     }
 
     have_packet = false;
-    /* No manual yield: RTSP/control runs one priority above both TCP reader and
-     * AAC processor and therefore preempts refill bursts immediately. */
+    /* No manual yield: the RTSP client task (core 0, priority 17) preempts
+     * this processor (core 0, priority 4) as soon as a command arrives, so a
+     * refill burst cannot delay FLUSH/anchor handling. */
   }
 
   if (decoder) aac_decoder_destroy(decoder);
@@ -1886,8 +1913,7 @@ static void ap2_buffered_processor_task(void *arg) {
   vTaskDelete(NULL);
 }
 
-static bool frame_is_fully_stale(uint32_t rtp, const timing_snapshot_t *snap,
-                                 int64_t *end_delta_us) {
+static bool frame_is_fully_stale(uint32_t rtp, const timing_snapshot_t *snap) {
   uint32_t wanted;
   if (!wanted_rtp_now(snap, &wanted)) {
     return false;
@@ -1896,12 +1922,7 @@ static bool frame_is_fully_stale(uint32_t rtp, const timing_snapshot_t *snap,
                                ? (uint32_t)snap->format.frame_size
                                : 1024U;
   uint32_t end_rtp = rtp + frame_samples;
-  int32_t remaining = rtp_delta(end_rtp, wanted);
-  if (end_delta_us) {
-    int sr = snap->format.sample_rate > 0 ? snap->format.sample_rate : 44100;
-    *end_delta_us = ((int64_t)remaining * 1000000LL) / sr;
-  }
-  return remaining <= 0;
+  return rtp_delta(end_rtp, wanted) <= 0;
 }
 
 static bool realtime_playout_deadline(uint32_t rtp,
@@ -1950,7 +1971,7 @@ static bool realtime_pcm_sink_locked(uint32_t rtp, int16_t *pcm, size_t frames,
     return false;
   }
 
-  if (snap.anchor_valid && frame_is_fully_stale(rtp, &snap, NULL)) {
+  if (snap.anchor_valid && frame_is_fully_stale(rtp, &snap)) {
     return false;
   }
 
@@ -2181,10 +2202,17 @@ static void process_i2s_completions(const timing_snapshot_t *snap) {
 /* Volume scaling is the LAST requantisation to 16 bit, so it is where TPDF
  * dither belongs. The Q15 product carries 15 fractional bits; adding +-1 LSB
  * triangular noise before rounding decorrelates the rounding error from the
- * signal (no harmonic distortion on fades / quiet passages). Unity gain is
- * bit-perfect and is never dithered; exact-zero input samples stay exactly
- * zero (digital silence stays silent). Only the playout task calls this, so
- * the PRNG state needs no locking. */
+ * signal (no harmonic distortion on fades / quiet passages).
+ *
+ * - Unity gain is bit-perfect and never dithered.
+ * - An all-zero block (digital silence, paused output, track gap) stays exactly
+ *   zero. Dither is decided per block, not per sample: switching it off on
+ *   every individual zero sample would gate the noise floor with the signal
+ *   and make very quiet material "breathe".
+ * - Volume changes ramp linearly across one block (no zipper noise).
+ *
+ * Only the playout task calls this, so the PRNG state needs no locking. The
+ * two channels use independent generators so the dither is uncorrelated. */
 static uint32_t s_vol_dither_state[2] = {0x9E3779B9U, 0x85EBCA6BU};
 
 static inline uint32_t vol_dither_rng(uint32_t *st) {
@@ -2204,6 +2232,16 @@ static inline int32_t vol_dither_tpdf_q15(uint32_t *st) {
   return a - b;
 }
 
+/* x * gain (both <= 2^15) fits in int32; + dither + rounding stays in range. */
+static inline int16_t vol_scale_dither(int32_t x, int32_t gain_q15,
+                                       uint32_t *dither_state) {
+  if (gain_q15 == 0) return 0; /* a fade to mute ends in true silence */
+  int32_t y = (x * gain_q15 + vol_dither_tpdf_q15(dither_state) + 16384) >> 15;
+  if (y > INT16_MAX) y = INT16_MAX;
+  else if (y < INT16_MIN) y = INT16_MIN;
+  return (int16_t)y;
+}
+
 static void apply_output_volume(int16_t *pcm, uint32_t frames,
                                 int32_t *current_q15) {
   if (!pcm || !current_q15 || frames == 0U) return;
@@ -2211,39 +2249,40 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
   if (target < 0) target = 0;
   if (target > 32768) target = 32768;
   const int32_t start = *current_q15;
+  *current_q15 = target;
+  if (start == target && target == 32768) return; /* bit-perfect */
+
+  const uint32_t samples = frames * 2U;
+  uint32_t first_nonzero = 0;
+  while (first_nonzero < samples && pcm[first_nonzero] == 0) ++first_nonzero;
+  if (first_nonzero == samples) return; /* digital silence stays silent */
+
   if (start == target) {
-    if (target == 32768) return;
     if (target == 0) {
-      memset(pcm, 0, (size_t)frames * 2U * sizeof(*pcm));
+      memset(pcm, 0, (size_t)samples * sizeof(*pcm));
       return;
     }
-    for (uint32_t i = 0; i < frames * 2U; ++i) {
-      const int32_t x = pcm[i];
-      if (x == 0) continue;
-      int32_t y = (x * target + vol_dither_tpdf_q15(&s_vol_dither_state[i & 1U]) +
-                   16384) >> 15;
-      if (y > INT16_MAX) y = INT16_MAX;
-      else if (y < INT16_MIN) y = INT16_MIN;
-      pcm[i] = (int16_t)y;
+    for (uint32_t i = 0; i < samples; i += 2U) {
+      pcm[i] = vol_scale_dither(pcm[i], target, &s_vol_dither_state[0]);
+      pcm[i + 1U] = vol_scale_dither(pcm[i + 1U], target, &s_vol_dither_state[1]);
     }
     return;
   }
-  const int64_t dg = (int64_t)target - (int64_t)start;
+
+  /* Linear ramp start -> target over this block; the last frame is exactly
+   * target. |target - start| <= 2^15 and frames is one DMA block, so the
+   * product stays in 32 bits (no 64-bit software division per frame). */
+  const int32_t dg = target - start;
+  const bool narrow = frames <= 65535U;
   for (uint32_t f = 0; f < frames; ++f) {
     const int32_t gain =
-        start + (int32_t)((dg * (int64_t)(f + 1U)) / (int64_t)frames);
-    for (uint32_t ch = 0; ch < 2U; ++ch) {
-      const uint32_t i = f * 2U + ch;
-      if (pcm[i] == 0) continue;
-      int64_t y = (int64_t)pcm[i] * (int64_t)gain +
-                  vol_dither_tpdf_q15(&s_vol_dither_state[ch]);
-      y = (y + 16384) >> 15;
-      if (y > INT16_MAX) y = INT16_MAX;
-      else if (y < INT16_MIN) y = INT16_MIN;
-      pcm[i] = (int16_t)y;
-    }
+        narrow ? start + (dg * (int32_t)(f + 1U)) / (int32_t)frames
+               : start + (int32_t)(((int64_t)dg * (int64_t)(f + 1U)) /
+                                   (int64_t)frames);
+    const uint32_t i = f * 2U;
+    pcm[i] = vol_scale_dither(pcm[i], gain, &s_vol_dither_state[0]);
+    pcm[i + 1U] = vol_scale_dither(pcm[i + 1U], gain, &s_vol_dither_state[1]);
   }
-  *current_q15 = target;
 }
 
 
@@ -2286,8 +2325,8 @@ static bool buffered_anchor_moved(const timing_snapshot_t *previous,
   return shift_us > block_us || shift_us < -block_us;
 }
 
-/* ---- wired latency measurement: the I2S side (v4.1.21, v4.1.23) ----
- * v4.1.23: runs like the Wi-Fi scan. The web handler stops RTSP and releases
+/* ---- wired latency measurement: the I2S side ----
+ * Runs like the Wi-Fi scan. The web handler stops RTSP and releases
  * the audio engine (playout task stopped, codec memory freed), so the I2S
  * driver has no other owner and the ADC gets internal DMA memory. The caller's
  * task then plays silence + LATENCY_CAL_BURSTS chirps and records, from the
@@ -2508,7 +2547,7 @@ static void ap2_playout_task(void *arg) {
       cursor_timing = snap;
     }
 
-    /* v4.1.15 hard resync (Shairport resync_threshold semantics). */
+    /* Hard resync (Shairport resync_threshold semantics). */
     if (state == PLAYOUT_RUNNING && s.output_sync.valid &&
         s.output_sync.generation == snap.generation) {
       const int32_t err_us = s.output_sync.us;
@@ -2591,7 +2630,7 @@ static void ap2_playout_task(void *arg) {
       memset(silence, 0, sizeof(silence));
 
       /* The silence tags use generation 0 on purpose: their EOFs are only a
-       * phase probe and must not become the generation's public SYNC START.
+       * phase probe and must not become the generation's first sync observation.
        * The first real block carries the real generation and therefore becomes
        * the first normal sync observation. */
       const uint32_t silence_rtp =
@@ -2666,10 +2705,9 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      /* Convert the measured EOF edge into the stream presentation clock.
-       * For realtime ALAC this stays as the ISR's ESP-local timestamp; AAC
-       * keeps the original local+PTP-offset conversion. Descriptor #3 starts
-       * one block after descriptor #1 EOF because descriptor #2 is in flight. */
+      /* The measured EOF edge is already ESP-monotonic presentation time for
+       * both codecs. Descriptor #3 starts one block after descriptor #1 EOF
+       * because descriptor #2 is in flight. */
       const int64_t probe_done_time_ns = completion_presentation_ns(&snap, &probe_done);
       int64_t rate_scale_ppm = 1000000LL + (int64_t)servo_ppm;
       if (rate_scale_ppm < 900000LL) rate_scale_ppm = 900000LL;
@@ -2797,9 +2835,8 @@ static void ap2_playout_task(void *arg) {
     }
 
     /* In RUNNING, cursor_rtp is the next future block to queue. The two DMA
-     * descriptors are paced by their EOF interrupts. No guessed current+1
-     * subtraction is used for sync any more; the ISR completion tags are the
-     * source of truth. */
+     * descriptors are paced by their EOF interrupts; sync is measured only
+     * from the ISR completion tags. */
     bool have_pcm = pcm_rtp_ring_read_256(
         s.pcm_ring, cursor_rtp, snap.pcm_generation, block);
     if (!have_pcm && snap.stream_type == AUDIO_STREAM_BUFFERED) {
@@ -2868,11 +2905,10 @@ static void ap2_playout_task(void *arg) {
      *   SYNC > 0 : ESP is early -> negative pressure on ppm
      *
      * The PID math runs every 1 s, but i2s_channel_tune_rate() is allowed at
-     * most every 5 s and only for a useful >=5 ppm change.  This separation
-     * matters because IDF tuning needs disable->tune->enable, which can itself
-     * perturb phase.  +/-1 ms is deliberately treated as GOOD: once there and
-     * phase velocity is modest, the PID stops acting and a slow centring loop
-     * (v4.1.17, AP2_CENTER_*) steers towards 0 ms with at most one small step
+     * most every 5 s and only for a useful >=5 ppm change, so small PTP jitter
+     * does not turn into a stream of MCLK steps.  +/-1 ms is deliberately
+     * treated as GOOD: once there and phase velocity is modest, the PID stops
+     * acting and a slow centring loop (AP2_CENTER_*) steers towards 0 ms with at most one small step
      * per 15 s window, based on a least-squares slope of the measured sync.
      */
     const int64_t pid_now_us = esp_timer_get_time();
@@ -2898,8 +2934,6 @@ static void ap2_playout_task(void *arg) {
       }
       pid_prev_error_ms = error_ms;
       pid_prev_valid = true;
-      /* Keep log sign intuitive: positive d means SYNC is moving upward. */
-
       const int32_t abs_sync_us = s.output_sync.us < 0
           ? -s.output_sync.us : s.output_sync.us;
       const bool in_deadband = abs_sync_us <= AP2_PID_DEADBAND_US;
@@ -2947,7 +2981,7 @@ static void ap2_playout_task(void *arg) {
        * D still remains alive, so a clear passage through the band will be seen
        * on the next calculation rather than being hidden forever. */
       const double sync_slope_ms_s = -pid_d_filtered_ms_s;
-      /* v4.1.18 hysteresis around the centring mode. */
+      /* Hysteresis around the centring mode. */
       if (center_active) {
         if (abs_sync_us > AP2_CENTER_EXIT_HARD_US) {
           center_active = false;
@@ -2964,7 +2998,7 @@ static void ap2_playout_task(void *arg) {
       const bool center_enter = !center_active && in_deadband &&
           sync_slope_ms_s > -0.080 && sync_slope_ms_s < 0.080;
       if (center_active || center_enter) {
-        /* Hold the learned clock, then centre slowly (v4.1.17/18). */
+        /* Hold the learned clock, then centre slowly. */
         bool restart_window = false;
         if (center_enter) {
           next_target = servo_ppm; /* entering the zone: drop pending PID step */
@@ -3052,7 +3086,7 @@ static void ap2_playout_task(void *arg) {
           servo_ppm = next_ppm;
           tune_fail_count = 0;
         } else {
-          /* Previously silent: a failing tune means drift is not corrected. */
+          /* Report it: a failing tune means drift is not corrected. */
           tune_fail_count++;
           pevt_post(PEVT_TUNE_FAIL, next_ppm, (int32_t)te,
                     (int32_t)tune_fail_count, 0, 0, NULL);
@@ -3410,9 +3444,15 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
     return ESP_ERR_NOT_SUPPORTED;
   }
 
-  if (!realtime_stage_stop_and_wait() || !realtime_receiver_is_idle())
+  if (!realtime_stage_stop_and_wait()) return ESP_ERR_INVALID_STATE;
+  if (!realtime_receiver_is_idle()) {
+    ESP_LOGE(TAG, "buffered start refused: realtime (ALAC) receiver still active");
     return ESP_ERR_INVALID_STATE;
-  if (!s.transport) return ESP_ERR_INVALID_STATE;
+  }
+  if (!s.transport) {
+    ESP_LOGE(TAG, "buffered start refused: audio engine not initialised (no FIFO)");
+    return ESP_ERR_INVALID_STATE;
+  }
   if (s.rx_running) return ESP_OK;
   if (s.processor_task) {
     ESP_LOGE(TAG,
@@ -3434,6 +3474,15 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
   if (xTaskCreatePinnedToCore(ap2_buffered_processor_task, "ap2_buf_proc",
                               AP2_PROCESS_STACK, NULL, AP2_DECODE_PRIORITY,
                               &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE) != pdPASS) {
+    ESP_LOGE(TAG,
+             "buffered start failed: cannot create processor task (%u B stack); "
+             "internal free=%u largest=%u, psram free=%u largest=%u",
+             (unsigned)AP2_PROCESS_STACK,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    s.processor_task = NULL;
     s.rx_running = false;
     ap2_buffered_fifo_notify(s.transport);
     ap2_buffered_fifo_stop(s.transport);
@@ -3538,12 +3587,6 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
   return ESP_ERR_NOT_SUPPORTED;
 }
 
-esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port) {
-  (void)data_port;
-  (void)control_port;
-  return ESP_ERR_NOT_SUPPORTED;
-}
-
 static bool wait_playout_quiesced(uint32_t request, uint32_t timeout_ms) {
   if (!s.playout_task || !s.engine_running) return true;
   const int64_t deadline_us =
@@ -3619,25 +3662,14 @@ void audio_receiver_stop(void) {
   s.port = 0;
 }
 
-void audio_receiver_stop_buffered_only(void) { audio_receiver_stop(); }
 uint16_t audio_receiver_get_buffered_port(void) { return s.port; }
 
-size_t audio_receiver_get_buffered_audio_buffer_size(void) {
-  return ap2_buffered_fifo_capacity(s.transport);
-}
-
-uint16_t audio_receiver_get_stream_port(void) { return s.port; }
 void audio_receiver_set_volume_q15(int32_t volume_q15) {
   if (volume_q15 < 0) volume_q15 = 0;
   if (volume_q15 > 32768) volume_q15 = 32768;
   __atomic_store_n(&s_volume_target_q15, volume_q15, __ATOMIC_RELEASE);
 }
 
-int32_t audio_receiver_get_volume_q15(void) {
-  return __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
-}
-
-void audio_receiver_flush(void) { mark_timeline_discontinuity(); }
 void audio_receiver_seek_flush(void) { mark_timeline_discontinuity(); }
 
 void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
@@ -3722,7 +3754,8 @@ esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t fr
   return err;
 }
 
-void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
+void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
+                                        bool until_seq_valid) {
   AUDIO_DIAG_FLUSH_IMMEDIATE_BEGIN();
 
   /* Shairport 5.5.2 handle_flushbuffered() immediate path:
@@ -3731,8 +3764,9 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
    *   3. invalidate the presentation anchor;
    *   4. keep consuming compressed packets until untilSeq is reached or
    *      overshot. The endpoint packet itself is retained.
-   * untilTS is stored with the request for protocol parity but does not drive
-   * the sequential discard decision. */
+   * untilTS does not drive the sequential decision - except when untilSeq is
+   * 0 / missing (until_seq_valid false): then the endpoint is found by
+   * timestamp, see buffered_control_classify(). */
   /* Shairport updates the immediate request, play flag and anchor while its
    * flush_mutex excludes the packet classifier. Keep that same atomic control
    * boundary so the processor cannot observe an armed FLUSH with the old play
@@ -3740,31 +3774,11 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
   xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
   xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
   AUDIO_DIAG_FLUSH_IMMEDIATE_PUBLISH_ACQUIRED();
-  const uint32_t masked_until_seq = until_seq & 0x007fffffU;
-  s_buffered_control.immediate_until_seq = masked_until_seq;
+  s_buffered_control.immediate_active = true;
+  __atomic_store_n(&s_buffered_control.immediate_by_ts, !until_seq_valid,
+                   __ATOMIC_RELEASE);
+  s_buffered_control.immediate_until_seq = until_seq & 0x007fffffU;
   s_buffered_control.immediate_until_rtp = until_ts;
-
-  if (masked_until_seq == 0U) {
-    /* Zero is a transition sentinel here, not a literal sequence endpoint.
-     * Do not run seq23_delta(packet, 0). Stop the consumer until the next
-     * SETRATEANCHORTIME anchor, then resynchronise by consuming stale packets
-     * from the old RTP neighbourhood. A new immediate zero-seq request simply
-     * replaces any older pending/resync state. */
-    s_buffered_control.immediate_active = false;
-    s_buffered_control.zero_seq_wait_anchor = true;
-    s_buffered_control.zero_seq_resync_active = false;
-    s_buffered_control.zero_seq_old_until_rtp = until_ts;
-    s_buffered_control.zero_seq_anchor_rtp = 0;
-    s_buffered_control.zero_seq_dropped = 0;
-    memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
-  } else {
-    s_buffered_control.immediate_active = true;
-    s_buffered_control.zero_seq_wait_anchor = false;
-    s_buffered_control.zero_seq_resync_active = false;
-    s_buffered_control.zero_seq_old_until_rtp = 0;
-    s_buffered_control.zero_seq_anchor_rtp = 0;
-    s_buffered_control.zero_seq_dropped = 0;
-  }
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);
@@ -3774,13 +3788,6 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
   AUDIO_DIAG_FLUSH_IMMEDIATE_PCM_DONE();
   xSemaphoreGive(s.publish_mutex);
   xSemaphoreGive(s_buffered_control.mutex);
-
-  if (masked_until_seq == 0U) {
-    ESP_LOGI(TAG,
-             "AAC zero-seq FLUSH: consumer waiting for new anchor "
-             "oldUntilTS=%" PRIu32,
-             until_ts);
-  }
 
   media_control_wake();
   audio_status_notify();
@@ -3802,7 +3809,6 @@ void audio_receiver_set_playout_latency_samples(uint32_t v) {
   s.playout_latency_samples = v;
   taskEXIT_CRITICAL(&s.state_mux);
 }
-uint32_t audio_receiver_get_hardware_latency_us(void) { return audio_playout_hardware_latency_us(); }
 
 int32_t audio_receiver_get_output_latency_us(void) {
   return __atomic_load_n(&s_output_latency_us, __ATOMIC_RELAXED);
@@ -3856,7 +3862,7 @@ esp_err_t audio_receiver_measure_output_latency(latency_cal_result_t *res,
     return err;
   }
   /* The amplifier is normally OFF without an AirPlay session. "audible"
-   * switches it on for the test (the usual 300 s off-delay applies after).
+   * switches it on for the test (the configured amp off-delay applies after).
    * A line-level measurement before the amplifier is not affected. */
   if (audible) {
     amp_control_session_connected();
@@ -3906,19 +3912,6 @@ void audio_receiver_set_playing(bool p) {
   audio_status_notify();
 }
 
-bool audio_receiver_is_playing(void) {
-  bool playing;
-  taskENTER_CRITICAL(&s.state_mux);
-  playing = s.playing;
-  taskEXIT_CRITICAL(&s.state_mux);
-  return playing;
-}
-
-void audio_receiver_reset_timing(void) {
-  mark_timeline_discontinuity();
-  ptp_clock_clear();
-}
-
 void audio_receiver_set_client_control(uint32_t ip, uint16_t port) {
   realtime_receiver_set_client_control(ip, port);
 }
@@ -3959,13 +3952,8 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
     s_anchor_commit_us = esp_timer_get_time();
     s_anchor_commit_gen = gen;
   }
-  /* An immediate FLUSHBUFFERED with explicit untilSeq=0 has no usable
-   * sequence endpoint. The new anchor is the point at which its media consumer
-   * may resume and classify old-vs-new RTP blocks. */
-  buffered_control_anchor_committed(rtp);
-
   /* Shairport-style separation: SETRATEANCHORTIME updates presentation timing
-   * only. The compressed FIFO itself has no RTP cursor to search or rebind. */
+   * only. The compressed FIFO has no RTP cursor to search or rebind. */
   if (s.transport) ap2_buffered_fifo_notify(s.transport);
   playout_wake();
   realtime_stage_kick();
@@ -4015,7 +4003,8 @@ bool audio_receiver_set_realtime_anchor_local(
     if (!have_running_local_map) {
       /* Initial stream startup: no phase exists to preserve yet, so use the
        * sender/GM conversion directly and establish this epoch with zero
-       * media bias. The existing ~400 ms PTP readiness remains unchanged. */
+       * media bias. PTP readiness (~400 ms mastership, ptp_clock.c) still
+       * gates the candidate. */
       s.rt_media_rebase_valid = true;
       s.rt_media_rebase_clock_id = clock_id;
       s.rt_media_rebase_epoch = gm_epoch;

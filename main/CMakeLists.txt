@@ -41,15 +41,14 @@ set(SRC_FILES
     "network/log_stream.c"
 )
 
-
-# Temporary diagnostics are a true compile-time feature. When the master
-# switch is off, or all categories are off, audio_diag.c is not compiled.
+# Diagnostics are compile-time only: audio_diag.c is built only when at least
+# one diagnostics category is enabled.
 if(CONFIG_AIRPLAY_DIAG_ACTIVE)
     list(APPEND SRC_FILES "audio/audio_diag.c")
 endif()
 
-# v4.1.21 output latency: the pure analysis is always built (tiny), the ADC
-# capture only with the wired measurement option.
+# Output latency: the chirp/analysis code is always built, the ADC capture only
+# with the wired measurement option.
 list(APPEND SRC_FILES "audio/latency_cal_dsp.c")
 if(CONFIG_AIRPLAY_LATENCY_CAL)
     list(APPEND SRC_FILES "audio/latency_cal.c")

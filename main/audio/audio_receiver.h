@@ -11,9 +11,10 @@
  * sequential AAC consumer, following Shairport Sync's buffered path. */
 #define AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES (6U * 1024U * 1024U)
 
-/* AirPlay type-103 capacity advertised to the sender. Keep this equal to the
- * physical 6 MiB raw FIFO so normal TCP backpressure bounds sender preload. */
-#define AP2_BUFFERED_AUDIO_ADVERTISED_BYTES (6U * 1024U * 1024U)
+/* AirPlay type-103 capacity advertised to the sender ("audioBufferSize").
+ * Equal to the physical raw FIFO, so normal TCP backpressure bounds the
+ * sender's preload. */
+#define AP2_BUFFERED_AUDIO_ADVERTISED_BYTES AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES
 
 /* AirPlay 2 audio receiver: buffered AAC plus realtime ALAC. */
 typedef struct {
@@ -21,13 +22,12 @@ typedef struct {
   int sample_rate;
   int channels;
   int bits_per_sample;
-  int frame_size; /* observed AP2 AAC path: 1024 PCM frames/AU */
+  int frame_size; /* PCM frames per packet: AAC 1024, ALAC 352 */
 } audio_format_t;
 
 typedef enum {
   AUDIO_ENCRYPT_NONE = 0,
-  AUDIO_ENCRYPT_AES_CBC,
-  AUDIO_ENCRYPT_CHACHA20_POLY1305
+  AUDIO_ENCRYPT_CHACHA20_POLY1305 = 2
 } audio_encrypt_type_t;
 
 typedef struct {
@@ -55,22 +55,17 @@ void audio_receiver_set_format(const audio_format_t *format);
 void audio_receiver_set_encryption(const audio_encrypt_t *encrypt);
 void audio_receiver_set_stream_type(audio_stream_type_t type);
 
-esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port);
 esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
                                       uint16_t tcp_port);
 esp_err_t audio_receiver_start_buffered(uint16_t tcp_port);
 void audio_receiver_stop(void);
-void audio_receiver_stop_buffered_only(void);
-uint16_t audio_receiver_get_stream_port(void);
 uint16_t audio_receiver_get_buffered_port(void);
-size_t audio_receiver_get_buffered_audio_buffer_size(void);
 
 /* Software output volume. Q15: 0=mute, 32768=0 dB/full scale. */
 void audio_receiver_set_volume_q15(int32_t volume_q15);
-int32_t audio_receiver_get_volume_q15(void);
 
-/* Timeline/generation control. These invalidate old PCM in O(1), no scan. */
-void audio_receiver_flush(void);
+/* Timeline control: invalidate the presentation anchor (old PCM can no
+ * longer be scheduled) until the sender publishes a new one. O(1), no scan. */
 void audio_receiver_seek_flush(void);
 /* AP2 realtime FLUSH with RTP-Info: discard audio older than the sender's
  * RTP boundary while preserving the validated D7/SETRATE RTP<->PTP map. */
@@ -78,11 +73,12 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp);
 void audio_receiver_realtime_flush_wait_sender_anchor(void);
 esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
                                                    uint32_t until_seq, uint32_t until_ts);
-void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts);
+/* Immediate FLUSHBUFFERED. until_seq_valid=false (flushUntilSeq 0 or missing)
+ * ends the flush by timestamp instead of by sequence number. */
+void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
+                                        bool until_seq_valid);
 void audio_receiver_pause(void);
 void audio_receiver_set_playing(bool playing);
-bool audio_receiver_is_playing(void);
-void audio_receiver_reset_timing(void);
 
 void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
                                     uint32_t rtp_time);
@@ -100,8 +96,8 @@ typedef struct {
  * already running, a new PTP mastership epoch is intentionally kept out of
  * the media phase until it has been stable for the handover settle period.
  * The first accepted anchor from that epoch is then rebased onto the existing
- * RTP<->ESP-local timeline, and the resulting constant media-domain bias is
- * applied to later anchors from the same epoch. PTP itself is never biased or
+ * RTP<->ESP-local timeline; the resulting media-domain bias is applied to
+ * later anchors from the same epoch and retired at 50 us/s. PTP itself is never biased or
  * slewed, and buffered/AAC timing is untouched.
  *
  * Returns true when the anchor was published. False means it was deliberately
@@ -114,11 +110,12 @@ bool audio_receiver_set_realtime_anchor_local(
 void audio_receiver_set_client_control(uint32_t client_ip,
                                        uint16_t client_control_port);
 
-/* RTSP compatibility: buffered AP2 uses zero extra playout latency here. */
+/* Extra sender-side playout latency in samples (realtime ALAC: SETUP
+ * latencyMin, default 11025). Buffered AAC schedules from the anchor directly
+ * and sets 0. */
 void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
-uint32_t audio_receiver_get_hardware_latency_us(void);
 
-/* v4.1.21 output latency after the ESP (DAC/DSP), microseconds. Positive =
+/* Output latency after the ESP (DAC/DSP), microseconds. Positive =
  * the chain delays the sound, so the ESP plays that much earlier. Applied
  * live; persist=true also stores it in NVS. Range -100000..150000. */
 #include "latency_cal.h"

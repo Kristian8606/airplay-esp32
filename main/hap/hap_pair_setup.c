@@ -10,17 +10,13 @@
 
 static const char *TAG = "hap_setup";
 
-#define TLV_TYPE_METHOD 0x00
-#define TLV_TYPE_SALT   0x02
-#define TLV_TYPE_PROOF  0x04
-#define TLV_TYPE_FLAGS  0x13
+#define TLV_TYPE_FLAGS 0x13
 
 #define PAIR_SETUP_M1 1
 #define PAIR_SETUP_M2 2
 #define PAIR_SETUP_M3 3
 #define PAIR_SETUP_M4 4
 #define PAIR_SETUP_M5 5
-#define PAIR_SETUP_M6 6
 
 esp_err_t hap_pair_setup_m1(hap_session_t *session, const uint8_t *input,
                             size_t input_len, uint8_t *output,
@@ -134,6 +130,7 @@ esp_err_t hap_pair_setup_m3(hap_session_t *session, const uint8_t *input,
     hap_hkdf_sha512((uint8_t *)"Control-Salt", 12, srp_key, srp_key_len,
                     (uint8_t *)"Control-Write-Encryption-Key", 28,
                     session->decrypt_key, 32);
+    hap_derive_event_keys(session, srp_key, srp_key_len, true);
     session->encrypt_nonce = 0;
     session->decrypt_nonce = 0;
     session->session_established = true;

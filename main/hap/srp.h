@@ -27,7 +27,6 @@ typedef struct srp_session {
   size_t session_key_len;
   uint8_t proof_m1[SRP_SESSION_KEY_BYTES]; // Client proof
   uint8_t proof_m2[SRP_SESSION_KEY_BYTES]; // Server proof
-  int state;
   bool verified;
 } srp_session_t;
 
@@ -87,6 +86,6 @@ const uint8_t *srp_get_proof(srp_session_t *session);
 
 /**
  * Get session key K after successful verification
- * This key is used to encrypt M5/M6 messages
+ * Used to derive the M5/M6 key and, for transient pairing, the control keys
  */
 const uint8_t *srp_get_session_key(srp_session_t *session, size_t *len);

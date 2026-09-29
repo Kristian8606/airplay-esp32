@@ -21,7 +21,6 @@ typedef bool (*realtime_deadline_cb_t)(uint32_t rtp,
  * same boundary so an in-flight RTX remains useful after the last NACK. */
 #define REALTIME_RECOVERY_FINAL_MARGIN_US 50000LL
 
-
 typedef struct {
   uint32_t work_queue_depth;
   uint32_t work_queue_capacity;
@@ -36,10 +35,9 @@ typedef struct {
   void *deadline_ctx;
 } realtime_receiver_config_t;
 
-/* Large ingress packet pools may live in caller-owned shared PSRAM. This is
- * intentionally limited to DATA/RTX slots; queues, decoder scratch and loss
- * tracking keep their existing allocation and task logic. Call only before
- * the first realtime start while the receiver is idle. */
+/* The DATA/RTX packet pools may live in caller-owned shared PSRAM; queues,
+ * decoder scratch and loss tracking are always allocated by the receiver.
+ * Call only while the receiver is idle and has no packet pools bound. */
 size_t realtime_receiver_packet_workspace_size(void);
 esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
                                                   size_t workspace_bytes);

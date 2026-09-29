@@ -4,9 +4,9 @@
 > Edit this file in place. Never create `PROJECT_CONTRACT_v2.md`, dated copies,
 > “new” copies, or parallel contracts. Git history is the history.
 
-**Last reviewed against project:** `v4.1.43-zero-seq-warn`  
+**Last reviewed against project:** `v4.1.55`  
 **Behavioural reference:** Shairport Sync `5.5.2`  
-**Reference review date:** 2026-09-25
+**Reference review date:** 2026-09-28
 
 ---
 
@@ -94,8 +94,11 @@ Before changing the reference version:
 
 ### Approved ESP32-specific deviations
 
-- **6 MiB** physical/advertised buffered FIFO rather than blindly copying host
-  memory sizes from Shairport.
+- **6 MiB** physical buffered FIFO rather than blindly copying host memory
+  sizes from Shairport. The advertised `audioBufferSize` equals the physical
+  FIFO (Shairport advertises 8 MiB).
+- Immediate FLUSH with `flushUntilSeq` 0 / missing ends by timestamp, not by
+  sequence number (see §6).
 - FreeRTOS event/semaphore waits instead of pthread/usleep mechanisms.
 - ESP32 task priorities/core pinning.
 - ESP32 I2S/APLL sync strategy instead of Linux backend correction methods.
@@ -139,7 +142,11 @@ Playout / PTP / I2S         physical output owner
 - write complete raw blocks to FIFO;
 - apply normal backpressure;
 - report connection/stream epoch;
-- stop a broken transport connection.
+- stop a broken transport connection;
+- after an orderly close (FIN) by the sender, keep the bytes already received
+  readable until the processor consumes them (Shairport `buffered_read()`
+  keeps its buffer). Only stop/abort/transport errors or the next accepted
+  connection discard them.
 
 ### TCP Reader MUST NOT
 
@@ -153,7 +160,10 @@ Playout / PTP / I2S         physical output owner
 
 ### Buffered Processor OWNS
 
-- one current/held packet;
+- one current/held packet, read in two steps from the FIFO: the 12-byte RTP
+  head first, then the body. A block that FLUSH or the SSRC gate drops at the
+  head has its body consumed without being copied. This is still the single
+  sequential consumer (no search, no skip-ahead, no second cursor);
 - sequence/timestamp interpretation;
 - SSRC recognition;
 - immediate/deferred FLUSH application;
@@ -295,29 +305,28 @@ Processor applies it to the one sequential packet stream.
 7. Overshooting packet also survives and completes the request.
 8. Immediate completion clears deferred FLUSH requests.
 
-For a normal non-zero `flushUntilSeq`, immediate FLUSH must not wait for a new
-anchor before draining.
+Immediate FLUSH must not wait for a new anchor before draining. Dropped blocks
+are consumed block by block by the processor (body not copied); this is not a
+FIFO fast skip.
 
-### Explicit immediate `flushUntilSeq == 0`
+#### Immediate FLUSH with `flushUntilSeq` 0 or missing (ESP deviation)
 
-An explicit zero endpoint is treated as a timeline-transition sentinel rather
-than as literal 23-bit sequence number zero. This is a narrow, intentional
-deviation from Shairport Sync 5.5.2: its modulo-23 comparison assumes the two
-sequence numbers are within half the sequence space and can falsely complete a
-zero endpoint immediately.
+Shairport compares 0 modulo 2^23: when the session's sequence numbers are above
+2^22 that discards every block until the sequence wraps (minutes to hours of
+silence while the sender keeps streaming). Here such a request ignores sequence
+numbers and ends at the first block that:
 
-1. Disable playback and invalidate the old anchor exactly like normal immediate
-   FLUSH.
-2. Do **not** compare packets against sequence zero and do **not** drain before
-   a new anchor is known. TCP ingress may continue filling the raw FIFO.
-3. When the next buffered anchor is committed, resume the single sequential
-   consumer.
-4. Before decrypt/decode, compare each packet RTP with the old `flushUntilTS`
-   and the new anchor RTP using modulo-2^32 distance. Packets closer to the old
-   timeline are consumed/dropped.
-5. The first packet at least as close to the new anchor as to the old endpoint
-   ends resync and survives into the normal timing/decode path.
-6. No second cursor, FIFO search, rewind or physical byte purge is permitted.
+1. has RTP timestamp == `flushUntilTS` (observed on HomePod/Apple TV: that is
+   the first block of the new content, the same block that ends the pending
+   deferred ranges); or
+2. once the sender's new anchor is valid, lies on the new timeline: RTP within
+   +/-10 s of the new anchor's RTP. Measured against the anchor, never against
+   the clock, so an anchor placed far in the future or a fast burst cannot
+   push every new block outside the window.
+
+The ending block survives and completion clears deferred requests, as for the
+sequential rule. A later immediate FLUSH with a valid `flushUntilSeq` replaces
+it. This is the only place an RTP window may decide a FLUSH endpoint.
 
 ### Deferred FLUSH
 
@@ -338,8 +347,9 @@ Forbidden:
 
 - FIFO fast skip;
 - FIFO RTP/sequence search;
-- stale-FLUSH rescue heuristics outside the explicit zero-sequence transition above;
-- fixed RTP plausibility windows used to guess a FLUSH endpoint;
+- stale-FLUSH rescue heuristics;
+- RTP plausibility windows used to guess a FLUSH endpoint (sole exception:
+  immediate FLUSH without a usable `flushUntilSeq`, above);
 - raw-FIFO purge as normal FLUSHBUFFERED implementation.
 
 ---
@@ -432,9 +442,9 @@ Current ownership/priorities:
 
 | Task | Core | Priority | Purpose |
 |---|---:|---:|---|
-| RTSP client/control | 0 | **17** | FLUSH / anchor / SETUP / TEARDOWN |
+| RTSP client/control (up to 3, one per connection) | 0 | **17** | FLUSH / anchor / SETUP / TEARDOWN |
 | RTSP accept server | 0 | **5** | accept only |
-| Event-port task | 0 | **5** | event connection lifecycle |
+| Event-port task (stack in PSRAM, never touches flash) | 0 | **5** | event channel: updateInfo, consume sender messages |
 | Buffered AAC processor | 0 | **4** | sequential buffered consumer |
 | Buffered TCP reader | 1 | **4** | raw TCP ingress |
 | Audio playout | 1 | **8** | physical output |
@@ -451,6 +461,12 @@ RTSP client priority 17 is intentionally:
 High-priority RTSP code must stay short: parse, validate, update, wake, reply.
 Do not perform decode or long waits at priority 17.
 
+Handler bodies of all RTSP connections run one at a time under the RTSP handler
+mutex (`rtsp_handlers_lock()`); the play owner's disconnect cleanup runs under
+it too. Lock order: play lock first, handler mutex second - never acquire the
+play lock while holding the handler mutex (acquiring waits for the previous
+owner's task, which may be waiting for the handler mutex).
+
 ---
 
 ## 12. RTSP / Session Lifecycle Contract
@@ -461,6 +477,76 @@ Do not perform decode or long waits at priority 17.
 - Valid plist with `streams`: stop stream/player, keep RTSP connection.
 - Valid plist without `streams`: full session teardown; return `200 OK` with
   `Connection: close`, then terminate RTSP connection.
+
+### Dead sender detection
+
+The RTSP control socket uses TCP keepalive like Shairport (95 s idle, 5 probes
+5 s apart). A sender that disappears without FIN/RST ends the session after
+~2 minutes instead of holding it (and the amplifier) forever.
+
+### Connections and the play lock (Shairport `principal_conn`)
+
+- Every RTSP connection has its own client task and `rtsp_conn_t`, up to
+  `RTSP_MAX_CLIENTS` (3). Accepting a connection never touches audio.
+- Exactly one connection at a time holds the play lock (`conn->play_owner`).
+  Only the owner may drive the global audio engine, PTP state, volume,
+  amplifier and event port.
+- A connection takes the play lock when it starts to play: AirPlay 2 initial
+  SETUP with a timing protocol, or any stream SETUP. Taking it stops the
+  previous owner's connection first; the new owner touches audio only after
+  that connection's cleanup has finished.
+- AirPlay 1 is not supported: a SETUP with an RTSP `Transport:` header (or a
+  stream SETUP without a bplist body) is answered `461 Unsupported Transport`
+  without taking the play lock, so it never interrupts the current playback.
+- AirPlay 2 initial SETUP with `timingProtocol` = `None` is remote-control only:
+  answered (event port 0), no play lock, playback untouched.
+- On a connection without the play lock, RECORD, SET_PARAMETER, PAUSE, FLUSH,
+  FLUSHBUFFERED, TEARDOWN, SETRATEANCHORTIME, SETPEERS(X) are answered `200 OK`
+  without side effects (volume is remembered on that connection).
+- GET /info, OPTIONS, pairing, FairPlay, GET_PARAMETER on other connections must
+  never stop or reset playback.
+- All slots busy: close the oldest connection that does NOT hold the play lock.
+- Unknown method: `200 OK` (Shairport forces 200). Unparsable request:
+  `400 Bad Request`.
+
+### Audio start failure in SETUP
+
+- Every failed audio start is logged with its reason and the memory state
+  (no silent 500).
+- A failed buffered start resets the audio engine to the hard session boundary
+  (`audio_receiver_stop()`, re-init if the engine is gone) and retries once.
+- After 3 consecutive failed stream SETUPs the device restarts itself: it is
+  unusable in that state and previously needed a power cycle.
+
+### Device identity (mDNS, /info, updateInfo)
+
+The device presents itself as a HomePod (2nd generation) — owner's decision
+(approved deviation from Shairport Sync, which uses `ShairportSync` / `366.0`
+/ `0x18340405C4A00`).
+
+- Feature bits `0x1C340405C4A00`: Shairport Sync's AirPlay 2 value plus bit 46
+  SupportsHKPairingAndAccessControl (HomePod presentation).
+- `model` is `AudioAccessory6,1` (HomePod 2). One define (`AIRPLAY_MODEL` in
+  rtsp_handlers.h) feeds mDNS, `/info` and `updateInfo`.
+- Software version `377.40.00` (`AIRPLAY_SOURCE_VERSION` in
+  rtsp/airplay_version.h): mDNS `srcvers`/`vs`, `/info` and every RTSP
+  `Server: AirTunes/377.40.00` header. No other version string may exist.
+
+### AirPlay 2 event channel
+
+- The event port is created by the play owner's initial SETUP. When the sender
+  connects, the receiver sends one encrypted `POST /command` with the
+  `updateInfo` plist (`/info` dict + `txtAirPlay`), as Shairport
+  `ap2_event_send_update_info()`. The message is built in the RTSP task before
+  the event task starts: the event task's stack is in PSRAM and must not read
+  NVS/flash.
+- Keys: HKDF-SHA512 "Events-Salt"; the receiver encrypts with
+  "Events-Write-Encryption-Key" and decrypts with "Events-Read-Encryption-Key"
+  (Shairport server cipher channel 4), each with its own nonce counter starting
+  at 0 per event connection. Framing is the control-channel framing.
+- Everything the sender sends on the event channel is read and consumed
+  (decrypted and logged when possible, otherwise discarded). Never leave
+  received bytes in a socket that is polled with select().
 
 ### Session replacement
 
@@ -486,9 +572,10 @@ Accept only **exactly 32 bytes** for ChaCha20-Poly1305-IETF.
 - no zero-padding of short keys;
 - parser must preserve real source length for validation.
 
-### `timingPeerInfo.Addresses`
+### `timingPeerInfo.Addresses` / SETPEERS list
 
-If an array element is not a string:
+If an array element (SETPEERSX `Addresses`, or a plain SETPEERS entry) is not a
+string:
 
 - skip that element;
 - keep valid string addresses;
@@ -498,6 +585,9 @@ If an array element is not a string:
 ### General remote-input rule
 
 RTSP / bplist / TLV parsing must have bounds and forward-progress checks.
+In the bplist parser every wire count/length is checked with the overflow-free
+`bplist_span_ok()` / `bplist_read_ext_len()` helpers (size_t is 32 bits on the
+ESP32), and the recursive key search has a global visit budget.
 Malformed network input must not cause OOB access, infinite loops, unbounded
 stack use or partially-valid crypto state.
 
@@ -543,8 +633,9 @@ build/config/sdkconfig.h
 
 ## 15. Memory / Shared Workspace Contract
 
-- Buffered FIFO is currently 6 MiB and advertised capacity matches physical
-  capacity.
+- Buffered FIFO is currently 6 MiB and the advertised `audioBufferSize` is the
+  same: a full FIFO stops the TCP reader and TCP backpressure holds the
+  sender; nothing is dropped.
 - Buffered and realtime modes may share large codec/media workspace only with
   exclusive ownership.
 - Realtime start must not reuse shared workspace while buffered transport/
@@ -586,6 +677,10 @@ Do not reintroduce any of these without explicitly redesigning this contract:
 - old anchor reused after immediate FLUSH;
 - old FLUSH requests crossing into a new buffered session;
 - full TEARDOWN connection kept alive as stream-only teardown;
+- a new RTSP connection (probe, pairing, remote control) stopping playback
+  before it takes the play lock;
+- polling a socket with select() and only MSG_PEEKing it (unconsumed data
+  makes select() fire forever: a busy loop that starves lower-priority tasks);
 - malformed `shk` accepted via truncation/zero-padding;
 - a new workaround left beside the obsolete workaround it replaced.
 
@@ -667,6 +762,8 @@ There is no silent third option.
 - stream TEARDOWN with `streams`, then new SETUP on same RTSP connection;
 - full TEARDOWN without `streams`, confirming connection closes;
 - rapid old-player -> new-player replacement;
+- /info probes, pairing and a second device's connection during playback
+  (playback must continue; log "acquired / takes the play lock" only on play);
 - no old PCM audible after fast stop/start;
 - new buffered session has no old FLUSH requests.
 

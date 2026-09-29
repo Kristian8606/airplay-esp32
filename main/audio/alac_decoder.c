@@ -137,11 +137,6 @@ int alac_decoder_decode(alac_decoder_t *d, const uint8_t *input,
   }
   if (info) {
     info->channels = out_channels;
-    info->sample_rate = dec_info.sample_rate > 0 ? dec_info.sample_rate
-                                                 : d->config.sample_rate;
-    info->bits_per_sample = dec_info.bits_per_sample > 0
-                                ? dec_info.bits_per_sample
-                                : d->config.bits_per_sample;
   }
   return (int)frames;
 }

@@ -36,10 +36,10 @@ rtsp_conn_t *rtsp_conn_create(void) {
     conn->volume_db = -15.0f;
   }
   conn->volume_q15 = volume_db_to_q15(conn->volume_db);
-  audio_receiver_set_volume_q15(conn->volume_q15);
+  /* The output volume is applied when this connection acquires the play
+   * lock (rtsp_server_acquire_play_lock); merely connecting must not change
+   * the volume of a session that is already playing. */
 
-  conn->data_socket = -1;
-  conn->control_socket = -1;
   conn->event_socket = -1;
 
   return conn;
@@ -58,8 +58,10 @@ void rtsp_conn_free(rtsp_conn_t *conn) {
     amp_control_session_disconnected();
   }
 
-  // Persist volume at disconnect
-  settings_persist_volume();
+  // Persist volume at disconnect (only the playing connection owns it)
+  if (conn->play_owner) {
+    settings_persist_volume();
+  }
 
   // Cleanup any resources
   rtsp_conn_cleanup(conn);
@@ -73,19 +75,6 @@ void rtsp_conn_free(rtsp_conn_t *conn) {
   free(conn);
 }
 
-void rtsp_conn_reset_stream(rtsp_conn_t *conn) {
-  if (!conn) {
-    return;
-  }
-
-  // Reset stream state but keep session alive
-  conn->stream_active = false;
-  conn->stream_paused = true; // Paused, not fully torn down
-
-  // Keep ports allocated for quick resume
-  // Don't clear: data_port, control_port, timing_port, event_port
-}
-
 void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   if (!conn) {
     return;
@@ -95,15 +84,6 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   // and must be managed by the caller (rtsp_server cleanup / handle_teardown)
   // to avoid killing a new session's audio during client replacement.
 
-  // Close sockets
-  if (conn->data_socket >= 0) {
-    close(conn->data_socket);
-    conn->data_socket = -1;
-  }
-  if (conn->control_socket >= 0) {
-    close(conn->control_socket);
-    conn->control_socket = -1;
-  }
   if (conn->event_socket >= 0) {
     close(conn->event_socket);
     conn->event_socket = -1;
@@ -114,17 +94,18 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->stream_paused = false;
   conn->data_port = 0;
   conn->control_port = 0;
-  conn->timing_port = 0;
   conn->event_port = 0;
   conn->buffered_port = 0;
 
   // Connection teardown ends the lifetime of SETPEERS/SETPEERSX metadata.
   // Stream-level TEARDOWN keeps the RTSP connection alive and therefore does
   // not come through this cleanup path until the session actually closes.
-  ptp_clock_set_peers(NULL, 0);
-
-  // Clear PTP clock for fresh sync on next connection
-  ptp_clock_clear();
+  // PTP is global: only the playing connection may reset it.
+  if (conn->play_owner) {
+    ptp_clock_set_peers(NULL, 0);
+    // Clear PTP clock for fresh sync on next connection
+    ptp_clock_clear();
+  }
   conn->ptp_session_fresh = false;
 
   // Reset encryption state
@@ -136,21 +117,16 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
     return;
   }
 
-  // AirPlay uses dB attenuation: 0 dB is full scale and -30 dB is mute.
+  // AirPlay volume in dB: 0 = full scale; -30 and below (-144 = mute) are silent.
   if (volume_db > 0.0f) volume_db = 0.0f;
   if (volume_db < -144.0f) volume_db = -144.0f;
   conn->volume_db = volume_db;
   conn->volume_q15 = volume_db_to_q15(volume_db);
+  if (!conn->play_owner) {
+    return; // remembered for this connection; applied if it starts playing
+  }
   audio_receiver_set_volume_q15(conn->volume_q15);
-
 
   // Persist at disconnect.
   settings_set_volume(volume_db);
-}
-
-int32_t rtsp_conn_get_volume_q15(rtsp_conn_t *conn) {
-  if (!conn) {
-    return 32768; // Default full volume
-  }
-  return conn->volume_q15;
 }

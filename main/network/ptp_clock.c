@@ -25,9 +25,7 @@ static const char *TAG = "ptp_clock";
 
 // PTP message types
 #define PTP_MSG_SYNC       0x0
-#define PTP_MSG_DELAY_REQ  0x1
 #define PTP_MSG_FOLLOW_UP  0x8
-#define PTP_MSG_DELAY_RESP 0x9
 #define PTP_MSG_ANNOUNCE   0xB
 
 // PTP header size and timestamp offset
@@ -37,14 +35,12 @@ static const char *TAG = "ptp_clock";
 
 // Synchronization parameters
 //
-// WiFi-side timestamping jitter on ESP32 is ~20–30 ms in practice, so a tight
-// 40 ms lock threshold can take 10+ seconds to satisfy.  Loosen the lock
-// criteria to converge in <1 s while still rejecting genuine outliers via
-// the median filter:
+// WiFi-side timestamping jitter on ESP32 is ~20–30 ms, so lock uses tolerant
+// criteria that converge in <1 s; gross outliers are rejected by the engine's
+// outlier guard (OUTLIER_THRESHOLD_NS):
 //   • LOCK_THRESHOLD_NS:    50 ms  — accept normal WiFi jitter
-//   • OUTLIER_THRESHOLD_NS: 75 ms  — keep the threshold strictly larger than
-//                                   LOCK_THRESHOLD_NS so a borderline sample
-//                                   isn't both kept and counted against lock
+//   • OUTLIER_THRESHOLD_NS: 50 ms  — samples further than this from the
+//                                    filter are dropped
 //   • MIN_SAMPLES_FOR_LOCK: 4      — ~500 ms at 8 Hz SYNC rate
 //   • LOCK_STABLE_TIME_MS:  250    — confirm stability without long wait
 #define LOCK_THRESHOLD_NS    50000000LL // 50ms - tolerant of WiFi jitter
@@ -64,7 +60,6 @@ static const char *TAG = "ptp_clock";
 #define SMOOTH_POS_STEADY_DIV  16  // later, apply 1/16 of positive jitter
 #define SMOOTH_NEG_DIV         256 // always apply only 1/256 of negative jitter
 #define SMOOTH_NEG_CLAMP_NS    (-2500000LL) // clamp negative jitter at -2.5ms
-#define STARTUP_DURATION_MS 1000 // first second: aggressive positive tracking
 
 // Threshold above which we reset the PTP smoothing filter on resume.
 // E.g. at 50 ppm crystal accuracy, 30 s of pause accumulates ~1.5 ms of drift —
@@ -79,8 +74,6 @@ static const char *TAG = "ptp_clock";
 #define RT_MASTER_READY_AGE_MS 400U
 #define RT_MIN_MASTER_SAMPLES 4U
 
-/* Realtime ALAC follows the current filtered remote-to-local offset.
- * Freezing it at startup hides relative clock drift from the audio servo. */
 
 #define PTP_TASK_PRIORITY_LEGACY   6U
 #define PTP_TASK_PRIORITY_REALTIME 8U
@@ -101,13 +94,7 @@ static struct {
   bool locked;
   uint32_t lock_candidate_start_ms;
   uint32_t last_sync_ms;
-  int64_t filtered_offset_ns; // PTP_time = local_time + offset
   uint32_t sample_count;
-
-  // Asymmetric smoothing state (replaces median ring buffer)
-  int64_t previous_offset;
-  uint32_t previous_offset_time_ms; // 0 = no previous sample yet
-  uint32_t mastership_start_ms;     // when continuous tracking began
 
   // Two-step sync tracking
   uint16_t last_sync_seq;
@@ -222,17 +209,8 @@ static int64_t parse_ptp_correction_ns(const uint8_t *data, size_t len) {
   return ((int64_t)raw) / 65536LL;
 }
 
-// Update offset with new sample using asymmetric smoothing (nqptp-style).
-//
-// The key insight from nqptp: since we are a passive PTP listener (no
-// DELAY_REQ/DELAY_RESP), every measured offset contains a one-way network
-// delay bias:  offset_measured = true_offset - delay.
-// LARGER offsets come from SHORTER delays and are MORE accurate.
-//
-// By accepting positive jitter (larger offset = shorter delay) quickly and
-// dampening negative jitter (smaller offset = longer delay) slowly, the
-// filter converges to the offset corresponding to the minimum network
-// delay — the best available approximation of the true clock offset.
+/* One PTP STEP event, filled while ptp_state_mux is held and logged after
+ * release. */
 typedef struct {
   bool emit;
   const char *reason;
@@ -272,8 +250,8 @@ static void log_ptp_step(const ptp_step_log_t *ev) {
 }
 
 /* Caller holds ptp_state_mux. Only accepted samples advance freshness, lock
- * qualification and public sample_count. This fixes the old behaviour where
- * an outlier could keep a stale clock looking alive. */
+ * qualification and public sample_count, so an outlier cannot keep a stale
+ * clock looking alive. */
 static void update_legacy_offset_locked(int64_t raw_offset_ns,
                                         int64_t reception_ns,
                                         int64_t rx_lag_ns,
@@ -289,7 +267,6 @@ static void update_legacy_offset_locked(int64_t raw_offset_ns,
   }
 
 
-  ptp.filtered_offset_ns = r.filtered_offset_ns;
   ptp.sample_count = r.accepted_samples;
   ptp.last_sync_ms = (uint32_t)(reception_ns / 1000000LL);
 
@@ -346,9 +323,9 @@ static void fill_domain_step_locked(const char *reason,
   step_ev->grandmaster_clock_id = de->new_grandmaster_clock_id;
   step_ev->epoch = de->epoch;
   /* set_domain() intentionally starts the new estimator clean. For a normal
-   * same-source GM handover, log the old active clock estimate instead of a
-   * misleading zero and keep that estimate as short holdover until the new
-   * GM produces accepted samples. */
+   * same-source GM handover, log the old estimate instead of a misleading
+   * zero and keep ptp.locked; snapshots report valid=false until the new GM
+   * produces accepted samples. */
   step_ev->raw_offset_ns = preserve_holdover && de->old_estimator_valid
                                ? de->old_raw_offset_ns
                                : ptp.legacy_engine.raw_offset_ns;
@@ -379,7 +356,6 @@ static void fill_domain_step_locked(const char *reason,
     ptp.lock_candidate_start_ms = 0;
     ptp.last_sync_ms = 0;
     ptp.sample_count = 0;
-    ptp.filtered_offset_ns = 0;
   }
 }
 
@@ -412,9 +388,7 @@ static bool realtime_source_matches_locked(uint32_t source_ip) {
  * separate RTP<->ESP-local presentation anchor and keeps using it while the
  * new GM estimator acquires. */
 static void realtime_reset_master_estimator_locked(uint64_t new_gm,
-                                                    uint64_t source_clock,
-                                                    int64_t now_ns) {
-  (void)now_ns;
+                                                    uint64_t source_clock) {
   ptp.source_clock_id = source_clock;
   ptp.grandmaster_clock_id = new_gm;
   ptp.rt_master_offset_ns = 0;
@@ -432,14 +406,10 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.rt_sync_source_ip = 0;
   ptp.rt_awaiting_followup = false;
 
-  /* Realtime PTP lock means "the current GM estimator is ready" only. It no
-   * longer means audio must stop: ALAC playout is in ESP-local time. */
+  /* Realtime PTP lock means only "the current GM estimator is ready"; ALAC
+   * playout runs in ESP-local time and does not stop while it acquires. */
   ptp.locked = false;
-  ptp.filtered_offset_ns = 0;
   ptp.sample_count = 0;
-  ptp.previous_offset = 0;
-  ptp.previous_offset_time_ms = 0;
-  ptp.mastership_start_ms = 0;
   ptp.last_sync_ms = 0;
 }
 
@@ -487,11 +457,6 @@ static bool realtime_update_offset_locked(int64_t raw_offset_ns,
 
 
   /* Publish the same filtered estimate to audio and diagnostics. */
-  ptp.filtered_offset_ns = smoothed;
-  ptp.previous_offset = smoothed;
-  ptp.previous_offset_time_ms = (uint32_t)(reception_ns / 1000000LL);
-  ptp.mastership_start_ms =
-      (uint32_t)(ptp.rt_mastership_start_ns / 1000000LL);
 
   const uint32_t master_age_ms =
       ptp.rt_mastership_start_ns > 0 && reception_ns >= ptp.rt_mastership_start_ns
@@ -708,7 +673,7 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
     old_gm = ptp.grandmaster_clock_id;
     if (old_gm != gm) {
       if (old_gm != 0) ptp.rt_gm_changes++;
-      realtime_reset_master_estimator_locked(gm, source_clock, reception_ns);
+      realtime_reset_master_estimator_locked(gm, source_clock);
       changed = true;
     } else {
       ptp.source_clock_id = source_clock;
@@ -986,9 +951,7 @@ static void ptp_task(void *pvParameters) {
       continue;
     }
 
-    if (ret == 0) {
-      // Timeout - check if we lost lock due to no messages
-    } else {
+    if (ret > 0) {
       /* Match nqptp's userspace timestamp point: sample the local clock once
        * immediately after select() reports readable PTP sockets, then use that
        * reception timestamp for this ready batch. */
@@ -1107,11 +1070,7 @@ static void ptp_clear_estimators_locked(void) {
   ptp.locked = false;
   ptp.lock_candidate_start_ms = 0;
   ptp.last_sync_ms = 0;
-  ptp.filtered_offset_ns = 0;
   ptp.sample_count = 0;
-  ptp.previous_offset = 0;
-  ptp.previous_offset_time_ms = 0;
-  ptp.mastership_start_ms = 0;
   ptp.last_sync_seq = 0;
   ptp.last_sync_local_ns = 0;
   ptp.last_sync_correction_ns = 0;
@@ -1192,14 +1151,12 @@ void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count) {
     }
   }
   if (changed) {
-    /* v4.1.14: a session is starting (empty -> non-empty peer list). Before
-     * this point the task admitted ANY PTP source it heard on the network
-     * (boot, other AirPlay/HomeKit devices) and latched onto the first one.
-     * That latch was never undone, so the real sender's packets were rejected
-     * as a "mixed" source until the next full TEARDOWN: the first session
-     * after boot could stay silent forever. Drop the pre-session estimator so
-     * only the advertised peers can seed it. Mid-session peer changes (group
-     * edits) keep the estimator and its handover logic. */
+    /* A session is starting (empty -> non-empty peer list). Before this the
+     * task admits any PTP source on the network (boot, other AirPlay/HomeKit
+     * devices) and latches onto the first one, which would reject the real
+     * sender as a "mixed" source. Drop the pre-session estimator so only the
+     * advertised peers can seed it. Mid-session peer changes (group edits)
+     * keep the estimator and its handover logic. */
     if (ptp.peer_count == 0 && normalized_count > 0 && !ptp.realtime_mode &&
         (ptp.legacy_engine.source_clock_id != 0 || ptp.legacy_source_mixed)) {
       dropped_source = ptp.legacy_engine.source_clock_id;
@@ -1241,13 +1198,11 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
     ptp.rt_sync_source_ip = 0;
     ptp.rt_awaiting_followup = false;
     ptp.locked = false;
-    ptp.filtered_offset_ns = 0;
     step_ev.source_clock_id = ptp.source_clock_id;
     step_ev.grandmaster_clock_id = ptp.grandmaster_clock_id;
     step_ev.epoch = ptp.grandmaster_clock_id ? ptp.rt_gm_changes + 1U : 0U;
   } else {
     ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
-    ptp.filtered_offset_ns = 0;
     ptp.sample_count = 0;
     ptp.last_sync_ms = 0;
     ptp.locked = false;
@@ -1270,22 +1225,6 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
 }
 
 
-uint64_t ptp_clock_get_time_ns(void) {
-  const int64_t local_ns = get_local_time_ns();
-  int64_t offset_ns;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  offset_ns = ptp.filtered_offset_ns;
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  return (uint64_t)(local_ns + offset_ns);
-}
-
-int64_t ptp_clock_get_offset_ns(void) {
-  int64_t offset_ns;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  offset_ns = ptp.filtered_offset_ns;
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  return offset_ns;
-}
 
 
 void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
@@ -1309,7 +1248,6 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
   snapshot->realtime_mode = ptp.realtime_mode;
   snapshot->locked = ptp.locked;
   snapshot->source_mixed = ptp.legacy_source_mixed;
-  snapshot->expected_clock_id = ptp.expected_clock_id;
   snapshot->peer_count = (uint32_t)ptp.peer_count;
   if (ptp.realtime_mode) {
     snapshot->valid = ptp.rt_master_ready && ptp.rt_last_followup_rx_ns > 0;
@@ -1372,11 +1310,7 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.locked = false;
     ptp.lock_candidate_start_ms = 0;
     ptp.last_sync_ms = 0;
-    ptp.filtered_offset_ns = 0;
     ptp.sample_count = 0;
-    ptp.previous_offset = 0;
-    ptp.previous_offset_time_ms = 0;
-    ptp.mastership_start_ms = 0;
     ptp.last_sync_seq = 0;
     ptp.last_sync_local_ns = 0;
     ptp.last_sync_correction_ns = 0;
@@ -1435,14 +1369,6 @@ void ptp_clock_note_realtime_d7(uint64_t clock_id) {
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
-bool ptp_clock_realtime_time_to_local(uint64_t clock_id,
-                                      uint64_t remote_ptp_ns,
-                                      uint64_t *local_ns) {
-  ptp_realtime_snapshot_t snapshot;
-  ptp_clock_get_realtime_snapshot(&snapshot);
-  return ptp_clock_realtime_snapshot_to_local(
-      &snapshot, clock_id, remote_ptp_ns, local_ns);
-}
 
 void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
   if (!snapshot) return;
@@ -1503,7 +1429,6 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
         ptp.locked = false;
         ptp.lock_candidate_start_ms = 0;
         ptp.last_sync_ms = 0;
-        ptp.filtered_offset_ns = 0;
         ptp.sample_count = 0;
         ptp.last_sync_seq = 0;
         ptp.last_sync_local_ns = 0;
@@ -1549,13 +1474,4 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
     (void)source_mixed;
 #endif
   }
-}
-
-uint64_t ptp_clock_get_master_clock_id(void) {
-  uint64_t clock_id;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  clock_id = ptp.realtime_mode ? ptp.grandmaster_clock_id
-                               : ptp.expected_clock_id;
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  return clock_id;
 }

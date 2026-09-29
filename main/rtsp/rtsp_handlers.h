@@ -13,35 +13,35 @@
  * Inspired by shairport-sync's method_handlers pattern
  */
 
+// AirPlay feature flags 0x1C340405C4A00: Shairport Sync's AirPlay 2 value
+// (0x18340405C4A00) plus bit 46, so senders show the device as a HomePod.
 // Key bits:
 //   Bit 38: SupportsCoreUtilsPairingAndEncryption
-//   Bit 46: SupportsHKPairingAndAccessControl
+//   Bit 46: SupportsHKPairingAndAccessControl (HomePod presentation)
 //   Bit 48: SupportsTransientPairing
-#ifdef CONFIG_AIRPLAY_FORCE_V1
-// AirPlay v1: strip pairing/encryption bits so iOS uses classic RAOP
-#define AIRPLAY_FEATURES_HI 0x0
-#define AIRPLAY_FEATURES_LO 0x5C4A00
-#else
 #define AIRPLAY_FEATURES_HI 0x1C340
 #define AIRPLAY_FEATURES_LO 0x405C4A00
-#endif
+
+// Model identifier in mDNS ("model", "am"), /info and updateInfo:
+// AudioAccessory6,1 = HomePod (2nd generation).
+#define AIRPLAY_MODEL "AudioAccessory6,1"
 
 // Include for audio_format_t and the shared buffered transport capacity.
 #include "audio_receiver.h"
 
-// Advertise exactly the amount of raw type-103 audio we can stage.
 
 /**
  * Codec registry entry
  */
 typedef struct {
-  const char *name; // Codec name: "ALAC", "AAC", "OPUS"
-  int64_t type_id;  // bplist "ct" value (2=ALAC, 4=AAC, 8=AAC-ELD)
+  const char *name; // Codec name: "ALAC", "AAC", "AAC-ELD", "OPUS"
+  int64_t type_id;  // bplist "ct" value (2=ALAC, 4=AAC, 8=AAC-ELD, 64=OPUS)
 } rtsp_codec_t;
 
 /**
  * Configure audio format from codec type ID
- * Looks up codec in registry and calls its configure function.
+ * Looks up the codec in the registry and fills fmt (2 ch, 16 bit, given
+ * sample rate and samples per frame).
  * @param type_id Codec type from bplist "ct" field
  * @param fmt Audio format struct to configure
  * @param sample_rate Sample rate from bplist
@@ -78,6 +78,21 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
                   size_t raw_len);
 
 /**
+ * Create the handler mutex. Call once before the RTSP server accepts
+ * connections (rtsp_server_start() does).
+ */
+esp_err_t rtsp_handlers_init(void);
+
+/**
+ * Serialise work on the shared RTSP/audio state across client tasks.
+ * rtsp_dispatch() takes it around every handler; rtsp_server takes it around
+ * the play owner's disconnect cleanup. Never acquire the play lock while
+ * holding it.
+ */
+void rtsp_handlers_lock(void);
+void rtsp_handlers_unlock(void);
+
+/**
  * Get device ID string (MAC address format)
  * @param device_id Output buffer (at least 18 bytes)
  * @param len Buffer size
@@ -85,6 +100,7 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
 void rtsp_get_device_id(char *device_id, size_t len);
 
 // Event port task management
-esp_err_t rtsp_start_event_port_task(int listen_socket);
+// session: the play owner's HAP session (event channel keys); may be NULL.
+esp_err_t rtsp_start_event_port_task(int listen_socket,
+                                     const hap_session_t *session);
 void rtsp_stop_event_port_task(void);
-int rtsp_event_port_listen_socket(void);

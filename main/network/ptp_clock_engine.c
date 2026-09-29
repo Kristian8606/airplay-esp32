@@ -1,7 +1,6 @@
 #include "ptp_clock_engine.h"
 
 #include <string.h>
-#include <limits.h>
 
 #define PTP_ENGINE_STARTUP_NS        1000000000LL
 #define PTP_ENGINE_POS_STEADY_DIV    16LL
@@ -54,12 +53,9 @@ bool ptp_clock_engine_set_domain(ptp_clock_engine_t *engine,
   }
   if (!changed) return false;
 
-  const uint64_t old_source = engine->source_clock_id;
-  const uint64_t old_gm = engine->grandmaster_clock_id;
   const bool old_valid = engine->valid;
   const int64_t old_raw_offset_ns = engine->raw_offset_ns;
   const int64_t old_filtered_offset_ns = engine->filtered_offset_ns;
-  const uint32_t old_accepted_samples = engine->accepted_samples;
 
   if (first_domain || source_changed || gm_changed) {
     engine->epoch = next_epoch(engine->epoch);
@@ -77,15 +73,11 @@ bool ptp_clock_engine_set_domain(ptp_clock_engine_t *engine,
   if (event_out) {
     event_out->source_changed = source_changed;
     event_out->gm_changed = gm_changed;
-    event_out->first_domain = first_domain;
-    event_out->old_source_clock_id = old_source;
-    event_out->old_grandmaster_clock_id = old_gm;
     event_out->new_source_clock_id = engine->source_clock_id;
     event_out->new_grandmaster_clock_id = engine->grandmaster_clock_id;
     event_out->old_estimator_valid = old_valid;
     event_out->old_raw_offset_ns = old_raw_offset_ns;
     event_out->old_filtered_offset_ns = old_filtered_offset_ns;
-    event_out->old_accepted_samples = old_accepted_samples;
     event_out->epoch = engine->epoch;
   }
   return true;
@@ -105,7 +97,6 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
   if (!engine || reception_time_ns <= 0) return result;
 
   result.raw_offset_ns = raw_offset_ns;
-  result.epoch = engine->epoch;
 
   if (engine->valid && engine->outlier_threshold_ns > 0) {
     int64_t diff = raw_offset_ns - engine->filtered_offset_ns;
@@ -160,11 +151,8 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
                                 : 0;
   result.raw_filter_delta_ns = raw_offset_ns - smoothed;
   result.accepted_samples = engine->accepted_samples;
-  result.epoch = engine->epoch;
   return result;
 }
-
-
 
 static bool add_signed_u64(uint64_t base, int64_t delta, uint64_t *out) {
   if (!out) return false;

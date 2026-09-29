@@ -31,20 +31,6 @@ static httpd_handle_t s_server = NULL;
 #define HTTP_SERVER_TASK_PRIORITY 3
 #define HTTP_BODY_IDLE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 
-static void log_wifi_scan_memory(const char *where) {
-  ESP_LOGI(TAG,
-           "WiFi scan MEM %s internal=%uKiB largest=%uKiB psram=%uKiB largest=%uKiB",
-           where,
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) /
-                      1024U),
-           (unsigned)(heap_caps_get_largest_free_block(
-                          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) /
-                      1024U),
-           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) /
-                      1024U));
-}
-
 static esp_err_t restore_airplay_after_wifi_scan(void) {
   esp_err_t last_err = ESP_FAIL;
 
@@ -69,7 +55,6 @@ static esp_err_t restore_airplay_after_wifi_scan(void) {
     }
 
     if (attempt == 1) {
-      log_wifi_scan_memory("restore-retry");
       vTaskDelay(pdMS_TO_TICKS(100));
     }
   }
@@ -139,9 +124,6 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
                           "Audio engine could not pause for WiFi scan");
       return ESP_FAIL;
     }
-    log_wifi_scan_memory("after-audio-release");
-  } else {
-    log_wifi_scan_memory("setup-mode");
   }
 
   esp_err_t err = wifi_scan(&ap_list, &ap_count);
@@ -161,7 +143,6 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
       return ESP_FAIL;
     }
     ESP_LOGI(TAG, "WiFi scan: AirPlay ready again");
-    log_wifi_scan_memory("after-audio-restore");
   }
 
   cJSON *json = cJSON_CreateObject();
@@ -192,7 +173,6 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   free(ap_list);
   ap_list = NULL;
   cJSON_Delete(json);
-  log_wifi_scan_memory("after-scan-results-free");
 
   if (!json_str) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
@@ -227,9 +207,9 @@ static esp_err_t recv_json(httpd_req_t *req, char *buf, size_t cap){
   buf[got] = 0;
   return ESP_OK;
 }
-/* v4.1.28 optional admin password (menuconfig AIRPLAY_WEB_ADMIN_PASSWORD).
- * Empty = no check (default, unchanged behaviour). When set, firmware update,
- * restart, Wi-Fi/name changes and the latency test require HTTP Basic auth
+/* Optional admin password (menuconfig AIRPLAY_WEB_ADMIN_PASSWORD).
+ * Empty = no check (default). When set, firmware update, restart, Wi-Fi/name
+ * changes and the output-latency setting and test require HTTP Basic auth
  * (user "admin"); the browser shows its own login prompt once. */
 #ifndef CONFIG_AIRPLAY_WEB_ADMIN_PASSWORD
 #define CONFIG_AIRPLAY_WEB_ADMIN_PASSWORD ""
@@ -261,16 +241,13 @@ static esp_err_t wifi_config_handler(httpd_req_t *req){
   char b[512]; if(recv_json(req,b,sizeof(b))!=ESP_OK){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid body");return ESP_FAIL;} cJSON *j=cJSON_Parse(b); cJSON *s=j?cJSON_GetObjectItem(j,"ssid"):NULL; cJSON *p=j?cJSON_GetObjectItem(j,"password"):NULL; cJSON *r=cJSON_CreateObject();
   if(s&&cJSON_IsString(s)){ esp_err_t e=settings_set_wifi_credentials(s->valuestring,(p&&cJSON_IsString(p))?p->valuestring:""); cJSON_AddBoolToObject(r,"success",e==ESP_OK); if(e!=ESP_OK)cJSON_AddStringToObject(r,"error",esp_err_to_name(e)); }
   else { cJSON_AddBoolToObject(r,"success",false); cJSON_AddStringToObject(r,"error","Invalid SSID"); }
-  /* v4.1.28: restart ONLY after the new credentials were really saved. */
+  /* Restart only after the new credentials were really saved. */
   cJSON *ok_item=cJSON_GetObjectItem(r,"success"); const bool saved=ok_item&&cJSON_IsTrue(ok_item);
   char *out=cJSON_PrintUnformatted(r); httpd_resp_set_type(req,"application/json"); httpd_resp_sendstr(req,out); free(out); cJSON_Delete(r); if(j)cJSON_Delete(j);
   if(saved){ vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); }
   return ESP_OK;
 }
-/* ---- v4.1.21 output latency (manual value + optional wired measurement) ---- */
-#ifndef CONFIG_AIRPLAY_OUTPUT_LATENCY_US
-#define CONFIG_AIRPLAY_OUTPUT_LATENCY_US 0
-#endif
+/* ---- Output latency (manual value + optional wired measurement) ---- */
 static void send_json_obj(httpd_req_t *req, cJSON *r) {
   char *out = cJSON_PrintUnformatted(r);
   httpd_resp_set_type(req, "application/json");
@@ -337,8 +314,8 @@ static esp_err_t latency_measure_handler(httpd_req_t *req) {
       if (j) cJSON_Delete(j);
     }
   }
-  /* v4.1.23: same lifecycle as the Wi-Fi scan: stop AirPlay, release its
-   * memory, measure, restore AirPlay. */
+  /* Same lifecycle as the Wi-Fi scan: stop AirPlay, release its memory,
+   * measure, restore AirPlay. */
   const bool restore_airplay = audio_receiver_is_initialized();
   if (restore_airplay) {
     ESP_LOGI(TAG, "Latency test: pausing AirPlay and releasing audio memory");
@@ -356,7 +333,6 @@ static esp_err_t latency_measure_handler(httpd_req_t *req) {
                           "Audio engine could not pause for the latency test");
       return ESP_FAIL;
     }
-    log_wifi_scan_memory("latency-test-released");
   }
   latency_cal_result_t res;
   esp_err_t e = audio_receiver_measure_output_latency(&res, audible);
@@ -591,4 +567,3 @@ esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_conf
   ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
 #undef REG
   e=log_stream_register(s_server);if(e!=ESP_OK)ESP_LOGW(TAG,"log stream register failed: %s",esp_err_to_name(e));ESP_LOGI(TAG,"Web UI started on port %u",port);return ESP_OK; }
-void web_server_stop(void){if(s_server){httpd_stop(s_server);s_server=NULL;}}

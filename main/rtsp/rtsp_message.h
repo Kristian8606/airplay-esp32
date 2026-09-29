@@ -18,7 +18,6 @@ typedef struct {
   char protocol[16];
   int cseq;
   char content_type[64];
-  size_t content_length;
   const uint8_t *body;
   size_t body_len;
 } rtsp_request_t;
@@ -100,12 +99,3 @@ int rtsp_send_ok(int socket, rtsp_conn_t *conn, int cseq);
 int rtsp_send_http_response(int socket, rtsp_conn_t *conn, int status_code,
                             const char *status_text, const char *content_type,
                             const char *body, size_t body_len);
-
-/**
- * Parse Transport header for client ports (AirPlay 1)
- * @param request Request string
- * @param control_port Output: client's control port (or 0)
- * @param timing_port Output: client's timing port (or 0)
- */
-void rtsp_parse_transport(const char *request, uint16_t *control_port,
-                          uint16_t *timing_port);

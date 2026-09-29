@@ -33,9 +33,7 @@ struct ap2_buffered_fifo {
   size_t read_pos;
   size_t write_pos;
   size_t occupancy;
-  uint64_t total_written;
-  uint64_t total_read;
-
+  uint64_t total_written; /* bytes accepted on the current connection */
 
   SemaphoreHandle_t fifo_mutex;
   SemaphoreHandle_t not_empty;
@@ -80,25 +78,40 @@ void ap2_buffered_fifo_wait(ap2_buffered_fifo_t *fifo, uint32_t timeout_ms) {
   (void)xSemaphoreTake(fifo->control_wake, ticks);
 }
 
+static inline void fifo_advance_locked(ap2_buffered_fifo_t *fifo, size_t n) {
+  fifo->read_pos += n;
+  if (fifo->read_pos >= fifo->capacity) fifo->read_pos -= fifo->capacity;
+  fifo->occupancy -= n;
+}
+
+/* Copy `len` bytes starting `offset` bytes after read_pos (wrap-aware). */
+static inline void fifo_peek_locked(const ap2_buffered_fifo_t *fifo,
+                                    size_t offset, uint8_t *dst, size_t len) {
+  size_t pos = fifo->read_pos + offset;
+  if (pos >= fifo->capacity) pos -= fifo->capacity;
+  const size_t first = len < fifo->capacity - pos ? len : fifo->capacity - pos;
+  memcpy(dst, fifo->buffer + pos, first);
+  if (first < len) memcpy(dst + first, fifo->buffer, len - first);
+}
+
 static void fifo_discard_all(ap2_buffered_fifo_t *fifo) {
   if (!fifo || !fifo->fifo_mutex) return;
   xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
-  fifo->total_read = fifo->total_written;
   /* Any in-flight read belongs to the previous byte stream. */
   (void)next_epoch(fifo);
   xSemaphoreGive(fifo->fifo_mutex);
   signal_all(fifo);
 }
 
-static bool fifo_read_exact(ap2_buffered_fifo_t *fifo, uint8_t *dst,
-                            size_t len, uint32_t expected_epoch) {
-  size_t copied = 0;
-  while (copied < len && fifo->running) {
-    if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) != expected_epoch)
-      return false;
-
+/* Consume exactly `len` bytes in stream order. dst == NULL consumes them
+ * without copying (the processor has already decided to drop the block).
+ * Returns false if the connection ended or the stream epoch changed. */
+static bool fifo_consume_exact(ap2_buffered_fifo_t *fifo, uint8_t *dst,
+                               size_t len, uint32_t expected_epoch) {
+  size_t done = 0;
+  while (done < len && fifo->running) {
     xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
     if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) != expected_epoch) {
       xSemaphoreGive(fifo->fifo_mutex);
@@ -112,20 +125,19 @@ static bool fifo_read_exact(ap2_buffered_fifo_t *fifo, uint8_t *dst,
       continue;
     }
 
-    size_t n = len - copied;
+    size_t n = len - done;
     if (n > fifo->occupancy) n = fifo->occupancy;
-    const size_t to_end = fifo->capacity - fifo->read_pos;
-    if (n > to_end) n = to_end;
-    memcpy(dst + copied, fifo->buffer + fifo->read_pos, n);
-    fifo->read_pos += n;
-    if (fifo->read_pos == fifo->capacity) fifo->read_pos = 0;
-    fifo->occupancy -= n;
-    fifo->total_read += n;
+    if (dst) {
+      const size_t to_end = fifo->capacity - fifo->read_pos;
+      if (n > to_end) n = to_end;
+      memcpy(dst + done, fifo->buffer + fifo->read_pos, n);
+    }
+    fifo_advance_locked(fifo, n);
     xSemaphoreGive(fifo->fifo_mutex);
-    copied += n;
+    done += n;
     xSemaphoreGive(fifo->not_full);
   }
-  return copied == len;
+  return done == len;
 }
 
 static bool wait_for_connected_epoch(ap2_buffered_fifo_t *fifo,
@@ -169,7 +181,6 @@ static void tcp_reader_task(void *arg) {
     fifo->write_pos = 0;
     fifo->occupancy = 0;
     fifo->total_written = 0;
-    fifo->total_read = 0;
     fifo->connected = true;
     fifo->client_sock = c;
     (void)next_epoch(fifo);
@@ -179,6 +190,7 @@ static void tcp_reader_task(void *arg) {
              (unsigned)(fifo->capacity / 1024U));
     signal_all(fifo);
 
+    bool peer_closed = false;
     while (fifo->running) {
       size_t write_pos = 0;
       size_t request = 0;
@@ -203,6 +215,7 @@ static void tcp_reader_task(void *arg) {
       if (n <= 0) {
         if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
           continue;
+        peer_closed = n == 0;
         break;
       }
 
@@ -226,20 +239,33 @@ static void tcp_reader_task(void *arg) {
     }
 
     /* The reader owns close(); detach the shared descriptor before closing it
-     * so stop/abort can never shutdown a recycled lwIP descriptor. */
+     * so stop/abort can never shutdown a recycled lwIP descriptor.
+     *
+     * Orderly end of stream (FIN from the sender, connection still ours):
+     * like Shairport's buffered_read(), bytes already received stay readable
+     * until the processor has consumed them. Only stop/abort/errors, or the
+     * next accepted connection, discard them. */
     xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+    const bool keep_backlog =
+        peer_closed && fifo->running && fifo->connected && fifo->client_sock == c;
     if (fifo->client_sock == c) fifo->client_sock = -1;
     fifo->connected = false;
-    fifo->read_pos = fifo->write_pos;
-    fifo->occupancy = 0;
-    fifo->total_read = fifo->total_written;
-    (void)next_epoch(fifo);
+    if (!keep_backlog) {
+      fifo->read_pos = fifo->write_pos;
+      fifo->occupancy = 0;
+      (void)next_epoch(fifo);
+    }
+    const size_t kept = fifo->occupancy;
     xSemaphoreGive(fifo->fifo_mutex);
 
     (void)shutdown(c, SHUT_RDWR);
     close(c);
     signal_all(fifo);
-    ESP_LOGI(TAG, "buffered TCP disconnected");
+    if (kept)
+      ESP_LOGI(TAG, "buffered TCP closed by sender; %u bytes left to play",
+               (unsigned)kept);
+    else
+      ESP_LOGI(TAG, "buffered TCP disconnected");
   }
 
   __atomic_store_n(&fifo->reader_task, NULL, __ATOMIC_RELEASE);
@@ -335,7 +361,6 @@ void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
   fifo->connected = false;
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
-  fifo->total_read = fifo->total_written;
   if (client >= 0) (void)shutdown(client, SHUT_RDWR);
   (void)next_epoch(fifo);
   xSemaphoreGive(fifo->fifo_mutex);
@@ -375,7 +400,6 @@ void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo) {
   fifo->connected = false;
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
-  fifo->total_read = fifo->total_written;
   (void)next_epoch(fifo);
   if (client >= 0) (void)shutdown(client, SHUT_RDWR);
   xSemaphoreGive(fifo->fifo_mutex);
@@ -397,16 +421,15 @@ void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
   out->used_bytes = fifo->occupancy;
   out->bytes_received = fifo->total_written;
   xSemaphoreGive(fifo->fifo_mutex);
-
 }
 
-esp_err_t ap2_buffered_fifo_read_block(ap2_buffered_fifo_t *fifo,
-                                       uint8_t *block_storage,
-                                       size_t block_capacity,
-                                       size_t *block_len,
-                                       uint32_t *stream_epoch) {
-  if (!fifo || !block_storage || !block_len || !stream_epoch ||
-      block_capacity < 12U)
+esp_err_t ap2_buffered_fifo_read_block_head(ap2_buffered_fifo_t *fifo,
+                                            uint8_t *head, size_t head_len,
+                                            size_t block_capacity,
+                                            size_t *block_len,
+                                            uint32_t *stream_epoch) {
+  if (!fifo || !head || !block_len || !stream_epoch || head_len == 0U ||
+      block_capacity < head_len)
     return ESP_ERR_INVALID_ARG;
 
   for (;;) {
@@ -415,25 +438,52 @@ esp_err_t ap2_buffered_fifo_read_block(ap2_buffered_fifo_t *fifo,
     if (!wait_for_connected_epoch(fifo, &epoch)) return ESP_ERR_INVALID_STATE;
 
     uint8_t length_bytes[2];
-    if (!fifo_read_exact(fifo, length_bytes, sizeof(length_bytes), epoch))
-      continue;
-    const uint16_t wire_len =
-        ((uint16_t)length_bytes[0] << 8) | length_bytes[1];
-    if (wire_len < FIFO_MIN_WIRE_LEN || (size_t)wire_len > block_capacity + 2U) {
+    bool have_head = false;
+
+    /* Fast path: the length prefix and the block head are normally already
+     * queued, so take them with a single lock. */
+    xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+    if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) == epoch &&
+        fifo->occupancy >= 2U + head_len) {
+      fifo_peek_locked(fifo, 0U, length_bytes, 2U);
+      fifo_peek_locked(fifo, 2U, head, head_len);
+      fifo_advance_locked(fifo, 2U + head_len);
+      have_head = true;
+    }
+    xSemaphoreGive(fifo->fifo_mutex);
+
+    if (have_head) {
+      xSemaphoreGive(fifo->not_full);
+    } else if (!fifo_consume_exact(fifo, length_bytes, 2U, epoch)) {
+      continue; /* connection ended or epoch changed: start over */
+    }
+
+    /* Validate the length before waiting for the rest of the head: a corrupt
+     * prefix must abort the client, not wait for bytes that may never come. */
+    const size_t wire_len = ((size_t)length_bytes[0] << 8) | length_bytes[1];
+    if (wire_len < 2U + head_len || wire_len < FIFO_MIN_WIRE_LEN ||
+        wire_len > block_capacity + 2U) {
       ESP_LOGW(TAG,
                "invalid buffered block length=%u; aborting client to restore framing",
                (unsigned)wire_len);
       ap2_buffered_fifo_abort_client(fifo);
       return ESP_ERR_INVALID_SIZE;
     }
-
-    const size_t body_len = (size_t)wire_len - 2U;
-    if (!fifo_read_exact(fifo, block_storage, body_len, epoch)) continue;
-    if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) != epoch)
+    if (!have_head && !fifo_consume_exact(fifo, head, head_len, epoch)) {
       continue;
+    }
 
-    *block_len = body_len;
+    *block_len = wire_len - 2U;
     *stream_epoch = epoch;
     return ESP_OK;
   }
+}
+
+esp_err_t ap2_buffered_fifo_read_block_rest(ap2_buffered_fifo_t *fifo,
+                                            uint8_t *dst, size_t len,
+                                            uint32_t stream_epoch) {
+  if (!fifo) return ESP_ERR_INVALID_ARG;
+  if (len == 0U) return ESP_OK;
+  return fifo_consume_exact(fifo, dst, len, stream_epoch) ? ESP_OK
+                                                          : ESP_ERR_INVALID_STATE;
 }

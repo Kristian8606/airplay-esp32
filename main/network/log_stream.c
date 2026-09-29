@@ -72,7 +72,7 @@ static size_t ring_read(char *buf, size_t max) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Log hook — called from any task/ISR-safe context by esp_log       */
+/*  Log hook — called from task context by esp_log (never from ISRs)  */
 /* ------------------------------------------------------------------ */
 
 static int log_vprintf_hook(const char *fmt, va_list args) {

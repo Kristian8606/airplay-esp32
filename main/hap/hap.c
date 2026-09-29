@@ -4,7 +4,6 @@
 
 #include "esp_log.h"
 #include "nvs.h"
-#include "nvs_flash.h"
 #include "sodium.h"
 
 #include "srp.h"
@@ -113,5 +112,7 @@ void hap_session_free(hap_session_t *session) {
   sodium_memzero(session->shared_secret, sizeof(session->shared_secret));
   sodium_memzero(session->encrypt_key, sizeof(session->encrypt_key));
   sodium_memzero(session->decrypt_key, sizeof(session->decrypt_key));
+  sodium_memzero(session->event_encrypt_key, sizeof(session->event_encrypt_key));
+  sodium_memzero(session->event_decrypt_key, sizeof(session->event_decrypt_key));
   free(session);
 }

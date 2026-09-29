@@ -14,8 +14,6 @@ typedef struct {
 
 typedef struct {
   int channels;
-  int sample_rate;
-  int bits_per_sample;
 } alac_decode_info_t;
 
 alac_decoder_t *alac_decoder_create(const alac_decoder_config_t *config);

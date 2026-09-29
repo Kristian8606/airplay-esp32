@@ -203,7 +203,6 @@ esp_err_t srp_start(srp_session_t *session, const char *username,
   mbedtls_mpi_mod_mpi(&B, &B, &N);
 
   mpi_to_bytes_padded(&B, session->server_public_key, SRP_PRIME_BYTES);
-  session->state = 1;
   ret = 0;
 
 cleanup:
@@ -407,7 +406,6 @@ esp_err_t srp_verify_client(srp_session_t *session,
   }
 
   session->verified = true;
-  session->state = 2;
   ret = 0;
 
 cleanup:

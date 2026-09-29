@@ -61,15 +61,6 @@ void plist_dict_uint(plist_t *p, const char *key, uint64_t value) {
   }
 }
 
-void plist_dict_bool(plist_t *p, const char *key, bool value) {
-  size_t remaining = p->capacity - p->size;
-  int len = snprintf(p->buffer + p->size, remaining, "<key>%s</key>\n<%s/>\n",
-                     key, value ? "true" : "false");
-  if (len > 0 && (size_t)len < remaining) {
-    p->size += (size_t)len;
-  }
-}
-
 void plist_dict_data(plist_t *p, const char *key, const uint8_t *data,
                      size_t len) {
   size_t b64_len = base64_encoded_length(len);
@@ -96,11 +87,6 @@ void plist_dict_data(plist_t *p, const char *key, const uint8_t *data,
   plist_append(p, "</data>\n");
 }
 
-void plist_dict_data_hex(plist_t *p, const char *key, const uint8_t *data,
-                         size_t len) {
-  plist_dict_data(p, key, data, len);
-}
-
 void plist_dict_end(plist_t *p) {
   plist_append(p, "</dict>\n");
 }
@@ -114,21 +100,8 @@ void plist_dict_array_begin(plist_t *p, const char *key) {
   }
 }
 
-void plist_array_begin(plist_t *p) {
-  plist_append(p, "<array>\n");
-}
-
 void plist_array_end(plist_t *p) {
   plist_append(p, "</array>\n");
-}
-
-void plist_array_int(plist_t *p, int64_t value) {
-  size_t remaining = p->capacity - p->size;
-  int len = snprintf(p->buffer + p->size, remaining,
-                     "<integer>%" PRId64 "</integer>\n", value);
-  if (len > 0 && (size_t)len < remaining) {
-    p->size += (size_t)len;
-  }
 }
 
 size_t plist_end(plist_t *p) {

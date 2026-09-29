@@ -6,10 +6,10 @@
 #include "sdkconfig.h"
 
 /*
- * Temporary AirPlay diagnostics facade.
+ * Compile-time AirPlay diagnostics facade (CONFIG_AIRPLAY_DIAGNOSTICS).
  *
- * Production audio_status is intentionally NOT part of this module.
- * Every temporary counter/timestamp/array/buffer/helper/task must either live
+ * The permanent audio_status log is NOT part of this module.
+ * Every diagnostic counter/timestamp/array/buffer/helper/task must either live
  * in audio_diag.c or be enclosed by the matching CONFIG_AIRPLAY_DIAG_* guard.
  *
  * When the master switch/category is disabled, the macros below erase both the
@@ -131,35 +131,21 @@ void audio_diag_playout_i2s(uint32_t mclk_hz, uint32_t dma_desc,
 void audio_diag_transport_socket_buffer(uint32_t requested, uint32_t actual);
 void audio_diag_transport_ports(uint32_t data_port, uint32_t control_port);
 void audio_diag_transport_retransmit_target(uint32_t ip_be, uint32_t port);
-/* Buffered AAC/TCP hot-path statistics. All state is owned by audio_diag.c.
+/* Buffered AAC/TCP block statistics. All state is owned by audio_diag.c.
  * These hooks are compiled out completely with TRANSPORT diagnostics off. */
-void audio_diag_transport_aac_session_reset(void);
 void audio_diag_transport_aac_rx_block(uint32_t payload_bytes);
-void audio_diag_transport_aac_store_wait_begin(void);
-void audio_diag_transport_aac_store_wait_end(void);
-/* Decoder-cursor diagnostics. Normal exact hits stay O(1); these hooks only
- * count why the cursor waited or entered the recovery-only descriptor scan. */
 #define AUDIO_DIAG_TRANSPORT_SOCKET_BUFFER(...) \
   audio_diag_transport_socket_buffer(__VA_ARGS__)
 #define AUDIO_DIAG_TRANSPORT_PORTS(...) audio_diag_transport_ports(__VA_ARGS__)
 #define AUDIO_DIAG_TRANSPORT_RETRANSMIT_TARGET(...) \
   audio_diag_transport_retransmit_target(__VA_ARGS__)
-#define AUDIO_DIAG_TRANSPORT_AAC_SESSION_RESET() \
-  audio_diag_transport_aac_session_reset()
 #define AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK(...) \
   audio_diag_transport_aac_rx_block(__VA_ARGS__)
-#define AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_BEGIN() \
-  audio_diag_transport_aac_store_wait_begin()
-#define AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_END() \
-  audio_diag_transport_aac_store_wait_end()
 #else
 #define AUDIO_DIAG_TRANSPORT_SOCKET_BUFFER(...) do {} while (0)
 #define AUDIO_DIAG_TRANSPORT_PORTS(...) do {} while (0)
 #define AUDIO_DIAG_TRANSPORT_RETRANSMIT_TARGET(...) do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_AAC_SESSION_RESET() do {} while (0)
 #define AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK(...) do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_BEGIN() do {} while (0)
-#define AUDIO_DIAG_TRANSPORT_AAC_STORE_WAIT_END() do {} while (0)
 #endif
 
 #if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
@@ -182,8 +168,6 @@ void audio_diag_flush_control_rx_begin(int socket);
 void audio_diag_flush_control_rx_header_done(int socket);
 void audio_diag_flush_control_rx_payload_done(int socket);
 void audio_diag_flush_control_rx_end(int socket, uint32_t plaintext_bytes);
-void audio_diag_flush_status_wait_begin(void);
-void audio_diag_flush_status_wait_end(uint32_t timed_out);
 void audio_diag_flush_immediate_begin(void);
 void audio_diag_flush_immediate_publish_acquired(void);
 void audio_diag_flush_immediate_transport_done(void);
@@ -203,10 +187,6 @@ void audio_diag_flush_immediate_end(void);
   audio_diag_flush_control_rx_payload_done(__VA_ARGS__)
 #define AUDIO_DIAG_FLUSH_CONTROL_RX_END(...) \
   audio_diag_flush_control_rx_end(__VA_ARGS__)
-#define AUDIO_DIAG_FLUSH_STATUS_WAIT_BEGIN() \
-  audio_diag_flush_status_wait_begin()
-#define AUDIO_DIAG_FLUSH_STATUS_WAIT_END(...) \
-  audio_diag_flush_status_wait_end(__VA_ARGS__)
 #define AUDIO_DIAG_FLUSH_IMMEDIATE_BEGIN() \
   audio_diag_flush_immediate_begin()
 #define AUDIO_DIAG_FLUSH_IMMEDIATE_PUBLISH_ACQUIRED() \
@@ -225,8 +205,6 @@ void audio_diag_flush_immediate_end(void);
 #define AUDIO_DIAG_FLUSH_CONTROL_RX_HEADER_DONE(...) do {} while (0)
 #define AUDIO_DIAG_FLUSH_CONTROL_RX_PAYLOAD_DONE(...) do {} while (0)
 #define AUDIO_DIAG_FLUSH_CONTROL_RX_END(...) do {} while (0)
-#define AUDIO_DIAG_FLUSH_STATUS_WAIT_BEGIN() do {} while (0)
-#define AUDIO_DIAG_FLUSH_STATUS_WAIT_END(...) do {} while (0)
 #define AUDIO_DIAG_FLUSH_IMMEDIATE_BEGIN() do {} while (0)
 #define AUDIO_DIAG_FLUSH_IMMEDIATE_PUBLISH_ACQUIRED() do {} while (0)
 #define AUDIO_DIAG_FLUSH_IMMEDIATE_TRANSPORT_DONE() do {} while (0)

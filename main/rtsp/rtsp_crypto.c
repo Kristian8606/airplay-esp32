@@ -114,13 +114,11 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
   return (int)plaintext_len;
 }
 
-int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
-                            size_t data_len) {
-  if (!conn || !conn->hap_session || !conn->encrypted_mode) {
-    // Expected during session teardown - not an error
+int rtsp_crypto_seal_send(int socket, const uint8_t key[32], uint64_t *nonce,
+                          const uint8_t *data, size_t data_len) {
+  if (!key || !nonce || (!data && data_len > 0)) {
     return -1;
   }
-
   size_t offset = 0;
   while (offset < data_len) {
     uint16_t block_len = (data_len - offset) > RTSP_ENCRYPTED_BLOCK_MAX
@@ -131,8 +129,8 @@ int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
     len_buf[0] = block_len & 0xFF;
     len_buf[1] = (block_len >> 8) & 0xFF;
 
-    uint8_t nonce[12] = {0};
-    memcpy(nonce + 4, &conn->hap_session->encrypt_nonce, 8);
+    uint8_t nonce_buf[12] = {0};
+    memcpy(nonce_buf + 4, nonce, 8);
 
     size_t encrypted_len = block_len + 16; // +16 for Poly1305 tag
     uint8_t *encrypted = malloc(encrypted_len);
@@ -144,7 +142,7 @@ int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
     unsigned long long ct_len;
     crypto_aead_chacha20poly1305_ietf_encrypt(
         encrypted, &ct_len, data + offset, block_len, len_buf, sizeof(len_buf),
-        NULL, nonce, conn->hap_session->encrypt_key);
+        NULL, nonce_buf, key);
 
     if (ct_len != encrypted_len) {
       ESP_LOGE(TAG, "Unexpected encrypted length: %llu", ct_len);
@@ -160,9 +158,42 @@ int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
     }
 
     free(encrypted);
-    conn->hap_session->encrypt_nonce++;
+    (*nonce)++;
     offset += block_len;
   }
 
   return 0;
+}
+
+int rtsp_crypto_open(const uint8_t key[32], uint64_t *nonce,
+                     const uint8_t *frame, size_t frame_len, uint8_t *out) {
+  if (!key || !nonce || !frame || !out || frame_len < 2 + 16) {
+    return -1;
+  }
+  const uint16_t block_len = (uint16_t)frame[0] | ((uint16_t)frame[1] << 8);
+  if (block_len == 0 || block_len > RTSP_ENCRYPTED_BLOCK_MAX ||
+      frame_len != (size_t)block_len + 2 + 16) {
+    return -1;
+  }
+  uint8_t nonce_buf[12] = {0};
+  memcpy(nonce_buf + 4, nonce, 8);
+  unsigned long long plaintext_len = 0;
+  if (crypto_aead_chacha20poly1305_ietf_decrypt(
+          out, &plaintext_len, NULL, frame + 2, (size_t)block_len + 16, frame,
+          2, nonce_buf, key) != 0) {
+    return -1;
+  }
+  (*nonce)++;
+  return (int)plaintext_len;
+}
+
+int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
+                            size_t data_len) {
+  if (!conn || !conn->hap_session || !conn->encrypted_mode) {
+    // Expected during session teardown - not an error
+    return -1;
+  }
+  return rtsp_crypto_seal_send(socket, conn->hap_session->encrypt_key,
+                               &conn->hap_session->encrypt_nonce, data,
+                               data_len);
 }

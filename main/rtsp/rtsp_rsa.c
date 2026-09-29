@@ -84,10 +84,9 @@ static int ensure_pk_initialized(void) {
 // Simple base64 decode using libsodium
 static int b64_decode(const char *b64, uint8_t *out, size_t out_size,
                       size_t *out_len) {
-  // Apple base64 may lack padding — libsodium handles that with _IGNORE variant
+  // Apple base64 may lack padding: try the no-padding variant, then padded
   if (sodium_base642bin(out, out_size, b64, strlen(b64), "\r\n \t", out_len,
                         NULL, sodium_base64_VARIANT_ORIGINAL_NO_PADDING) != 0) {
-    // Try with padding variant
     if (sodium_base642bin(out, out_size, b64, strlen(b64), "\r\n \t", out_len,
                           NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
       return -1;
@@ -167,40 +166,5 @@ int rsa_apple_challenge_response(const char *challenge_b64, uint32_t ip_addr,
     return -1;
   }
 
-  return 0;
-}
-
-int rsa_decrypt_aes_key(const char *encrypted_b64, uint8_t *out_key,
-                        size_t out_key_size, size_t *out_key_len) {
-  if (ensure_pk_initialized() != 0) {
-    return -1;
-  }
-
-  // Decode the base64 RSA-encrypted key
-  uint8_t encrypted[512];
-  size_t encrypted_len = 0;
-  if (b64_decode(encrypted_b64, encrypted, sizeof(encrypted), &encrypted_len) !=
-      0) {
-    ESP_LOGE(TAG, "Failed to decode RSA-encrypted AES key");
-    return -1;
-  }
-
-  ESP_LOGI(TAG, "RSA-encrypted AES key: %zu bytes (expected 256)",
-           encrypted_len);
-
-  // RSA OAEP-SHA1 decrypt (RAOP uses OAEP padding for the AES key)
-  mbedtls_rsa_context *rsa = mbedtls_pk_rsa(s_pk_ctx);
-  mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
-
-  size_t olen = 0;
-  int ret = mbedtls_rsa_pkcs1_decrypt(rsa, mbedtls_ctr_drbg_random, &s_ctr_drbg,
-                                      &olen, encrypted, out_key, out_key_size);
-  if (ret != 0) {
-    ESP_LOGE(TAG, "RSA AES key decrypt failed: -0x%04x", -ret);
-    return -1;
-  }
-
-  *out_key_len = olen;
-  ESP_LOGI(TAG, "Decrypted AES key: %zu bytes", olen);
   return 0;
 }

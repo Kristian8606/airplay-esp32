@@ -240,10 +240,9 @@ static bool page_has_protected_future(const pcm_slot_tag_t *tag,
   return validity_any_range(tag->valid, off, end_off - off);
 }
 
-/* Acquire a slot writer token with CAS. Readers only trust even sequence
- * values; invalidate_range() uses the same odd/even ownership protocol.
- * Keep retries bounded: if a lower-priority task on the same core was
- * preempted while holding the slot, an unbounded spin here could deadlock it. */
+/* Take a slot writer token (seq odd). Readers only trust even sequence
+ * values; invalidate_range() uses the same odd/even protocol. All writers hold
+ * writer_mutex, so this normally succeeds at once; the bound is defensive. */
 static bool slot_writer_acquire(pcm_slot_tag_t *tag, uint32_t *seq_even) {
   for (int retry = 0; retry < 32; ++retry) {
     uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
@@ -281,9 +280,9 @@ static bool pcm_rtp_ring_write_locked(pcm_rtp_ring_t *r, uint32_t first_rtp,
   }
 
   /* Current producers are AAC (1024 frames) and ALAC (352 frames), therefore
-   * one decoded block can touch at most two 1024-frame RTP pages. Keeping that
-   * invariant explicit lets us acquire every destination page before copying,
-   * so a concurrent FLUSH invalidate can never leave a partially-published AU. */
+   * one decoded block can touch at most two 1024-frame RTP pages. Acquiring
+   * every destination page before copying keeps lock-free readers from ever
+   * seeing a partially-published block. */
   if (frames > PCM_RTP_SLOT_FRAMES) {
     return false;
   }
@@ -317,8 +316,9 @@ static bool pcm_rtp_ring_write_locked(pcm_rtp_ring_t *r, uint32_t first_rtp,
     remain -= chunk;
   }
 
-  /* Acquire all destination pages first. If invalidate_range() currently owns
-   * one of them, publish nothing from this decoded block. */
+  /* Mark every destination page odd (writer-owned) before copying so a
+   * lock-free reader never sees a half-published block. Writers are already
+   * serialised by writer_mutex; the failure path is purely defensive. */
   for (unsigned i = 0; i < chunk_count; ++i) {
     if (!slot_writer_acquire(chunks[i].tag, &chunks[i].seq_even)) {
       for (unsigned j = 0; j < i; ++j) {
@@ -342,8 +342,8 @@ static bool pcm_rtp_ring_write_locked(pcm_rtp_ring_t *r, uint32_t first_rtp,
     return false;
   }
 
-  /* Collision decisions must be made while we own the tags; a preflight done
-   * before acquiring the seqlock can itself race with FLUSH/invalidation. */
+  /* Collision decisions are made while we own the tags, after the
+   * generation re-check above. */
   for (unsigned i = 0; i < chunk_count; ++i) {
     pcm_slot_tag_t *tag = chunks[i].tag;
     if (tag->generation == generation && tag->page_rtp != chunks[i].base) {
@@ -654,33 +654,6 @@ void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *r, uint32_t from_rtp,
     const uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
     (void)__atomic_exchange_n(&tag->seq, seq + 1U, __ATOMIC_ACQ_REL);
     validity_clear_range(tag->valid, off, stop - off);
-    if (!validity_any(tag->valid)) {
-      tag->page_rtp = 0U;
-      tag->generation = 0U;
-    }
-    __atomic_store_n(&tag->seq, seq + 2U, __ATOMIC_RELEASE);
-  }
-  xSemaphoreGive(r->writer_mutex);
-}
-
-void pcm_rtp_ring_invalidate_before(pcm_rtp_ring_t *r, uint32_t until_rtp,
-                                    uint32_t generation) {
-  if (!r) return;
-  xSemaphoreTake(r->writer_mutex, portMAX_DELAY);
-  if (generation != __atomic_load_n(&r->generation, __ATOMIC_ACQUIRE)) {
-    xSemaphoreGive(r->writer_mutex);
-    return;
-  }
-  for (uint32_t i = 0; i < PCM_RTP_SLOT_COUNT; ++i) {
-    pcm_slot_tag_t *tag = &r->tags[i];
-    if (tag->generation != generation) continue;
-    const int32_t before = rtp_delta(until_rtp, tag->page_rtp);
-    if (before <= 0) continue;
-    const uint32_t count = before >= (int32_t)PCM_RTP_SLOT_FRAMES
-                              ? PCM_RTP_SLOT_FRAMES : (uint32_t)before;
-    const uint32_t seq = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
-    (void)__atomic_exchange_n(&tag->seq, seq + 1U, __ATOMIC_ACQ_REL);
-    validity_clear_range(tag->valid, 0U, count);
     if (!validity_any(tag->valid)) {
       tag->page_rtp = 0U;
       tag->generation = 0U;

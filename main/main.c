@@ -2,7 +2,6 @@
 #include "audio_diag.h"
 #include "amp_control.h"
 #include "audio_eq.h"
-#include "dns_server.h"
 #include "hap.h"
 #include "log_stream.h"
 #include "led.h"
@@ -21,7 +20,6 @@
 #include "freertos/task.h"
 
 static const char *TAG = "main";
-#define AP_IP_ADDR 0x0104A8C0
 
 static void log_memory_state(const char *where) {
   ESP_LOGI(TAG,
@@ -42,14 +40,13 @@ static void print_firmware_banner(void) {
   ESP_LOGI(TAG, "VERSION: %s", app ? app->version : "unknown");
   ESP_LOGI(TAG, "BUILD: %s %s", __DATE__, __TIME__);
   ESP_LOGI(TAG, "IDF: %s", app ? app->idf_ver : "unknown");
-  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP + AAC TCP/decode/EQ + ALAC UDP/decrypt/decode");
-  ESP_LOGI(TAG, "CORE PLAN: Core1=high-priority PTP/RTP playout + ALAC ordered staging/EQ");
+  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP + AAC decode/EQ + ALAC UDP/decrypt/decode");
+  ESP_LOGI(TAG, "CORE PLAN: Core1=high-priority PTP/RTP playout + AAC TCP RX + ALAC ordered staging/EQ");
   ESP_LOGI(TAG, "============================================================");
 }
 
 void app_main(void) {
   print_firmware_banner();
-  log_memory_state("boot");
   ESP_ERROR_CHECK(amp_control_init());
 
   esp_err_t e = nvs_flash_init();
@@ -71,15 +68,13 @@ void app_main(void) {
   if (provisioning_only || !wifi_wait_connected(30000)) {
     ESP_LOGW(TAG,
              "STA not connected; captive WiFi setup remains available at 192.168.4.1");
-    dns_server_start(AP_IP_ADDR);
   } else {
     ESP_LOGI(TAG, "WiFi connected");
   }
-  log_memory_state("post-wifi");
 
-  /* Temporary diagnostics must exist before PTP/audio init so category-owned
-   * startup events are captured by the low-priority worker. This is a no-op
-   * when diagnostics are disabled or no category is selected. */
+  /* Diagnostics start before PTP/audio init so category-owned startup events
+   * are captured by the low-priority worker. No-op when diagnostics are
+   * disabled or no category is selected. */
   (void)AUDIO_DIAG_INIT();
   ESP_ERROR_CHECK(ptp_clock_init());
   ESP_ERROR_CHECK(hap_init());
@@ -91,10 +86,10 @@ void app_main(void) {
      * runtime until that normal connected boot. */
     ESP_LOGI(TAG,
              "WiFi provisioning mode: audio engine deferred until credentials are saved and device restarts");
-    log_memory_state("setup-ready");
+    log_memory_state("ready");
   } else {
     ESP_ERROR_CHECK(audio_receiver_init());
-    log_memory_state("post-audio-init");
+    log_memory_state("ready");
     mdns_airplay_init();
     ESP_ERROR_CHECK(rtsp_server_start());
   }

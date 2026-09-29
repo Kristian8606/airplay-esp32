@@ -1,7 +1,10 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stdint.h>
+
+#include "rtsp_conn.h"
 
 /**
  * Start the AirPlay RTSP server on port 7000
@@ -15,13 +18,10 @@ esp_err_t rtsp_server_start(void);
 void rtsp_server_stop(void);
 
 /**
- * Set volume from AirPlay (in dB, range -144 to 0)
- * @param volume_db Volume in dB (0 = max, -144 = mute)
+ * Take the play lock (Shairport "principal_conn") for this connection.
+ * Called by the connection's own task when it starts to play. If another
+ * connection holds the lock, that connection is stopped first and this call
+ * waits (bounded) until its global audio/PTP cleanup has finished.
+ * @return true when conn now owns the audio engine.
  */
-void airplay_set_volume(float volume_db);
-
-/**
- * Get current volume as Q15 scale factor for audio processing
- * @return Q15 fixed-point multiplier (0 = mute, 32768 = unity)
- */
-int32_t airplay_get_volume_q15(void);
+bool rtsp_server_acquire_play_lock(rtsp_conn_t *conn);

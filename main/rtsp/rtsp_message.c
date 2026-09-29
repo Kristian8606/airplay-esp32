@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 
 #include "esp_log.h"
+#include "airplay_version.h"
 #include "rtsp_crypto.h"
 
 static const char *TAG = "rtsp_message";
@@ -52,44 +53,6 @@ const uint8_t *rtsp_get_body(const char *request, size_t request_len,
   return NULL;
 }
 
-// Parse Transport header for client ports (AirPlay 1)
-// Format: Transport:
-// RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002
-void rtsp_parse_transport(const char *request, uint16_t *control_port,
-                          uint16_t *timing_port) {
-  if (control_port) {
-    *control_port = 0;
-  }
-  if (timing_port) {
-    *timing_port = 0;
-  }
-
-  // RTSP header names and Transport-header parameter names are
-  // case-insensitive (RFC 2326), so match accordingly.
-  const char *transport = strcasestr(request, "Transport:");
-  if (!transport) {
-    return;
-  }
-
-  // Find end of Transport header line
-  const char *line_end = strstr(transport, "\r\n");
-  if (!line_end) {
-    line_end = transport + strlen(transport);
-  }
-
-  // Parse control_port
-  const char *cp = strcasestr(transport, "control_port=");
-  if (cp && cp < line_end && control_port) {
-    *control_port = (uint16_t)strtoul(cp + 13, NULL, 10);
-  }
-
-  // Parse timing_port
-  const char *tp = strcasestr(transport, "timing_port=");
-  if (tp && tp < line_end && timing_port) {
-    *timing_port = (uint16_t)strtoul(tp + 12, NULL, 10);
-  }
-}
-
 int rtsp_request_parse(const uint8_t *data, size_t len, rtsp_request_t *req) {
   if (!data || !req || len == 0) {
     return -1;
@@ -126,9 +89,6 @@ int rtsp_request_parse(const uint8_t *data, size_t len, rtsp_request_t *req) {
 
   // Parse CSeq
   req->cseq = rtsp_parse_cseq((const char *)data);
-
-  // Parse Content-Length
-  req->content_length = (size_t)rtsp_parse_content_length((const char *)data);
 
   // Parse Content-Type
   const char *ct = strstr((const char *)data, "Content-Type:");
@@ -167,7 +127,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
         snprintf(header, sizeof(header),
                  "RTSP/1.0 %d %s\r\n"
                  "CSeq: %d\r\n"
-                 "Server: AirTunes/377.40.00\r\n"
+                 "Server: AirTunes/" AIRPLAY_SOURCE_VERSION "\r\n"
                  "%s"
                  "Content-Length: %zu\r\n"
                  "\r\n",
@@ -176,7 +136,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
     header_len = snprintf(header, sizeof(header),
                           "RTSP/1.0 %d %s\r\n"
                           "CSeq: %d\r\n"
-                          "Server: AirTunes/377.40.00\r\n"
+                          "Server: AirTunes/" AIRPLAY_SOURCE_VERSION "\r\n"
                           "%s"
                           "\r\n",
                           status_code, status_text, cseq, extra_headers);
@@ -184,7 +144,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
     header_len = snprintf(header, sizeof(header),
                           "RTSP/1.0 %d %s\r\n"
                           "CSeq: %d\r\n"
-                          "Server: AirTunes/377.40.00\r\n"
+                          "Server: AirTunes/" AIRPLAY_SOURCE_VERSION "\r\n"
                           "Content-Length: %zu\r\n"
                           "\r\n",
                           status_code, status_text, cseq, body_len);
@@ -192,9 +152,16 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
     header_len = snprintf(header, sizeof(header),
                           "RTSP/1.0 %d %s\r\n"
                           "CSeq: %d\r\n"
-                          "Server: AirTunes/377.40.00\r\n"
+                          "Server: AirTunes/" AIRPLAY_SOURCE_VERSION "\r\n"
                           "\r\n",
                           status_code, status_text, cseq);
+  }
+
+  /* snprintf() returns the length it wanted to write. Never copy more header
+   * bytes than the stack buffer holds (Shairport 5.5 RTSP sizing fix). */
+  if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
+    ESP_LOGE(TAG, "Response header too large (%d bytes)", header_len);
+    return -1;
   }
 
   // Build complete response
@@ -237,10 +204,17 @@ int rtsp_send_http_response(int socket, rtsp_conn_t *conn, int status_code,
                             "HTTP/1.1 %d %s\r\n"
                             "Content-Type: %s\r\n"
                             "Content-Length: %zu\r\n"
-                            "Server: AirTunes/377.40.00\r\n"
+                            "Server: AirTunes/" AIRPLAY_SOURCE_VERSION "\r\n"
                             "CSeq: 1\r\n"
                             "\r\n",
                             status_code, status_text, content_type, body_len);
+
+  /* snprintf() returns the length it wanted to write. Never copy more header
+   * bytes than the stack buffer holds (Shairport 5.5 RTSP sizing fix). */
+  if (header_len < 0 || (size_t)header_len >= sizeof(header)) {
+    ESP_LOGE(TAG, "Response header too large (%d bytes)", header_len);
+    return -1;
+  }
 
   // Build complete response
   size_t total_len = (size_t)header_len + body_len;

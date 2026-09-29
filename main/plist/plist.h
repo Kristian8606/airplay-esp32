@@ -4,8 +4,6 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#include "base64.h"
-
 /**
  * Simple plist builder for AirPlay
  * Builds XML plist format (easier to debug, iOS accepts it)
@@ -48,21 +46,10 @@ void plist_dict_int(plist_t *p, const char *key, int64_t value);
 void plist_dict_uint(plist_t *p, const char *key, uint64_t value);
 
 /**
- * Add boolean to dictionary
- */
-void plist_dict_bool(plist_t *p, const char *key, bool value);
-
-/**
  * Add base64 data to dictionary
  */
 void plist_dict_data(plist_t *p, const char *key, const uint8_t *data,
                      size_t len);
-
-/**
- * Add data as hex string (for pk field)
- */
-void plist_dict_data_hex(plist_t *p, const char *key, const uint8_t *data,
-                         size_t len);
 
 /**
  * End dictionary
@@ -75,19 +62,9 @@ void plist_dict_end(plist_t *p);
 void plist_dict_array_begin(plist_t *p, const char *key);
 
 /**
- * Start an array (standalone)
- */
-void plist_array_begin(plist_t *p);
-
-/**
  * End array
  */
 void plist_array_end(plist_t *p);
-
-/**
- * Add integer to array
- */
-void plist_array_int(plist_t *p, int64_t value);
 
 /**
  * End plist document
@@ -186,7 +163,7 @@ bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
                             size_t index, int64_t *type, size_t *ekey_len,
                             size_t *eiv_len, size_t *shk_len);
 
-// Stream key debug info
+// Key/value summary of one stream dict entry
 typedef struct {
   char key[64];
   uint8_t value_type; // See BPLIST_VALUE_*
@@ -203,7 +180,7 @@ typedef struct {
 #define BPLIST_VALUE_DICT    6
 
 /**
- * Get key/value info for a stream dict (debug helper)
+ * Get key/value info for a stream dict
  * @param plist Binary plist data
  * @param plist_len Length of plist
  * @param index Stream index
@@ -291,7 +268,8 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
 
 /**
  * Build stream SETUP response bplist (with streams array)
- * Returns streams[] array with type, dataPort, controlPort, audioBufferSize.
+ * Returns streams[] array with type, dataPort, controlPort and, for buffered
+ * streams, audioBufferSize.
  * @param out Output buffer
  * @param capacity Buffer capacity
  * @param stream_type Stream type (96=realtime UDP, 103=buffered TCP)
@@ -333,7 +311,21 @@ size_t bplist_build_feedback_response(uint8_t *out, size_t capacity,
  */
 size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_id,
-                                  const char *device_name,
+                                  const char *device_name, const char *model,
                                   const uint8_t *public_key,
                                   size_t public_key_len, uint64_t features,
                                   int64_t protocol_version);
+
+/**
+ * Build the AirPlay 2 event-channel "updateInfo" plist, as Shairport Sync
+ * sends it once the sender connects to the event port:
+ *   { type = "updateInfo"; value = <same dict as /info> + txtAirPlay }
+ * @param txt _airplay._tcp TXT record data (length-prefixed "key=value")
+ * @return Length of generated bplist, or 0 on error
+ */
+size_t bplist_build_update_info(uint8_t *out, size_t capacity,
+                                const char *device_id, const char *device_name,
+                                const char *model, const uint8_t *public_key,
+                                size_t public_key_len, uint64_t features,
+                                int64_t protocol_version, const uint8_t *txt,
+                                size_t txt_len);

@@ -24,7 +24,8 @@ void ptp_clock_stop(void);
 /**
  * Clear PTP clock synchronization state.
  * Resets offset and lock status without stopping the clock.
- * Called during TEARDOWN to allow re-sync on new session.
+ * Called at session boundaries (first stream SETUP of a connection, final
+ * TEARDOWN, connection close) and by the buffered timing watchdog.
  */
 void ptp_clock_clear(void);
 
@@ -43,26 +44,14 @@ typedef struct {
 /**
  * Atomically replace the AirPlay-advertised PTP peer set.
  *
- * This never resets the active estimator and never changes audio timing. The
- * peer list is used to reject unrelated IPv4 PTP sources while the buffered
- * path does not yet have an authoritative D7/networkTimeTimelineID clock id,
- * and to broaden the realtime timing-peer admission to explicitly advertised
- * group peers. Passing NULL/0 clears the tracked list.
+ * In buffered mode the first non-empty list of a session drops any estimator
+ * latched before the session (boot, other devices on the network); later
+ * changes keep the estimator. The list rejects unrelated IPv4 PTP sources
+ * until the D7/networkTimeTimelineID clock id is known. In realtime mode it
+ * restricts the accepted sources only when SETUP supplied no timing peer.
+ * Passing NULL/0 clears the tracked list.
  */
 void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count);
-
-/**
- * Get current PTP time in nanoseconds.
- * Returns local time adjusted by PTP offset.
- * @return PTP time in nanoseconds since epoch
- */
-uint64_t ptp_clock_get_time_ns(void);
-
-/**
- * Get current offset from local clock to PTP time in nanoseconds.
- * PTP_time = local_time + offset
- */
-int64_t ptp_clock_get_offset_ns(void);
 
 typedef struct {
   bool realtime_mode;
@@ -79,9 +68,8 @@ typedef struct {
   uint32_t mastership_age_ms;
   uint32_t sample_count;
   uint32_t sample_age_ms; /* UINT32_MAX when no accepted timing sample exists. */
-  /* Diagnostics (v4.1.14): why a buffered anchor may never become usable. */
+  /* Diagnostics: why a buffered anchor may never become usable. */
   bool source_mixed;          /* packets from a second source were rejected */
-  uint64_t expected_clock_id; /* D7/timeline hint, 0 = none */
   uint32_t peer_count;        /* SETPEERS entries currently tracked */
 } ptp_clock_snapshot_t;
 
@@ -112,7 +100,8 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms);
  * only estimates remote-GM -> ESP-local conversion; audio continuity is owned
  * by the ALAC RTP<->local anchor, not by a synthetic/virtual PTP timeline.
  *
- * Buffered AAC leaves this mode disabled and keeps the existing PTP behaviour.
+ * Buffered AAC leaves this mode disabled and uses the buffered
+ * (sourcePortIdentity-filtered) estimator.
  */
 void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip);
 
@@ -122,15 +111,6 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip);
  * the realtime audio timeline.
  */
 void ptp_clock_note_realtime_d7(uint64_t clock_id);
-
-/**
- * Convert a remote timestamp from the current READY realtime grandmaster into
- * ESP monotonic time. Returns false while a new GM is still acquiring or when
- * the D7 clock_id does not match the current grandmaster.
- */
-bool ptp_clock_realtime_time_to_local(uint64_t clock_id,
-                                      uint64_t remote_ptp_ns,
-                                      uint64_t *local_ns);
 
 typedef struct {
   bool realtime_mode;
@@ -180,15 +160,11 @@ void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot);
  *
  * Pass 0 to clear the filter (accept any master — the default at startup).
  *
- * In buffered/legacy mode this retains the original behaviour: changing the
- * expected clock resets samples and filters PTP by sourcePortIdentity.
+ * In buffered mode PTP is then filtered by sourcePortIdentity. An estimator
+ * already built from that same (unmixed) source is kept; otherwise samples
+ * are reset.
  * In AirPlay 2 realtime mode it is only an anchor-clock hint; PTP source
  * selection comes from the RTSP client IP and Announce determines the actual
  * grandmaster, matching the Shairport/NQPTP model.
  */
 void ptp_clock_set_master_clock_id(uint64_t clock_id);
-
-/**
- * Read the current expected master clock_id (0 if none / filter cleared).
- */
-uint64_t ptp_clock_get_master_clock_id(void);

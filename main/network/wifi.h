@@ -14,7 +14,8 @@ void wifi_init_apsta(const char *ap_ssid, const char *ap_password);
 /**
  * Block until WiFi is connected and has an IP address
  * @param timeout_ms Timeout in milliseconds (0 = wait forever)
- * @return true if connected, false if timeout
+ * @return true if connected, false on timeout or when the connection failed
+ *         (no usable saved network or retries exhausted)
  */
 bool wifi_wait_connected(uint32_t timeout_ms);
 
@@ -45,13 +46,9 @@ esp_err_t wifi_get_ip_str(char *ip_str, size_t len);
 esp_err_t wifi_scan(wifi_ap_record_t **ap_list, uint16_t *ap_count);
 
 /**
- * Disconnect and stop WiFi
- */
-void wifi_stop(void);
-
-/**
  * Set the DHCP hostname from the given device name.
- * Sanitizes to a valid DNS label (lowercase, hyphens for spaces/symbols).
+ * Sanitizes to a valid DNS label (letters and digits kept, other characters
+ * collapsed to single hyphens).
  * Takes effect on the next DHCP transaction.
  */
 void wifi_set_hostname(const char *device_name);

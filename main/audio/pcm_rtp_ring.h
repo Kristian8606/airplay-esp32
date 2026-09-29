@@ -50,8 +50,9 @@ void pcm_rtp_ring_set_generation(pcm_rtp_ring_t *ring, uint32_t generation);
  * If wanted_valid is true, a write is rejected only when it would overwrite
  * still-valid PCM inside the current playhead's finite future cache window.
  * Empty/invalid pages and pages from an unrelated RTP neighbourhood are cache
- * history and are immediately reusable.  The caller may wait here; TCP remains
- * independent and is stopped only by the compressed-store backpressure point.
+ * history and are immediately reusable. A rejected write returns false; the
+ * caller may retry. TCP stays independent and is stopped only by the
+ * compressed-store backpressure point.
  */
 bool pcm_rtp_ring_write(pcm_rtp_ring_t *ring, uint32_t first_rtp,
                         const int16_t *pcm, size_t frames, int channels,
@@ -97,10 +98,4 @@ uint32_t pcm_rtp_ring_contiguous_frames(const pcm_rtp_ring_t *ring,
 void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *ring, uint32_t from_rtp,
                                    uint32_t until_rtp, uint32_t generation);
 
-/* Immediate FLUSHBUFFERED control-path operation: invalidate every cached PCM
- * sample strictly before until_rtp in wrap-safe RTP order. The bytes are not
- * erased; validity metadata alone is changed so playout/decoder never waits on
- * physical clearing. */
-void pcm_rtp_ring_invalidate_before(pcm_rtp_ring_t *ring, uint32_t until_rtp,
-                                    uint32_t generation);
 
