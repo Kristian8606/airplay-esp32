@@ -164,10 +164,6 @@ static inline void rt_set_running(bool running) {
   __atomic_store_n(&s_rt.running, running, __ATOMIC_RELEASE);
 }
 
-static inline void rt_task_reserve(void) {
-  (void)__atomic_add_fetch(&s_rt.live_tasks, 1U, __ATOMIC_ACQ_REL);
-}
-
 static inline void rt_task_release(void) {
   (void)__atomic_sub_fetch(&s_rt.live_tasks, 1U, __ATOMIC_ACQ_REL);
 }
@@ -185,6 +181,20 @@ static void rt_request_stop(void) {
     (void)xQueueSendToFront(s_rt.resend_event_q, &wake, 0);
   }
 }
+
+/* The four realtime tasks are created once, on the first realtime start,
+ * with their stacks in PSRAM, and then live for the life of the device. Each
+ * session wakes them with a task notification; each one releases its
+ * live_tasks reservation when the session ends and goes back to waiting.
+ * Creating ~18 KiB of internal-RAM stacks at every SETUP failed whenever a
+ * second RTSP connection was open (SETUP -> "audio receiver start failed"
+ * with ~10 KiB internal free), and deleting PSRAM-stack tasks needs internal
+ * RAM of its own. These tasks never touch flash (no NVS/partition access),
+ * so a PSRAM stack is safe for them. */
+enum { RT_T_DATA, RT_T_CTRL, RT_T_WORK, RT_T_RESEND, RT_T_COUNT };
+static TaskHandle_t s_rt_task[RT_T_COUNT];
+
+static void rt_wait_session(void) { (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY); }
 
 static inline uint16_t read_be16(const uint8_t *p) {
   return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
@@ -673,8 +683,7 @@ done:
   return;
 }
 
-static void data_rx_task(void *arg) {
-  (void)arg;
+static void data_rx_session(void) {
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_RT_DATA,
                                     xPortGetCoreID(), RT_DATA_RX_PRIORITY,
                                     RT_DATA_POOL_SLOTS);
@@ -704,13 +713,18 @@ static void data_rx_task(void *arg) {
       release_packet_slot(slot);
     }
   }
-
-  rt_task_release();
-  vTaskDelete(NULL);
 }
 
-static void control_rx_task(void *arg) {
+static void data_rx_task(void *arg) {
   (void)arg;
+  for (;;) {
+    rt_wait_session();
+    data_rx_session();
+    rt_task_release();
+  }
+}
+
+static void control_rx_session(void) {
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_RT_CTRL,
                                     xPortGetCoreID(), RT_CTRL_RX_PRIORITY,
                                     RT_RTX_POOL_SLOTS);
@@ -727,8 +741,15 @@ static void control_rx_task(void *arg) {
     }
     process_control_packet(s_rt.control_packet, (size_t)n);
   }
-  rt_task_release();
-  vTaskDelete(NULL);
+}
+
+static void control_rx_task(void *arg) {
+  (void)arg;
+  for (;;) {
+    rt_wait_session();
+    control_rx_session(); /* returns at once when there is no control socket */
+    rt_task_release();
+  }
 }
 
 static void worker_note_gap(uint32_t previous_ext, uint32_t current_ext,
@@ -745,8 +766,7 @@ static void worker_note_gap(uint32_t previous_ext, uint32_t current_ext,
                            gap, first_rtp);
 }
 
-static void alac_worker_task(void *arg) {
-  (void)arg;
+static void alac_worker_session(void) {
   alac_decoder_config_t dcfg = {
       .sample_rate = s_rt.cfg.format.sample_rate,
       .channels = s_rt.cfg.format.channels,
@@ -757,8 +777,6 @@ static void alac_worker_task(void *arg) {
   if (!decoder) {
     ESP_LOGE(TAG, "failed to create ALAC decoder");
     rt_request_stop();
-    rt_task_release();
-    vTaskDelete(NULL);
     return;
   }
 
@@ -826,12 +844,18 @@ static void alac_worker_task(void *arg) {
   }
 
   alac_decoder_destroy(decoder);
-  rt_task_release();
-  vTaskDelete(NULL);
 }
 
-static void resend_task(void *arg) {
+static void alac_worker_task(void *arg) {
   (void)arg;
+  for (;;) {
+    rt_wait_session();
+    alac_worker_session();
+    rt_task_release();
+  }
+}
+
+static void resend_session(void) {
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_RT_RESEND,
                                     xPortGetCoreID(), RT_RESEND_PRIORITY,
                                     RT_RESEND_SCAN_MS);
@@ -863,9 +887,43 @@ static void resend_task(void *arg) {
     }
 
   }
+}
 
-  rt_task_release();
-  vTaskDelete(NULL);
+static void resend_task(void *arg) {
+  (void)arg;
+  for (;;) {
+    rt_wait_session();
+    resend_session();
+    rt_task_release();
+  }
+}
+
+/* Create the persistent realtime tasks once (PSRAM stacks). */
+static esp_err_t ensure_rt_tasks(void) {
+  static const struct {
+    TaskFunction_t fn;
+    const char *name;
+    uint32_t stack;
+    UBaseType_t prio;
+  } spec[RT_T_COUNT] = {
+      [RT_T_DATA] = {data_rx_task, "alac_data", RT_DATA_RX_STACK, RT_DATA_RX_PRIORITY},
+      [RT_T_CTRL] = {control_rx_task, "alac_ctrl", RT_CTRL_RX_STACK, RT_CTRL_RX_PRIORITY},
+      [RT_T_WORK] = {alac_worker_task, "alac_work", RT_WORK_STACK, RT_WORK_PRIORITY},
+      [RT_T_RESEND] = {resend_task, "alac_resend", RT_RESEND_STACK, RT_RESEND_PRIORITY},
+  };
+  for (int i = 0; i < RT_T_COUNT; ++i) {
+    if (s_rt_task[i]) continue;
+    if (xTaskCreatePinnedToCoreWithCaps(spec[i].fn, spec[i].name, spec[i].stack,
+                                        NULL, spec[i].prio, &s_rt_task[i],
+                                        RT_TASK_CORE,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+      s_rt_task[i] = NULL;
+      ESP_LOGE(TAG, "cannot create realtime task %s (%u B PSRAM stack)",
+               spec[i].name, (unsigned)spec[i].stack);
+      return ESP_ERR_NO_MEM;
+    }
+  }
+  return ESP_OK;
 }
 
 size_t realtime_receiver_packet_workspace_size(void) {
@@ -1022,6 +1080,8 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
 
   esp_err_t err = ensure_transport_resources();
   if (err != ESP_OK) return err;
+  err = ensure_rt_tasks();
+  if (err != ESP_OK) return err;
   reset_transport_tracking();
   reset_transport_queues();
 
@@ -1053,39 +1113,11 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
     (void)setsockopt(s_rt.control_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   }
 
+  /* Every persistent task takes part in every session (CTRL returns at once
+   * without a control socket), so all four are reserved before any wakes. */
+  __atomic_store_n(&s_rt.live_tasks, (uint32_t)RT_T_COUNT, __ATOMIC_RELEASE);
   rt_set_running(true);
-
-  rt_task_reserve();
-  if (xTaskCreatePinnedToCore(alac_worker_task, "alac_work", RT_WORK_STACK, NULL,
-                              RT_WORK_PRIORITY, NULL, RT_TASK_CORE) != pdPASS) {
-    rt_task_release();
-    realtime_receiver_stop();
-    return ESP_FAIL;
-  }
-  rt_task_reserve();
-  if (xTaskCreatePinnedToCore(resend_task, "alac_resend", RT_RESEND_STACK, NULL,
-                              RT_RESEND_PRIORITY, NULL, RT_TASK_CORE) != pdPASS) {
-    rt_task_release();
-    realtime_receiver_stop();
-    return ESP_FAIL;
-  }
-  if (s_rt.control_sock >= 0) {
-    rt_task_reserve();
-    if (xTaskCreatePinnedToCore(control_rx_task, "alac_ctrl", RT_CTRL_RX_STACK,
-                                NULL, RT_CTRL_RX_PRIORITY, NULL,
-                                RT_TASK_CORE) != pdPASS) {
-      rt_task_release();
-      realtime_receiver_stop();
-      return ESP_FAIL;
-    }
-  }
-  rt_task_reserve();
-  if (xTaskCreatePinnedToCore(data_rx_task, "alac_data", RT_DATA_RX_STACK, NULL,
-                              RT_DATA_RX_PRIORITY, NULL, RT_TASK_CORE) != pdPASS) {
-    rt_task_release();
-    realtime_receiver_stop();
-    return ESP_FAIL;
-  }
+  for (int i = 0; i < RT_T_COUNT; ++i) xTaskNotifyGive(s_rt_task[i]);
 
   AUDIO_DIAG_TRANSPORT_PORTS((uint32_t)data_port, (uint32_t)control_port);
   return ESP_OK;

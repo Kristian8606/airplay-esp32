@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdio.h>
 
 #include "hap.h"
 #include "hap_internal.h"
@@ -88,5 +89,41 @@ esp_err_t hap_derive_audio_key(hap_session_t *session, uint8_t *audio_key,
                   (uint8_t *)"Control-Read-Encryption-Key", 27, audio_key,
                   key_len);
 
+  return ESP_OK;
+}
+
+
+esp_err_t hap_derive_datastream_keys(const hap_session_t *session, uint64_t seed,
+                                     uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE],
+                                     uint8_t decrypt_key[HAP_CHACHA20_KEY_SIZE]) {
+  if (!session || !encrypt_key || !decrypt_key) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!session->session_established) {
+    ESP_LOGW(TAG, "Cannot derive DataStream keys before session established");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  char salt[64];
+  const int n = snprintf(salt, sizeof(salt), "DataStream-Salt%llu",
+                         (unsigned long long)seed);
+  if (n <= 0 || (size_t)n >= sizeof(salt)) {
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  static const char input_info[] = "DataStream-Input-Encryption-Key";
+  static const char output_info[] = "DataStream-Output-Encryption-Key";
+
+  /* The AirPlay sender opens the TCP connection.  Its output key is our
+   * decrypt key; its input key is our encrypt key (Shairport cipher channel 5). */
+  hap_hkdf_sha512((const uint8_t *)salt, (size_t)n,
+                  session->shared_secret, sizeof(session->shared_secret),
+                  (const uint8_t *)input_info, sizeof(input_info) - 1,
+                  encrypt_key, HAP_CHACHA20_KEY_SIZE);
+  hap_hkdf_sha512((const uint8_t *)salt, (size_t)n,
+                  session->shared_secret, sizeof(session->shared_secret),
+                  (const uint8_t *)output_info, sizeof(output_info) - 1,
+                  decrypt_key, HAP_CHACHA20_KEY_SIZE);
+  sodium_memzero(salt, sizeof(salt));
   return ESP_OK;
 }

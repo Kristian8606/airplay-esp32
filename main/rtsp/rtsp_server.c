@@ -122,6 +122,20 @@ bool rtsp_server_acquire_play_lock(rtsp_conn_t *conn) {
     ESP_LOGD(TAG, "Client slot %d acquired the play lock", me);
   }
 
+  /* The play lock is the true AirPlay control-session boundary.  Reset PTP
+   * here, before this connection receives SETPEERS/SETPEERSX, instead of at
+   * the first audio stream SETUP.  That lets the estimator keep every valid
+   * sample collected between SETPEERS and the first SETRATEANCHORTIME anchor.
+   *
+   * If a PTP source was latched in the short window before SETPEERS arrives,
+   * ptp_clock_set_peers() will still discard it on the empty->non-empty peer
+   * transition. RemoteControlOnly/type-130 connections never take this lock
+   * and therefore cannot disturb the playing session's clock. */
+  ptp_clock_set_peers(NULL, 0);
+  ptp_clock_clear();
+  conn->ptp_session_fresh = true;
+  ESP_LOGI(TAG, "PTP session reset at play-lock acquisition");
+
   /* Volume set on this connection before it started playing applies now. */
   audio_receiver_set_volume_q15(conn->volume_q15);
   return true;
@@ -215,8 +229,23 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
 }
 
 // Client task
+/* The task parameter carries the slot index and, in CLIENT_ARG_PSRAM, where
+ * the stack lives: the slot may be reused as soon as slot->task is cleared,
+ * so the task must not read that from the slot when it deletes itself. */
+#define CLIENT_ARG_PSRAM 0x100
+
+static void client_task_exit(bool psram_stack) {
+  if (psram_stack) {
+    vTaskDeleteWithCaps(NULL);
+  } else {
+    vTaskDelete(NULL);
+  }
+}
+
 static void client_task(void *pvParameters) {
-  int slot_idx = (int)(intptr_t)pvParameters;
+  const int arg = (int)(intptr_t)pvParameters;
+  const bool psram_stack = (arg & CLIENT_ARG_PSRAM) != 0;
+  int slot_idx = arg & 0xFF;
   client_slot_t *slot = &clients[slot_idx];
 
   // Create connection state
@@ -226,7 +255,7 @@ static void client_task(void *pvParameters) {
     close(slot->socket);
     slot->socket = -1;
     slot->task = NULL;
-    vTaskDelete(NULL);
+    client_task_exit(psram_stack);
     return;
   }
   slot->conn = conn;
@@ -256,7 +285,7 @@ static void client_task(void *pvParameters) {
     close(slot->socket);
     slot->socket = -1;
     slot->task = NULL;
-    vTaskDelete(NULL);
+    client_task_exit(psram_stack);
     return;
   }
 
@@ -391,7 +420,7 @@ cleanup:
   slot->should_stop = false;
   slot->task = NULL;
 
-  vTaskDelete(NULL);
+  client_task_exit(psram_stack);
 }
 
 // Signal a client to stop.  A new play-lock owner waits for the task to finish
@@ -491,7 +520,10 @@ static void server_task(void *pvParameters) {
       continue;
     }
 
-    ESP_LOGI(TAG, "New client connected");
+    ESP_LOGI(TAG, "New client connected (internal free=%uKiB largest=%uKiB min=%uKiB)",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U),
+             (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024U));
 
     /* Shairport model: a new connection never stops playback by itself.
      * Use a free slot; if none is free, close the oldest connection that does
@@ -536,6 +568,22 @@ static void server_task(void *pvParameters) {
         xTaskCreatePinnedToCore(client_task, "rtsp_client", CLIENT_STACK_SIZE,
                                 (void *)(intptr_t)new_slot, RTSP_CLIENT_TASK_PRIORITY,
                                 &clients[new_slot].task, 0);
+    if (task_ret != pdPASS) {
+      /* While a stream plays, internal RAM is too short for another 8 KiB
+       * stack; a second sender (e.g. an iPhone taking over from an Apple TV)
+       * would be refused. Use PSRAM then: handlers never touch flash (device
+       * name and volume are cached, the volume is saved by its own task). */
+      clients[new_slot].task = NULL;
+      task_ret = xTaskCreatePinnedToCoreWithCaps(
+          client_task, "rtsp_client", CLIENT_STACK_SIZE,
+          (void *)(intptr_t)(new_slot | CLIENT_ARG_PSRAM),
+          RTSP_CLIENT_TASK_PRIORITY, &clients[new_slot].task, 0,
+          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (task_ret == pdPASS) {
+        ESP_LOGI(TAG, "Client slot %d: internal RAM low, task stack in PSRAM",
+                 new_slot);
+      }
+    }
     if (task_ret != pdPASS || clients[new_slot].task == NULL) {
       ESP_LOGE(TAG, "Failed to create client task");
       close(new_socket);

@@ -62,6 +62,151 @@ menu "AirPlay Receiver"
         default n
 endmenu
 
+menu "AirPlay feature bits (experimental)"
+    comment "Base: 0x14340405C4A00 (Shairport Sync bits + bit 46). HomePod mini bits below."
+    config AIRPLAY_FEATURE_BIT_15
+        bool "Bit 15: MetadataFeatures_0"
+        default n
+    config AIRPLAY_FEATURE_BIT_16
+        bool "Bit 16: MetadataFeatures_1"
+        default n
+    config AIRPLAY_FEATURE_BIT_17
+        bool "Bit 17: MetadataFeatures_2"
+        default n
+    config AIRPLAY_FEATURE_BIT_21
+        bool "Bit 21: AudioFormats_3"
+        default n
+    config AIRPLAY_FEATURE_BIT_25
+        bool "Bit 25: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_27
+        bool "Bit 27: SupportsLegacyPairing"
+        default n
+    config AIRPLAY_FEATURE_BIT_36
+        bool "Bit 36: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_39
+        bool "Bit 39: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_43
+        bool "Bit 43: SupportsSystemPairing"
+        default n
+    config AIRPLAY_FEATURE_BIT_45
+        bool "Bit 45: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_47
+        bool "Bit 47: no public name - Shairport Sync sets it, HomePod mini does not"
+        default y
+    config AIRPLAY_FEATURE_BIT_50
+        bool "Bit 50: MetadataFeatures_3"
+        default n
+    config AIRPLAY_FEATURE_BIT_52
+        bool "Bit 52: SupportsSetPeersExtendedMessage"
+        default y
+    config AIRPLAY_FEATURE_BIT_53
+        bool "Bit 53: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_58
+        bool "Bit 58: SupportsHangdogRemoteControl"
+        default n
+    config AIRPLAY_FEATURE_BIT_59
+        bool "Bit 59: SupportsAudioStreamConnectionSetup"
+        default y
+    config AIRPLAY_FEATURE_BIT_60
+        bool "Bit 60: SupportsAudioMediaDataControl (encrypted DataStream transport)"
+        default y
+        help
+            Advertise MediaDataControl only when using the built-in encrypted
+            DataStream transport. The transport, key derivation and sync/rply
+            framing are implemented; higher-level MediaRemote protobuf semantics
+            are currently traced/acknowledged rather than fully interpreted.
+    config AIRPLAY_FEATURE_BIT_61
+        bool "Bit 61: SupportsRFC2198Redundancy"
+        default n
+    comment "Extended bits (published as the \"fex\" TXT key), HomePod mini"
+    config AIRPLAY_FEATURE_BIT_68
+        bool "Bit 68: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_72
+        bool "Bit 72: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_77
+        bool "Bit 77: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_79
+        bool "Bit 79: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_81
+        bool "Bit 81: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_82
+        bool "Bit 82: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_83
+        bool "Bit 83: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_85
+        bool "Bit 85: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_87
+        bool "Bit 87: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_91
+        bool "Bit 91: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_92
+        bool "Bit 92: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_94
+        bool "Bit 94: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_95
+        bool "Bit 95: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_96
+        bool "Bit 96: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_98
+        bool "Bit 98: no public name"
+        default n
+    config AIRPLAY_FEATURE_BIT_99
+        bool "Bit 99: no public name"
+        default n
+    config AIRPLAY_PROTOCOL_TRACE
+        bool "Log what the sender sends (protocol trace)"
+        default n
+        help
+            Heavy protocol debug trace for feature-bit and sender-behaviour
+            experiments. Normal MediaRemote state does not require it. Logs every RTSP
+            request (not just the first method/path occurrence), every
+            decrypted event-channel message, complete printable bplist bodies,
+            /command type values, DataStream headers/payloads and lightweight
+            MediaRemote ProtocolMessage envelope decoding. Also prints the
+            exact effective features/fex masks and set bit numbers at boot.
+
+    config AIRPLAY_PROTOCOL_TRACE_MR_COMMANDS
+        bool "Dump every MediaRemote supported command (very verbose)"
+        depends on AIRPLAY_PROTOCOL_TRACE
+        default n
+        help
+            Print one detailed PTRACE MRcmd[...] line for every command inside
+            updateMRSupportedCommands, including options and embedded bplist
+            descriptions. This can produce dozens of long lines whenever Apple
+            refreshes its command capabilities. Leave disabled for normal tracing;
+            MediaRemote capability parsing/state remains fully active.
+
+    config AIRPLAY_PROTOCOL_TRACE_RAW_BPLIST
+        bool "Also print raw bplist for structured RTSP trace"
+        depends on AIRPLAY_PROTOCOL_TRACE
+        default n
+        help
+            SETUP, SETPEERS/SETPEERSX, SETRATEANCHORTIME and FLUSHBUFFERED are
+            normally printed as compact multi-line structured blocks. Enable
+            this only when the exact original bplist description is needed as
+            well. It can create very long single log lines and is not required
+            for parsing or normal protocol diagnostics.
+endmenu
+
 menu "Amplifier Power Control"
     config AIRPLAY_AMP_CONTROL
         bool "Enable amplifier power control GPIO"

@@ -44,6 +44,29 @@ size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
                                  ap2_buffered_fifo_usage_t *out);
 
+/* TCP reader diagnostics (read-only; used by the audio_status line).
+ * `state` says where the reader task is right now. When it is RECV and no
+ * bytes arrive, lwIP has nothing queued for us: the sender is not sending. */
+typedef enum {
+  AP2_FIFO_RX_ACCEPT = 0, /* no client: waiting in accept() */
+  AP2_FIFO_RX_RECV,       /* blocked in recv(): waiting for sender bytes */
+  AP2_FIFO_RX_WAIT_SPACE, /* FIFO full: waiting for the decoder */
+  AP2_FIFO_RX_PACE,       /* Shairport-style 10 ms pacing sleep */
+} ap2_fifo_rx_state_t;
+
+typedef struct {
+  bool connected;
+  ap2_fifo_rx_state_t state;
+  uint32_t state_ms;      /* time in the current state */
+  uint32_t idle_ms;       /* time since the last received byte */
+  int socket_unread;      /* bytes queued in the socket (FIONREAD), -1 unknown */
+  uint32_t recv_timeouts; /* recv() returning EAGAIN on this connection */
+} ap2_buffered_fifo_rx_diag_t;
+
+void ap2_buffered_fifo_get_rx_diag(ap2_buffered_fifo_t *fifo,
+                                   ap2_buffered_fifo_rx_diag_t *out);
+const char *ap2_buffered_fifo_rx_state_name(ap2_fifo_rx_state_t state);
+
 /* Wake the single packet consumer after a control-plane change. */
 void ap2_buffered_fifo_notify(ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_wait(ap2_buffered_fifo_t *fifo, uint32_t timeout_ms);

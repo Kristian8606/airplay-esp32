@@ -2,12 +2,23 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "sdkconfig.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdint.h>
 #include <string.h>
 
 static const char *TAG = "settings";
 static const char *NS = "airplay";
+
+/* Device name and volume are read by RTSP client tasks, whose stacks may be
+ * in PSRAM (see rtsp_server.c): such a task must not touch flash. Both
+ * values are therefore loaded into RAM by settings_init() and the volume is
+ * written back by a short-lived task with an internal stack. */
+static portMUX_TYPE s_cache_mux = portMUX_INITIALIZER_UNLOCKED;
+static char s_device_name[65];
 static float s_volume_db = 0.0f;
+static bool s_volume_stored = false;
+static float s_volume_saved_db = 0.0f;
 
 #define NVS_KEY_WIFI_SSID "wifi_ssid"
 #define NVS_KEY_WIFI_PASS "wifi_pass"
@@ -122,17 +133,20 @@ esp_err_t settings_init(void) {
     }
   }
 
-  nvs_close(h);
-  return e;
-}
+  char name[sizeof(s_device_name)] = {0};
+  size_t name_len = sizeof(name);
+  if (nvs_get_str(h, "device_name", name, &name_len) != ESP_OK || name[0] == '\0') {
+    strlcpy(name, SETTINGS_DEFAULT_DEVICE_NAME, sizeof(name));
+  }
+  int32_t mv = 0;
+  const bool have_volume = nvs_get_i32(h, "volume_mdb", &mv) == ESP_OK;
+  taskENTER_CRITICAL(&s_cache_mux);
+  strlcpy(s_device_name, name, sizeof(s_device_name));
+  s_volume_stored = have_volume;
+  if (have_volume) s_volume_db = (float)mv / 1000.0f;
+  s_volume_saved_db = s_volume_db;
+  taskEXIT_CRITICAL(&s_cache_mux);
 
-static esp_err_t get_str(const char *key, char *out, size_t len) {
-  if (!out || !len) return ESP_ERR_INVALID_ARG;
-  nvs_handle_t h;
-  esp_err_t e = nvs_open(NS, NVS_READONLY, &h);
-  if (e != ESP_OK) return e;
-  size_t need = len;
-  e = nvs_get_str(h, key, out, &need);
   nvs_close(h);
   return e;
 }
@@ -242,27 +256,37 @@ bool settings_has_wifi_credentials(void) {
 
 esp_err_t settings_get_device_name(char *name, size_t len) {
   if (!name || !len) return ESP_ERR_INVALID_ARG;
-  esp_err_t e = get_str("device_name", name, len);
-  if (e != ESP_OK || name[0] == '\0') {
-    strlcpy(name, SETTINGS_DEFAULT_DEVICE_NAME, len);
-    return ESP_OK;
-  }
+  taskENTER_CRITICAL(&s_cache_mux);
+  strlcpy(name, s_device_name[0] ? s_device_name : SETTINGS_DEFAULT_DEVICE_NAME,
+          len);
+  taskEXIT_CRITICAL(&s_cache_mux);
   return ESP_OK;
 }
-esp_err_t settings_set_device_name(const char *name) { return set_str("device_name", name); }
-esp_err_t settings_get_volume(float *volume_db) {
-  if (!volume_db) return ESP_ERR_INVALID_ARG;
-  nvs_handle_t h;
-  esp_err_t e = nvs_open(NS, NVS_READONLY, &h);
-  if (e != ESP_OK) { *volume_db = s_volume_db; return e; }
-  int32_t mv = 0;
-  e = nvs_get_i32(h, "volume_mdb", &mv);
-  nvs_close(h);
-  if (e == ESP_OK) s_volume_db = (float)mv / 1000.0f;
-  *volume_db = s_volume_db;
+esp_err_t settings_set_device_name(const char *name) {
+  const esp_err_t e = set_str("device_name", name);
+  if (e == ESP_OK) {
+    taskENTER_CRITICAL(&s_cache_mux);
+    strlcpy(s_device_name, name ? name : "", sizeof(s_device_name));
+    taskEXIT_CRITICAL(&s_cache_mux);
+  }
   return e;
 }
-esp_err_t settings_set_volume(float volume_db) { s_volume_db = volume_db; return ESP_OK; }
+/* Returns ESP_ERR_NVS_NOT_FOUND (and the current value) when no volume was
+ * ever saved, so the caller can apply its own default. */
+esp_err_t settings_get_volume(float *volume_db) {
+  if (!volume_db) return ESP_ERR_INVALID_ARG;
+  taskENTER_CRITICAL(&s_cache_mux);
+  *volume_db = s_volume_db;
+  const bool stored = s_volume_stored;
+  taskEXIT_CRITICAL(&s_cache_mux);
+  return stored ? ESP_OK : ESP_ERR_NVS_NOT_FOUND;
+}
+esp_err_t settings_set_volume(float volume_db) {
+  taskENTER_CRITICAL(&s_cache_mux);
+  s_volume_db = volume_db;
+  taskEXIT_CRITICAL(&s_cache_mux);
+  return ESP_OK;
+}
 
 esp_err_t settings_get_output_latency_us(int32_t *us) {
   if (!us) return ESP_ERR_INVALID_ARG;
@@ -293,12 +317,40 @@ esp_err_t settings_clear_output_latency(void) {
   nvs_close(h);
   return e;
 }
-esp_err_t settings_persist_volume(void) {
+static void persist_volume_task(void *arg) {
+  (void)arg;
+  taskENTER_CRITICAL(&s_cache_mux);
+  const float v = s_volume_db;
+  taskEXIT_CRITICAL(&s_cache_mux);
   nvs_handle_t h;
   esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
-  if (e != ESP_OK) return e;
-  e = nvs_set_i32(h, "volume_mdb", (int32_t)(s_volume_db * 1000.0f));
-  if (e == ESP_OK) e = nvs_commit(h);
-  nvs_close(h);
-  return e;
+  if (e == ESP_OK) {
+    e = nvs_set_i32(h, "volume_mdb", (int32_t)(v * 1000.0f));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+  }
+  if (e == ESP_OK) {
+    taskENTER_CRITICAL(&s_cache_mux);
+    s_volume_saved_db = v;
+    s_volume_stored = true;
+    taskEXIT_CRITICAL(&s_cache_mux);
+  } else {
+    ESP_LOGW(TAG, "Saving volume failed: %s", esp_err_to_name(e));
+  }
+  vTaskDelete(NULL);
+}
+
+/* Safe to call from any task: the NVS write runs in its own short-lived task
+ * with an internal stack. Skipped when the value did not change. */
+esp_err_t settings_persist_volume(void) {
+  taskENTER_CRITICAL(&s_cache_mux);
+  const bool changed = !s_volume_stored || s_volume_db != s_volume_saved_db;
+  taskEXIT_CRITICAL(&s_cache_mux);
+  if (!changed) return ESP_OK;
+  if (xTaskCreatePinnedToCore(persist_volume_task, "vol_save", 3072, NULL, 2,
+                              NULL, 0) != pdPASS) {
+    ESP_LOGW(TAG, "Saving volume skipped: no memory for the save task");
+    return ESP_ERR_NO_MEM;
+  }
+  return ESP_OK;
 }

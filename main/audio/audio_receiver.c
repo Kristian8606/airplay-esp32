@@ -209,6 +209,11 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 
 static const char *TAG = "audio_receiver";
 static const char *STATUS_TAG = "audio_status";
+/* RX IDLE diagnostic: report when the sender sent nothing for this long while
+ * the compressed FIFO holds less than this (normal sender pauses happen with
+ * a full FIFO and are not reported). */
+#define AP2_RX_IDLE_REPORT_MS 3000U
+#define AP2_RX_IDLE_REPORT_FIFO (1024U * 1024U)
 
 /* Updated by RTSP control on Core0, consumed by playout on Core1. */
 static volatile int32_t s_volume_target_q15 = 32768;
@@ -1303,6 +1308,31 @@ static void audio_status_task(void *arg) {
                  control_suffix, (unsigned)(usage.used_bytes / 1024U),
                  (unsigned)(usage.capacity_bytes / 1024U), (unsigned long)rx_kbps,
                  status_frames_to_ms(pcm_frames, sr));
+      }
+
+      /* Stall diagnostic: the sender has sent nothing for a while and the
+       * FIFO is running low. The reader state and the socket's unread byte
+       * count tell whether bytes are waiting on our side (reader not
+       * reading) or the sender really stopped (reader in recv, 0 unread). */
+      static uint32_t rx_idle_reported_ms = 0;
+      ap2_buffered_fifo_rx_diag_t rxd;
+      ap2_buffered_fifo_get_rx_diag(s.transport, &rxd);
+      if (rxd.connected && rxd.idle_ms >= AP2_RX_IDLE_REPORT_MS &&
+          usage.used_bytes < AP2_RX_IDLE_REPORT_FIFO) {
+        ESP_LOGW(STATUS_TAG,
+                 "RX IDLE %lu ms, fifo=%uKiB: reader=%s for %lu ms, "
+                 "socket unread=%d B, recv timeouts=%lu",
+                 (unsigned long)rxd.idle_ms,
+                 (unsigned)(usage.used_bytes / 1024U),
+                 ap2_buffered_fifo_rx_state_name(rxd.state),
+                 (unsigned long)rxd.state_ms, rxd.socket_unread,
+                 (unsigned long)rxd.recv_timeouts);
+        rx_idle_reported_ms = rxd.idle_ms;
+      } else if (rx_idle_reported_ms != 0 && rxd.idle_ms < AP2_RX_IDLE_REPORT_MS) {
+        ESP_LOGW(STATUS_TAG, "RX resumed (idle was >= %lu ms), fifo=%uKiB",
+                 (unsigned long)rx_idle_reported_ms,
+                 (unsigned)(usage.used_bytes / 1024U));
+        rx_idle_reported_ms = 0;
       }
     } else if (task_stream == AUDIO_STREAM_REALTIME) {
       realtime_receiver_usage_t usage = {0};

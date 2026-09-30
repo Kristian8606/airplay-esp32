@@ -223,124 +223,293 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
 size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  int64_t stream_type, uint16_t data_port,
                                  uint16_t control_port,
-                                 uint32_t audio_buffer_size) {
-  if (capacity < 200) {
+                                 uint32_t audio_buffer_size,
+                                 uint32_t stream_id, bool include_stream_id,
+                                 bool stream_connection_rtp,
+                                 bool stream_connection_rtcp,
+                                 bool stream_connection_mdc,
+                                 uint16_t media_data_control_port,
+                                 uint64_t media_data_control_seed) {
+  if (!out || capacity < 256 || stream_type < 0 || stream_type > UINT8_MAX) {
     return 0;
   }
+
+  /* Bit 59 (SupportsAudioStreamConnectionSetup) changes the SETUP contract:
+   * the sender may include streamConnections and supportsDynamicStreamID.  In
+   * that path it expects the receiver to return a streamID and to mirror each
+   * requested RTP/RTCP connection with streamConnectionKeyPort.  Build the
+   * response as a small generic binary plist rather than relying on the old
+   * fixed object numbers. */
+  size_t pos = 0;
+  if (!bplist_has_room(pos, 8, capacity)) return 0;
+  memcpy(out + pos, "bplist00", 8);
+  pos += 8;
+
+  size_t offsets[32];
+  size_t obj = 0;
+
+#define ADD_STRING(var, text)                                                   \
+  uint8_t var = (uint8_t)obj;                                                   \
+  do {                                                                          \
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;                  \
+    offsets[obj++] = pos;                                                       \
+    if (!bplist_write_ascii_string(out, capacity, &pos, (text))) return 0;      \
+  } while (0)
+#define ADD_INT(var, value)                                                     \
+  uint8_t var = (uint8_t)obj;                                                   \
+  do {                                                                          \
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;                  \
+    offsets[obj++] = pos;                                                       \
+    if (!bplist_write_int(out, capacity, &pos, (uint64_t)(value))) return 0;    \
+  } while (0)
+
+  ADD_STRING(k_streams, "streams");
+  ADD_STRING(k_type, "type");
+  ADD_STRING(k_data_port, "dataPort");
+  ADD_STRING(k_control_port, "controlPort");
+
+  uint8_t k_buffer_size = 0;
+  const bool buffered = stream_type == AUDIO_STREAM_BUFFERED;
+  if (buffered) {
+    ADD_STRING(tmp_k_buffer_size, "audioBufferSize");
+    k_buffer_size = tmp_k_buffer_size;
+  }
+
+  uint8_t k_stream_id = 0;
+  if (include_stream_id) {
+    ADD_STRING(tmp_k_stream_id, "streamID");
+    k_stream_id = tmp_k_stream_id;
+  }
+
+  const bool include_stream_connections =
+      stream_connection_rtp || stream_connection_rtcp || stream_connection_mdc;
+  uint8_t k_stream_connections = 0;
+  uint8_t k_sc_rtp = 0;
+  uint8_t k_sc_rtcp = 0;
+  uint8_t k_sc_mdc = 0;
+  uint8_t k_sc_port = 0;
+  uint8_t k_sc_seed = 0;
+  if (include_stream_connections) {
+    ADD_STRING(tmp_k_sc, "streamConnections");
+    k_stream_connections = tmp_k_sc;
+    if (stream_connection_rtp) {
+      ADD_STRING(tmp_k_sc_rtp, "streamConnectionTypeRTP");
+      k_sc_rtp = tmp_k_sc_rtp;
+    }
+    if (stream_connection_rtcp) {
+      ADD_STRING(tmp_k_sc_rtcp, "streamConnectionTypeRTCP");
+      k_sc_rtcp = tmp_k_sc_rtcp;
+    }
+    if (stream_connection_mdc) {
+      ADD_STRING(tmp_k_sc_mdc, "streamConnectionTypeMediaDataControl");
+      k_sc_mdc = tmp_k_sc_mdc;
+    }
+    ADD_STRING(tmp_k_sc_port, "streamConnectionKeyPort");
+    k_sc_port = tmp_k_sc_port;
+    if (stream_connection_mdc) {
+      ADD_STRING(tmp_k_sc_seed, "streamConnectionKeyEncryptionSeed");
+      k_sc_seed = tmp_k_sc_seed;
+    }
+  }
+
+  ADD_INT(v_type, (uint8_t)stream_type);
+  ADD_INT(v_data_port, data_port);
+  ADD_INT(v_control_port, control_port);
+
+  uint8_t v_buffer_size = 0;
+  if (buffered) {
+    ADD_INT(tmp_v_buffer_size, audio_buffer_size);
+    v_buffer_size = tmp_v_buffer_size;
+  }
+
+  uint8_t v_stream_id = 0;
+  if (include_stream_id) {
+    ADD_INT(tmp_v_stream_id, stream_id);
+    v_stream_id = tmp_v_stream_id;
+  }
+
+  uint8_t d_sc_rtp = 0;
+  if (stream_connection_rtp) {
+    ADD_INT(v_sc_rtp_port, data_port);
+    d_sc_rtp = (uint8_t)obj;
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+    offsets[obj++] = pos;
+    const uint8_t keys[] = {k_sc_port};
+    const uint8_t vals[] = {v_sc_rtp_port};
+    if (!bplist_write_dict(out, capacity, &pos, keys, vals, 1)) return 0;
+  }
+
+  uint8_t d_sc_rtcp = 0;
+  if (stream_connection_rtcp) {
+    ADD_INT(v_sc_rtcp_port, control_port);
+    d_sc_rtcp = (uint8_t)obj;
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+    offsets[obj++] = pos;
+    const uint8_t keys[] = {k_sc_port};
+    const uint8_t vals[] = {v_sc_rtcp_port};
+    if (!bplist_write_dict(out, capacity, &pos, keys, vals, 1)) return 0;
+  }
+
+  uint8_t d_sc_mdc = 0;
+  if (stream_connection_mdc) {
+    ADD_INT(v_sc_mdc_port, media_data_control_port);
+    ADD_INT(v_sc_mdc_seed, media_data_control_seed);
+    d_sc_mdc = (uint8_t)obj;
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+    offsets[obj++] = pos;
+    const uint8_t keys[] = {k_sc_port, k_sc_seed};
+    const uint8_t vals[] = {v_sc_mdc_port, v_sc_mdc_seed};
+    if (!bplist_write_dict(out, capacity, &pos, keys, vals, 2)) return 0;
+  }
+
+  uint8_t d_stream_connections = 0;
+  if (include_stream_connections) {
+    uint8_t keys[3];
+    uint8_t vals[3];
+    size_t count = 0;
+    if (stream_connection_rtp) {
+      keys[count] = k_sc_rtp;
+      vals[count] = d_sc_rtp;
+      count++;
+    }
+    if (stream_connection_rtcp) {
+      keys[count] = k_sc_rtcp;
+      vals[count] = d_sc_rtcp;
+      count++;
+    }
+    if (stream_connection_mdc) {
+      keys[count] = k_sc_mdc;
+      vals[count] = d_sc_mdc;
+      count++;
+    }
+    d_stream_connections = (uint8_t)obj;
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+    offsets[obj++] = pos;
+    if (!bplist_write_dict(out, capacity, &pos, keys, vals, count)) return 0;
+  }
+
+  uint8_t stream_keys[7];
+  uint8_t stream_vals[7];
+  size_t stream_count = 0;
+  stream_keys[stream_count] = k_type;
+  stream_vals[stream_count++] = v_type;
+  stream_keys[stream_count] = k_data_port;
+  stream_vals[stream_count++] = v_data_port;
+  stream_keys[stream_count] = k_control_port;
+  stream_vals[stream_count++] = v_control_port;
+  if (buffered) {
+    stream_keys[stream_count] = k_buffer_size;
+    stream_vals[stream_count++] = v_buffer_size;
+  }
+  if (include_stream_id) {
+    stream_keys[stream_count] = k_stream_id;
+    stream_vals[stream_count++] = v_stream_id;
+  }
+  if (include_stream_connections) {
+    stream_keys[stream_count] = k_stream_connections;
+    stream_vals[stream_count++] = d_stream_connections;
+  }
+
+  const uint8_t d_stream = (uint8_t)obj;
+  if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+  offsets[obj++] = pos;
+  if (!bplist_write_dict(out, capacity, &pos, stream_keys, stream_vals,
+                         stream_count)) {
+    return 0;
+  }
+
+  const uint8_t a_streams = (uint8_t)obj;
+  if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+  offsets[obj++] = pos;
+  const uint8_t stream_refs[] = {d_stream};
+  if (!bplist_write_array(out, capacity, &pos, stream_refs, 1)) return 0;
+
+  const uint8_t top = (uint8_t)obj;
+  if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+  offsets[obj++] = pos;
+  const uint8_t top_keys[] = {k_streams};
+  const uint8_t top_vals[] = {a_streams};
+  if (!bplist_write_dict(out, capacity, &pos, top_keys, top_vals, 1)) return 0;
+
+#undef ADD_STRING
+#undef ADD_INT
+
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) return 0;
+  return pos;
+}
+
+size_t bplist_build_datastream_setup(uint8_t *out, size_t capacity,
+                                     uint16_t data_port, uint32_t stream_id,
+                                     bool include_data_port) {
+  if (!out || capacity < 160) return 0;
 
   size_t pos = 0;
   memcpy(out + pos, "bplist00", 8);
   pos += 8;
-
-  size_t offsets[16];
+  size_t offsets[12];
   size_t obj = 0;
 
-  offsets[obj++] = pos;
-  out[pos++] = 0x57;
-  memcpy(out + pos, "streams", 7);
-  pos += 7;
+#define DS_ADD_STRING(var, text)                                               \
+  uint8_t var = (uint8_t)obj;                                                  \
+  do {                                                                         \
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;                 \
+    offsets[obj++] = pos;                                                      \
+    if (!bplist_write_ascii_string(out, capacity, &pos, (text))) return 0;     \
+  } while (0)
+#define DS_ADD_INT(var, value)                                                  \
+  uint8_t var = (uint8_t)obj;                                                   \
+  do {                                                                          \
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;                  \
+    offsets[obj++] = pos;                                                       \
+    if (!bplist_write_int(out, capacity, &pos, (uint64_t)(value))) return 0;   \
+  } while (0)
 
-  offsets[obj++] = pos;
-  out[pos++] = 0x54;
-  memcpy(out + pos, "type", 4);
-  pos += 4;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x58;
-  memcpy(out + pos, "dataPort", 8);
-  pos += 8;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x5B;
-  memcpy(out + pos, "controlPort", 11);
-  pos += 11;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x5F;
-  out[pos++] = 0x10;
-  out[pos++] = 15;
-  memcpy(out + pos, "audioBufferSize", 15);
-  pos += 15;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x10;
-  out[pos++] = (uint8_t)stream_type;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x11;
-  out[pos++] = (data_port >> 8) & 0xFF;
-  out[pos++] = data_port & 0xFF;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x11;
-  out[pos++] = (control_port >> 8) & 0xFF;
-  out[pos++] = control_port & 0xFF;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x12;
-  out[pos++] = (audio_buffer_size >> 24) & 0xFF;
-  out[pos++] = (audio_buffer_size >> 16) & 0xFF;
-  out[pos++] = (audio_buffer_size >> 8) & 0xFF;
-  out[pos++] = audio_buffer_size & 0xFF;
-
-  offsets[obj++] = pos;
-  if ((stream_type == AUDIO_STREAM_BUFFERED)) {
-    out[pos++] = 0xD4;
-    out[pos++] = 1;
-    out[pos++] = 2;
-    out[pos++] = 4;
-    out[pos++] = 3;
-    out[pos++] = 5;
-    out[pos++] = 6;
-    out[pos++] = 8;
-    out[pos++] = 7;
-  } else {
-    out[pos++] = 0xD3;
-    out[pos++] = 1;
-    out[pos++] = 2;
-    out[pos++] = 3;
-    out[pos++] = 5;
-    out[pos++] = 6;
-    out[pos++] = 7;
+  DS_ADD_STRING(k_streams, "streams");
+  DS_ADD_STRING(k_type, "type");
+  DS_ADD_STRING(k_stream_id, "streamID");
+  uint8_t k_data_port = 0;
+  if (include_data_port) {
+    DS_ADD_STRING(tmp_k_data_port, "dataPort");
+    k_data_port = tmp_k_data_port;
+  }
+  DS_ADD_INT(v_type, 130);
+  DS_ADD_INT(v_stream_id, stream_id);
+  uint8_t v_data_port = 0;
+  if (include_data_port) {
+    DS_ADD_INT(tmp_v_data_port, data_port);
+    v_data_port = tmp_v_data_port;
   }
 
+  uint8_t stream_keys[3];
+  uint8_t stream_vals[3];
+  size_t stream_count = 0;
+  stream_keys[stream_count] = k_type;
+  stream_vals[stream_count++] = v_type;
+  stream_keys[stream_count] = k_stream_id;
+  stream_vals[stream_count++] = v_stream_id;
+  if (include_data_port) {
+    stream_keys[stream_count] = k_data_port;
+    stream_vals[stream_count++] = v_data_port;
+  }
+
+  const uint8_t d_stream = (uint8_t)obj;
   offsets[obj++] = pos;
-  out[pos++] = 0xA1;
-  out[pos++] = 9;
-
+  if (!bplist_write_dict(out, capacity, &pos, stream_keys, stream_vals,
+                         stream_count)) return 0;
+  const uint8_t a_streams = (uint8_t)obj;
   offsets[obj++] = pos;
-  out[pos++] = 0xD1;
-  out[pos++] = 0;
-  out[pos++] = 10;
+  const uint8_t refs[] = {d_stream};
+  if (!bplist_write_array(out, capacity, &pos, refs, 1)) return 0;
+  const uint8_t top = (uint8_t)obj;
+  offsets[obj++] = pos;
+  const uint8_t top_keys[] = {k_streams};
+  const uint8_t top_vals[] = {a_streams};
+  if (!bplist_write_dict(out, capacity, &pos, top_keys, top_vals, 1)) return 0;
 
-  size_t offset_table_offset = pos;
-  for (size_t i = 0; i < obj; i++) {
-    if (offsets[i] > 0xFF) {
-      return 0;
-    }
-    out[pos++] = (uint8_t)offsets[i];
-  }
+#undef DS_ADD_STRING
+#undef DS_ADD_INT
 
-  memset(out + pos, 0, 6);
-  pos += 6;
-  out[pos++] = 1;
-  out[pos++] = 1;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = (uint8_t)obj;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = 11;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = (uint8_t)offset_table_offset;
-
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) return 0;
   return pos;
 }
 
@@ -766,6 +935,43 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
     }
   }
   if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) {
+    return 0;
+  }
+  return pos;
+}
+
+size_t bplist_build_anchor(uint8_t *out, size_t capacity, uint64_t rate,
+                           uint64_t rtp_time, uint64_t network_time_secs,
+                           uint64_t network_time_frac, uint64_t flags,
+                           uint64_t timeline_id) {
+  static const char *const keys[] = {"rate", "rtpTime", "networkTimeSecs",
+                                     "networkTimeFrac", "networkTimeFlags",
+                                     "networkTimeTimelineID"};
+  const uint64_t values[] = {rate, rtp_time, network_time_secs,
+                             network_time_frac, flags, timeline_id};
+  enum { N = 6 };
+  if (!out || capacity < 8) return 0;
+  size_t pos = 0;
+  size_t offsets[2 * N + 1];
+  uint8_t key_refs[N];
+  uint8_t value_refs[N];
+  memcpy(out, "bplist00", 8);
+  pos = 8;
+  size_t obj = 0;
+  for (size_t i = 0; i < N; ++i) {
+    offsets[obj] = pos;
+    key_refs[i] = (uint8_t)obj++;
+    if (!bplist_write_ascii_string(out, capacity, &pos, keys[i])) return 0;
+  }
+  for (size_t i = 0; i < N; ++i) {
+    offsets[obj] = pos;
+    value_refs[i] = (uint8_t)obj++;
+    if (!bplist_write_int(out, capacity, &pos, values[i])) return 0;
+  }
+  offsets[obj] = pos;
+  const size_t top = obj++;
+  if (!bplist_write_dict(out, capacity, &pos, key_refs, value_refs, N) ||
+      !bplist_finish(out, capacity, &pos, offsets, obj, top)) {
     return 0;
   }
   return pos;

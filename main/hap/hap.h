@@ -148,6 +148,17 @@ esp_err_t hap_derive_audio_key(hap_session_t *session, uint8_t *audio_key,
                                size_t key_len);
 
 /**
+ * Derive AirPlay 2 DataStream keys for a receiver-side dedicated TCP stream.
+ * The 64-bit seed is appended as an unsigned decimal number to
+ * "DataStream-Salt", matching Apple/Shairport/pyatv.  Because the sender
+ * initiates the TCP connection, the receiver encrypts with the Input key and
+ * decrypts with the Output key.
+ */
+esp_err_t hap_derive_datastream_keys(const hap_session_t *session, uint64_t seed,
+                                     uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE],
+                                     uint8_t decrypt_key[HAP_CHACHA20_KEY_SIZE]);
+
+/**
  * Handle pair-setup M1 (client initiates SRP)
  * @param session HAP session
  * @param input Input TLV (method, state, flags)

@@ -1,6 +1,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "mdns.h"
+#include "sodium.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -38,7 +39,8 @@ static const char *TAG = "mdns_airplay";
 typedef struct {
   char device_id[18];
   char features[32];
-  char pk[65]; // 32 bytes = 64 hex chars + null
+  char fex[32]; // base64 of the 128-bit feature set, see airplay_txt_values()
+  char pk[65];  // 32 bytes = 64 hex chars + null
 } airplay_txt_values_t;
 
 static void airplay_txt_values(airplay_txt_values_t *v) {
@@ -49,11 +51,31 @@ static void airplay_txt_values(airplay_txt_values_t *v) {
   }
   snprintf(v->features, sizeof(v->features), "0x%X,0x%X", AIRPLAY_FEATURES_LO,
            AIRPLAY_FEATURES_HI);
+
+  /* "fex": all feature bits (0-127) as little-endian bytes, trailing zero
+   * bytes dropped, base64 without padding - the form HomePods advertise. */
+  uint8_t bytes[16];
+  const uint64_t words[2] = {AIRPLAY_FEATURES, AIRPLAY_FEATURES_EX};
+  size_t len = 0;
+  for (size_t i = 0; i < sizeof(bytes); ++i) {
+    bytes[i] = (uint8_t)(words[i / 8] >> (8 * (i % 8)));
+    if (bytes[i]) len = i + 1;
+  }
+  sodium_bin2base64(v->fex, sizeof(v->fex), bytes, len,
+                    sodium_base64_VARIANT_ORIGINAL_NO_PADDING);
 }
+
+/* Published only when an extended feature bit (64+) is selected. */
+#if AIRPLAY_FEATURES_EX != 0
+#define AIRPLAY_TXT_FEX(v) {"fex", (v).fex},
+#else
+#define AIRPLAY_TXT_FEX(v)
+#endif
 
 #define AIRPLAY_TXT_ITEMS(v)                                             \
   {                                                                      \
     {"deviceid", (v).device_id}, {"features", (v).features},             \
+        AIRPLAY_TXT_FEX(v)                                               \
         {"flags", AIRPLAY_FLAGS}, {"model", AIRPLAY_MODEL},              \
         {"pk", (v).pk},                                                  \
         {"pi", "00000000-0000-0000-0000-000000000000"},                  \

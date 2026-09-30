@@ -9,6 +9,7 @@
 #include "amp_control.h"
 #include "ptp_clock.h"
 #include "settings.h"
+#include "rtsp_datastream.h"
 
 
 static int32_t volume_db_to_q15(float volume_db){
@@ -41,6 +42,7 @@ rtsp_conn_t *rtsp_conn_create(void) {
    * the volume of a session that is already playing. */
 
   conn->event_socket = -1;
+  conn->buffered_control_socket = -1;
 
   return conn;
 }
@@ -88,6 +90,14 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
     close(conn->event_socket);
     conn->event_socket = -1;
   }
+  if (conn->buffered_control_socket >= 0) {
+    close(conn->buffered_control_socket);
+    conn->buffered_control_socket = -1;
+  }
+  rtsp_datastream_stop(&conn->media_data_control);
+  rtsp_datastream_stop(&conn->remote_control_datastream);
+  conn->media_data_control_port = 0;
+  conn->remote_control_data_port = 0;
 
   // Reset stream state
   conn->stream_active = false;
@@ -96,6 +106,7 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->control_port = 0;
   conn->event_port = 0;
   conn->buffered_port = 0;
+  conn->stream_id = 0;
 
   // Connection teardown ends the lifetime of SETPEERS/SETPEERSX metadata.
   // Stream-level TEARDOWN keeps the RTSP connection alive and therefore does

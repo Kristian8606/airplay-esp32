@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #if defined(ESP_PLATFORM)
 #include "lwip/sockets.h"
@@ -51,7 +52,24 @@ struct ap2_buffered_fifo {
   int task_core;
   int task_priority;
   uint32_t task_stack;
+
+  /* Reader diagnostics, written only by the reader task. */
+  volatile uint32_t rx_state;
+  volatile uint32_t rx_state_since_ms;
+  volatile uint32_t rx_last_byte_ms;
+  volatile uint32_t rx_recv_timeouts;
 };
+
+static inline uint32_t now_ms(void) {
+  return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static inline void set_rx_state(ap2_buffered_fifo_t *fifo,
+                                ap2_fifo_rx_state_t st) {
+  if (fifo->rx_state == (uint32_t)st) return;
+  fifo->rx_state_since_ms = now_ms();
+  fifo->rx_state = (uint32_t)st;
+}
 
 static uint32_t next_epoch(ap2_buffered_fifo_t *fifo) {
   uint32_t v = __atomic_add_fetch(&fifo->stream_epoch, 1U, __ATOMIC_ACQ_REL);
@@ -164,6 +182,7 @@ static void tcp_reader_task(void *arg) {
                                     xPortGetCoreID(), fifo->task_priority, 0U);
 
   while (fifo->running) {
+    set_rx_state(fifo, AP2_FIFO_RX_ACCEPT);
     struct sockaddr_storage addr;
     socklen_t alen = sizeof(addr);
     int c = accept(fifo->listen_sock, (struct sockaddr *)&addr, &alen);
@@ -184,6 +203,8 @@ static void tcp_reader_task(void *arg) {
     fifo->connected = true;
     fifo->client_sock = c;
     (void)next_epoch(fifo);
+    fifo->rx_last_byte_ms = now_ms();
+    fifo->rx_recv_timeouts = 0;
     xSemaphoreGive(fifo->fifo_mutex);
 
     ESP_LOGI(TAG, "buffered TCP connected fifo=%uKiB",
@@ -199,6 +220,7 @@ static void tcp_reader_task(void *arg) {
       xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
       if (fifo->occupancy == fifo->capacity) {
         xSemaphoreGive(fifo->fifo_mutex);
+        set_rx_state(fifo, AP2_FIFO_RX_WAIT_SPACE);
         (void)xSemaphoreTake(fifo->not_full, pdMS_TO_TICKS(100));
         continue;
       }
@@ -211,14 +233,18 @@ static void tcp_reader_task(void *arg) {
       write_epoch = __atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE);
       xSemaphoreGive(fifo->fifo_mutex);
 
+      set_rx_state(fifo, AP2_FIFO_RX_RECV);
       const ssize_t n = recv(c, fifo->buffer + write_pos, request, 0);
       if (n <= 0) {
-        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+          fifo->rx_recv_timeouts++;
           continue;
+        }
         peer_closed = n == 0;
         break;
       }
 
+      fifo->rx_last_byte_ms = now_ms();
       xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
       if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) == write_epoch &&
           fifo->connected) {
@@ -232,6 +258,7 @@ static void tcp_reader_task(void *arg) {
       xSemaphoreGive(fifo->not_empty);
 
       if (have_time_to_sleep) {
+        set_rx_state(fifo, AP2_FIFO_RX_PACE);
         TickType_t ticks = pdMS_TO_TICKS(FIFO_PACE_SLEEP_MS);
         if (ticks == 0) ticks = 1;
         vTaskDelay(ticks);
@@ -404,6 +431,44 @@ void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo) {
   if (client >= 0) (void)shutdown(client, SHUT_RDWR);
   xSemaphoreGive(fifo->fifo_mutex);
   signal_all(fifo);
+}
+
+const char *ap2_buffered_fifo_rx_state_name(ap2_fifo_rx_state_t state) {
+  switch (state) {
+  case AP2_FIFO_RX_ACCEPT: return "accept";
+  case AP2_FIFO_RX_RECV: return "recv";
+  case AP2_FIFO_RX_WAIT_SPACE: return "wait-space";
+  case AP2_FIFO_RX_PACE: return "pace";
+  default: return "?";
+  }
+}
+
+void ap2_buffered_fifo_get_rx_diag(ap2_buffered_fifo_t *fifo,
+                                   ap2_buffered_fifo_rx_diag_t *out) {
+  if (!out) return;
+  memset(out, 0, sizeof(*out));
+  out->socket_unread = -1;
+  if (!fifo || !fifo->fifo_mutex) return;
+
+  const uint32_t t = now_ms();
+  const uint32_t state = fifo->rx_state;
+  const uint32_t since = fifo->rx_state_since_ms;
+  const uint32_t last = fifo->rx_last_byte_ms;
+  out->state = (ap2_fifo_rx_state_t)state;
+  out->state_ms = t - since;
+  out->idle_ms = t - last;
+  out->recv_timeouts = fifo->rx_recv_timeouts;
+
+  /* The mutex keeps client_sock from being closed and recycled meanwhile
+   * (the reader detaches it under this mutex before close()). FIONREAD only
+   * reads lwIP's receive counters and never blocks. */
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  out->connected = fifo->connected;
+  if (fifo->connected && fifo->client_sock >= 0) {
+    int avail = 0;
+    if (ioctl(fifo->client_sock, FIONREAD, &avail) == 0) out->socket_unread = avail;
+  }
+  xSemaphoreGive(fifo->fifo_mutex);
 }
 
 size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo) {

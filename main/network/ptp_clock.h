@@ -24,8 +24,9 @@ void ptp_clock_stop(void);
 /**
  * Clear PTP clock synchronization state.
  * Resets offset and lock status without stopping the clock.
- * Called at session boundaries (first stream SETUP of a connection, final
- * TEARDOWN, connection close) and by the buffered timing watchdog.
+ * Called at true session boundaries (play-lock acquisition, final TEARDOWN,
+ * connection close) and by the buffered timing watchdog. Audio stream SETUP
+ * inside an already-established control session must not clear good samples.
  */
 void ptp_clock_clear(void);
 

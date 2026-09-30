@@ -13,18 +13,12 @@
  * Inspired by shairport-sync's method_handlers pattern
  */
 
-// AirPlay feature flags 0x1C340405C4A00: Shairport Sync's AirPlay 2 value
-// (0x18340405C4A00) plus bit 46, so senders show the device as a HomePod.
-// Key bits:
-//   Bit 38: SupportsCoreUtilsPairingAndEncryption
-//   Bit 46: SupportsHKPairingAndAccessControl (HomePod presentation)
-//   Bit 48: SupportsTransientPairing
-#define AIRPLAY_FEATURES_HI 0x1C340
-#define AIRPLAY_FEATURES_LO 0x405C4A00
+// AirPlay feature flags (AIRPLAY_FEATURES*), see airplay_features.h.
+#include "airplay_features.h"
 
 // Model identifier in mDNS ("model", "am"), /info and updateInfo:
-// AudioAccessory6,1 = HomePod (2nd generation).
-#define AIRPLAY_MODEL "AudioAccessory6,1"
+// AudioAccessory5,1 = HomePod mini.
+#define AIRPLAY_MODEL "AudioAccessory5,1"
 
 // Include for audio_format_t and the shared buffered transport capacity.
 #include "audio_receiver.h"

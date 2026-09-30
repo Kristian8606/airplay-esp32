@@ -139,6 +139,21 @@ bool bplist_find_data_deep(const uint8_t *plist, size_t plist_len,
                            size_t out_capacity, size_t *out_len);
 
 /**
+ * Read one DATA element from an ARRAY value located by key anywhere in a
+ * binary plist. This is primarily useful for AirPlay 2 control structures such
+ * as params.mrSupportedCommandsFromSender, whose array elements are themselves
+ * serialized binary plists.
+ *
+ * @param item_index Zero-based index in the matching DATA array.
+ * @param out_count Receives the full array element count when the key is found.
+ * @return true when the requested element exists and is a DATA object.
+ */
+bool bplist_get_data_array_item_deep(const uint8_t *plist, size_t plist_len,
+                                     const char *key, size_t item_index,
+                                     uint8_t *out_data, size_t out_capacity,
+                                     size_t *out_len, size_t *out_count);
+
+/**
  * Get number of stream entries in a binary plist "streams" array
  * @param plist Binary plist data
  * @param plist_len Length of plist
@@ -194,6 +209,34 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
                                size_t out_capacity, size_t *out_count);
 
 /**
+ * Inspect the optional AirPlay 2 streamConnections dictionary for one stream.
+ * Bit 59 (SupportsAudioStreamConnectionSetup) makes modern senders describe
+ * the transport endpoints this way instead of relying only on the legacy
+ * controlPort/dataPort fields.  The receiver must mirror the requested
+ * connection types in its SETUP response and add streamConnectionKeyPort.
+ *
+ * @return true when a valid streamConnections dictionary was present.
+ */
+typedef struct {
+  bool has_rtp;
+  bool has_rtcp;
+  bool has_media_data_control;
+  bool has_media_data_control_seed;
+  uint64_t media_data_control_seed;
+} bplist_stream_connection_info_t;
+
+/** Parse streamConnections types plus the optional MediaDataControl seed. */
+bool bplist_get_stream_connection_info(
+    const uint8_t *plist, size_t plist_len, size_t index,
+    bplist_stream_connection_info_t *out);
+
+/* Compatibility wrapper when only the connection type flags are needed. */
+bool bplist_get_stream_connection_types(const uint8_t *plist,
+                                        size_t plist_len, size_t index,
+                                        bool *has_rtp, bool *has_rtcp,
+                                        bool *has_media_data_control);
+
+/**
  * Find stream-specific crypto fields in a binary plist
  * @param plist Binary plist data
  * @param plist_len Length of plist
@@ -227,6 +270,10 @@ bool bplist_find_stream_crypto(const uint8_t *plist, size_t plist_len,
 bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
                      int64_t *out_value);
 
+/** Find a top-level boolean value by key in a binary plist. */
+bool bplist_find_bool(const uint8_t *plist, size_t plist_len, const char *key,
+                      bool *out_value);
+
 /**
  * Find a real/float value by key in a binary plist
  * Handles both real and integer values (converting int to double)
@@ -250,6 +297,24 @@ bool bplist_find_real(const uint8_t *plist, size_t plist_len, const char *key,
  */
 bool bplist_find_string(const uint8_t *plist, size_t plist_len, const char *key,
                         char *out_str, size_t out_capacity);
+
+
+/**
+ * Deep-search variants used for nested AirPlay 2 control/metadata plists.
+ * They traverse dictionaries/arrays with the same bounded visit budget as
+ * bplist_find_data_deep(), so malformed self-references remain safe.
+ */
+bool bplist_find_int_deep(const uint8_t *plist, size_t plist_len,
+                          const char *key, int64_t *out_value);
+bool bplist_find_bool_deep(const uint8_t *plist, size_t plist_len,
+                           const char *key, bool *out_value);
+bool bplist_find_real_deep(const uint8_t *plist, size_t plist_len,
+                           const char *key, double *out_value);
+bool bplist_find_string_deep(const uint8_t *plist, size_t plist_len,
+                             const char *key, char *out_str,
+                             size_t out_capacity);
+bool bplist_find_data_len_deep(const uint8_t *plist, size_t plist_len,
+                               const char *key, size_t *out_len);
 
 // ========================================
 // Binary plist builders (for AirPlay SETUP responses)
@@ -276,12 +341,30 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
  * @param data_port Data port to include
  * @param control_port Control port to include
  * @param audio_buffer_size Audio buffer size to advertise
+ * @param stream_id Receiver-assigned dynamic stream ID
+ * @param include_stream_id Include streamID in the stream descriptor
+ * @param stream_connection_rtp Mirror streamConnectionTypeRTP with data port
+ * @param stream_connection_rtcp Mirror streamConnectionTypeRTCP with control port
+ * @param stream_connection_mdc Mirror MediaDataControl with port and seed
+ * @param media_data_control_port Dedicated encrypted DataStream listener port
+ * @param media_data_control_seed Seed echoed from the sender's MDC request
  * @return Length of generated bplist, or 0 on error
  */
 size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  int64_t stream_type, uint16_t data_port,
                                  uint16_t control_port,
-                                 uint32_t audio_buffer_size);
+                                 uint32_t audio_buffer_size,
+                                 uint32_t stream_id, bool include_stream_id,
+                                 bool stream_connection_rtp,
+                                 bool stream_connection_rtcp,
+                                 bool stream_connection_mdc,
+                                 uint16_t media_data_control_port,
+                                 uint64_t media_data_control_seed);
+
+/** Build a type-130 dedicated DataStream SETUP response. */
+size_t bplist_build_datastream_setup(uint8_t *out, size_t capacity,
+                                     uint16_t data_port, uint32_t stream_id,
+                                     bool include_data_port);
 
 /**
  * Build feedback response bplist
@@ -329,3 +412,25 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
                                 size_t public_key_len, uint64_t features,
                                 int64_t protocol_version, const uint8_t *txt,
                                 size_t txt_len);
+
+/**
+ * Render a binary plist as compact text for the protocol trace, e.g.
+ * {streams=[{type=103, ct=4, shk=<data 32>}], timingProtocol="PTP"}.
+ * Bounded like the other parsers (depth, visit budget, spans); truncated at
+ * out_capacity and always NUL-terminated.
+ * @return Length written (0 if the input is not a valid bplist)
+ */
+size_t bplist_describe(const uint8_t *plist, size_t plist_len, char *out,
+                       size_t out_capacity);
+
+/**
+ * GETANCHOR reply (receiver-placed anchor): { rate, rtpTime, networkTimeSecs,
+ * networkTimeFrac, networkTimeFlags, networkTimeTimelineID } with the same
+ * encoding the sender uses in SETRATEANCHORTIME (frac = 2^-64 s units,
+ * timeline id = PTP clock id as a 64-bit integer).
+ * @return Length of generated bplist, or 0 on error
+ */
+size_t bplist_build_anchor(uint8_t *out, size_t capacity, uint64_t rate,
+                           uint64_t rtp_time, uint64_t network_time_secs,
+                           uint64_t network_time_frac, uint64_t flags,
+                           uint64_t timeline_id);
