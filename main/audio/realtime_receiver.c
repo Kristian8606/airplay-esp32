@@ -1012,11 +1012,21 @@ static esp_err_t ensure_transport_resources(void) {
     if (!s_rt.missing) s_rt.missing = calloc(RT_MISSING_SLOTS, sizeof(*s_rt.missing));
   }
 
-  if (!s_rt.data_free_q) s_rt.data_free_q = xQueueCreate(RT_DATA_POOL_SLOTS, sizeof(rt_packet_slot_t *));
-  if (!s_rt.rtx_free_q) s_rt.rtx_free_q = xQueueCreate(RT_RTX_POOL_SLOTS, sizeof(rt_packet_slot_t *));
-  if (!s_rt.work_q) s_rt.work_q = xQueueCreate(RT_WORK_QUEUE_SLOTS, sizeof(rt_packet_slot_t *));
+  /* The queues stay allocated after the first realtime session, so keep them
+   * out of internal RAM: resend_event_q alone is 512 x 12 B. With xQueueCreate
+   * the first ALAC session permanently took ~7 KiB of internal RAM and the
+   * next AAC SETUP could no longer create its 6 KiB processor stack. Only
+   * tasks touch these queues (never an ISR), so PSRAM is fine. */
+#define RT_Q_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+  if (!s_rt.data_free_q)
+    s_rt.data_free_q = xQueueCreateWithCaps(RT_DATA_POOL_SLOTS, sizeof(rt_packet_slot_t *), RT_Q_CAPS);
+  if (!s_rt.rtx_free_q)
+    s_rt.rtx_free_q = xQueueCreateWithCaps(RT_RTX_POOL_SLOTS, sizeof(rt_packet_slot_t *), RT_Q_CAPS);
+  if (!s_rt.work_q)
+    s_rt.work_q = xQueueCreateWithCaps(RT_WORK_QUEUE_SLOTS, sizeof(rt_packet_slot_t *), RT_Q_CAPS);
   if (!s_rt.resend_event_q)
-    s_rt.resend_event_q = xQueueCreate(RT_RESEND_EVENT_SLOTS, sizeof(rt_resend_event_t));
+    s_rt.resend_event_q = xQueueCreateWithCaps(RT_RESEND_EVENT_SLOTS, sizeof(rt_resend_event_t), RT_Q_CAPS);
+#undef RT_Q_CAPS
 
   if (!s_rt.data_pool || !s_rt.rtx_pool || !s_rt.control_packet ||
       !s_rt.decrypt_buf || !s_rt.pcm || !s_rt.seen || !s_rt.missing ||

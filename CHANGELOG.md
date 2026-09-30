@@ -1,3 +1,15 @@
+# v4.1.68-rt2 (based on v4.1.68-rxdiag-rt)
+
+- Fix: after the first ALAC (realtime) session an AAC SETUP failed -
+  `buffered start failed: cannot create processor task (6144 B stack);
+  internal free=4863 largest=3584`. The realtime receiver's four queues are
+  created once and kept; with xQueueCreate they lived in internal RAM
+  (`resend_event_q` alone 512 x 12 B), about 7 KiB taken for good by the
+  first ALAC session. They are now created with xQueueCreateWithCaps in
+  PSRAM (tasks only, never an ISR).
+- What stays in internal RAM after the first ALAC session: the four task
+  control blocks (~1.4 KiB) of the persistent realtime tasks.
+
 # v4.1.68-rxdiag-rt (based on v4.1.68-rxdiag)
 
 - Fix: realtime ALAC stream (type 96) could not start while another RTSP
