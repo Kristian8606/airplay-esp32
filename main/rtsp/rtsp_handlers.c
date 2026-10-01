@@ -13,6 +13,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
@@ -23,6 +24,7 @@
 #include "sodium.h"
 
 #include "audio_receiver.h"
+#include "apap_frame_queue.h"
 #include "audio_diag.h"
 #include "amp_control.h"
 #include "hap.h"
@@ -39,7 +41,7 @@
 #include "rtsp_connection_model.h"
 #include "rtsp_timeline_control.h"
 #include "rtsp_datastream.h"
-#include "rtsp_apap_observer.h"
+#include "rtsp_apap_audio.h"
 #include "rtsp_protocol_trace.h"
 #include "media_remote_state.h"
 #include "airplay_identity.h"
@@ -47,8 +49,40 @@
 #include "rtsp_events.h"
 #include "rtsp_server.h"
 #include "mdns_airplay.h"
+#include "wifi.h"
 
 static const char *TAG = "rtsp_handlers";
+
+static uint64_t diag_session_elapsed_ms(const rtsp_conn_t *conn) {
+  if (!conn || conn->diag_audio_setup_us == 0) return 0;
+  const int64_t now_us = esp_timer_get_time();
+  if (now_us <= 0 || (uint64_t)now_us <= conn->diag_audio_setup_us) return 0;
+  return ((uint64_t)now_us - conn->diag_audio_setup_us) / 1000ULL;
+}
+
+static void diag_log_bplist(const char *label, const uint8_t *body, size_t len) {
+  if (!label) label = "plist";
+  if (!body || len == 0) {
+    ESP_LOGI(TAG, "%s: <empty>", label);
+    return;
+  }
+  if (len < 8 || memcmp(body, "bplist00", 8) != 0) {
+    ESP_LOGI(TAG, "%s: %uB non-bplist", label, (unsigned)len);
+    return;
+  }
+  char *desc = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!desc) {
+    ESP_LOGW(TAG, "%s: %uB bplist (describe alloc failed)", label,
+             (unsigned)len);
+    return;
+  }
+  if (bplist_describe(body, len, desc, 4096) > 0) {
+    ESP_LOGI(TAG, "%s: %s", label, desc);
+  } else {
+    ESP_LOGW(TAG, "%s: %uB bplist (describe failed)", label, (unsigned)len);
+  }
+  heap_caps_free(desc);
+}
 
 static void amp_session_activate_once(rtsp_conn_t *conn) {
   if (!conn || conn->amp_session_active) return;
@@ -186,7 +220,7 @@ static bool ap2_audio_format_supported(int64_t stream_type, int64_t codec_type,
     return codec_type == 2 && sample_rate == 44100 &&
            samples_per_frame == 352;
   }
-  if (stream_type == AUDIO_STREAM_BUFFERED) {
+  if (stream_type == AUDIO_STREAM_APAP) {
     return codec_type == 4 && sample_rate == 44100 &&
            samples_per_frame == 1024;
   }
@@ -205,6 +239,11 @@ static int event_client_socket = -1;
 static int event_listen_socket = -1;
 static TaskHandle_t event_task_handle = NULL;
 static volatile bool event_task_should_stop = false;
+/* updateInfo is intentionally deferred until RECORD has been acknowledged.
+ * The event task owns the event-channel TX nonce, so the RTSP task only sets
+ * this request flag; the event task performs the encrypted send itself. */
+static volatile bool event_update_info_requested = false;
+static volatile bool event_update_info_sent = false;
 
 void rtsp_get_device_id(char *device_id, size_t len) {
   uint8_t mac[6];
@@ -292,36 +331,10 @@ static void audio_start_failed(const char *what, esp_err_t err) {
   }
 }
 
-/* Start the buffered (type 103) listener. On failure reset the audio engine
- * to the hard session boundary (and re-create it if it is gone), then retry
- * once. */
-static esp_err_t start_buffered_with_recovery(void) {
-  esp_err_t err = audio_receiver_start_buffered(0);
-  if (err == ESP_OK) return ESP_OK;
-  ESP_LOGE(TAG, "SETUP: buffered audio start failed (%s); resetting the audio "
-                "engine and retrying", esp_err_to_name(err));
-  log_memory("before audio reset");
-  audio_receiver_stop();
-  if (!audio_receiver_is_initialized()) {
-    const esp_err_t init_err = audio_receiver_init();
-    if (init_err != ESP_OK) {
-      ESP_LOGE(TAG, "SETUP: audio engine re-init failed: %s",
-               esp_err_to_name(init_err));
-    }
-  }
-  err = audio_receiver_start_buffered(0);
-  if (err == ESP_OK) {
-    ESP_LOGW(TAG, "SETUP: buffered audio started after the reset");
-  }
-  return err;
-}
-
-static bool start_audio_receiver_or_fail(int socket, rtsp_conn_t *conn,
-                                         const rtsp_request_t *req,
-                                         int64_t stream_type) {
-  audio_receiver_set_stream_type((audio_stream_type_t)stream_type);
-  esp_err_t err = audio_receiver_start_stream(
-      conn->data_port, conn->control_port, conn->buffered_port);
+static bool start_realtime_receiver_or_fail(int socket, rtsp_conn_t *conn,
+                                         const rtsp_request_t *req) {
+  esp_err_t err =
+      audio_receiver_start_realtime(conn->data_port, conn->control_port);
   if (err != ESP_OK) {
     audio_start_failed("audio receiver start", err);
     rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
@@ -778,8 +791,10 @@ static void trace_event_message(const uint8_t *msg, size_t len) {
  * The sender connects to the event port announced in the initial SETUP. The
  * channel is encrypted like the control channel, with its own keys
  * ("Events-Salt") and nonce counters. Like Shairport (ap2_event_receiver.c)
- * we send "POST /command" with an updateInfo plist once the sender connects;
- * the sender answers with an RTSP response.
+ * we send "POST /command" with an updateInfo plist only after RECORD has
+ * been acknowledged.  This matches the AirPlay 2 lifecycle: event TCP first,
+ * then RECORD, then receiver state advertisement over the event channel.
+ * The sender answers the POST with an RTSP response.
  *
  * Every byte the sender sends is consumed: unread bytes would keep select()
  * firing forever and spin this task (priority 5, core 0), starving the
@@ -802,8 +817,9 @@ typedef struct {
 
 /* Build Shairport's updateInfo "POST /command" (ap2_event_port_post_command():
  * exactly these headers). Runs on the RTSP client task: it reads NVS. */
-static uint8_t *event_build_update_info(size_t *out_len) {
-  enum { TXT_CAP = 512, PLIST_CAP = 2048, HDR_CAP = 160 };
+static uint8_t *event_build_update_info(size_t *out_len, uint32_t client_ip,
+                                        uint16_t client_rtsp_port) {
+  enum { TXT_CAP = 512, PLIST_CAP = 4096, HDR_CAP = 160 };
   *out_len = 0;
   uint8_t *txt = malloc(TXT_CAP);
   uint8_t *plist = malloc(PLIST_CAP);
@@ -817,17 +833,38 @@ static uint8_t *event_build_update_info(size_t *out_len) {
     settings_get_device_name(device_name, sizeof(device_name));
     const uint64_t features =
         ((uint64_t)AIRPLAY_FEATURES_HI << 32) | AIRPLAY_FEATURES_LO;
+    char features_ex[40] = {0};
+    char sender_address[64] = {0};
+    struct in_addr sender_ip = {.s_addr = client_ip};
+    const char *ip = inet_ntop(AF_INET, &sender_ip, sender_address,
+                               sizeof(sender_address));
+    if (!ip) {
+      snprintf(sender_address, sizeof(sender_address), "0.0.0.0");
+    }
+    size_t sender_len = strlen(sender_address);
+    snprintf(sender_address + sender_len, sizeof(sender_address) - sender_len,
+             ":%u", (unsigned)client_rtsp_port);
+    const size_t fex_len =
+        mdns_airplay_features_ex_string(features_ex, sizeof(features_ex));
     const size_t txt_len = mdns_airplay_txt_record_data(txt, TXT_CAP);
     const size_t plist_len = bplist_build_update_info(
         plist, PLIST_CAP, device_id, device_name, AIRPLAY_MODEL,
         hap_get_public_key(), 32, features, AIRPLAY_VV,
-        airplay_identity_flags(), airplay_identity_pi(), txt, txt_len);
+        airplay_identity_flags(), airplay_identity_pi(),
+        airplay_identity_psi(), features_ex, sender_address, txt, txt_len);
+    if (plist_len > 0) {
+      diag_log_bplist("Event TX updateInfo plist", plist, plist_len);
+    }
+    if (fex_len == 0) {
+      ESP_LOGE(TAG, "Event channel: could not derive HomePod featuresEx");
+    }
     const int hdr_len = snprintf(
         (char *)msg, HDR_CAP,
         "POST /command RTSP/1.0\r\nContent-Length: %u\r\n"
         "Content-Type: application/x-apple-binary-plist\r\n\r\n",
         (unsigned)plist_len);
-    if (txt_len > 0 && plist_len > 0 && hdr_len > 0 && hdr_len < HDR_CAP) {
+    if (fex_len > 0 && txt_len > 0 && plist_len > 0 && hdr_len > 0 &&
+        hdr_len < HDR_CAP) {
       memcpy(msg + hdr_len, plist, plist_len);
       *out_len = (size_t)hdr_len + plist_len;
       ok = true;
@@ -843,16 +880,26 @@ static uint8_t *event_build_update_info(size_t *out_len) {
   return msg;
 }
 
-static void event_send_update_info(event_ctx_t *ctx, int client) {
+static bool event_send_update_info(event_ctx_t *ctx, int client) {
   if (!ctx->have_keys) {
     ESP_LOGW(TAG, "Event channel: no pairing keys, updateInfo not sent");
-    return;
+    return false;
   }
-  if (!ctx->update_info) return;
+  if (!ctx->update_info) {
+    ESP_LOGW(TAG, "Event channel: updateInfo body unavailable");
+    return false;
+  }
+
+  ESP_LOGI(TAG,
+           "Event TX: POST /command type=updateInfo len=%u nonce=%" PRIu64,
+           (unsigned)ctx->update_info_len, ctx->enc_nonce);
   if (rtsp_crypto_seal_send(client, ctx->enc_key, &ctx->enc_nonce,
                             ctx->update_info, ctx->update_info_len) != 0) {
     ESP_LOGW(TAG, "Event channel: sending updateInfo failed");
+    return false;
   }
+  ESP_LOGI(TAG, "Event TX: updateInfo sent");
+  return true;
 }
 
 /* Consume what the sender sent. Returns false when the connection ended. */
@@ -901,7 +948,20 @@ static bool event_consume(event_ctx_t *ctx, int client, uint8_t *rx,
 #ifdef CONFIG_AIRPLAY_PROTOCOL_TRACE
     trace_event_message(plain, (size_t)plain_len);
 #endif
-    /* The sender's replies (200 OK to POST /command) carry nothing we use. */
+    /* The sender normally answers our POST /command with an RTSP response.
+     * Keep this concise diagnostic always on so we can prove that updateInfo
+     * was accepted even when full protocol tracing is disabled. */
+    if (plain_len >= 5 && memcmp(plain, "RTSP/", 5) == 0) {
+      size_t first_line = 0;
+      while (first_line < (size_t)plain_len && first_line < 96 &&
+             plain[first_line] != '\r' && plain[first_line] != '\n') {
+        first_line++;
+      }
+      ESP_LOGI(TAG, "Event RX: %.*s (%dB)", (int)first_line,
+               (const char *)plain, plain_len);
+    } else {
+      ESP_LOGI(TAG, "Event RX: decrypted message %dB", plain_len);
+    }
     memmove(rx, rx + frame_len, *rx_len - frame_len);
     *rx_len -= frame_len;
   }
@@ -973,20 +1033,37 @@ static void event_port_task(void *pvParameters) {
       rtsp_events_emit(RTSP_EVENT_CLIENT_CONNECTED, NULL);
 
       /* A new event connection starts both nonce counters at 0, as the
-       * sender does. */
+       * sender does.  Do NOT advertise updateInfo yet: the sender has not
+       * completed RECORD, so defer it until handle_record() acknowledges the
+       * control-plane transition. */
       ctx->enc_nonce = 0;
       ctx->dec_nonce = 0;
-      event_send_update_info(ctx, client);
+      event_update_info_requested = false;
+      event_update_info_sent = false;
+      ESP_LOGI(TAG, "Event: updateInfo deferred until RECORD");
 
       size_t rx_len = 0;
       bool cipher_ok = ctx->have_keys;
       uint32_t discarded = 0;
 
       while (event_client_socket >= 0 && !event_task_should_stop) {
+        if (event_update_info_requested && !event_update_info_sent) {
+          /* Consume the request before sending so a failed TX cannot spin and
+           * flood the log.  A new event connection resets both flags. */
+          event_update_info_requested = false;
+          event_update_info_sent =
+              event_send_update_info(ctx, event_client_socket);
+        }
+
         fd_set cfds;
         FD_ZERO(&cfds);
         FD_SET(event_client_socket, &cfds);
-        struct timeval ctv = {.tv_sec = 1, .tv_usec = 0};
+        /* Before RECORD/updateInfo, poll briefly so the deferred send happens
+         * before the sender advances to type-130 setup.  Afterwards return to
+         * the low-wakeup 1 s event wait used during normal playback. */
+        struct timeval ctv = event_update_info_sent
+                                 ? (struct timeval){.tv_sec = 1, .tv_usec = 0}
+                                 : (struct timeval){.tv_sec = 0, .tv_usec = 10000};
 
         ret = select(event_client_socket + 1, &cfds, NULL, NULL, &ctv);
         if (ret < 0) {
@@ -1028,7 +1105,9 @@ static bool event_port_wait_for_task_stopped(int timeout_ticks) {
 }
 
 esp_err_t rtsp_start_event_port_task(int listen_socket,
-                                     const hap_session_t *session) {
+                                     const hap_session_t *session,
+                                     uint32_t client_ip,
+                                     uint16_t client_rtsp_port) {
   event_ctx_t *ctx = calloc(1, sizeof(*ctx));
   if (!ctx) {
     return ESP_ERR_NO_MEM;
@@ -1038,7 +1117,8 @@ esp_err_t rtsp_start_event_port_task(int listen_socket,
     memcpy(ctx->enc_key, session->event_encrypt_key, sizeof(ctx->enc_key));
     memcpy(ctx->dec_key, session->event_decrypt_key, sizeof(ctx->dec_key));
     ctx->have_keys = true;
-    ctx->update_info = event_build_update_info(&ctx->update_info_len);
+    ctx->update_info = event_build_update_info(&ctx->update_info_len, client_ip,
+                                               client_rtsp_port);
   }
   if (event_task_handle != NULL) {
     rtsp_stop_event_port_task();
@@ -1049,6 +1129,8 @@ esp_err_t rtsp_start_event_port_task(int listen_socket,
     }
   }
   event_task_should_stop = false;
+  event_update_info_requested = false;
+  event_update_info_sent = false;
   event_listen_socket = -1;
   event_task_handle = NULL;
   /* Stack in PSRAM: internal RAM is the scarce resource once the audio
@@ -1130,7 +1212,8 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
 static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
                                      const rtsp_request_t *req,
                                      const uint8_t *raw, size_t raw_len);
-static void mdc_on_message(const char *type, const char *command,
+static void mdc_on_message(rtsp_datastream_t *stream,
+                           const char *type, const char *command,
                            const uint8_t *payload, size_t payload_len,
                            uint8_t *reply, size_t reply_cap, size_t *reply_len,
                            void *user);
@@ -1212,6 +1295,173 @@ static const char *parse_raw_header(const uint8_t *raw, size_t raw_len,
   return NULL;
 }
 
+
+/* v4.1.91 session-lifecycle diagnostics. Keep this intentionally compact and
+ * always enabled in the diagnostic build: unlike AIRPLAY_PROTOCOL_TRACE it
+ * does not dump payloads or run expensive formatting on every feedback frame. */
+static bool diag_copy_raw_header(const uint8_t *raw, size_t raw_len,
+                                 const char *name, char *out, size_t out_cap) {
+  if (!raw || !name || !out || out_cap == 0) return false;
+  out[0] = '\0';
+  const uint8_t *header_end = rtsp_find_header_end(raw, raw_len);
+  if (!header_end) return false;
+
+  const char *line = (const char *)raw;
+  const char *end = (const char *)header_end;
+  const size_t name_len = strlen(name);
+  while (line < end) {
+    const char *line_end = line;
+    while (line_end < end && *line_end != '\r' && *line_end != '\n') line_end++;
+    if ((size_t)(line_end - line) >= name_len &&
+        strncasecmp(line, name, name_len) == 0) {
+      const char *v = line + name_len;
+      while (v < line_end && (*v == ' ' || *v == '\t')) v++;
+      size_t n = (size_t)(line_end - v);
+      if (n >= out_cap) n = out_cap - 1U;
+      memcpy(out, v, n);
+      out[n] = '\0';
+      return true;
+    }
+    line = line_end;
+    while (line < end && (*line == '\r' || *line == '\n')) line++;
+  }
+  return false;
+}
+
+static bool diag_is_session_method(const rtsp_request_t *req) {
+  if (!req) return false;
+  return strcasecmp(req->method, "SETUP") == 0 ||
+         strcasecmp(req->method, "RECORD") == 0 ||
+         strcasecmp(req->method, "TEARDOWN") == 0 ||
+         strcasecmp(req->method, "SETPEERS") == 0 ||
+         strcasecmp(req->method, "SETPEERSX") == 0 ||
+         strcasecmp(req->method, "SETRATEANCHORTIME") == 0;
+}
+
+static void diag_log_session_plist(const rtsp_conn_t *conn,
+                                   const rtsp_request_t *req) {
+  if (!conn || !req || !req->body || req->body_len < 8 ||
+      memcmp(req->body, "bplist00", 8) != 0) return;
+
+  char session_uuid[96] = "-";
+  char corr_uuid[96] = "-";
+  char group_uuid[96] = "-";
+  char timing[32] = "-";
+  char channel_id[96] = "-";
+  char client_uuid[96] = "-";
+  char client_type_uuid[96] = "-";
+  char client_id[96] = "-";
+  bool remote_only = false, have_remote_only = false;
+  bool dedicated = false, have_dedicated = false;
+  int64_t control_type = -1, seed = -1, stream_connection_id = -1;
+  bool have_control_type = false, have_seed = false;
+  bool have_stream_connection_id = false;
+  size_t stream_count = 0;
+  const bool have_streams =
+      bplist_get_streams_count(req->body, req->body_len, &stream_count);
+
+  (void)bplist_find_string_deep(req->body, req->body_len, "sessionUUID",
+                           session_uuid, sizeof(session_uuid));
+  (void)bplist_find_string_deep(req->body, req->body_len, "sessionCorrelationUUID",
+                           corr_uuid, sizeof(corr_uuid));
+  (void)bplist_find_string_deep(req->body, req->body_len, "groupUUID",
+                           group_uuid, sizeof(group_uuid));
+  (void)bplist_find_string_deep(req->body, req->body_len, "timingProtocol",
+                           timing, sizeof(timing));
+  have_remote_only = bplist_find_bool_deep(req->body, req->body_len,
+                                           "isRemoteControlOnly", &remote_only);
+  (void)bplist_find_string_deep(req->body, req->body_len, "channelID",
+                                channel_id, sizeof(channel_id));
+  (void)bplist_find_string_deep(req->body, req->body_len, "clientUUID",
+                                client_uuid, sizeof(client_uuid));
+  (void)bplist_find_string_deep(req->body, req->body_len, "clientTypeUUID",
+                                client_type_uuid, sizeof(client_type_uuid));
+  (void)bplist_find_string_deep(req->body, req->body_len, "clientID",
+                                client_id, sizeof(client_id));
+  have_dedicated = bplist_find_bool_deep(req->body, req->body_len,
+                                         "wantsDedicatedSocket", &dedicated);
+  have_control_type = bplist_find_int_deep(req->body, req->body_len,
+                                           "controlType", &control_type);
+  have_seed = bplist_find_int_deep(req->body, req->body_len, "seed", &seed);
+  have_stream_connection_id = bplist_find_int_deep(
+      req->body, req->body_len, "streamConnectionID", &stream_connection_id);
+
+  ESP_LOGI(TAG,
+           "RSESSION PLIST id=%u cseq=%d streams=%s/%u timing=%s remoteOnly=%s sessionUUID=%s correlationUUID=%s groupUUID=%s",
+           (unsigned)conn->diag_conn_id, req->cseq,
+           have_streams ? "yes" : "no", (unsigned)stream_count, timing,
+           have_remote_only ? (remote_only ? "true" : "false") : "-",
+           session_uuid, corr_uuid, group_uuid);
+
+  if (channel_id[0] != '-' || client_uuid[0] != '-' ||
+      client_type_uuid[0] != '-' || client_id[0] != '-' ||
+      have_control_type || have_seed || have_dedicated ||
+      have_stream_connection_id) {
+    ESP_LOGI(TAG,
+             "RSESSION IDS id=%u cseq=%d channelID=%s clientUUID=%s clientTypeUUID=%s clientID=%s controlType=%lld seed=%lld dedicated=%s streamConnectionID=%lld",
+             (unsigned)conn->diag_conn_id, req->cseq, channel_id, client_uuid,
+             client_type_uuid, client_id,
+             (long long)(have_control_type ? control_type : -1),
+             (long long)(have_seed ? seed : -1),
+             have_dedicated ? (dedicated ? "true" : "false") : "-",
+             (long long)(have_stream_connection_id ? stream_connection_id : -1));
+  }
+
+  if (have_streams) {
+    const size_t shown = stream_count < 4U ? stream_count : 4U;
+    for (size_t i = 0; i < shown; ++i) {
+      int64_t type = -1;
+      size_t ekey_len = 0, eiv_len = 0, shk_len = 0;
+      if (bplist_get_stream_info(req->body, req->body_len, i, &type,
+                                 &ekey_len, &eiv_len, &shk_len)) {
+        ESP_LOGI(TAG,
+                 "RSESSION STREAM id=%u cseq=%d index=%u type=%lld ekey=%u eiv=%u shk=%u",
+                 (unsigned)conn->diag_conn_id, req->cseq, (unsigned)i,
+                 (long long)type, (unsigned)ekey_len, (unsigned)eiv_len,
+                 (unsigned)shk_len);
+      }
+    }
+  }
+}
+
+static void diag_log_session_request(int socket, rtsp_conn_t *conn,
+                                     const rtsp_request_t *req,
+                                     const uint8_t *raw, size_t raw_len) {
+  if (!conn || !req) return;
+  const uint32_t n = ++conn->diag_request_seq;
+  if (!diag_is_session_method(req)) return;
+
+  char session[128] = "-";
+  char x_session[128] = "-";
+  char connection[48] = "-";
+  char user_agent[96] = "-";
+  char dacp_id[64] = "-";
+  char active_remote[64] = "-";
+  (void)diag_copy_raw_header(raw, raw_len, "Session:", session, sizeof(session));
+  (void)diag_copy_raw_header(raw, raw_len, "X-Apple-Session-ID:", x_session,
+                             sizeof(x_session));
+  (void)diag_copy_raw_header(raw, raw_len, "Connection:", connection,
+                             sizeof(connection));
+  (void)diag_copy_raw_header(raw, raw_len, "User-Agent:", user_agent,
+                             sizeof(user_agent));
+  (void)diag_copy_raw_header(raw, raw_len, "DACP-ID:", dacp_id, sizeof(dacp_id));
+  (void)diag_copy_raw_header(raw, raw_len, "Active-Remote:", active_remote,
+                             sizeof(active_remote));
+
+  ESP_LOGI(TAG,
+           "RSESSION RX id=%u req=%u fd=%d cseq=%d %s %s owner=%d enc=%d active=%d streamType=%lld body=%u ct=%s",
+           (unsigned)conn->diag_conn_id, (unsigned)n, socket, req->cseq,
+           req->method, req->path, conn->play_owner ? 1 : 0,
+           conn->encrypted_mode ? 1 : 0, conn->stream_active ? 1 : 0,
+           (long long)conn->stream_type, (unsigned)req->body_len,
+           req->content_type[0] ? req->content_type : "-");
+  ESP_LOGI(TAG,
+           "RSESSION HDR id=%u cseq=%d Session=%s XAppleSessionID=%s Connection=%s UserAgent=%s DACPID=%s ActiveRemote=%s",
+           (unsigned)conn->diag_conn_id, req->cseq, session, x_session,
+           connection, user_agent, dacp_id, active_remote);
+  diag_log_session_plist(conn, req);
+}
+
 static bool parse_rtp_info_rtptime(const uint8_t *raw, size_t raw_len,
                                     uint32_t *rtptime) {
   if (!rtptime) return false;
@@ -1275,8 +1525,12 @@ void rtsp_handlers_unlock(void) {
  * connection has no player to act on. */
 static bool method_needs_play_lock(const char *method) {
   static const char *const methods[] = {
-      "RECORD", "SET_PARAMETER", "PAUSE", "FLUSH", "FLUSHBUFFERED",
-      "TEARDOWN", "SETRATEANCHORTIME", "SETPEERS", "SETPEERSX", NULL};
+      /* RECORD is deliberately not play-lock gated.  In AirPlay 2 the
+       * RemoteControl-only bootstrap sends RECORD before the audio stream
+       * SETUP; handle_record() is side-effect free and returns the expected
+       * Audio-Latency / Audio-Jack-Status headers. */
+      "SET_PARAMETER", "PAUSE", "FLUSH", "FLUSHBUFFERED", "TEARDOWN",
+      "SETRATEANCHORTIME", "SETPEERS", "SETPEERSX", NULL};
   for (int i = 0; methods[i]; ++i) {
     if (strcasecmp(method, methods[i]) == 0) return true;
   }
@@ -1338,6 +1592,9 @@ static void handle_without_play_lock(int socket, rtsp_conn_t *conn,
     rtsp_datastream_stop(&conn->remote_control_datastream);
     conn->remote_control_data_port = 0;
     if (!bplist_get_streams_count(req->body, req->body_len, &streams)) {
+      ESP_LOGI(TAG,
+               "RSESSION TX id=%u cseq=%d non-owner TEARDOWN without streams -> 200 Connection:close",
+               (unsigned)conn->diag_conn_id, req->cseq);
       rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                          "Connection: close\r\n", NULL, 0);
       conn->close_after_response = true;
@@ -1391,6 +1648,7 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
 static int dispatch_locked(int socket, rtsp_conn_t *conn,
                            const rtsp_request_t *req,
                            const uint8_t *raw_request, size_t raw_len) {
+  diag_log_session_request(socket, conn, req, raw_request, raw_len);
 #ifdef CONFIG_AIRPLAY_PROTOCOL_TRACE
   trace_request(conn, req, raw_request, raw_len);
 #endif
@@ -1752,6 +2010,15 @@ static void handle_post(int socket, rtsp_conn_t *conn,
     rtsp_send_ok(socket, conn, req->cseq);
 
   } else if (strstr(req->path, "/feedback")) {
+    const uint32_t feedback_no = ++conn->diag_feedback_rx;
+    const uint64_t elapsed_ms = diag_session_elapsed_ms(conn);
+    ESP_LOGI(TAG,
+             "FEEDBACK RX #%u +%llums body=%uB cseq=%d stream=%lld active=%d",
+             (unsigned)feedback_no, (unsigned long long)elapsed_ms,
+             (unsigned)body_len, req->cseq, (long long)conn->stream_type,
+             conn->stream_active ? 1 : 0);
+    diag_log_bplist("FEEDBACK request plist", body, body_len);
+
     if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
       int64_t value;
       if (bplist_find_int(body, body_len, "networkTimeSecs", &value)) {
@@ -1759,31 +2026,74 @@ static void handle_post(int socket, rtsp_conn_t *conn,
       }
     }
 
+    /* RemoteControl-only sessions use /feedback as a two-second keepalive
+     * before an audio stream exists.  The AirPlay 2 reference flow answers
+     * those requests with the bplist {streams:[]}; a bare 200 OK is not the
+     * same protocol response and can make the sender abandon the RC endpoint. */
+    const bool remote_control_keepalive =
+        conn->remote_control_datastream != NULL && conn->stream_type == 0;
+
+    if (remote_control_keepalive) {
+      uint8_t response[96];
+      const size_t response_len =
+          bplist_build_feedback_empty_streams(response, sizeof(response));
+      if (response_len > 0) {
+        diag_log_bplist("FEEDBACK RC keepalive response plist", response,
+                        response_len);
+        rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                           "Content-Type: application/x-apple-binary-plist\r\n",
+                           (const char *)response, response_len);
+        const uint32_t tx_no = ++conn->diag_feedback_tx;
+        ESP_LOGI(TAG,
+                 "FEEDBACK TX #%u +%llums 200 RC-KEEPALIVE bplist=%uB streams=[]",
+                 (unsigned)tx_no,
+                 (unsigned long long)diag_session_elapsed_ms(conn),
+                 (unsigned)response_len);
+      } else {
+        rtsp_send_ok(socket, conn, req->cseq);
+        const uint32_t tx_no = ++conn->diag_feedback_tx;
+        ESP_LOGW(TAG,
+                 "FEEDBACK TX #%u +%llums 200 EMPTY (RC keepalive plist build failed)",
+                 (unsigned)tx_no,
+                 (unsigned long long)diag_session_elapsed_ms(conn));
+      }
     // Buffered streams (type 103): always answer with the stream status; it
     // acts as a keepalive that stops the iPhone sending TEARDOWN during a long
     // pause. Realtime AP2 (type 96) answers the same way while its stream is
     // set up, as Shairport Sync handle_feedback() does for 96 and 103.
-    if (conn->stream_type == 103 ||
-        (conn->stream_type == 96 && conn->stream_active)) {
+    } else if (conn->stream_type == 103 ||
+               (conn->stream_type == 96 && conn->stream_active)) {
       uint8_t response[128];
       size_t response_len = bplist_build_feedback_response(
           response, sizeof(response), conn->stream_type, 44100.0);
 
       if (response_len > 0) {
-        ESP_LOGD(
-            TAG,
-            "/feedback responding with stream status (type=%lld, sr=44100)",
-            (long long)conn->stream_type);
+        diag_log_bplist("FEEDBACK response plist", response, response_len);
         rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                            "Content-Type: application/x-apple-binary-plist\r\n",
                            (const char *)response, response_len);
+        const uint32_t tx_no = ++conn->diag_feedback_tx;
+        ESP_LOGI(TAG,
+                 "FEEDBACK TX #%u +%llums 200 bplist=%uB type=%lld sr=44100",
+                 (unsigned)tx_no,
+                 (unsigned long long)diag_session_elapsed_ms(conn),
+                 (unsigned)response_len, (long long)conn->stream_type);
       } else {
-        // Fallback to simple OK if response build fails
+        // Fallback to simple OK if response build fails.
         rtsp_send_ok(socket, conn, req->cseq);
+        const uint32_t tx_no = ++conn->diag_feedback_tx;
+        ESP_LOGW(TAG,
+                 "FEEDBACK TX #%u +%llums 200 EMPTY (plist build failed)",
+                 (unsigned)tx_no,
+                 (unsigned long long)diag_session_elapsed_ms(conn));
       }
     } else {
-      // For non-buffered streams, simple OK is fine
+      // For non-buffered streams, simple OK is fine.
       rtsp_send_ok(socket, conn, req->cseq);
+      const uint32_t tx_no = ++conn->diag_feedback_tx;
+      ESP_LOGI(TAG, "FEEDBACK TX #%u +%llums 200 EMPTY non-audio",
+               (unsigned)tx_no,
+               (unsigned long long)diag_session_elapsed_ms(conn));
     }
 
   } else {
@@ -1800,6 +2110,272 @@ static void handle_announce(int socket, rtsp_conn_t *conn,
   (void)raw;
   (void)raw_len;
   rtsp_send_ok(socket, conn, req->cseq);
+}
+
+/*
+ * Type-130 RemoteControl is a MediaRemote Protocol (MRP) channel carried in
+ * an encrypted AirPlay DataStream.  The sender's first sync/comm message is a
+ * bplist wrapper whose params.data contains one or more protobuf
+ * ProtocolMessage envelopes (normally DEVICE_INFO_MESSAGE first).
+ *
+ * v4.1.81 only acknowledged this message at the DataStream framing layer.
+ * Because type-130 had no on_message callback, the reply contained no payload
+ * at all.  Apple receivers instead answer this request with a valid bplist
+ * payload; an empty dictionary is 42 bytes on the wire.  Keep this handler
+ * deliberately small: it diagnoses the nested MRP handshake and returns the
+ * protocol-level empty dictionary without touching audio/MDC state.
+ */
+
+#define RCS_MRP_CAPTURE_MAX 4096U
+#define RCS_HEX_CHUNK       32U
+
+static const uint8_t k_rcs_empty_bplist_dict[] = {
+    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, /* bplist00 */
+    0xd0,                                           /* empty dict */
+    0x08,                                           /* offset table */
+    /* trailer */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, /* offset size */
+    0x01, /* object ref size */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, /* object count */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* top object */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09  /* offset table */
+};
+
+static bool rcs_read_varint(const uint8_t *buf, size_t len, size_t *pos,
+                            uint64_t *out) {
+  uint64_t value = 0;
+  unsigned shift = 0;
+  size_t p = *pos;
+  while (p < len && shift < 64U) {
+    const uint8_t b = buf[p++];
+    value |= (uint64_t)(b & 0x7fU) << shift;
+    if ((b & 0x80U) == 0) {
+      *pos = p;
+      *out = value;
+      return true;
+    }
+    shift += 7U;
+  }
+  return false;
+}
+
+static const char *rcs_mrp_type_name(uint64_t type) {
+  switch (type) {
+    case 15: return "DEVICE_INFO_MESSAGE";
+    case 16: return "CLIENT_UPDATES_CONFIG_MESSAGE";
+    case 36: return "SET_READY_STATE_MESSAGE";
+    case 37: return "DEVICE_INFO_UPDATE_MESSAGE";
+    case 38: return "SET_CONNECTION_STATE_MESSAGE";
+    case 42: return "GENERIC_MESSAGE";
+    case 46: return "SET_NOW_PLAYING_CLIENT_MESSAGE";
+    case 47: return "SET_NOW_PLAYING_PLAYER_MESSAGE";
+    case 72: return "SET_DEFAULT_SUPPORTED_COMMANDS_MESSAGE";
+    case 120: return "CONFIGURE_CONNECTION_MESSAGE";
+    default: return "unmapped";
+  }
+}
+
+static void rcs_hex_dump(const uint8_t *data, size_t len) {
+  if (!data || len == 0) return;
+  for (size_t off = 0; off < len; off += RCS_HEX_CHUNK) {
+    const size_t n = (len - off < RCS_HEX_CHUNK) ? len - off : RCS_HEX_CHUNK;
+    char line[RCS_HEX_CHUNK * 3U + 1U];
+    size_t p = 0;
+    for (size_t i = 0; i < n && p + 3U < sizeof(line); ++i) {
+      const int w = snprintf(line + p, sizeof(line) - p, "%02X%s",
+                             data[off + i], i + 1U == n ? "" : " ");
+      if (w <= 0) break;
+      p += (size_t)w;
+    }
+    line[sizeof(line) - 1U] = '\0';
+    ESP_LOGI(TAG, "RCS params.data +0x%04x: %s", (unsigned)off, line);
+  }
+}
+
+/* Parse just enough of the protobuf ProtocolMessage envelope to identify the
+ * message. Field 1 is type and field 2 is the textual identifier. */
+static bool rcs_log_one_mrp(const uint8_t *buf, size_t len, unsigned index) {
+  size_t pos = 0;
+  bool have_type = false;
+  uint64_t type = 0;
+  char identifier[96] = {0};
+  unsigned fields = 0;
+
+  while (pos < len && fields++ < 64U) {
+    uint64_t key = 0;
+    if (!rcs_read_varint(buf, len, &pos, &key) || key == 0) return false;
+    const uint32_t field = (uint32_t)(key >> 3);
+    const uint8_t wire = (uint8_t)(key & 7U);
+
+    if (wire == 0) {
+      uint64_t value = 0;
+      if (!rcs_read_varint(buf, len, &pos, &value)) return false;
+      if (field == 1) {
+        type = value;
+        have_type = true;
+      }
+    } else if (wire == 1) {
+      if (len - pos < 8U) return false;
+      pos += 8U;
+    } else if (wire == 2) {
+      uint64_t item_len64 = 0;
+      if (!rcs_read_varint(buf, len, &pos, &item_len64) ||
+          item_len64 > len - pos) {
+        return false;
+      }
+      const size_t item_len = (size_t)item_len64;
+      if (field == 2 && item_len > 0) {
+        const size_t copy = item_len < sizeof(identifier) - 1U
+                                ? item_len : sizeof(identifier) - 1U;
+        bool printable = true;
+        for (size_t i = 0; i < copy; ++i) {
+          if (buf[pos + i] < 0x20 || buf[pos + i] > 0x7e) {
+            printable = false;
+            break;
+          }
+        }
+        if (printable) {
+          memcpy(identifier, buf + pos, copy);
+          identifier[copy] = '\0';
+        }
+      }
+      pos += item_len;
+    } else if (wire == 5) {
+      if (len - pos < 4U) return false;
+      pos += 4U;
+    } else {
+      return false;
+    }
+  }
+
+  if (!have_type) return false;
+  ESP_LOGI(TAG, "RCS MRP[%u]: type=%llu (%s) id=\"%s\" bytes=%u",
+           index, (unsigned long long)type, rcs_mrp_type_name(type),
+           identifier, (unsigned)len);
+  return true;
+}
+
+static bool rcs_log_mrp_blob(const uint8_t *data, size_t len) {
+  if (!data || len == 0) return false;
+
+  size_t pos = 0;
+  unsigned index = 0;
+  bool any = false;
+  while (pos < len && index < 32U) {
+    const size_t prefix = pos;
+    uint64_t msg_len64 = 0;
+    if (!rcs_read_varint(data, len, &pos, &msg_len64) || msg_len64 == 0 ||
+        msg_len64 > len - pos) {
+      pos = prefix;
+      break;
+    }
+    if (!rcs_log_one_mrp(data + pos, (size_t)msg_len64, index)) {
+      pos = prefix;
+      break;
+    }
+    any = true;
+    ++index;
+    pos += (size_t)msg_len64;
+  }
+
+  if (any && pos == len) return true;
+  if (!any && rcs_log_one_mrp(data, len, 0)) return true;
+  return any;
+}
+
+static size_t rcs_make_uuid4(char out[37]) {
+  if (!out) return 0;
+  uint8_t u[16];
+  for (size_t i = 0; i < sizeof(u); i += 4) {
+    const uint32_t r = esp_random();
+    u[i + 0] = (uint8_t)(r >> 24);
+    u[i + 1] = (uint8_t)(r >> 16);
+    u[i + 2] = (uint8_t)(r >> 8);
+    u[i + 3] = (uint8_t)r;
+  }
+  u[6] = (uint8_t)((u[6] & 0x0fU) | 0x40U); /* UUIDv4 */
+  u[8] = (uint8_t)((u[8] & 0x3fU) | 0x80U);
+  snprintf(out, 37,
+           "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+           u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9],
+           u[10], u[11], u[12], u[13], u[14], u[15]);
+  return 36;
+}
+
+static void remote_control_on_message(rtsp_datastream_t *stream,
+                                      const char *type, const char *command,
+                                      const uint8_t *payload,
+                                      size_t payload_len, uint8_t *reply,
+                                      size_t reply_cap, size_t *reply_len,
+                                      void *user) {
+  (void)stream;
+  (void)user;
+  if (reply_len) *reply_len = 0;
+  bool saw_device_info = false;
+
+  ESP_LOGI(TAG, "RCS message: %s/%s payload=%uB",
+           type ? type : "?", command ? command : "?",
+           (unsigned)payload_len);
+
+  if (payload && payload_len >= 8U &&
+      memcmp(payload, "bplist00", 8U) == 0) {
+    uint8_t *nested = heap_caps_malloc(RCS_MRP_CAPTURE_MAX,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (nested) {
+      size_t nested_len = 0;
+      if (bplist_find_data_deep(payload, payload_len, "data", nested,
+                                RCS_MRP_CAPTURE_MAX, &nested_len) &&
+          nested_len > 0) {
+        ESP_LOGI(TAG, "RCS handshake params.data=%uB", (unsigned)nested_len);
+        rcs_hex_dump(nested, nested_len);
+        if (nested_len >= 8U && memcmp(nested, "bplist00", 8U) == 0) {
+          char *desc = heap_caps_malloc(2048,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+          if (desc) {
+            if (bplist_describe(nested, nested_len, desc, 2048) > 0) {
+              ESP_LOGI(TAG, "RCS nested bplist: %s", desc);
+            }
+            heap_caps_free(desc);
+          }
+        } else {
+          if (!rcs_log_mrp_blob(nested, nested_len)) {
+            ESP_LOGW(TAG, "RCS params.data did not decode as MRP envelope");
+          }
+          size_t rp = 0;
+          uint64_t ml = 0;
+          if (rcs_read_varint(nested, nested_len, &rp, &ml) &&
+              ml <= nested_len - rp && ml >= 2U &&
+              nested[rp] == 0x08 && nested[rp + 1] == 0x0F) {
+            saw_device_info = true;
+          }
+        }
+      } else {
+        ESP_LOGW(TAG, "RCS bplist has no readable params.data");
+      }
+      heap_caps_free(nested);
+    } else {
+      ESP_LOGW(TAG, "RCS params.data capture allocation failed");
+    }
+  }
+
+  /* A sync/comm request expects a protocol-level plist response. Returning a
+   * valid empty dictionary is intentionally different from a zero-byte rply. */
+  if (type && command && strcmp(type, "sync") == 0 &&
+      strcmp(command, "comm") == 0) {
+    if (reply && reply_len && reply_cap >= sizeof(k_rcs_empty_bplist_dict)) {
+      memcpy(reply, k_rcs_empty_bplist_dict, sizeof(k_rcs_empty_bplist_dict));
+      *reply_len = sizeof(k_rcs_empty_bplist_dict);
+      ESP_LOGI(TAG, "RCS sync/comm -> bplist {} reply (%uB)",
+               (unsigned)*reply_len);
+      if (saw_device_info) {
+        ESP_LOGI(TAG,
+                 "RCS receiver role: DEVICE_INFO ACKed; no receiver-originated MRP queued; waiting for sender follow-up");
+      }
+    } else {
+      ESP_LOGW(TAG, "RCS sync/comm: reply buffer too small for bplist {}");
+    }
+  }
 }
 
 static void handle_type130_setup(int socket, rtsp_conn_t *conn,
@@ -1826,7 +2402,8 @@ static void handle_type130_setup(int socket, rtsp_conn_t *conn,
   if (have_seed) {
     const uint64_t seed = (uint64_t)seed_signed;
     esp_err_t err = rtsp_datastream_start(
-        conn->hap_session, seed, conn->client_ip, "RemoteControl", NULL, NULL,
+        conn->hap_session, seed, conn->client_ip, "RemoteControl",
+        remote_control_on_message, conn,
         &conn->remote_control_datastream, &conn->remote_control_data_port);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "SETUP type=130: DataStream start failed: %s",
@@ -1918,15 +2495,49 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     }
   }
 
-  /* Remote-control-only initial SETUP (timingProtocol "None") on a connection
-   * without the play lock: answer the handshake but create no event port,
-   * no PTP/audio state and no amplifier session - the global event-port task
-   * belongs to the playing connection. */
+  /* Remote-control-only initial SETUP (timingProtocol "None") must still
+   * establish the AirPlay 2 event channel.  The sender connects to eventPort,
+   * sends RECORD, then creates the type-130 DataStream.  Returning eventPort=0
+   * leaves the RCS tunnel only half-established and modern senders tear it
+   * down a few seconds later.  Do not acquire the audio play lock here: this
+   * is control-plane state only and must not disturb an existing stream.
+   *
+   * The current embedded event receiver is global.  Never replace an event
+   * task that already belongs to another active playback connection; in that
+   * coexistence case retain the old non-invasive behaviour rather than
+   * stealing its channel. */
   if (!conn->play_owner) {
-    ESP_LOGI(TAG, "SETUP: remote-control-only session; playback untouched");
+    if (conn->event_port == 0 && event_task_handle == NULL) {
+      conn->event_socket = rtsp_create_event_socket(&conn->event_port);
+      if (conn->event_socket >= 0) {
+        if (rtsp_start_event_port_task(conn->event_socket, conn->hap_session,
+                                   conn->client_ip, conn->client_rtsp_port) ==
+            ESP_OK) {
+          ESP_LOGI(TAG,
+                   "SETUP: RemoteControl event port %u created before RECORD",
+                   conn->event_port);
+        } else {
+          close(conn->event_socket);
+          conn->event_socket = -1;
+          conn->event_port = 0;
+          rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq,
+                             NULL, NULL, 0);
+          return;
+        }
+      }
+    } else if (conn->event_port == 0) {
+      ESP_LOGW(TAG,
+               "SETUP: RemoteControl event channel busy; preserving active "
+               "playback event task");
+    }
+
+    ESP_LOGI(TAG,
+             "SETUP: remote-control-only session; playback untouched "
+             "eventPort=%u",
+             conn->event_port);
     uint8_t plist_body[128];
-    const size_t plist_len =
-        bplist_build_initial_setup(plist_body, sizeof(plist_body), 0);
+    const size_t plist_len = bplist_build_initial_setup(
+        plist_body, sizeof(plist_body), conn->event_port, NULL);
     if (plist_len == 0) {
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                          NULL, 0);
@@ -2123,7 +2734,8 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   if (conn->event_port == 0) {
     conn->event_socket = rtsp_create_event_socket(&conn->event_port);
     if (conn->event_socket >= 0) {
-      if (rtsp_start_event_port_task(conn->event_socket, conn->hap_session) ==
+      if (rtsp_start_event_port_task(conn->event_socket, conn->hap_session,
+                                   conn->client_ip, conn->client_rtsp_port) ==
           ESP_OK) {
         ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
       } else {
@@ -2143,9 +2755,27 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     ESP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
 
     if (is_bplist) {
-      uint8_t plist_body[128];
+      char timing_protocol[16] = {0};
+      const bool setup_ptp =
+          bplist_find_string_deep(body, body_len, "timingProtocol",
+                                  timing_protocol, sizeof(timing_protocol)) &&
+          strcmp(timing_protocol, "PTP") == 0;
+      char timing_peer_addr[32] = {0};
+      const char *timing_peer = NULL;
+      if (setup_ptp &&
+          wifi_get_ip_str(timing_peer_addr, sizeof(timing_peer_addr)) == ESP_OK) {
+        timing_peer = timing_peer_addr;
+      }
+
+      uint8_t plist_body[384];
       size_t plist_len = bplist_build_initial_setup(
-          plist_body, sizeof(plist_body), conn->event_port);
+          plist_body, sizeof(plist_body), conn->event_port, timing_peer);
+      if (setup_ptp) {
+        ESP_LOGI(TAG,
+                 "SETUP response: PTP timingPeerInfo Addresses=[%s] ID=%s eventPort=%u timingPort=0",
+                 timing_peer ? timing_peer : "<unavailable>",
+                 timing_peer ? timing_peer : "<unavailable>", conn->event_port);
+      }
       if (plist_len == 0) {
         rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                            NULL, 0);
@@ -2173,7 +2803,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   ESP_LOGI(TAG, "SETUP: Stream setup, stream_type=%lld",
            (long long)stream_type);
 
-  bool buffered = (stream_type == AUDIO_STREAM_BUFFERED);
+  bool buffered = (stream_type == AUDIO_STREAM_APAP);
 
   /* A fresh audio stream must not inherit the previous APAP strt media point. */
   conn->mdc_start_valid = false;
@@ -2182,6 +2812,10 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   conn->mdc_anchor_valid = false;
   conn->mdc_anchor_clock_id = 0;
   conn->mdc_anchor_ptp_ns = 0;
+  conn->diag_audio_setup_us = (uint64_t)esp_timer_get_time();
+  conn->diag_feedback_rx = 0;
+  conn->diag_feedback_tx = 0;
+  ESP_LOGI(TAG, "CONTROL DIAG: audio session timer started");
 
   /* Only AirPlay 2 realtime ALAC uses the NQPTP-style GM estimator plus
    * local presentation-anchor path. Buffered AAC stays on the PTP anchor
@@ -2204,12 +2838,32 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   /* A genuine HomePod-27 profile advertises fex bit 72
    * (SupportsBufferedAPAP). Direct iPhone 27.2 therefore requests APAP rather
    * than RTP for type-103 audio. APAP owns framing/decryption/AAC decode, then
-   * publishes timed PCM into the same EQ/PTP/I2S pipeline as legacy buffered
-   * AAC. */
-  rtsp_apap_observer_stop(&conn->apap_observer);
+   * publishes timed PCM into the common EQ/PTP/I2S pipeline. This branch has
+   * no legacy buffered-RTP byte FIFO. */
+  rtsp_apap_audio_stop(&conn->apap_audio);
   conn->apap_port = 0;
-  if (buffered && stream_connection_apap) {
-    esp_err_t apap_audio_err = audio_receiver_start_external_buffered();
+  if (buffered) {
+    /* This branch intentionally implements only the modern Buffered APAP
+     * transport. A sender that asks for legacy type-103 RTP/TCP is rejected
+     * instead of reviving the removed raw-byte FIFO path. */
+    if (!stream_connection_apap || !stream_connection_mdc ||
+        !stream_connection_apap_uses_stream_key || apap_stream_key_len != 32U) {
+      ESP_LOGW(TAG,
+               "SETUP: type-103 requires APAP + MediaDataControl + 32B stream key "
+               "(apap=%d mdc=%d keyFlag=%d key=%uB)",
+               stream_connection_apap ? 1 : 0, stream_connection_mdc ? 1 : 0,
+               stream_connection_apap_uses_stream_key ? 1 : 0,
+               (unsigned)apap_stream_key_len);
+      rtsp_send_response(socket, conn, 461, "Unsupported Transport", req->cseq,
+                         NULL, NULL, 0);
+      return;
+    }
+    /* APAP is the only buffered transport on this branch. If a sender also
+     * advertises legacy RTP/RTCP alternatives, do not mirror them back or
+     * allocate runtime state for them. Realtime type-96 RTP is unaffected. */
+    stream_connection_rtp = false;
+    stream_connection_rtcp = false;
+    esp_err_t apap_audio_err = audio_receiver_start_apap();
     if (apap_audio_err != ESP_OK) {
       ESP_LOGE(TAG, "SETUP: APAP audio pipeline start failed: %s",
                esp_err_to_name(apap_audio_err));
@@ -2217,10 +2871,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
                          NULL, NULL, 0);
       return;
     }
-    esp_err_t apap_err = rtsp_apap_observer_start(
-        conn->client_ip, stream_connection_apap_uses_stream_key,
-        apap_stream_key, apap_stream_key_len,
-        &conn->apap_observer, &conn->apap_port);
+    esp_err_t apap_err = rtsp_apap_audio_start(
+        conn->client_ip, apap_stream_key, apap_stream_key_len,
+        &conn->apap_audio, &conn->apap_port);
     if (apap_err != ESP_OK) {
       ESP_LOGE(TAG, "SETUP: APAP receiver start failed: %s",
                esp_err_to_name(apap_err));
@@ -2229,48 +2882,36 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
                          NULL, NULL, 0);
       return;
     }
-    conn->buffered_port = 0;
-  } else if (buffered) {
-    esp_err_t err = start_buffered_with_recovery();
-    if (err != ESP_OK) {
-      audio_start_failed("buffered audio start", err);
-      rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
-                         NULL, 0);
-      return;
-    }
-    conn->buffered_port = audio_receiver_get_buffered_port();
   }
 
-  /* Legacy buffered RTP uses a TCP data socket plus a UDP AP2 control/RTCP
-   * endpoint. Keep the control socket for compatibility. APAP itself does not
-   * consume this UDP socket, but leaving the legacy controlPort present is
-   * harmless while the APAP response is carried authoritatively in
-   * streamConnections. */
+  /* iOS currently accepts APAP with the conventional top-level controlPort
+   * still present. Keep that bound UDP compatibility endpoint until wire
+   * traces prove it can be omitted; no legacy buffered-RTP engine consumes it. */
   if (!buffered) {
-    if (conn->buffered_control_socket >= 0) {
-      rtsp_conn_close_buffered_control(conn);
-      conn->buffered_control_socket = -1;
+    if (conn->apap_control_socket >= 0) {
+      rtsp_conn_close_apap_control(conn);
+      conn->apap_control_socket = -1;
     }
     ensure_stream_ports(conn);
   } else {
     conn->data_port = 0;
-    if (conn->buffered_control_socket >= 0) {
-      rtsp_conn_close_buffered_control(conn);
-      conn->buffered_control_socket = -1;
+    if (conn->apap_control_socket >= 0) {
+      rtsp_conn_close_apap_control(conn);
+      conn->apap_control_socket = -1;
       conn->control_port = 0;
     }
-    conn->buffered_control_socket = rtsp_create_udp_socket(&conn->control_port);
-    if (conn->buffered_control_socket >= 0 && conn->control_port != 0)
-      ap2_control_watch(conn->buffered_control_socket, conn->control_port);
-    if (conn->buffered_control_socket < 0 || conn->control_port == 0) {
+    conn->apap_control_socket = rtsp_create_udp_socket(&conn->control_port);
+    if (conn->apap_control_socket >= 0 && conn->control_port != 0)
+      ap2_control_watch(conn->apap_control_socket, conn->control_port);
+    if (conn->apap_control_socket < 0 || conn->control_port == 0) {
       ESP_LOGE(TAG, "SETUP: could not allocate buffered AP2 control port");
-      if (conn->buffered_control_socket >= 0) {
-        rtsp_conn_close_buffered_control(conn);
-        conn->buffered_control_socket = -1;
+      if (conn->apap_control_socket >= 0) {
+        rtsp_conn_close_apap_control(conn);
+        conn->apap_control_socket = -1;
       }
       conn->control_port = 0;
       audio_receiver_stop();
-      rtsp_apap_observer_stop(&conn->apap_observer);
+      rtsp_apap_audio_stop(&conn->apap_audio);
       conn->apap_port = 0;
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                          NULL, 0);
@@ -2278,21 +2919,16 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     }
   }
 
-  uint16_t response_data_port =
-      buffered ? (stream_connection_apap ? conn->apap_port
-                                         : conn->buffered_port)
-               : conn->data_port;
+  uint16_t response_data_port = buffered ? conn->apap_port : conn->data_port;
 
-  /* APAP has its own APTransport framing and stream cryptor, so it does not
-   * start the legacy raw AAC FIFO. Its decoded PCM still uses audio_receiver's
-   * normal scheduler. RTP and realtime paths remain unchanged. */
-  if (!stream_connection_apap &&
-      !start_audio_receiver_or_fail(socket, conn, req, stream_type)) {
-    if (buffered && conn->buffered_control_socket >= 0) {
-      rtsp_conn_close_buffered_control(conn);
-      conn->buffered_control_socket = -1;
+  /* APAP owns buffered AAC transport end-to-end. Its decoded PCM enters the
+   * common scheduler; only realtime ALAC uses the separate RTP path. */
+  if (!buffered &&
+      !start_realtime_receiver_or_fail(socket, conn, req)) {
+    if (buffered && conn->apap_control_socket >= 0) {
+      rtsp_conn_close_apap_control(conn);
+      conn->apap_control_socket = -1;
       conn->control_port = 0;
-      conn->buffered_port = 0;
     }
     return;
   }
@@ -2312,14 +2948,13 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       ESP_LOGE(TAG, "SETUP: MediaDataControl start failed: %s",
                esp_err_to_name(mdc_err));
       audio_receiver_stop();
-      rtsp_apap_observer_stop(&conn->apap_observer);
+      rtsp_apap_audio_stop(&conn->apap_audio);
       conn->apap_port = 0;
-      if (buffered && conn->buffered_control_socket >= 0) {
-        rtsp_conn_close_buffered_control(conn);
-        conn->buffered_control_socket = -1;
+      if (buffered && conn->apap_control_socket >= 0) {
+        rtsp_conn_close_apap_control(conn);
+        conn->apap_control_socket = -1;
       }
       conn->control_port = 0;
-      conn->buffered_port = 0;
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq,
                          NULL, NULL, 0);
       return;
@@ -2379,8 +3014,8 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   }
 
   uint8_t plist_body[512];
-  uint32_t audio_buffer_size = (stream_type == AUDIO_STREAM_BUFFERED)
-      ? (uint32_t)AP2_BUFFERED_AUDIO_ADVERTISED_BYTES : 0U;
+  uint32_t audio_buffer_size = (stream_type == AUDIO_STREAM_APAP)
+      ? (uint32_t)APAP_FRAME_QUEUE_BYTES : 0U;
   size_t plist_len = bplist_build_stream_setup(
       plist_body, sizeof(plist_body), stream_type, response_data_port,
       conn->control_port, audio_buffer_size, conn->stream_id,
@@ -2390,14 +3025,13 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   if (plist_len == 0) {
     audio_receiver_stop();
     rtsp_datastream_stop(&conn->media_data_control);
-    rtsp_apap_observer_stop(&conn->apap_observer);
+    rtsp_apap_audio_stop(&conn->apap_audio);
     conn->media_data_control_port = 0;
     conn->apap_port = 0;
-    if (buffered && conn->buffered_control_socket >= 0) {
-      rtsp_conn_close_buffered_control(conn);
-      conn->buffered_control_socket = -1;
+    if (buffered && conn->apap_control_socket >= 0) {
+      rtsp_conn_close_apap_control(conn);
+      conn->apap_control_socket = -1;
       conn->control_port = 0;
-      conn->buffered_port = 0;
     }
     rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                        NULL, 0);
@@ -2452,11 +3086,28 @@ static void handle_record(int socket, rtsp_conn_t *conn,
    * opened by negotiated rate/anchor control (MDC srat in the observed modern
    * path), while realtime AP2 is opened by stream SETUP and remains blocked
    * downstream until D7/PTP timing becomes valid. */
+  ESP_LOGI(TAG, "RECORD: acknowledged eventPort=%u playOwner=%d",
+           conn->event_port, conn->play_owner ? 1 : 0);
   char headers[128];
   snprintf(headers, sizeof(headers),
            "Audio-Latency: 0\r\n"
            "Audio-Jack-Status: connected\r\n");
   rtsp_send_response(socket, conn, 200, "OK", req->cseq, headers, NULL, 0);
+
+  /* AirPlay 2 receiver state advertisement belongs after RECORD.  Keep the
+   * encrypted event TX in event_port_task (it owns enc_nonce); only signal it
+   * here after the 200 OK has gone out on the RTSP control connection. */
+  if (conn->event_port != 0 && event_task_handle != NULL &&
+      event_client_socket >= 0 && !event_update_info_sent) {
+    event_update_info_requested = true;
+    ESP_LOGI(TAG,
+             "Event: RECORD completed -> schedule updateInfo on eventPort=%u",
+             conn->event_port);
+  } else if (conn->event_port != 0 && !event_update_info_sent) {
+    ESP_LOGW(TAG,
+             "Event: RECORD completed but event client is not ready; "
+             "updateInfo not scheduled");
+  }
 }
 
 // ============================================================================
@@ -2805,8 +3456,9 @@ static void handle_flush(int socket, rtsp_conn_t *conn,
       audio_receiver_realtime_flush_wait_sender_anchor();
     }
   } else {
-    // Buffered stream: seek flush.
-    audio_receiver_seek_flush();
+    /* Modern buffered audio is APAP-only. Without an explicit fshb boundary,
+     * invalidate the timed PCM cache and wait for the next strt/anch map. */
+    audio_receiver_apap_flush();
   }
   rtsp_send_ok(socket, conn, req->cseq);
 }
@@ -2820,7 +3472,7 @@ static void apply_flushbuffered(rtsp_conn_t *conn, const uint8_t *body,
   // remains the sole owner of discard/cursor side effects.
   rtsp_flushbuffered_t flush = {0};
   if (rtsp_timeline_parse_flushbuffered(body, body_len, &flush)) {
-    if (conn && conn->apap_observer) {
+    if (conn && conn->apap_audio) {
       ESP_LOGI(TAG,
                "%s APAP: fromSeq=%s%" PRId64 " untilSeq=%s%" PRId64
                " fromMedia=%s%" PRId64 "/%" PRId64
@@ -2831,45 +3483,25 @@ static void apply_flushbuffered(rtsp_conn_t *conn, const uint8_t *body,
                flush.from_media_time_value, flush.from_media_time_scale,
                flush.have_until_media_time ? "" : "missing/",
                flush.until_media_time_value, flush.until_media_time_scale);
-      rtsp_apap_observer_flush(conn->apap_observer, flush.have_from_seq,
-                               (uint32_t)flush.from_seq, flush.have_until_seq,
-                               (uint32_t)flush.until_seq);
+      const bool have_from_media =
+          flush.have_from_media_time &&
+          flush.from_media_time_scale > 0 &&
+          (uint64_t)flush.from_media_time_scale <= UINT32_MAX;
+      const bool have_until_media =
+          flush.have_until_media_time &&
+          flush.until_media_time_scale > 0 &&
+          (uint64_t)flush.until_media_time_scale <= UINT32_MAX;
+      rtsp_apap_audio_flush(
+          conn->apap_audio,
+          flush.have_from_seq, (uint32_t)flush.from_seq,
+          flush.have_until_seq, (uint32_t)flush.until_seq,
+          have_from_media, flush.from_media_time_value,
+          have_from_media ? (uint32_t)flush.from_media_time_scale : 0U,
+          have_until_media, flush.until_media_time_value,
+          have_until_media ? (uint32_t)flush.until_media_time_scale : 0U);
       return;
     }
-    /* Shairport Sync 5.5.2 handle_flushbuffered(): deferred iff flushFromSeq
-     * is present (the other fields default to 0 when missing). */
-    if (flush.have_from_seq) {
-      ESP_LOGI(TAG,
-               "%s deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
-               " untilSeq=%" PRId64 " untilTS=%" PRId64,
-               src, flush.from_seq, flush.from_ts, flush.until_seq, flush.until_ts);
-      esp_err_t flush_err = audio_receiver_set_deferred_flush_range(
-          (uint32_t)flush.from_seq, (uint32_t)flush.from_ts,
-          (uint32_t)flush.until_seq, (uint32_t)flush.until_ts);
-      if (flush_err != ESP_OK) {
-        /* Shairport: "no more room for deferred flush request records" is
-         * only logged; the reply is still 200. */
-        ESP_LOGW(TAG, "%s deferred not stored (%s)", src,
-                 esp_err_to_name(flush_err));
-      }
-    } else {
-      /* Absence of flushFromSeq selects immediate mode. flushUntilSeq 0 /
-       * missing ends by timestamp rather than being treated as sequence 0. */
-      const bool until_seq_valid = flush.have_until_seq && flush.until_seq != 0;
-      if (until_seq_valid) {
-        ESP_LOGI(TAG,
-                 "%s immediate: untilSeq=%" PRId64 " untilTS=%" PRId64, src,
-                 flush.until_seq, flush.until_ts);
-      } else {
-        ESP_LOGI(TAG,
-                 "%s immediate: untilSeq=%s untilTS=%" PRId64
-                 " (ends by timestamp)",
-                 src, flush.have_until_seq ? "0" : "missing", flush.until_ts);
-      }
-      audio_receiver_set_immediate_flush((uint32_t)flush.until_seq,
-                                         (uint32_t)flush.until_ts,
-                                         until_seq_valid);
-    }
+    ESP_LOGW(TAG, "%s ignored: no active APAP transport", src);
   }
 
   /* Shairport: a FLUSHBUFFERED without a plist does nothing and returns 200. */
@@ -2912,6 +3544,10 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   ESP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
            stream_count);
   log_memory("at TEARDOWN");
+  ESP_LOGI(TAG,
+           "CONTROL DIAG at TEARDOWN: +%llums feedback rx=%u tx=%u",
+           (unsigned long long)diag_session_elapsed_ms(conn),
+           (unsigned)conn->diag_feedback_rx, (unsigned)conn->diag_feedback_tx);
 
   /* A type-130 RemoteControl DataStream is a separate logical stream. iPhone
    * routinely tears it down while type-103 APAP audio is still active. The
@@ -2932,7 +3568,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
       }
       if (type == 130) {
         teardown_remote_control = true;
-      } else if (type == AUDIO_STREAM_BUFFERED ||
+      } else if (type == AUDIO_STREAM_APAP ||
                  type == AUDIO_STREAM_REALTIME) {
         teardown_audio = true;
       } else {
@@ -2949,6 +3585,11 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
              "TEARDOWN: type-130 RemoteControl only -> audio/APAP/MDC preserved");
     rtsp_datastream_stop(&conn->remote_control_datastream);
     conn->remote_control_data_port = 0;
+    ESP_LOGI(TAG,
+             "RSESSION TX id=%u cseq=%d TEARDOWN type130 -> 200 keep-control-connection-open owner=%d active=%d streamType=%lld",
+             (unsigned)conn->diag_conn_id, req->cseq,
+             conn->play_owner ? 1 : 0, conn->stream_active ? 1 : 0,
+             (long long)conn->stream_type);
     rtsp_send_ok(socket, conn, req->cseq);
     return;
   }
@@ -2970,19 +3611,18 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
     conn->remote_control_data_port = 0;
   }
   rtsp_datastream_stop(&conn->media_data_control);
-  rtsp_apap_observer_stop(&conn->apap_observer);
+  rtsp_apap_audio_stop(&conn->apap_audio);
   conn->media_data_control_port = 0;
   conn->apap_port = 0;
   conn->mdc_start_valid = false;
   conn->mdc_media_time_value = 0;
   conn->mdc_media_time_scale = 0;
-  if (conn->buffered_control_socket >= 0) {
-    rtsp_conn_close_buffered_control(conn);
-    conn->buffered_control_socket = -1;
+  if (conn->apap_control_socket >= 0) {
+    rtsp_conn_close_apap_control(conn);
+    conn->apap_control_socket = -1;
   }
   conn->data_port = 0;
   conn->control_port = 0;
-  conn->buffered_port = 0;
   conn->stream_id = 0;
   /* A stream-level TEARDOWN preserves the control session and its PTP clock.
    * Clearing it here needlessly forces a new PTP STEP/relock before the next
@@ -3007,6 +3647,11 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
     // Shairport Sync 5.1+ handle_teardown_2(): a valid AP2 TEARDOWN plist
     // without a streams item means terminate the RTSP connection. Send the
     // response first, advertise the close, then let the client task unwind.
+    ESP_LOGI(TAG,
+             "RSESSION TX id=%u cseq=%d full TEARDOWN -> 200 Connection:close owner=%d active=%d streamType=%lld",
+             (unsigned)conn->diag_conn_id, req->cseq,
+             conn->play_owner ? 1 : 0, conn->stream_active ? 1 : 0,
+             (long long)conn->stream_type);
     rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                        "Connection: close\r\n", NULL, 0);
     conn->close_after_response = true;
@@ -3235,7 +3880,7 @@ static size_t mdc_anchor_reply(rtsp_conn_t *conn, uint8_t *reply,
            conn->mdc_start_valid ? "" : " no-strt", (unsigned)len);
 
   if (len && choose_new_anchor && conn->mdc_start_valid &&
-      conn->apap_observer) {
+      conn->apap_audio) {
     (void)audio_receiver_set_media_anchor(
         anchor_clock_id, remote_ns, conn->mdc_media_time_value,
         (uint32_t)conn->mdc_media_time_scale);
@@ -3246,11 +3891,13 @@ static size_t mdc_anchor_reply(rtsp_conn_t *conn, uint8_t *reply,
   return len;
 }
 
-static void mdc_on_message(const char *type, const char *command,
+static void mdc_on_message(rtsp_datastream_t *stream,
+                           const char *type, const char *command,
                            const uint8_t *payload, size_t payload_len,
                            uint8_t *reply, size_t reply_cap, size_t *reply_len,
                            void *user) {
   rtsp_conn_t *conn = (rtsp_conn_t *)user;
+  (void)stream;
   if (!conn || !command) return;
   if (reply_len) *reply_len = 0;
 

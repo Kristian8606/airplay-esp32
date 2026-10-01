@@ -7,7 +7,8 @@
 #include "esp_err.h"
 
 /*
- * Direct RTP-addressed PCM store.
+ * Direct 32-bit sample-addressed PCM store. The address is RTP time for
+ * realtime ALAC and the low 32 bits of APAP media_sample for Buffered APAP.
  *
  * 128 slots x 1024 stereo frames = 131072 frames = 2.97 s @ 44.1 kHz.
  * A slot is keyed by absolute RTP page base (rtp & ~1023). RTP itself is the

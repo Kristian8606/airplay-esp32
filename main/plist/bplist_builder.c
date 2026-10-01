@@ -98,6 +98,26 @@ static bool bplist_write_int(uint8_t *out, size_t capacity, size_t *pos,
   return true;
 }
 
+static bool bplist_write_bool(uint8_t *out, size_t capacity, size_t *pos,
+                              bool value) {
+  if (!bplist_has_room(*pos, 1, capacity)) {
+    return false;
+  }
+  out[(*pos)++] = value ? 0x09 : 0x08;
+  return true;
+}
+
+static bool bplist_write_real64(uint8_t *out, size_t capacity, size_t *pos,
+                                double value) {
+  if (!bplist_has_room(*pos, 9, capacity)) {
+    return false;
+  }
+  uint64_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  out[(*pos)++] = 0x23; /* 8-byte IEEE-754 real */
+  return bplist_write_u64(out, capacity, pos, bits);
+}
+
 static bool bplist_write_refs(uint8_t *out, size_t capacity, size_t *pos,
                               const uint8_t *refs, size_t count) {
   if (!bplist_has_room(*pos, count, capacity)) {
@@ -151,72 +171,62 @@ static bool bplist_finish(uint8_t *out, size_t capacity, size_t *pos,
 }
 
 size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
-                                  uint16_t event_port) {
-  if (capacity < 100) {
-    return 0;
-  }
+                                  uint16_t event_port,
+                                  const char *timing_peer_addr) {
+  if (!out || capacity < 128) return 0;
 
+  const bool include_peer = timing_peer_addr && timing_peer_addr[0] != '\0';
   size_t pos = 0;
   memcpy(out + pos, "bplist00", 8);
   pos += 8;
 
-  size_t offsets[10];
+  size_t offsets[16];
   size_t obj = 0;
+#define NEW_OBJ(var, expr)             \
+  do {                                 \
+    (var) = (uint8_t)obj;              \
+    offsets[obj++] = pos;              \
+    if (!(expr)) return 0;             \
+  } while (0)
 
-  offsets[obj++] = pos;
-  out[pos++] = 0x59;
-  memcpy(out + pos, "eventPort", 9);
-  pos += 9;
+  uint8_t k_event, k_timing, v_event, v_timing;
+  NEW_OBJ(k_event, bplist_write_ascii_string(out, capacity, &pos, "eventPort"));
+  NEW_OBJ(k_timing, bplist_write_ascii_string(out, capacity, &pos, "timingPort"));
+  NEW_OBJ(v_event, bplist_write_int(out, capacity, &pos, event_port));
+  NEW_OBJ(v_timing, bplist_write_int(out, capacity, &pos, 0));
 
-  offsets[obj++] = pos;
-  out[pos++] = 0x5A;
-  memcpy(out + pos, "timingPort", 10);
-  pos += 10;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x11;
-  out[pos++] = (event_port >> 8) & 0xFF;
-  out[pos++] = event_port & 0xFF;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0x10;
-  out[pos++] = 0;
-
-  offsets[obj++] = pos;
-  out[pos++] = 0xD2;
-  out[pos++] = 0;
-  out[pos++] = 1;
-  out[pos++] = 2;
-  out[pos++] = 3;
-
-  size_t offset_table_offset = pos;
-  for (size_t i = 0; i < obj; i++) {
-    if (offsets[i] > 0xFF) {
-      return 0;
+  uint8_t root = 0;
+  if (!include_peer) {
+    const uint8_t keys[] = {k_event, k_timing};
+    const uint8_t vals[] = {v_event, v_timing};
+    NEW_OBJ(root, bplist_write_dict(out, capacity, &pos, keys, vals, 2));
+  } else {
+    uint8_t k_peer, k_addrs, k_id, v_addr, v_addrs, v_peer;
+    NEW_OBJ(k_peer, bplist_write_ascii_string(out, capacity, &pos,
+                                              "timingPeerInfo"));
+    NEW_OBJ(k_addrs, bplist_write_ascii_string(out, capacity, &pos,
+                                               "Addresses"));
+    NEW_OBJ(k_id, bplist_write_ascii_string(out, capacity, &pos, "ID"));
+    NEW_OBJ(v_addr, bplist_write_ascii_string(out, capacity, &pos,
+                                              timing_peer_addr));
+    {
+      const uint8_t refs[] = {v_addr};
+      NEW_OBJ(v_addrs, bplist_write_array(out, capacity, &pos, refs, 1));
     }
-    out[pos++] = (uint8_t)offsets[i];
+    {
+      const uint8_t keys[] = {k_addrs, k_id};
+      const uint8_t vals[] = {v_addrs, v_addr};
+      NEW_OBJ(v_peer, bplist_write_dict(out, capacity, &pos, keys, vals, 2));
+    }
+    {
+      const uint8_t keys[] = {k_event, k_timing, k_peer};
+      const uint8_t vals[] = {v_event, v_timing, v_peer};
+      NEW_OBJ(root, bplist_write_dict(out, capacity, &pos, keys, vals, 3));
+    }
   }
 
-  memset(out + pos, 0, 6);
-  pos += 6;
-  out[pos++] = 1;
-  out[pos++] = 1;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = (uint8_t)obj;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = 4;
-
-  for (int i = 0; i < 7; i++) {
-    out[pos++] = 0;
-  }
-  out[pos++] = (uint8_t)offset_table_offset;
-
+#undef NEW_OBJ
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, root)) return 0;
   return pos;
 }
 
@@ -271,7 +281,7 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
   ADD_STRING(k_control_port, "controlPort");
 
   uint8_t k_buffer_size = 0;
-  const bool buffered = stream_type == AUDIO_STREAM_BUFFERED;
+  const bool buffered = stream_type == AUDIO_STREAM_APAP;
   if (buffered) {
     ADD_STRING(tmp_k_buffer_size, "audioBufferSize");
     k_buffer_size = tmp_k_buffer_size;
@@ -534,6 +544,86 @@ size_t bplist_build_datastream_setup(uint8_t *out, size_t capacity,
 #undef DS_ADD_INT
 
   if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) return 0;
+  return pos;
+}
+
+size_t bplist_build_params_data(uint8_t *out, size_t capacity,
+                                const uint8_t *data, size_t data_len) {
+  if (!out || (!data && data_len != 0) || capacity < 96) {
+    return 0;
+  }
+
+  size_t pos = 0;
+  memcpy(out + pos, "bplist00", 8);
+  pos += 8;
+
+  size_t offsets[5];
+  size_t obj = 0;
+
+  /* Object 0: key "params". */
+  offsets[obj++] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "params")) return 0;
+
+  /* Object 1: key "data". */
+  offsets[obj++] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "data")) return 0;
+
+  /* Object 2: raw MRP blob. */
+  offsets[obj++] = pos;
+  if (!bplist_write_data(out, capacity, &pos, data, data_len)) return 0;
+
+  /* Object 3: {"data": object2}. */
+  offsets[obj++] = pos;
+  {
+    const uint8_t keys[] = {1};
+    const uint8_t values[] = {2};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 1)) return 0;
+  }
+
+  /* Object 4 (top): {"params": object3}. */
+  offsets[obj++] = pos;
+  {
+    const uint8_t keys[] = {0};
+    const uint8_t values[] = {3};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 1)) return 0;
+  }
+
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, 4)) return 0;
+  return pos;
+}
+
+size_t bplist_build_feedback_empty_streams(uint8_t *out, size_t capacity) {
+  /* AirPlay 2 RemoteControl-only /feedback response:
+   *   { "streams": [] }
+   *
+   * The sender uses this exchange as a two-second keepalive before an audio
+   * stream exists.  A bare 200 OK is not protocol-equivalent: the reference
+   * flow returns an application/x-apple-binary-plist body with an empty
+   * streams array. */
+  if (!out || capacity < 64) return 0;
+
+  size_t pos = 0;
+  memcpy(out + pos, "bplist00", 8);
+  pos += 8;
+
+  size_t offsets[3];
+  size_t obj = 0;
+
+  offsets[obj++] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "streams")) return 0;
+
+  offsets[obj++] = pos;
+  if (!bplist_has_room(pos, 1, capacity)) return 0;
+  out[pos++] = 0xA0; /* empty array */
+
+  offsets[obj++] = pos;
+  {
+    const uint8_t keys[] = {0};
+    const uint8_t values[] = {1};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 1)) return 0;
+  }
+
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, 2)) return 0;
   return pos;
 }
 
@@ -921,53 +1011,171 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
                                 const char *model, const uint8_t *public_key,
                                 size_t public_key_len, uint64_t features,
                                 int64_t protocol_version, uint64_t status_flags,
-                                const char *pairing_id, const uint8_t *txt,
-                                size_t txt_len) {
+                                const char *pairing_id,
+                                const char *system_pairing_id,
+                                const char *features_ex,
+                                const char *sender_address,
+                                const uint8_t *txt, size_t txt_len) {
+  /* HomePod/AudioAccessory-style updateInfo.  Keep identity-bearing values
+   * local to this receiver, but mirror the receiver-state/capability shape
+   * used by AudioAccessory5,1.  This is deliberately independent from the
+   * compact /info builder above so the RCS experiment cannot perturb /info. */
+  enum { UPDATE_MAX_OBJECTS = 96, UPDATE_MAX_TOP_PAIRS = 32 };
   if (!out || !device_id || !device_name || !model || !public_key ||
-      public_key_len == 0 || !pairing_id || !txt || txt_len == 0 ||
-      capacity < 1024) {
+      public_key_len == 0 || !pairing_id || !system_pairing_id ||
+      !features_ex || !sender_address || !txt || txt_len == 0 ||
+      capacity < 2048) {
     return 0;
   }
+
   size_t pos = 0;
-  size_t offsets[INFO_MAX_OBJECTS];
+  size_t offsets[UPDATE_MAX_OBJECTS];
   size_t obj = 0;
-  size_t info_dict = 0;
-  if (!bplist_has_room(pos, 8, capacity)) {
-    return 0;
-  }
+  uint8_t top_keys[UPDATE_MAX_TOP_PAIRS];
+  uint8_t top_values[UPDATE_MAX_TOP_PAIRS];
+  size_t top_count = 0;
+
+  if (!bplist_has_room(pos, 8, capacity)) return 0;
   memcpy(out + pos, "bplist00", 8);
   pos += 8;
-  if (!bplist_write_info_objects(out, capacity, &pos, offsets, &obj, device_id,
-                                 device_name, model, public_key, public_key_len,
-                                 features, protocol_version, status_flags,
-                                 pairing_id, txt, txt_len, &info_dict) ||
-      obj != INFO_OBJ_COUNT + 2) {
-    return 0;
-  }
-  /* { "type": "updateInfo", "value": <info dict> } - Shairport
-   * ap2_event_send_update_info(). "type" reuses the /info key object. */
-  const size_t type_value = obj;
-  offsets[obj++] = pos;
-  if (!bplist_write_ascii_string(out, capacity, &pos, "updateInfo")) {
-    return 0;
-  }
-  const size_t value_key = obj;
-  offsets[obj++] = pos;
-  if (!bplist_write_ascii_string(out, capacity, &pos, "value")) {
-    return 0;
-  }
-  const size_t top = obj;
-  offsets[obj++] = pos;
+
+#define NEW_OBJ(refvar, expr)                                                \
+  do {                                                                       \
+    if (obj >= UPDATE_MAX_OBJECTS) return 0;                                 \
+    (refvar) = (uint8_t)obj;                                                 \
+    offsets[obj++] = pos;                                                    \
+    if (!(expr)) return 0;                                                   \
+  } while (0)
+#define ADD_TOP_STRING(kstr, vstr)                                           \
+  do {                                                                       \
+    uint8_t _k, _v;                                                         \
+    NEW_OBJ(_k, bplist_write_ascii_string(out, capacity, &pos, (kstr)));     \
+    NEW_OBJ(_v, bplist_write_ascii_string(out, capacity, &pos, (vstr)));     \
+    if (top_count >= UPDATE_MAX_TOP_PAIRS) return 0;                         \
+    top_keys[top_count] = _k; top_values[top_count] = _v; top_count++;       \
+  } while (0)
+#define ADD_TOP_INT(kstr, ival)                                              \
+  do {                                                                       \
+    uint8_t _k, _v;                                                         \
+    NEW_OBJ(_k, bplist_write_ascii_string(out, capacity, &pos, (kstr)));     \
+    NEW_OBJ(_v, bplist_write_int(out, capacity, &pos, (uint64_t)(ival)));    \
+    if (top_count >= UPDATE_MAX_TOP_PAIRS) return 0;                         \
+    top_keys[top_count] = _k; top_values[top_count] = _v; top_count++;       \
+  } while (0)
+#define ADD_TOP_BOOL(kstr, bval)                                             \
+  do {                                                                       \
+    uint8_t _k, _v;                                                         \
+    NEW_OBJ(_k, bplist_write_ascii_string(out, capacity, &pos, (kstr)));     \
+    NEW_OBJ(_v, bplist_write_bool(out, capacity, &pos, (bval)));             \
+    if (top_count >= UPDATE_MAX_TOP_PAIRS) return 0;                         \
+    top_keys[top_count] = _k; top_values[top_count] = _v; top_count++;       \
+  } while (0)
+#define ADD_TOP_DATA(kstr, ptr, len)                                         \
+  do {                                                                       \
+    uint8_t _k, _v;                                                         \
+    NEW_OBJ(_k, bplist_write_ascii_string(out, capacity, &pos, (kstr)));     \
+    NEW_OBJ(_v, bplist_write_data(out, capacity, &pos, (ptr), (len)));       \
+    if (top_count >= UPDATE_MAX_TOP_PAIRS) return 0;                         \
+    top_keys[top_count] = _k; top_values[top_count] = _v; top_count++;       \
+  } while (0)
+#define ADD_TOP_REF(kstr, refval)                                            \
+  do {                                                                       \
+    uint8_t _k;                                                             \
+    NEW_OBJ(_k, bplist_write_ascii_string(out, capacity, &pos, (kstr)));     \
+    if (top_count >= UPDATE_MAX_TOP_PAIRS) return 0;                         \
+    top_keys[top_count] = _k; top_values[top_count] = (uint8_t)(refval);     \
+    top_count++;                                                             \
+  } while (0)
+
+  /* playbackCapabilities = {false,false,false}, matching the HomePod-style
+   * receiver profile used by the public AirPlay 2 reference server. */
+  uint8_t playback_dict;
   {
-    const uint8_t keys[] = {INFO_OBJ_TYPE_KEY, (uint8_t)value_key};
-    const uint8_t values[] = {(uint8_t)type_value, (uint8_t)info_dict};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 2)) {
-      return 0;
+    uint8_t keys[3], vals[3];
+    NEW_OBJ(keys[0], bplist_write_ascii_string(out, capacity, &pos,
+                                               "supportsInterstitials"));
+    NEW_OBJ(vals[0], bplist_write_bool(out, capacity, &pos, false));
+    NEW_OBJ(keys[1], bplist_write_ascii_string(out, capacity, &pos,
+                                               "supportsFPSSecureStop"));
+    NEW_OBJ(vals[1], bplist_write_bool(out, capacity, &pos, false));
+    NEW_OBJ(keys[2], bplist_write_ascii_string(
+                         out, capacity, &pos, "supportsUIForAudioOnlyContent"));
+    NEW_OBJ(vals[2], bplist_write_bool(out, capacity, &pos, false));
+    NEW_OBJ(playback_dict,
+            bplist_write_dict(out, capacity, &pos, keys, vals, 3));
+  }
+
+  /* supportedFormats values from the AudioAccessory5,1 HomePod-style
+   * reference profile. */
+  uint8_t supported_formats_dict;
+  {
+    static const char *const names[4] = {
+        "lowLatencyAudioStream", "screenStream", "audioStream", "bufferStream"};
+    static const uint64_t values[4] = {
+        UINT64_C(4398080065536), UINT64_C(21235712),
+        UINT64_C(21235712), UINT64_C(1649282121728)};
+    uint8_t keys[4], vals[4];
+    for (size_t i = 0; i < 4; ++i) {
+      NEW_OBJ(keys[i], bplist_write_ascii_string(out, capacity, &pos, names[i]));
+      NEW_OBJ(vals[i], bplist_write_int(out, capacity, &pos, values[i]));
     }
+    NEW_OBJ(supported_formats_dict,
+            bplist_write_dict(out, capacity, &pos, keys, vals, 4));
   }
-  if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) {
-    return 0;
+
+  ADD_TOP_STRING("psi", system_pairing_id);
+  ADD_TOP_INT("vv", protocol_version);
+  ADD_TOP_REF("playbackCapabilities", playback_dict);
+  ADD_TOP_BOOL("canRecordScreenStream", false);
+  ADD_TOP_INT("statusFlags", status_flags);
+  ADD_TOP_BOOL("keepAliveSendStatsAsBody", true);
+  ADD_TOP_STRING("name", device_name);
+  ADD_TOP_STRING("protocolVersion", "1.1");
+  ADD_TOP_INT("volumeControlType", 3);
+  ADD_TOP_STRING("senderAddress", sender_address);
+  ADD_TOP_STRING("deviceID", device_id);
+  ADD_TOP_STRING("pi", pairing_id);
+  ADD_TOP_BOOL("screenDemoMode", false);
+  {
+    uint8_t k, v;
+    NEW_OBJ(k, bplist_write_ascii_string(out, capacity, &pos, "initialVolume"));
+    NEW_OBJ(v, bplist_write_real64(out, capacity, &pos, -27.0));
+    top_keys[top_count] = k; top_values[top_count] = v; top_count++;
   }
+  ADD_TOP_STRING("featuresEx", features_ex);
+  ADD_TOP_DATA("txtAirPlay", txt, txt_len);
+  ADD_TOP_REF("supportedFormats", supported_formats_dict);
+  ADD_TOP_STRING("sourceVersion", AIRPLAY_SOURCE_VERSION);
+  ADD_TOP_STRING("model", model);
+  ADD_TOP_DATA("pk", public_key, public_key_len);
+  ADD_TOP_STRING("macAddress", device_id);
+  ADD_TOP_STRING("receiverHDRCapability", "4k60");
+  ADD_TOP_INT("features", features);
+
+  uint8_t info_dict;
+  NEW_OBJ(info_dict, bplist_write_dict(out, capacity, &pos, top_keys,
+                                      top_values, top_count));
+
+  /* Event-channel envelope: {type="updateInfo", value=<HomePod info>} */
+  uint8_t type_key, type_value, value_key, top;
+  NEW_OBJ(type_key, bplist_write_ascii_string(out, capacity, &pos, "type"));
+  NEW_OBJ(type_value,
+          bplist_write_ascii_string(out, capacity, &pos, "updateInfo"));
+  NEW_OBJ(value_key, bplist_write_ascii_string(out, capacity, &pos, "value"));
+  {
+    const uint8_t keys[] = {type_key, value_key};
+    const uint8_t vals[] = {type_value, info_dict};
+    NEW_OBJ(top, bplist_write_dict(out, capacity, &pos, keys, vals, 2));
+  }
+
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) return 0;
+
+#undef ADD_TOP_REF
+#undef ADD_TOP_DATA
+#undef ADD_TOP_BOOL
+#undef ADD_TOP_INT
+#undef ADD_TOP_STRING
+#undef NEW_OBJ
   return pos;
 }
 

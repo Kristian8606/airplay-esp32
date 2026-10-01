@@ -6,17 +6,7 @@
 
 #include "esp_err.h"
 
-/* Raw AirPlay-2 buffered TCP FIFO. The receiver stores bytes exactly in TCP
- * order; packet framing and FLUSH interpretation happen only in the single
- * sequential AAC consumer, following Shairport Sync's buffered path. */
-#define AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES (6U * 1024U * 1024U)
-
-/* AirPlay type-103 capacity advertised to the sender ("audioBufferSize").
- * Equal to the physical raw FIFO, so normal TCP backpressure bounds the
- * sender's preload. */
-#define AP2_BUFFERED_AUDIO_ADVERTISED_BYTES AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES
-
-/* AirPlay 2 audio receiver: buffered AAC plus realtime ALAC. */
+/* AirPlay 2 audio receiver: Buffered APAP AAC plus realtime ALAC. */
 typedef struct {
   char codec[32];
   int sample_rate;
@@ -40,7 +30,7 @@ typedef struct {
 typedef enum {
   AUDIO_STREAM_NONE = 0,
   AUDIO_STREAM_REALTIME = 96,  /* AP2 realtime UDP ALAC */
-  AUDIO_STREAM_BUFFERED = 103  /* AP2 buffered TCP AAC */
+  AUDIO_STREAM_APAP = 103  /* AP2 Buffered APAP AAC */
 } audio_stream_type_t;
 
 esp_err_t audio_receiver_init(void);
@@ -55,27 +45,21 @@ void audio_receiver_set_format(const audio_format_t *format);
 void audio_receiver_set_encryption(const audio_encrypt_t *encrypt);
 void audio_receiver_set_stream_type(audio_stream_type_t type);
 
-esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
-                                      uint16_t tcp_port);
-esp_err_t audio_receiver_start_buffered(uint16_t tcp_port);
-
-
-/* Buffered APAP uses the receiver's existing PCM/EQ/PTP playout pipeline but
- * supplies already-framed/decrypted AAC externally instead of the legacy raw
- * RTP/TCP byte FIFO. */
-esp_err_t audio_receiver_start_external_buffered(void);
+esp_err_t audio_receiver_start_realtime(uint16_t data_port, uint16_t control_port);
+/* Buffered APAP is the only type-103 path on this branch. Its transport layer
+ * supplies decoded PCM into the existing EQ/timed-PCM/PTP playout engine. */
+esp_err_t audio_receiver_start_apap(void);
 
 /* Publish one decoded APAP PCM access unit using its media timestamp as the
  * PCM-ring address. The buffer is modified in place by the common EQ path.
  * Returns true when PCM was published, false when it was deliberately dropped
- * (late/stale/timeline changed) or the external buffered path is inactive. */
-bool audio_receiver_publish_timed_pcm(int64_t media_time_value,
-                                      uint32_t media_time_scale,
-                                      int16_t *pcm, size_t frames,
-                                      int channels);
+ * (late/stale/timeline changed) or the APAP path is inactive. */
+bool audio_receiver_publish_apap_pcm(uint64_t media_sample,
+                                        int16_t *pcm, size_t frames,
+                                        int channels);
 
 /* Receiver-chosen APAP anchor. mediaTime is converted into the stream sample
- * domain and then uses the normal buffered RTP<->PTP scheduler unchanged. */
+ * domain and then uses the common sample<->PTP scheduler unchanged. */
 bool audio_receiver_set_media_anchor(uint64_t clock_id, uint64_t network_time_ns,
                                      int64_t media_time_value,
                                      uint32_t media_time_scale);
@@ -83,9 +67,13 @@ bool audio_receiver_set_media_anchor(uint64_t clock_id, uint64_t network_time_ns
 /* APAP FLUSH/track boundary: invalidate current presentation timing and the
  * finite PCM cache. The actual AAC decoder remains transport-owned so codec
  * history can survive ordinary continuity where appropriate. */
-void audio_receiver_external_buffered_flush(void);
+void audio_receiver_apap_flush(void);
+/* APAP transport publishes semantic queue occupancy for the normal audio
+ * status line. This is diagnostic only; scheduling never depends on it. */
+void audio_receiver_set_apap_queue_status(uint32_t frames, uint32_t bytes,
+                                          uint32_t capacity_frames,
+                                          uint32_t capacity_bytes);
 void audio_receiver_stop(void);
-uint16_t audio_receiver_get_buffered_port(void);
 
 /* Software output volume. Q15: 0=mute, 32768=0 dB/full scale. */
 void audio_receiver_set_volume_q15(int32_t volume_q15);
@@ -97,12 +85,6 @@ void audio_receiver_seek_flush(void);
  * RTP boundary while preserving the validated D7/SETRATE RTP<->PTP map. */
 void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp);
 void audio_receiver_realtime_flush_wait_sender_anchor(void);
-esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
-                                                   uint32_t until_seq, uint32_t until_ts);
-/* Immediate FLUSHBUFFERED. until_seq_valid=false (flushUntilSeq 0 or missing)
- * ends the flush by timestamp instead of by sequence number. */
-void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
-                                        bool until_seq_valid);
 void audio_receiver_pause(void);
 void audio_receiver_set_playing(bool playing);
 

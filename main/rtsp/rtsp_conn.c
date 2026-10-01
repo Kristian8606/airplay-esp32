@@ -10,9 +10,13 @@
 #include "ptp_clock.h"
 #include "settings.h"
 #include "rtsp_datastream.h"
-#include "rtsp_apap_observer.h"
+#include "rtsp_apap_audio.h"
 #include "ap2_control_watch.h"
 
+
+/* Diagnostic connection IDs are logging-only. Atomic increment avoids duplicate
+ * IDs when two accepted RTSP client tasks start at nearly the same time. */
+static uint32_t s_diag_conn_serial;
 
 static int32_t volume_db_to_q15(float volume_db){
     if (volume_db <= -30.0f)
@@ -31,6 +35,13 @@ rtsp_conn_t *rtsp_conn_create(void) {
     return NULL;
   }
 
+  conn->diag_conn_id =
+      __atomic_add_fetch(&s_diag_conn_serial, 1U, __ATOMIC_RELAXED);
+  if (conn->diag_conn_id == 0) {
+    conn->diag_conn_id =
+        __atomic_add_fetch(&s_diag_conn_serial, 1U, __ATOMIC_RELAXED);
+  }
+
   // Load saved AirPlay volume or use a conservative default.
   float saved_volume;
   if (settings_get_volume(&saved_volume) == ESP_OK) {
@@ -44,7 +55,7 @@ rtsp_conn_t *rtsp_conn_create(void) {
    * the volume of a session that is already playing. */
 
   conn->event_socket = -1;
-  conn->buffered_control_socket = -1;
+  conn->apap_control_socket = -1;
 
   return conn;
 }
@@ -92,12 +103,12 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
     close(conn->event_socket);
     conn->event_socket = -1;
   }
-  if (conn->buffered_control_socket >= 0) {
-    rtsp_conn_close_buffered_control(conn);
+  if (conn->apap_control_socket >= 0) {
+    rtsp_conn_close_apap_control(conn);
   }
   rtsp_datastream_stop(&conn->media_data_control);
   rtsp_datastream_stop(&conn->remote_control_datastream);
-  rtsp_apap_observer_stop(&conn->apap_observer);
+  rtsp_apap_audio_stop(&conn->apap_audio);
   conn->media_data_control_port = 0;
   conn->remote_control_data_port = 0;
   conn->apap_port = 0;
@@ -108,7 +119,6 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->data_port = 0;
   conn->control_port = 0;
   conn->event_port = 0;
-  conn->buffered_port = 0;
   conn->stream_id = 0;
 
   // Connection teardown ends the lifetime of SETPEERS/SETPEERSX metadata.
@@ -145,9 +155,9 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
   settings_set_volume(volume_db);
 }
 
-void rtsp_conn_close_buffered_control(rtsp_conn_t *conn) {
-  if (!conn || conn->buffered_control_socket < 0) return;
-  ap2_control_unwatch(conn->buffered_control_socket);
-  close(conn->buffered_control_socket);
-  conn->buffered_control_socket = -1;
+void rtsp_conn_close_apap_control(rtsp_conn_t *conn) {
+  if (!conn || conn->apap_control_socket < 0) return;
+  ap2_control_unwatch(conn->apap_control_socket);
+  close(conn->apap_control_socket);
+  conn->apap_control_socket = -1;
 }

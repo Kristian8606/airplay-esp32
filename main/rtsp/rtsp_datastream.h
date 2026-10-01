@@ -16,7 +16,8 @@ typedef struct rtsp_datastream rtsp_datastream_t;
  * reply[0..reply_cap) and set *reply_len.  For sync messages it is appended
  * to the encrypted DataStream rply header.
  */
-typedef void (*rtsp_datastream_msg_cb)(const char *type, const char *command,
+typedef void (*rtsp_datastream_msg_cb)(rtsp_datastream_t *stream,
+                                       const char *type, const char *command,
                                        const uint8_t *payload,
                                        size_t payload_len, uint8_t *reply,
                                        size_t reply_cap, size_t *reply_len,
@@ -37,6 +38,16 @@ esp_err_t rtsp_datastream_start(const hap_session_t *session, uint64_t seed,
                                 void *on_message_user,
                                 rtsp_datastream_t **out_stream,
                                 uint16_t *out_port);
+
+
+/**
+ * Queue one receiver-originated DataStream sync message from inside the
+ * message callback. It is transmitted immediately after the current incoming
+ * sync request has been acknowledged, preserving DataStream nonce ordering.
+ */
+esp_err_t rtsp_datastream_queue_sync(rtsp_datastream_t *stream,
+                                     const char command[4], uint64_t seq,
+                                     const uint8_t *payload, size_t payload_len);
 
 /** Stop, close and free a DataStream created by rtsp_datastream_start(). */
 void rtsp_datastream_stop(rtsp_datastream_t **stream);

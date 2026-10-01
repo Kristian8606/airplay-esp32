@@ -1,15 +1,27 @@
 #pragma once
 
-// AirPlay feature flags = base | bits selected in menuconfig ("AirPlay
-// feature bits (experimental)"). Base 0x14340405C4A00: Shairport Sync's
-// AirPlay 2 bits without bit 47, plus bit 46 (HomePod presentation). Key bits:
-//   Bit 38: SupportsUnifiedMediaControl
-//   Bit 40: SupportsBufferedAudio, Bit 41: SupportsPTP
-//   Bit 46: SupportsHKPairingAndAccessControl
-//   Bit 48: SupportsCoreUtilsPairingAndEncryption
-// Bits 64+ are published only in the "fex" TXT key.
+/* AirPlay feature flags are intentionally composed entirely from menuconfig.
+ * This makes protocol A/B testing reproducible: every advertised bit in the
+ * current HomePod-like mask can be switched independently without editing code.
+ * Defaults in Kconfig reproduce v4.1.87: HomePod mini 27.2 feature set with
+ * bit 58 (SupportsHangdogRemoteControl) disabled. */
 #include "sdkconfig.h"
-#define AIRPLAY_FEATURES_BASE 0x00014340405C4A00ULL
+
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_9
+#define AP_FB9 (1ULL << 9)
+#else
+#define AP_FB9 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_11
+#define AP_FB11 (1ULL << 11)
+#else
+#define AP_FB11 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_14
+#define AP_FB14 (1ULL << 14)
+#else
+#define AP_FB14 0ULL
+#endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_15
 #define AP_FB15 (1ULL << 15)
 #else
@@ -25,10 +37,30 @@
 #else
 #define AP_FB17 0ULL
 #endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_18
+#define AP_FB18 (1ULL << 18)
+#else
+#define AP_FB18 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_19
+#define AP_FB19 (1ULL << 19)
+#else
+#define AP_FB19 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_20
+#define AP_FB20 (1ULL << 20)
+#else
+#define AP_FB20 0ULL
+#endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_21
 #define AP_FB21 (1ULL << 21)
 #else
 #define AP_FB21 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_22
+#define AP_FB22 (1ULL << 22)
+#else
+#define AP_FB22 0ULL
 #endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_25
 #define AP_FB25 (1ULL << 25)
@@ -40,15 +72,35 @@
 #else
 #define AP_FB27 0ULL
 #endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_30
+#define AP_FB30 (1ULL << 30)
+#else
+#define AP_FB30 0ULL
+#endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_36
 #define AP_FB36 (1ULL << 36)
 #else
 #define AP_FB36 0ULL
 #endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_38
+#define AP_FB38 (1ULL << 38)
+#else
+#define AP_FB38 0ULL
+#endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_39
 #define AP_FB39 (1ULL << 39)
 #else
 #define AP_FB39 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_40
+#define AP_FB40 (1ULL << 40)
+#else
+#define AP_FB40 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_41
+#define AP_FB41 (1ULL << 41)
+#else
+#define AP_FB41 0ULL
 #endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_43
 #define AP_FB43 (1ULL << 43)
@@ -60,10 +112,20 @@
 #else
 #define AP_FB45 0ULL
 #endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_46
+#define AP_FB46 (1ULL << 46)
+#else
+#define AP_FB46 0ULL
+#endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_47
 #define AP_FB47 (1ULL << 47)
 #else
 #define AP_FB47 0ULL
+#endif
+#ifdef CONFIG_AIRPLAY_FEATURE_BIT_48
+#define AP_FB48 (1ULL << 48)
+#else
+#define AP_FB48 0ULL
 #endif
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_50
 #define AP_FB50 (1ULL << 50)
@@ -100,6 +162,7 @@
 #else
 #define AP_FB61 0ULL
 #endif
+
 #ifdef CONFIG_AIRPLAY_FEATURE_BIT_68
 #define AP_FB68 (1ULL << 4)
 #else
@@ -180,22 +243,61 @@
 #else
 #define AP_FB99 0ULL
 #endif
-#if defined(CONFIG_AIRPLAY_FEATURES_HOMEPOD_MINI)
-/* Exactly what a HomePod mini on software 27.2 advertises:
- * features=0x4A7FCA00,0x3C356BD0, fex=AMp/StBrNTwQoa7YDQ. */
-#define AIRPLAY_FEATURES 0x3C356BD04A7FCA00ULL
-#define AIRPLAY_FEATURES_EX 0x0000000DD8AEA110ULL
-#else
+
+/* Standard features TXT word (bits 0..63). */
 #define AIRPLAY_FEATURES \
-  (AIRPLAY_FEATURES_BASE | \
-    AP_FB15 | AP_FB16 | AP_FB17 | AP_FB21 | AP_FB25 | AP_FB27 | AP_FB36 | \
-    AP_FB39 | AP_FB43 | AP_FB45 | AP_FB47 | AP_FB50 | AP_FB52 | AP_FB53 | \
-    AP_FB58 | AP_FB59 | AP_FB60 | AP_FB61)
+  (0ULL | \
+    AP_FB9 | \
+    AP_FB11 | \
+    AP_FB14 | \
+    AP_FB15 | \
+    AP_FB16 | \
+    AP_FB17 | \
+    AP_FB18 | \
+    AP_FB19 | \
+    AP_FB20 | \
+    AP_FB21 | \
+    AP_FB22 | \
+    AP_FB25 | \
+    AP_FB27 | \
+    AP_FB30 | \
+    AP_FB36 | \
+    AP_FB38 | \
+    AP_FB39 | \
+    AP_FB40 | \
+    AP_FB41 | \
+    AP_FB43 | \
+    AP_FB45 | \
+    AP_FB46 | \
+    AP_FB47 | \
+    AP_FB48 | \
+    AP_FB50 | \
+    AP_FB52 | \
+    AP_FB53 | \
+    AP_FB58 | \
+    AP_FB59 | \
+    AP_FB60 | \
+    AP_FB61)
+
+/* Extended fex word (global bits 64..127, shifted down by 64 here). */
 #define AIRPLAY_FEATURES_EX \
   (0ULL | \
-    AP_FB68 | AP_FB72 | AP_FB77 | AP_FB79 | AP_FB81 | AP_FB82 | AP_FB83 | \
-    AP_FB85 | AP_FB87 | AP_FB91 | AP_FB92 | AP_FB94 | AP_FB95 | AP_FB96 | \
-    AP_FB98 | AP_FB99)
-#endif
+    AP_FB68 | \
+    AP_FB72 | \
+    AP_FB77 | \
+    AP_FB79 | \
+    AP_FB81 | \
+    AP_FB82 | \
+    AP_FB83 | \
+    AP_FB85 | \
+    AP_FB87 | \
+    AP_FB91 | \
+    AP_FB92 | \
+    AP_FB94 | \
+    AP_FB95 | \
+    AP_FB96 | \
+    AP_FB98 | \
+    AP_FB99)
+
 #define AIRPLAY_FEATURES_HI ((unsigned)(AIRPLAY_FEATURES >> 32))
 #define AIRPLAY_FEATURES_LO ((unsigned)(AIRPLAY_FEATURES & 0xFFFFFFFFULL))

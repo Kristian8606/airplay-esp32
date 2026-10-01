@@ -1,3 +1,106 @@
+# v4.1.93-ptp-timingpeerinfo
+
+- Restores v4.1.91 keep-open behavior after the type-130 teardown; no Connection: close probe.
+- PTP no-stream SETUP response now includes `timingPeerInfo` with the ESP receiver IPv4 address in both `Addresses` and `ID`, matching documented AirPlay 2 PTP receiver responses.
+- RemoteControl-only initial SETUP (`timingProtocol=None`) is unchanged and still returns only eventPort/timingPort.
+- Keeps RSESSION lifecycle diagnostics for correlation.
+
+# v4.1.91-session-lifecycle-diag
+
+Diagnostic-only build based on v4.1.90. No AirPlay transport/audio behavior is intentionally changed.
+
+- Adds stable `RSESSION` connection IDs for each accepted RTSP TCP socket.
+- Logs play-lock acquisition and final socket cleanup with the same connection ID.
+- Logs SETUP/RECORD/TEARDOWN/SETPEERS/SETRATEANCHORTIME correlation: fd, CSeq, path, owner/encryption/audio state, `Session`, `X-Apple-Session-ID`, `Connection`, `User-Agent`, `DACP-ID`, and `Active-Remote`.
+- Summarizes relevant bplist identity/lifecycle fields: `sessionUUID`, `sessionCorrelationUUID`, `groupUUID`, `timingProtocol`, `isRemoteControlOnly`, `channelID`, `clientUUID`, `clientTypeUUID`, `clientID`, `controlType`, `seed`, `wantsDedicatedSocket`, `streamConnectionID`, and stream type.
+- Explicitly logs whether a type-130 TEARDOWN keeps the RTSP control connection open or a full TEARDOWN replies with `Connection: close`.
+- Heavy `AIRPLAY_PROTOCOL_TRACE` remains optional/off, so the diagnostic should not materially perturb timing.
+
+# v4.1.90-homepod-updateinfo
+
+- Expanded event-channel `updateInfo` to mirror the HomePod mini / `AudioAccessory5,1` receiver-state shape.
+- Added `playbackCapabilities`, `canRecordScreenStream`, `keepAliveSendStatsAsBody`, `volumeControlType`, `senderAddress`, `screenDemoMode`, `initialVolume`, `featuresEx`, `supportedFormats`, `macAddress`, and `receiverHDRCapability`.
+- Preserves this ESP receiver's own name, MAC/device ID, pi/psi, Ed25519 public key, current feature mask/fex, source version, status flags, and TXT record.
+- Logs the decoded `updateInfo` plist before encryption for direct comparison during the RCS test.
+- No changes to APAP, MDC, PTP, AAC, RemoteControl DataStream framing, or feedback behavior.
+
+## v4.1.89-rc-feedback-keepalive
+
+- RemoteControl-only `/feedback` now returns the AirPlay 2 keepalive plist `{streams: []}` instead of an empty 200 response.
+- Added dedicated diagnostics: `RC-KEEPALIVE ... streams=[]`.
+- No APAP, MDC, PTP, audio scheduling, feature-bit, or MediaRemote state changes.
+
+# v4.1.88-menuconfig-feature-bits
+
+- Reworked AirPlay feature advertisement for A/B testing.
+- Removed the all-or-nothing HomePod-mini feature-mask switch.
+- Every bit currently present in the v4.1.87 advertisement is now an independent
+  `menuconfig` checkbox, including the previously hard-coded base bits 9, 11, 14,
+  18, 19, 20, 22, 30, 38, 40, 41, 46 and 48.
+- Bit 58 `SupportsHangdogRemoteControl` is visible and defaults OFF, matching v4.1.87.
+- Bit 38 `SupportsUnifiedMediaControl` is separately visible for the next A/B test.
+- Extended HomePod `fex` bits are also independently selectable.
+- Defaults reproduce v4.1.87 exactly: `features=0x4A7FCA00,0x38356BD0` and
+  `fex=AMp/StBrNTwQoa7YDQ`.
+- No RTSP, RCS, APAP, MDC, PTP or audio pipeline behaviour changed.
+
+# v4.1.87-no-hangdog-rc-test (based on v4.1.86)
+
+Diagnostic A/B only: clear AirPlay feature bit 58 (`SupportsHangdogRemoteControl`)
+from the otherwise exact HomePod mini 27.2 advertisement. `features` becomes
+`0x4A7FCA00,0x38356BD0`; `fex`, model, APAP, PTP, type-103 stream connection
+and MediaDataControl support are unchanged. This tests whether bit 58 is what
+causes Apple Music to create the short-lived remote-control-only/type-130 RCS.
+
+# v4.1.81-feedback-diag (based on v4.1.80-apap-frame-queue)
+
+Passive diagnostics only; APAP, DSP and timing behavior are unchanged.
+
+- Logs every RTSP `/feedback` request and exact bplist response with per-session
+  RX/TX counters and milliseconds since the type-103 audio SETUP.
+- Logs every encrypted DataStream `sync/* -> rply` transaction, including
+  empty replies, send success/failure, reply payload size and elapsed time.
+- Adds a control summary at TEARDOWN so a ~60 s sender shutdown can be
+  correlated directly with the last feedback/MDC activity.
+- Adds internal-RAM and PSRAM free/largest-block telemetry to the existing
+  2-second AAC/APAP status line to rule memory leaks in or out without changing
+  the audio path.
+
+# v4.1.80-apap-frame-queue (based on v4.1.79-apap-pipeline-buildfix)
+
+- Make modern Buffered APAP the only type-103 audio transport on this branch.
+  SETUP now requires APAP + MediaDataControl + stream encryption with a 32-byte
+  `shk`; legacy buffered RTP/TCP is rejected instead of reviving the old FIFO.
+- Delete `ap2_buffered_fifo.c/.h` and the legacy buffered-RTP processor path,
+  including FIFO RX/flush diagnostics and their host tests.
+- Add a semantic PSRAM APAP queue: 64 frames x 4096-byte maximum AAC AU (~256
+  KiB, ~1.49 s at 1024 frames/AU). Each entry carries the 24-bit APAP sequence,
+  full 64-bit normalized media sample, original mediaTime and AAC payload.
+- Split APAP into a network producer (framing/decrypt/extensions/enqueue) and a
+  decoder consumer. Queue-full backpressure stops TCP reads naturally. Queue
+  copies are protected by a task mutex rather than a long interrupt-disabled
+  critical section.
+- Keep the proven post-decode path unchanged: AAC PCM -> common EQ -> timed PCM
+  ring -> PTP scheduler -> tagged I2S -> ppm servo. APAP never writes I2S.
+- Keep APAP media addresses 64-bit until final PCM-ring publication; factor the
+  exact quotient/remainder `mediaTime -> sample` conversion into one shared
+  helper and add trace-derived host regressions.
+- Apply `fshb` in the semantic consumer using both APAP sequence and mediaTime.
+  Immediate flush clears queued compressed frames and PCM immediately; deferred
+  flush keeps normal playback until `from`, then drops to `until`.
+- Create the AAC decoder once per APAP session and preserve it across ordinary
+  track/seek/fshb boundaries. EQ history is reset and the first post-boundary
+  PCM AU is muted.
+- Remove smoke/observer scaffolding: direct I2S, fixed -12 dB output, raw APAP
+  hex dumps, alternate cryptor probes, plaintext fallback and dynamic decoder
+  recreation. The retained encrypted format is the empirically working iOS
+  27.2 `ChaCha20-Poly1305-IETF + explicit nonce8 + APAP12 AAD` path.
+- Shrink the old shared codec workspace to realtime-ALAC staging + DATA/RTX
+  packet pools only; APAP owns its compact queue independently.
+- Keep realtime type-96 ALAC/RTP intact and separate from APAP transport state.
+- Update `PROJECT_CONTRACT.md` to make the APAP semantic-frame architecture the
+  source of truth for this branch.
+
 # v4.1.79-apap-pipeline-buildfix (based on v4.1.79-apap-pipeline)
 
 - ESP32-S3/Xtensa build fix: remove unsupported `__int128` from

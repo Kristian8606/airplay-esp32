@@ -40,8 +40,8 @@ static void print_firmware_banner(void) {
   ESP_LOGI(TAG, "VERSION: %s", app ? app->version : "unknown");
   ESP_LOGI(TAG, "BUILD: %s %s", __DATE__, __TIME__);
   ESP_LOGI(TAG, "IDF: %s", app ? app->idf_ver : "unknown");
-  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP + AAC decode/EQ + ALAC UDP/decrypt/decode");
-  ESP_LOGI(TAG, "CORE PLAN: Core1=high-priority PTP/RTP playout + AAC TCP RX + ALAC ordered staging/EQ");
+  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP + APAP RX/decrypt/AAC decode/EQ + ALAC UDP/decode");
+  ESP_LOGI(TAG, "CORE PLAN: Core1=high-priority timed playout + ALAC ordered staging/EQ");
   ESP_LOGI(TAG, "============================================================");
 }
 
@@ -81,8 +81,8 @@ void app_main(void) {
   led_init();
 
   if (provisioning_only) {
-    /* First-time setup needs Wi-Fi scan headroom, not a dormant 6 MiB audio
-     * FIFO. Saving Wi-Fi already restarts the ESP, so defer the entire AirPlay
+    /* First-time setup needs Wi-Fi scan headroom, not dormant audio codec
+     * workspaces. Saving Wi-Fi already restarts the ESP, so defer the AirPlay
      * runtime until that normal connected boot. */
     ESP_LOGI(TAG,
              "WiFi provisioning mode: audio engine deferred until credentials are saved and device restarts");

@@ -96,5 +96,7 @@ void rtsp_get_device_id(char *device_id, size_t len);
 // Event port task management
 // session: the play owner's HAP session (event channel keys); may be NULL.
 esp_err_t rtsp_start_event_port_task(int listen_socket,
-                                     const hap_session_t *session);
+                                     const hap_session_t *session,
+                                     uint32_t client_ip,
+                                     uint16_t client_rtsp_port);
 void rtsp_stop_event_port_task(void);

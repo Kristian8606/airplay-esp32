@@ -10,7 +10,3 @@ int audio_crypto_decrypt_rtp(const audio_encrypt_t *encrypt,
                              uint8_t *output, size_t output_capacity,
                              const uint8_t *full_packet,
                              size_t full_packet_len);
-
-int audio_crypto_decrypt_buffered(const audio_encrypt_t *encrypt,
-                                  const uint8_t *packet, size_t packet_len,
-                                  uint8_t *output, size_t output_capacity);

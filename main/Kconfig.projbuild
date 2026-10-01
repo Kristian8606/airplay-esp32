@@ -63,14 +63,6 @@ menu "AirPlay Receiver"
 endmenu
 
 menu "AirPlay identity (HomePod mini)"
-    config AIRPLAY_FEATURES_HOMEPOD_MINI
-        bool "Advertise exactly the HomePod mini feature bits"
-        default y
-        help
-            features=0x4A7FCA00,0x3C356BD0 and fex=AMp/StBrNTwQoa7YDQ, as a
-            HomePod mini on software 27.2 advertises them (Discovery,
-            2026-09-30). Turn off to choose bits one by one in
-            "AirPlay feature bits (custom)".
     config AIRPLAY_STATUS_FLAGS
         hex "Status flags (TXT flags/sf, /info statusFlags)"
         default 0x98004
@@ -94,117 +86,170 @@ menu "AirPlay identity (HomePod mini)"
         default ""
 endmenu
 
-menu "AirPlay feature bits (custom)"
-    depends on !AIRPLAY_FEATURES_HOMEPOD_MINI
-    comment "Base: 0x14340405C4A00 (Shairport Sync bits + bit 46). HomePod mini bits below."
+menu "AirPlay feature bits (A/B testing)"
+    comment "Every advertised bit is independently selectable. Defaults reproduce v4.1.87: HomePod mini 27.2 mask with bit 58 OFF."
+    comment "Disable ONE bit at a time for clean A/B tests. Bits 40/41/59/60 affect the active audio/control transports."
+
+    config AIRPLAY_FEATURE_BIT_9
+        bool "Bit 9: no public name"
+        default y
+    config AIRPLAY_FEATURE_BIT_11
+        bool "Bit 11: no public name"
+        default y
+    config AIRPLAY_FEATURE_BIT_14
+        bool "Bit 14: no public name"
+        default y
     config AIRPLAY_FEATURE_BIT_15
         bool "Bit 15: MetadataFeatures_0"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_16
         bool "Bit 16: MetadataFeatures_1"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_17
         bool "Bit 17: MetadataFeatures_2"
-        default n
+        default y
+    config AIRPLAY_FEATURE_BIT_18
+        bool "Bit 18: no public name"
+        default y
+    config AIRPLAY_FEATURE_BIT_19
+        bool "Bit 19: no public name"
+        default y
+    config AIRPLAY_FEATURE_BIT_20
+        bool "Bit 20: no public name"
+        default y
     config AIRPLAY_FEATURE_BIT_21
         bool "Bit 21: AudioFormats_3"
-        default n
+        default y
+    config AIRPLAY_FEATURE_BIT_22
+        bool "Bit 22: no public name"
+        default y
     config AIRPLAY_FEATURE_BIT_25
         bool "Bit 25: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_27
         bool "Bit 27: SupportsLegacyPairing"
-        default n
+        default y
+    config AIRPLAY_FEATURE_BIT_30
+        bool "Bit 30: no public name"
+        default y
     config AIRPLAY_FEATURE_BIT_36
         bool "Bit 36: no public name"
-        default n
+        default y
+    config AIRPLAY_FEATURE_BIT_38
+        bool "Bit 38: SupportsUnifiedMediaControl"
+        default y
+        help
+            Candidate for richer MediaRemote/control behaviour. Safe A/B target.
     config AIRPLAY_FEATURE_BIT_39
         bool "Bit 39: no public name"
-        default n
+        default y
+    config AIRPLAY_FEATURE_BIT_40
+        bool "Bit 40: SupportsBufferedAudio"
+        default y
+        help
+            Required for the buffered/APAP transport currently used by this project.
+            Turning it off is useful only as a protocol experiment and may change
+            the selected audio transport.
+    config AIRPLAY_FEATURE_BIT_41
+        bool "Bit 41: SupportsPTP"
+        default y
+        help
+            Advertises PTP timing. Turning it off may change or prevent the
+            current synchronized AirPlay 2 transport.
     config AIRPLAY_FEATURE_BIT_43
         bool "Bit 43: SupportsSystemPairing"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_45
         bool "Bit 45: no public name"
-        default n
+        default y
+    config AIRPLAY_FEATURE_BIT_46
+        bool "Bit 46: SupportsHKPairingAndAccessControl"
+        default y
     config AIRPLAY_FEATURE_BIT_47
         bool "Bit 47: no public name - Shairport Sync sets it, HomePod mini does not"
+        default n
+    config AIRPLAY_FEATURE_BIT_48
+        bool "Bit 48: SupportsCoreUtilsPairingAndEncryption"
         default y
     config AIRPLAY_FEATURE_BIT_50
         bool "Bit 50: MetadataFeatures_3"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_52
         bool "Bit 52: SupportsSetPeersExtendedMessage"
         default y
     config AIRPLAY_FEATURE_BIT_53
         bool "Bit 53: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_58
         bool "Bit 58: SupportsHangdogRemoteControl"
         default n
+        help
+            Main A/B candidate for the RemoteControl-only/type-130 session.
+            v4.1.87 intentionally advertised this bit OFF.
     config AIRPLAY_FEATURE_BIT_59
         bool "Bit 59: SupportsAudioStreamConnectionSetup"
         default y
+        help
+            Used by the current streamConnections/type-103 setup path.
     config AIRPLAY_FEATURE_BIT_60
         bool "Bit 60: SupportsAudioMediaDataControl (encrypted DataStream transport)"
         default y
         help
-            Advertise MediaDataControl only when using the built-in encrypted
-            DataStream transport. The transport, key derivation and sync/rply
-            framing are implemented; higher-level MediaRemote protobuf semantics
-            are currently traced/acknowledged rather than fully interpreted.
+            Used by the built-in MediaDataControl transport (magc/amsm/strt/anch/
+            srat/fshb). Turning it off may make the sender choose another control path.
     config AIRPLAY_FEATURE_BIT_61
         bool "Bit 61: SupportsRFC2198Redundancy"
-        default n
-    comment "Extended bits (published as the \"fex\" TXT key), HomePod mini"
+        default y
+
+    comment "Extended feature bits (64-127, published through TXT fex)"
     config AIRPLAY_FEATURE_BIT_68
         bool "Bit 68: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_72
         bool "Bit 72: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_77
         bool "Bit 77: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_79
         bool "Bit 79: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_81
         bool "Bit 81: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_82
         bool "Bit 82: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_83
         bool "Bit 83: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_85
         bool "Bit 85: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_87
         bool "Bit 87: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_91
         bool "Bit 91: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_92
         bool "Bit 92: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_94
         bool "Bit 94: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_95
         bool "Bit 95: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_96
         bool "Bit 96: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_98
         bool "Bit 98: no public name"
-        default n
+        default y
     config AIRPLAY_FEATURE_BIT_99
         bool "Bit 99: no public name"
-        default n
+        default y
 endmenu
 
 menu "AirPlay protocol trace"

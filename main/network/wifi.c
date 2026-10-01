@@ -246,8 +246,8 @@ static esp_err_t wifi_collect_scan_results(bool show_hidden,
   }
 
   /* Keep the temporary result array out of PSRAM. The web handler restores
-   * the 6 MiB contiguous audio workspace immediately after this function
-   * returns, so even a small scan allocation should not split that block. */
+   * the audio engine immediately after this function returns, so transient
+   * scan allocations should not fragment the PSRAM pools used by audio. */
   wifi_ap_record_t *aps = heap_caps_malloc(
       sizeof(*aps) * number, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!aps) {

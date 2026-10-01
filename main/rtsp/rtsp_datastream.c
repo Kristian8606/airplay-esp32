@@ -13,6 +13,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "plist.h"
@@ -32,6 +33,7 @@ static const char *TAG = "rtsp_datastream";
  * RTSP SETUP/TEARDOWN handlers, before the reply, so it must not wait ~1 s
  * (lwIP's shutdown() is not guaranteed to wake a select on a listener). */
 #define DATASTREAM_POLL_US 100000
+#define DATASTREAM_OUTBOUND_PAYLOAD_MAX 512U
 
 struct rtsp_datastream {
   int listen_socket;
@@ -64,6 +66,20 @@ struct rtsp_datastream {
   uint8_t *payload;
   size_t payload_len;
   bool capture_payload;
+
+  /* Passive control diagnostics. */
+  uint64_t started_us;
+  uint32_t sync_rx_count;
+  uint32_t reply_tx_count;
+
+  /* One deferred receiver-originated sync message. The callback queues it and
+   * message_complete() sends it only after acknowledging the inbound sync. */
+  bool pending_sync;
+  char pending_command[4];
+  uint64_t pending_seq;
+  uint8_t pending_payload[DATASTREAM_OUTBOUND_PAYLOAD_MAX];
+  size_t pending_payload_len;
+  uint32_t sync_tx_count;
 };
 
 static uint32_t read_be32(const uint8_t *p) {
@@ -121,6 +137,55 @@ static bool send_reply(rtsp_datastream_t *ctx, uint64_t seq,
   return true;
 }
 
+static bool send_sync(rtsp_datastream_t *ctx, const char command[4],
+                      uint64_t seq, const uint8_t *payload,
+                      size_t payload_len) {
+  uint8_t frame[DATASTREAM_HEADER_SIZE + DATASTREAM_OUTBOUND_PAYLOAD_MAX] = {0};
+  if (!ctx || !command || payload_len > DATASTREAM_OUTBOUND_PAYLOAD_MAX) {
+    return false;
+  }
+  write_be32(frame, (uint32_t)(DATASTREAM_HEADER_SIZE + payload_len));
+  memcpy(frame + 4, "sync", 4);
+  memcpy(frame + 16, command, 4);
+  write_be64(frame + 20, seq);
+  if (payload_len && payload) {
+    memcpy(frame + DATASTREAM_HEADER_SIZE, payload, payload_len);
+  }
+  if (rtsp_crypto_seal_send(ctx->client_socket, ctx->encrypt_key,
+                            &ctx->encrypt_nonce, frame,
+                            DATASTREAM_HEADER_SIZE + payload_len) != 0) {
+    ESP_LOGW(TAG, "%s: could not send DataStream sync/%.4s seq=%" PRIu64,
+             ctx->label, command, seq);
+    return false;
+  }
+  ++ctx->sync_tx_count;
+  ESP_LOGI(TAG, "%s TX sync/%.4s #%u seq=%" PRIu64 " payload=%uB",
+           ctx->label, command, (unsigned)ctx->sync_tx_count, seq,
+           (unsigned)payload_len);
+  return true;
+}
+
+esp_err_t rtsp_datastream_queue_sync(rtsp_datastream_t *stream,
+                                     const char command[4], uint64_t seq,
+                                     const uint8_t *payload,
+                                     size_t payload_len) {
+  if (!stream || !command || (!payload && payload_len != 0)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (payload_len > sizeof(stream->pending_payload)) {
+    return ESP_ERR_INVALID_SIZE;
+  }
+  if (stream->pending_sync) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  memcpy(stream->pending_command, command, 4);
+  stream->pending_seq = seq;
+  stream->pending_payload_len = payload_len;
+  if (payload_len) memcpy(stream->pending_payload, payload, payload_len);
+  stream->pending_sync = true;
+  return ESP_OK;
+}
+
 static void message_complete(rtsp_datastream_t *ctx) {
   const size_t full_payload_len = ctx->message_size - DATASTREAM_HEADER_SIZE;
   ESP_LOGI(TAG, "%s: %s/%s seq=%" PRIu64 " payload=%u captured=%u%s",
@@ -152,19 +217,40 @@ static void message_complete(rtsp_datastream_t *ctx) {
   size_t reply_len = 0;
   if (ctx->on_message && ctx->payload &&
       ctx->payload_len == full_payload_len) {
-    ctx->on_message(ctx->message_type, ctx->message_command, ctx->payload,
+    ctx->on_message(ctx, ctx->message_type, ctx->message_command, ctx->payload,
                     ctx->payload_len, reply_payload, sizeof(reply_payload),
                     &reply_len, ctx->on_message_user);
     if (reply_len > sizeof(reply_payload)) reply_len = 0;
   }
 
   if (ctx->message_sync) {
-    if (reply_len) {
-      ESP_LOGI(TAG, "%s: rply %s seq=%" PRIu64 " with %u B payload",
-               ctx->label, ctx->message_command, ctx->message_seq,
-               (unsigned)reply_len);
+    const uint32_t sync_no = ++ctx->sync_rx_count;
+    const uint64_t now_us = (uint64_t)esp_timer_get_time();
+    const uint64_t elapsed_ms =
+        (ctx->started_us && now_us > ctx->started_us)
+            ? (now_us - ctx->started_us) / 1000ULL
+            : 0ULL;
+    const bool sent =
+        send_reply(ctx, ctx->message_seq, reply_payload, reply_len);
+    if (sent) ++ctx->reply_tx_count;
+    ESP_LOGI(TAG,
+             "%s CTRL #%u +%llums sync/%s seq=%" PRIu64
+             " -> rply %s payload=%uB (tx=%u)",
+             ctx->label, (unsigned)sync_no,
+             (unsigned long long)elapsed_ms, ctx->message_command,
+             ctx->message_seq, sent ? "OK" : "FAIL", (unsigned)reply_len,
+             (unsigned)ctx->reply_tx_count);
+  }
+
+  if (ctx->pending_sync) {
+    const bool sent = send_sync(ctx, ctx->pending_command, ctx->pending_seq,
+                                ctx->pending_payload, ctx->pending_payload_len);
+    if (!sent) {
+      ESP_LOGW(TAG, "%s: deferred sync/%.4s send failed", ctx->label,
+               ctx->pending_command);
     }
-    (void)send_reply(ctx, ctx->message_seq, reply_payload, reply_len);
+    ctx->pending_sync = false;
+    ctx->pending_payload_len = 0;
   }
 
   ctx->header_len = 0;
@@ -374,7 +460,17 @@ static void datastream_task(void *arg) {
       close(ctx->client_socket);
       ctx->client_socket = -1;
     }
-    ESP_LOGI(TAG, "%s: DataStream client disconnected", ctx->label);
+    {
+      const uint64_t now_us = (uint64_t)esp_timer_get_time();
+      const uint64_t elapsed_ms =
+          (ctx->started_us && now_us > ctx->started_us)
+              ? (now_us - ctx->started_us) / 1000ULL
+              : 0ULL;
+      ESP_LOGI(TAG,
+               "%s: DataStream client disconnected +%llums sync=%u rply=%u",
+               ctx->label, (unsigned long long)elapsed_ms,
+               (unsigned)ctx->sync_rx_count, (unsigned)ctx->reply_tx_count);
+    }
   }
 
   if (ctx->client_socket >= 0) {
@@ -409,6 +505,7 @@ esp_err_t rtsp_datastream_start(const hap_session_t *session, uint64_t seed,
   ctx->client_socket = -1;
   ctx->seed = seed;
   ctx->expected_client_ip = expected_client_ip;
+  ctx->started_us = (uint64_t)esp_timer_get_time();
   ctx->on_message = on_message;
   ctx->on_message_user = on_message_user;
   snprintf(ctx->label, sizeof(ctx->label), "%s",

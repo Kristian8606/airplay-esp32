@@ -43,7 +43,7 @@ static inline uint32_t slot_for_page(uint32_t page_rtp) {
   return (page_rtp >> 10) & PCM_RING_MASK;
 }
 
-static inline int32_t rtp_delta(uint32_t a, uint32_t b) {
+static inline int32_t sample32_delta(uint32_t a, uint32_t b) {
   return (int32_t)(a - b);
 }
 
@@ -222,7 +222,7 @@ static bool page_has_protected_future(const pcm_slot_tag_t *tag,
                                       uint32_t wanted_rtp) {
   if (!validity_any(tag->valid)) return false;
 
-  const int32_t start_delta = rtp_delta(tag->page_rtp, wanted_rtp);
+  const int32_t start_delta = sample32_delta(tag->page_rtp, wanted_rtp);
   const int64_t end_delta =
       (int64_t)start_delta + (int64_t)PCM_RTP_SLOT_FRAMES;
   if (end_delta <= 0) return false;

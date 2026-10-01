@@ -14,7 +14,7 @@
 // Forward declarations
 typedef struct rtsp_conn rtsp_conn_t;
 typedef struct rtsp_datastream rtsp_datastream_t;
-typedef struct rtsp_apap_observer rtsp_apap_observer_t;
+typedef struct rtsp_apap_audio rtsp_apap_audio_t;
 
 /**
  * Connection state struct - consolidates all session state
@@ -41,6 +41,17 @@ struct rtsp_conn {
   bool mdc_anchor_valid;
   uint64_t mdc_anchor_clock_id;
   uint64_t mdc_anchor_ptp_ns;
+
+  /* v4.1.81 diagnostics: passive observation only. These counters do not
+   * change protocol behavior; they let us correlate sender TEARDOWN with
+   * /feedback and MediaDataControl activity. */
+  uint64_t diag_audio_setup_us;
+  uint32_t diag_feedback_rx;
+  uint32_t diag_feedback_tx;
+  /* v4.1.91: stable per-TCP-connection correlation ID and monotonically
+   * increasing request counter. Logging-only: never used for protocol logic. */
+  uint32_t diag_conn_id;
+  uint32_t diag_request_seq;
   // Shairport AP2 TEARDOWN semantics: a valid plist without a streams item
   // requests the RTSP connection itself to close after the 200 response.
   bool close_after_response;
@@ -60,20 +71,18 @@ struct rtsp_conn {
   uint16_t data_port;     // UDP port for audio data (type 96)
   uint16_t control_port;  // UDP port for control (retransmit requests)
   uint16_t event_port;    // TCP port for server->client events
-  uint16_t buffered_port; // TCP port for buffered audio (type 103)
   int event_socket; // TCP listener for event port
-  /* Buffered AP2 still advertises a UDP control/RTCP port.  Realtime owns
-   * that socket inside realtime_receiver; buffered audio has no UDP receiver,
-   * so the RTSP connection keeps a bound socket alive for the stream lifetime
-   * (matching Shairport Sync's separate AP2 control socket). */
-  int buffered_control_socket;
+  /* iOS currently accepts APAP with the conventional top-level UDP
+   * controlPort present. APAP does not consume it; the RTSP connection only
+   * keeps the compatibility endpoint bound for the stream lifetime. */
+  int apap_control_socket;
 
   /* Dedicated encrypted AirPlay 2 DataStream channels.  MediaDataControl is
    * tied to the current audio stream; remote_control_datastream belongs to a
    * type-130 RemoteControlOnly RTSP conversation. */
   rtsp_datastream_t *media_data_control;
   rtsp_datastream_t *remote_control_datastream;
-  rtsp_apap_observer_t *apap_observer;
+  rtsp_apap_audio_t *apap_audio;
   uint16_t media_data_control_port;
   uint16_t remote_control_data_port;
   uint16_t apap_port;
@@ -88,6 +97,7 @@ struct rtsp_conn {
 
   // Sender address: realtime PTP source filter and retransmit requests
   uint32_t client_ip;           // Client IP (network byte order)
+  uint16_t client_rtsp_port;    // Sender RTSP source port (for updateInfo senderAddress)
   uint16_t client_control_port; // Sender's control port (realtime NACKs)
 
 #ifdef CONFIG_AIRPLAY_PROTOCOL_TRACE
@@ -124,4 +134,4 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db);
 
 /* Close the buffered stream's UDP control socket (stops its trace watcher
  * first). No-op when none is open. */
-void rtsp_conn_close_buffered_control(rtsp_conn_t *conn);
+void rtsp_conn_close_apap_control(rtsp_conn_t *conn);

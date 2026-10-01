@@ -94,6 +94,16 @@ static size_t airplay_txt_items(const airplay_txt_values_t *v,
   return n;
 }
 
+size_t mdns_airplay_features_ex_string(char *out, size_t capacity) {
+  if (!out || capacity == 0) return 0;
+  airplay_txt_values_t v;
+  airplay_txt_values(&v);
+  const size_t len = strlen(v.fex);
+  if (len + 1 > capacity) return 0;
+  memcpy(out, v.fex, len + 1);
+  return len;
+}
+
 size_t mdns_airplay_txt_record_data(uint8_t *out, size_t capacity) {
   if (!out) return 0;
   airplay_txt_values_t v;

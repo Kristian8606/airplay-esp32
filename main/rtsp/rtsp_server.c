@@ -1,6 +1,7 @@
 #include "rtsp_server.h"
 
 #include <errno.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdlib.h>
@@ -121,6 +122,11 @@ bool rtsp_server_acquire_play_lock(rtsp_conn_t *conn) {
   } else {
     ESP_LOGD(TAG, "Client slot %d acquired the play lock", me);
   }
+
+  ESP_LOGI(TAG,
+           "RSESSION PLAYLOCK id=%u slot=%d previous=%d fd=%d streamActive=%d streamType=%lld",
+           (unsigned)conn->diag_conn_id, me, previous, clients[me].socket,
+           conn->stream_active ? 1 : 0, (long long)conn->stream_type);
 
   /* The play lock is the true AirPlay control-session boundary.  Reset PTP
    * here, before this connection receives SETPEERS/SETPEERSX, instead of at
@@ -264,15 +270,27 @@ static void client_task(void *pvParameters) {
   // Client IP: realtime PTP source filter and retransmit-request target
   struct sockaddr_in peer_addr;
   socklen_t peer_len = sizeof(peer_addr);
+  char peer_text[INET_ADDRSTRLEN] = "?";
+  char local_text[INET_ADDRSTRLEN] = "?";
+  uint16_t local_port = 0;
   if (getpeername(slot->socket, (struct sockaddr *)&peer_addr, &peer_len) ==
       0) {
     conn->client_ip = peer_addr.sin_addr.s_addr;
-    ESP_LOGI(TAG, "Client IP: %u.%u.%u.%u",
-             (unsigned int)(conn->client_ip & 0xFF),
-             (unsigned int)((conn->client_ip >> 8) & 0xFF),
-             (unsigned int)((conn->client_ip >> 16) & 0xFF),
-             (unsigned int)((conn->client_ip >> 24) & 0xFF));
+    conn->client_rtsp_port = ntohs(peer_addr.sin_port);
+    (void)inet_ntop(AF_INET, &peer_addr.sin_addr, peer_text, sizeof(peer_text));
+    ESP_LOGI(TAG, "Client IP: %s", peer_text);
   }
+  struct sockaddr_in local_addr = {0};
+  socklen_t local_len = sizeof(local_addr);
+  if (getsockname(slot->socket, (struct sockaddr *)&local_addr, &local_len) == 0) {
+    (void)inet_ntop(AF_INET, &local_addr.sin_addr, local_text, sizeof(local_text));
+    local_port = ntohs(local_addr.sin_port);
+  }
+  ESP_LOGI(TAG,
+           "RSESSION OPEN id=%u slot=%d fd=%d peer=%s:%u local=%s:%u conn=%p",
+           (unsigned)conn->diag_conn_id, slot_idx, slot->socket, peer_text,
+           (unsigned)conn->client_rtsp_port, local_text, (unsigned)local_port,
+           (void *)conn);
 
   // Allocate buffer
   size_t buf_capacity = RTSP_BUFFER_INITIAL;
@@ -382,6 +400,14 @@ static void client_task(void *pvParameters) {
   }
 
 cleanup:
+  ESP_LOGI(TAG,
+           "RSESSION CLOSE id=%u slot=%d fd=%d owner=%d active=%d streamType=%lld closeAfterResponse=%d eventPort=%u rcPort=%u apapPort=%u mdcPort=%u reqs=%u",
+           (unsigned)conn->diag_conn_id, slot_idx, slot->socket,
+           conn->play_owner ? 1 : 0, conn->stream_active ? 1 : 0,
+           (long long)conn->stream_type, conn->close_after_response ? 1 : 0,
+           (unsigned)conn->event_port, (unsigned)conn->remote_control_data_port,
+           (unsigned)conn->apap_port, (unsigned)conn->media_data_control_port,
+           (unsigned)conn->diag_request_seq);
   ESP_LOGI(TAG, "Client slot %d disconnected%s", slot_idx,
            conn->play_owner ? " (was playing)" : "");
   free(buffer);

@@ -20,3 +20,7 @@ void mdns_airplay_init(void);
  * @return bytes written, 0 on error (NULL buffer or capacity too small)
  */
 size_t mdns_airplay_txt_record_data(uint8_t *out, size_t capacity);
+
+/** Return the current AirPlay extended feature set (fex) as HomePod-style
+ * unpadded base64. Returns bytes written excluding NUL, or 0 on error. */
+size_t mdns_airplay_features_ex_string(char *out, size_t capacity);

@@ -99,10 +99,9 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   uint16_t ap_count = 0;
   const bool restore_airplay = audio_receiver_is_initialized();
 
-  /* The 6 MiB compressed store is intentionally borrowed by provisioning.
-   * A normal connected device stops AirPlay only for the duration of this
-   * scan. On first boot the audio engine was never created, so the scan starts
-   * with essentially the full PSRAM headroom already available. */
+  /* A normal connected device releases the active audio engine only for the
+   * duration of this scan. On first boot the engine was never created, so the
+   * scan already starts with maximum PSRAM headroom. */
   if (restore_airplay) {
     ESP_LOGI(TAG, "WiFi scan: pausing AirPlay and releasing audio memory");
     rtsp_server_stop();
@@ -129,9 +128,8 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   esp_err_t err = wifi_scan(&ap_list, &ap_count);
 
   /* esp_wifi_scan_get_ap_records() has already released the driver's scan
-   * list at this point. Reclaim the large contiguous 6 MiB codec workspace
-   * immediately, before cJSON/string allocations have a chance to fragment
-   * the freshly available PSRAM. */
+   * list at this point. Restore the audio engine immediately, before later
+   * cJSON/string allocations have a chance to fragment the available PSRAM. */
   if (restore_airplay) {
     const esp_err_t restore_err = restore_airplay_after_wifi_scan();
     if (restore_err != ESP_OK) {

@@ -324,14 +324,17 @@ bool bplist_find_data_len_deep(const uint8_t *plist, size_t plist_len,
 
 /**
  * Build initial SETUP response bplist (no streams array)
- * Returns eventPort and timingPort.
+ * Returns eventPort and timingPort and, when timing_peer_addr is provided,
+ * PTP timingPeerInfo {Addresses:[addr], ID:addr}.
  * @param out Output buffer
  * @param capacity Buffer capacity
  * @param event_port Event port to include in response
+ * @param timing_peer_addr Optional PTP receiver address/ID; NULL for no timingPeerInfo
  * @return Length of generated bplist, or 0 on error
  */
 size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
-                                  uint16_t event_port);
+                                  uint16_t event_port,
+                                  const char *timing_peer_addr);
 
 /**
  * Build stream SETUP response bplist (with streams array)
@@ -339,7 +342,7 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
  * streams, audioBufferSize.
  * @param out Output buffer
  * @param capacity Buffer capacity
- * @param stream_type Stream type (96=realtime UDP, 103=buffered TCP)
+ * @param stream_type Stream type (96=realtime RTP/UDP, 103=Buffered APAP)
  * @param data_port Data port to include
  * @param control_port Control port to include
  * @param audio_buffer_size Audio buffer size to advertise
@@ -370,6 +373,10 @@ size_t bplist_build_datastream_setup(uint8_t *out, size_t capacity,
                                      uint16_t data_port, uint32_t stream_id,
                                      bool include_data_port);
 
+/** Build {"params":{"data":<bytes>}} for DataStream/MRP messages. */
+size_t bplist_build_params_data(uint8_t *out, size_t capacity,
+                                const uint8_t *data, size_t data_len);
+
 /**
  * Build feedback response bplist
  * Returns a streams array with type and sample rate for keepalive.
@@ -382,6 +389,9 @@ size_t bplist_build_datastream_setup(uint8_t *out, size_t capacity,
  */
 size_t bplist_build_feedback_response(uint8_t *out, size_t capacity,
                                       int64_t stream_type, double sample_rate);
+
+/** Build the AirPlay 2 remote-control keepalive body {"streams": []}. */
+size_t bplist_build_feedback_empty_streams(uint8_t *out, size_t capacity);
 
 /**
  * Build /info response bplist.
@@ -409,7 +419,10 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
 /**
  * Build the AirPlay 2 event-channel "updateInfo" plist, as Shairport Sync
  * sends it once the sender connects to the event port:
- *   { type = "updateInfo"; value = <same dict as /info> + txtAirPlay }
+ *   { type = "updateInfo"; value = <HomePod/AudioAccessory receiver state> }
+ * The value includes playbackCapabilities, supportedFormats, featuresEx,
+ * txtAirPlay, volumeControlType and the receiver identity/state fields used by
+ * AudioAccessory5,1.
  * @param txt _airplay._tcp TXT record data (length-prefixed "key=value")
  * @return Length of generated bplist, or 0 on error
  */
@@ -418,8 +431,11 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
                                 const char *model, const uint8_t *public_key,
                                 size_t public_key_len, uint64_t features,
                                 int64_t protocol_version, uint64_t status_flags,
-                                const char *pairing_id, const uint8_t *txt,
-                                size_t txt_len);
+                                const char *pairing_id,
+                                const char *system_pairing_id,
+                                const char *features_ex,
+                                const char *sender_address,
+                                const uint8_t *txt, size_t txt_len);
 
 /**
  * Render a binary plist as compact text for the protocol trace, e.g.
