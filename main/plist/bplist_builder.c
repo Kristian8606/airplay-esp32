@@ -227,6 +227,8 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  uint32_t stream_id, bool include_stream_id,
                                  bool stream_connection_rtp,
                                  bool stream_connection_rtcp,
+                                 bool stream_connection_apap,
+                                 uint16_t apap_port,
                                  bool stream_connection_mdc,
                                  uint16_t media_data_control_port,
                                  uint64_t media_data_control_seed) {
@@ -282,10 +284,12 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
   }
 
   const bool include_stream_connections =
-      stream_connection_rtp || stream_connection_rtcp || stream_connection_mdc;
+      stream_connection_rtp || stream_connection_rtcp ||
+      stream_connection_apap || stream_connection_mdc;
   uint8_t k_stream_connections = 0;
   uint8_t k_sc_rtp = 0;
   uint8_t k_sc_rtcp = 0;
+  uint8_t k_sc_apap = 0;
   uint8_t k_sc_mdc = 0;
   uint8_t k_sc_port = 0;
   uint8_t k_sc_seed = 0;
@@ -299,6 +303,10 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
     if (stream_connection_rtcp) {
       ADD_STRING(tmp_k_sc_rtcp, "streamConnectionTypeRTCP");
       k_sc_rtcp = tmp_k_sc_rtcp;
+    }
+    if (stream_connection_apap) {
+      ADD_STRING(tmp_k_sc_apap, "streamConnectionTypeAPAP");
+      k_sc_apap = tmp_k_sc_apap;
     }
     if (stream_connection_mdc) {
       ADD_STRING(tmp_k_sc_mdc, "streamConnectionTypeMediaDataControl");
@@ -350,6 +358,17 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
     if (!bplist_write_dict(out, capacity, &pos, keys, vals, 1)) return 0;
   }
 
+  uint8_t d_sc_apap = 0;
+  if (stream_connection_apap) {
+    ADD_INT(v_sc_apap_port, apap_port);
+    d_sc_apap = (uint8_t)obj;
+    if (obj >= sizeof(offsets) / sizeof(offsets[0])) return 0;
+    offsets[obj++] = pos;
+    const uint8_t keys[] = {k_sc_port};
+    const uint8_t vals[] = {v_sc_apap_port};
+    if (!bplist_write_dict(out, capacity, &pos, keys, vals, 1)) return 0;
+  }
+
   uint8_t d_sc_mdc = 0;
   if (stream_connection_mdc) {
     ADD_INT(v_sc_mdc_port, media_data_control_port);
@@ -364,8 +383,8 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
 
   uint8_t d_stream_connections = 0;
   if (include_stream_connections) {
-    uint8_t keys[3];
-    uint8_t vals[3];
+    uint8_t keys[4];
+    uint8_t vals[4];
     size_t count = 0;
     if (stream_connection_rtp) {
       keys[count] = k_sc_rtp;
@@ -375,6 +394,11 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
     if (stream_connection_rtcp) {
       keys[count] = k_sc_rtcp;
       vals[count] = d_sc_rtcp;
+      count++;
+    }
+    if (stream_connection_apap) {
+      keys[count] = k_sc_apap;
+      vals[count] = d_sc_apap;
       count++;
     }
     if (stream_connection_mdc) {
@@ -638,6 +662,8 @@ static bool bplist_write_info_objects(uint8_t *out, size_t capacity,
                                       const uint8_t *public_key,
                                       size_t public_key_len, uint64_t features,
                                       int64_t protocol_version,
+                                      uint64_t status_flags,
+                                      const char *pairing_id,
                                       const uint8_t *txt, size_t txt_len,
                                       size_t *info_dict) {
   size_t pos = *pos_io;
@@ -704,7 +730,7 @@ static bool bplist_write_info_objects(uint8_t *out, size_t capacity,
     return false;
   }
   ADD_OFFSET(); // 13: statusFlags value
-  if (!bplist_write_int(out, capacity, &pos, 4)) {
+  if (!bplist_write_int(out, capacity, &pos, status_flags)) {
     return false;
   }
   ADD_OFFSET(); // 14: "pk"
@@ -720,8 +746,7 @@ static bool bplist_write_info_objects(uint8_t *out, size_t capacity,
     return false;
   }
   ADD_OFFSET(); // 17: pairing identifier
-  if (!bplist_write_ascii_string(out, capacity, &pos,
-                                 "00000000-0000-0000-0000-000000000000")) {
+  if (!bplist_write_ascii_string(out, capacity, &pos, pairing_id)) {
     return false;
   }
   ADD_OFFSET(); // 18: "name"
@@ -862,9 +887,13 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_name, const char *model,
                                   const uint8_t *public_key,
                                   size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version) {
+                                  int64_t protocol_version,
+                                  uint64_t status_flags,
+                                  const char *pairing_id, const uint8_t *txt,
+                                  size_t txt_len) {
   if (!out || !device_id || !device_name || !model || !public_key ||
-      public_key_len == 0 || capacity < 512) {
+      public_key_len == 0 || !pairing_id || capacity < 512 ||
+      (txt && txt_len == 0)) {
     return 0;
   }
   size_t pos = 0;
@@ -878,9 +907,9 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
   pos += 8;
   if (!bplist_write_info_objects(out, capacity, &pos, offsets, &obj, device_id,
                                  device_name, model, public_key, public_key_len,
-                                 features, protocol_version, NULL, 0,
-                                 &info_dict) ||
-      obj != INFO_OBJ_COUNT ||
+                                 features, protocol_version, status_flags,
+                                 pairing_id, txt, txt_len, &info_dict) ||
+      obj != INFO_OBJ_COUNT + (txt ? 2U : 0U) ||
       !bplist_finish(out, capacity, &pos, offsets, obj, info_dict)) {
     return 0;
   }
@@ -891,10 +920,12 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
                                 const char *device_id, const char *device_name,
                                 const char *model, const uint8_t *public_key,
                                 size_t public_key_len, uint64_t features,
-                                int64_t protocol_version, const uint8_t *txt,
+                                int64_t protocol_version, uint64_t status_flags,
+                                const char *pairing_id, const uint8_t *txt,
                                 size_t txt_len) {
   if (!out || !device_id || !device_name || !model || !public_key ||
-      public_key_len == 0 || !txt || txt_len == 0 || capacity < 1024) {
+      public_key_len == 0 || !pairing_id || !txt || txt_len == 0 ||
+      capacity < 1024) {
     return 0;
   }
   size_t pos = 0;
@@ -908,8 +939,8 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
   pos += 8;
   if (!bplist_write_info_objects(out, capacity, &pos, offsets, &obj, device_id,
                                  device_name, model, public_key, public_key_len,
-                                 features, protocol_version, txt, txt_len,
-                                 &info_dict) ||
+                                 features, protocol_version, status_flags,
+                                 pairing_id, txt, txt_len, &info_dict) ||
       obj != INFO_OBJ_COUNT + 2) {
     return 0;
   }
@@ -935,6 +966,37 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
     }
   }
   if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) {
+    return 0;
+  }
+  return pos;
+}
+
+size_t bplist_build_int_dict(uint8_t *out, size_t capacity,
+                             const char *const *keys, const uint64_t *values,
+                             size_t count) {
+  if (!out || !keys || !values || count == 0 || count > 16 || capacity < 8) {
+    return 0;
+  }
+  size_t pos = 8;
+  size_t offsets[2 * 16 + 1];
+  uint8_t key_refs[16];
+  uint8_t value_refs[16];
+  memcpy(out, "bplist00", 8);
+  size_t obj = 0;
+  for (size_t i = 0; i < count; ++i) {
+    offsets[obj] = pos;
+    key_refs[i] = (uint8_t)obj++;
+    if (!bplist_write_ascii_string(out, capacity, &pos, keys[i])) return 0;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    offsets[obj] = pos;
+    value_refs[i] = (uint8_t)obj++;
+    if (!bplist_write_int(out, capacity, &pos, values[i])) return 0;
+  }
+  offsets[obj] = pos;
+  const size_t top = obj++;
+  if (!bplist_write_dict(out, capacity, &pos, key_refs, value_refs, count) ||
+      !bplist_finish(out, capacity, &pos, offsets, obj, top)) {
     return 0;
   }
   return pos;

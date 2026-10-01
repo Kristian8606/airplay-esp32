@@ -12,8 +12,9 @@
  * This module records what the sender says about the current item, playback
  * state and command capabilities.  It deliberately has no dependency on the
  * audio receiver and must never start, stop, flush or re-anchor audio.  Audio
- * correctness remains owned by the RTSP timing path (FLUSHBUFFERED,
- * SETRATEANCHORTIME and D7 for realtime streams).
+ * correctness remains owned by negotiated audio timing control
+ * (MediaDataControl srat/fshb for the observed buffered path, D7 for realtime;
+ * legacy RTSP timing remains compatibility-only).
  */
 
 #define MEDIA_REMOTE_TITLE_MAX 128

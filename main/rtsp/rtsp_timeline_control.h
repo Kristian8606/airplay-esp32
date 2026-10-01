@@ -7,8 +7,8 @@
 /*
  * AirPlay timeline-control model.
  *
- * FLUSHBUFFERED and SETRATEANCHORTIME describe which media timeline is valid
- * and how RTP maps onto presentation time.  This module only parses those
+ * FLUSHBUFFERED and rate/anchor control describe which media timeline is valid
+ * and how RTP or APAP media time maps onto presentation time. This module only parses those
  * messages; it intentionally knows nothing about SETPEERSX, streamConnections,
  * pairing or dynamic stream IDs.
  */
@@ -19,6 +19,13 @@ typedef struct {
   bool have_until_seq;
   int64_t until_seq;
   int64_t until_ts;
+
+  bool have_from_media_time;
+  int64_t from_media_time_value;
+  int64_t from_media_time_scale;
+  bool have_until_media_time;
+  int64_t until_media_time_value;
+  int64_t until_media_time_scale;
 } rtsp_flushbuffered_t;
 
 typedef struct {

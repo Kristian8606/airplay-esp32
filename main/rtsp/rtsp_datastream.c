@@ -23,7 +23,7 @@
 
 static const char *TAG = "rtsp_datastream";
 
-#define DATASTREAM_STACK_SIZE 6144
+#define DATASTREAM_STACK_SIZE 8192
 #define DATASTREAM_HEADER_SIZE 32U
 #define DATASTREAM_CAPTURE_MAX 16384U
 #define DATASTREAM_MESSAGE_MAX (16U * 1024U * 1024U)
@@ -46,6 +46,12 @@ struct rtsp_datastream {
   uint64_t decrypt_nonce;
   uint64_t seed;
   char label[24];
+  /* Pairing IKM kept only for the first-frame key-variant probe. */
+  uint8_t ikm[64];
+  size_t ikm_len;
+  bool keys_confirmed;
+  rtsp_datastream_msg_cb on_message;
+  void *on_message_user;
 
   uint8_t header[DATASTREAM_HEADER_SIZE];
   size_t header_len;
@@ -93,13 +99,21 @@ static void copy_fourcc(char out[5], const uint8_t *p) {
   out[4] = '\0';
 }
 
-static bool send_reply(rtsp_datastream_t *ctx, uint64_t seq) {
-  uint8_t reply[DATASTREAM_HEADER_SIZE] = {0};
-  write_be32(reply, DATASTREAM_HEADER_SIZE);
+#define DATASTREAM_REPLY_PAYLOAD_MAX 512U
+
+static bool send_reply(rtsp_datastream_t *ctx, uint64_t seq,
+                       const uint8_t *payload, size_t payload_len) {
+  uint8_t reply[DATASTREAM_HEADER_SIZE + DATASTREAM_REPLY_PAYLOAD_MAX] = {0};
+  if (payload_len > DATASTREAM_REPLY_PAYLOAD_MAX) payload_len = 0;
+  write_be32(reply, (uint32_t)(DATASTREAM_HEADER_SIZE + payload_len));
   memcpy(reply + 4, "rply", 4); /* remaining 8 bytes of message type stay 0 */
   write_be64(reply + 20, seq);
+  if (payload_len && payload) {
+    memcpy(reply + DATASTREAM_HEADER_SIZE, payload, payload_len);
+  }
   if (rtsp_crypto_seal_send(ctx->client_socket, ctx->encrypt_key,
-                            &ctx->encrypt_nonce, reply, sizeof(reply)) != 0) {
+                            &ctx->encrypt_nonce, reply,
+                            DATASTREAM_HEADER_SIZE + payload_len) != 0) {
     ESP_LOGW(TAG, "%s: could not send DataStream rply seq=%" PRIu64,
              ctx->label, seq);
     return false;
@@ -134,8 +148,23 @@ static void message_complete(rtsp_datastream_t *ctx) {
                                          full_payload_len);
 #endif
 
+  uint8_t reply_payload[DATASTREAM_REPLY_PAYLOAD_MAX];
+  size_t reply_len = 0;
+  if (ctx->on_message && ctx->payload &&
+      ctx->payload_len == full_payload_len) {
+    ctx->on_message(ctx->message_type, ctx->message_command, ctx->payload,
+                    ctx->payload_len, reply_payload, sizeof(reply_payload),
+                    &reply_len, ctx->on_message_user);
+    if (reply_len > sizeof(reply_payload)) reply_len = 0;
+  }
+
   if (ctx->message_sync) {
-    (void)send_reply(ctx, ctx->message_seq);
+    if (reply_len) {
+      ESP_LOGI(TAG, "%s: rply %s seq=%" PRIu64 " with %u B payload",
+               ctx->label, ctx->message_command, ctx->message_seq,
+               (unsigned)reply_len);
+    }
+    (void)send_reply(ctx, ctx->message_seq, reply_payload, reply_len);
   }
 
   ctx->header_len = 0;
@@ -221,12 +250,47 @@ static bool consume_encrypted(rtsp_datastream_t *ctx, uint8_t *rx,
     const size_t frame_len = 2 + block_len + 16;
     if (*rx_len < frame_len) break;
 
-    const int plain_len = rtsp_crypto_open(ctx->decrypt_key,
-                                           &ctx->decrypt_nonce, rx, frame_len,
-                                           plain);
+    int plain_len = rtsp_crypto_open(ctx->decrypt_key, &ctx->decrypt_nonce,
+                                     rx, frame_len, plain);
+    if (plain_len < 0 && !ctx->keys_confirmed && ctx->decrypt_nonce == 0) {
+      /* First frame did not authenticate: find which derivation the sender
+       * used and log it, so the default can be corrected. */
+      ESP_LOGW(TAG, "%s: first frame failed with default keys (ikm=%uB, block=%u): "
+               "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+               ctx->label, (unsigned)ctx->ikm_len, (unsigned)block_len,
+               rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7], rx[8], rx[9]);
+      for (unsigned v = 1; v < HAP_DS_VARIANT_COUNT && plain_len < 0; v++) {
+        uint8_t ek[32], dk[32];
+        if (hap_derive_datastream_keys_ikm(ctx->ikm, ctx->ikm_len, ctx->seed, v,
+                                           ek, dk) != ESP_OK) {
+          continue;
+        }
+        uint64_t nonce = 0;
+        plain_len = rtsp_crypto_open(dk, &nonce, rx, frame_len, plain);
+        if (plain_len >= 0) {
+          ESP_LOGW(TAG, "%s: DataStream keys matched variant %u (%s%s%s)",
+                   ctx->label, v, (v & HAP_DS_VARIANT_SWAP) ? "swap " : "",
+                   (v & HAP_DS_VARIANT_IKM32) ? "ikm32 " : "",
+                   (v & HAP_DS_VARIANT_SIGNED) ? "signed-seed" : "");
+          memcpy(ctx->encrypt_key, ek, sizeof(ek));
+          memcpy(ctx->decrypt_key, dk, sizeof(dk));
+          ctx->decrypt_nonce = nonce;
+        }
+        sodium_memzero(ek, sizeof(ek));
+        sodium_memzero(dk, sizeof(dk));
+      }
+    }
     if (plain_len < 0) {
-      ESP_LOGW(TAG, "%s: DataStream decrypt/authentication failed", ctx->label);
+      ESP_LOGW(TAG, "%s: DataStream decrypt/authentication failed (nonce=%" PRIu64
+               ", all %u key variants tried=%s)", ctx->label, ctx->decrypt_nonce,
+               HAP_DS_VARIANT_COUNT, ctx->keys_confirmed ? "no" : "yes");
       return false;
+    }
+    if (!ctx->keys_confirmed) {
+      ctx->keys_confirmed = true;
+      sodium_memzero(ctx->ikm, sizeof(ctx->ikm));
+      ESP_LOGI(TAG, "%s: DataStream keys confirmed (first frame %d bytes plain)",
+               ctx->label, plain_len);
     }
     if (!feed_plain(ctx, plain, (size_t)plain_len)) return false;
 
@@ -332,6 +396,8 @@ static void datastream_task(void *arg) {
 esp_err_t rtsp_datastream_start(const hap_session_t *session, uint64_t seed,
                                 uint32_t expected_client_ip,
                                 const char *label,
+                                rtsp_datastream_msg_cb on_message,
+                                void *on_message_user,
                                 rtsp_datastream_t **out_stream,
                                 uint16_t *out_port) {
   if (!session || !out_stream || !out_port) return ESP_ERR_INVALID_ARG;
@@ -343,13 +409,23 @@ esp_err_t rtsp_datastream_start(const hap_session_t *session, uint64_t seed,
   ctx->client_socket = -1;
   ctx->seed = seed;
   ctx->expected_client_ip = expected_client_ip;
+  ctx->on_message = on_message;
+  ctx->on_message_user = on_message_user;
   snprintf(ctx->label, sizeof(ctx->label), "%s",
            label ? label : "DataStream");
 
+  ctx->ikm_len = session->pairing_secret_len ? session->pairing_secret_len
+                                             : sizeof(session->shared_secret);
+  if (ctx->ikm_len > sizeof(ctx->ikm)) ctx->ikm_len = sizeof(ctx->ikm);
+  memcpy(ctx->ikm,
+         session->pairing_secret_len ? session->pairing_secret
+                                     : session->shared_secret,
+         ctx->ikm_len);
   esp_err_t err = hap_derive_datastream_keys(session, seed,
                                              ctx->encrypt_key,
                                              ctx->decrypt_key);
   if (err != ESP_OK) {
+    sodium_memzero(ctx, sizeof(*ctx));
     free(ctx);
     return err;
   }

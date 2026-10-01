@@ -1959,11 +1959,15 @@ bool bplist_get_stream_connection_info(
       out->has_rtcp = true;
       continue;
     }
-    if (strcmp(key, "streamConnectionTypeMediaDataControl") != 0) {
-      continue;
-    }
 
-    out->has_media_data_control = true;
+    const bool is_apap = strcmp(key, "streamConnectionTypeAPAP") == 0;
+    const bool is_mdc =
+        strcmp(key, "streamConnectionTypeMediaDataControl") == 0;
+    if (!is_apap && !is_mdc) continue;
+
+    if (is_apap) out->has_apap = true;
+    if (is_mdc) out->has_media_data_control = true;
+
     const uint64_t val_idx = read_be_int(vals + i * ref_size, ref_size);
     const uint64_t val_off = bplist_get_offset(
         plist, plist_len, offset_table_offset, offset_size, val_idx);
@@ -1971,37 +1975,57 @@ bool bplist_get_stream_connection_info(
       continue;
     }
 
-    size_t mdc_count = 0, mdc_header_len = 0;
-    if (!bplist_parse_count(plist, plist_len, val_off, &mdc_count,
-                            &mdc_header_len)) {
+    size_t inner_count = 0, inner_header_len = 0;
+    if (!bplist_parse_count(plist, plist_len, val_off, &inner_count,
+                            &inner_header_len)) {
       continue;
     }
-    const uint64_t mdc_pos64 = val_off + mdc_header_len;
-    if (!bplist_span_ok(mdc_pos64, mdc_count,
+    const uint64_t inner_pos64 = val_off + inner_header_len;
+    if (!bplist_span_ok(inner_pos64, inner_count,
                         2U * (uint64_t)ref_size, plist_len)) {
       continue;
     }
-    const size_t mdc_pos = (size_t)mdc_pos64;
-    const uint8_t *mdc_keys = plist + mdc_pos;
-    const uint8_t *mdc_vals = plist + mdc_pos + mdc_count * ref_size;
-    for (size_t j = 0; j < mdc_count; ++j) {
-      const uint64_t mk_idx = read_be_int(mdc_keys + j * ref_size, ref_size);
-      const uint64_t mk_off = bplist_get_offset(
-          plist, plist_len, offset_table_offset, offset_size, mk_idx);
-      char mkey[64];
-      if (!bplist_read_string(plist, plist_len, mk_off, mkey, sizeof(mkey)) ||
-          strcmp(mkey, "streamConnectionKeyEncryptionSeed") != 0) {
+    const size_t inner_pos = (size_t)inner_pos64;
+    const uint8_t *inner_keys = plist + inner_pos;
+    const uint8_t *inner_vals =
+        plist + inner_pos + inner_count * ref_size;
+
+    for (size_t j = 0; j < inner_count; ++j) {
+      const uint64_t ik_idx =
+          read_be_int(inner_keys + j * ref_size, ref_size);
+      const uint64_t ik_off = bplist_get_offset(
+          plist, plist_len, offset_table_offset, offset_size, ik_idx);
+      char inner_key[64];
+      if (!bplist_read_string(plist, plist_len, ik_off, inner_key,
+                              sizeof(inner_key))) {
         continue;
       }
-      const uint64_t mv_idx = read_be_int(mdc_vals + j * ref_size, ref_size);
-      const uint64_t mv_off = bplist_get_offset(
-          plist, plist_len, offset_table_offset, offset_size, mv_idx);
-      int64_t signed_seed = 0;
-      if (bplist_read_int(plist, plist_len, mv_off, &signed_seed)) {
-        out->media_data_control_seed = (uint64_t)signed_seed;
-        out->has_media_data_control_seed = true;
+
+      if (is_apap &&
+          strcmp(inner_key, "streamConnectionKeyUseStreamEncryptionKey") ==
+              0) {
+        const uint64_t iv_idx =
+            read_be_int(inner_vals + j * ref_size, ref_size);
+        const uint64_t iv_off = bplist_get_offset(
+            plist, plist_len, offset_table_offset, offset_size, iv_idx);
+        /* bplist simple marker 0x09 = true, 0x08 = false. */
+        out->apap_use_stream_encryption_key =
+            iv_off < plist_len && plist[iv_off] == 0x09;
+        continue;
       }
-      break;
+
+      if (is_mdc &&
+          strcmp(inner_key, "streamConnectionKeyEncryptionSeed") == 0) {
+        const uint64_t iv_idx =
+            read_be_int(inner_vals + j * ref_size, ref_size);
+        const uint64_t iv_off = bplist_get_offset(
+            plist, plist_len, offset_table_offset, offset_size, iv_idx);
+        int64_t signed_seed = 0;
+        if (bplist_read_int(plist, plist_len, iv_off, &signed_seed)) {
+          out->media_data_control_seed = (uint64_t)signed_seed;
+          out->has_media_data_control_seed = true;
+        }
+      }
     }
   }
 

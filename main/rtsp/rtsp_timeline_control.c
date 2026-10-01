@@ -20,6 +20,16 @@ bool rtsp_timeline_parse_flushbuffered(const uint8_t *plist, size_t plist_len,
   out->have_until_seq =
       bplist_find_int(plist, plist_len, "flushUntilSeq", &out->until_seq);
   (void)bplist_find_int(plist, plist_len, "flushUntilTS", &out->until_ts);
+  out->have_from_media_time =
+      bplist_find_int(plist, plist_len, "flushFromMediaTimeValue",
+                      &out->from_media_time_value);
+  (void)bplist_find_int(plist, plist_len, "flushFromMediaTimeScale",
+                        &out->from_media_time_scale);
+  out->have_until_media_time =
+      bplist_find_int(plist, plist_len, "flushUntilMediaTimeValue",
+                      &out->until_media_time_value);
+  (void)bplist_find_int(plist, plist_len, "flushUntilMediaTimeScale",
+                        &out->until_media_time_scale);
   return true;
 }
 

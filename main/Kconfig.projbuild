@@ -62,7 +62,40 @@ menu "AirPlay Receiver"
         default n
 endmenu
 
-menu "AirPlay feature bits (experimental)"
+menu "AirPlay identity (HomePod mini)"
+    config AIRPLAY_FEATURES_HOMEPOD_MINI
+        bool "Advertise exactly the HomePod mini feature bits"
+        default y
+        help
+            features=0x4A7FCA00,0x3C356BD0 and fex=AMp/StBrNTwQoa7YDQ, as a
+            HomePod mini on software 27.2 advertises them (Discovery,
+            2026-09-30). Turn off to choose bits one by one in
+            "AirPlay feature bits (custom)".
+    config AIRPLAY_STATUS_FLAGS
+        hex "Status flags (TXT flags/sf, /info statusFlags)"
+        default 0x98004
+        help
+            HomePod mini observed values: 0x29a404 (stereo-pair leader),
+            0xb8c04 (stereo-pair member), 0x1bac04 (in an Apple TV home
+            theater); Apple TV 0x18644. Bits present on every HomePod:
+            2, 10, 15, 16, 19. Unofficial names (openairplay): 2 audio
+            cable attached, 10 set up for HomeKit access control, 11
+            supports relay, 13 tight-sync group leader, 15 Apple Music
+            subscriber, 16 cloud library on, 17 receiver session active;
+            19-21 unknown. Default 0x98004 = 2, 15, 16, 19: bit 10 (HomeKit)
+            and the group bits 11/13/17/20/21 stay off until we test them.
+    config AIRPLAY_TXT_COLOR
+        string "TXT c (HomePod colour code)"
+        default "2"
+        help
+            Observed: White = 2, Orange = 8. Published with cmv=2.
+    config AIRPLAY_TXT_GROUP_NAME
+        string "TXT gpn (room / group name, empty = not published)"
+        default ""
+endmenu
+
+menu "AirPlay feature bits (custom)"
+    depends on !AIRPLAY_FEATURES_HOMEPOD_MINI
     comment "Base: 0x14340405C4A00 (Shairport Sync bits + bit 46). HomePod mini bits below."
     config AIRPLAY_FEATURE_BIT_15
         bool "Bit 15: MetadataFeatures_0"
@@ -172,6 +205,9 @@ menu "AirPlay feature bits (experimental)"
     config AIRPLAY_FEATURE_BIT_99
         bool "Bit 99: no public name"
         default n
+endmenu
+
+menu "AirPlay protocol trace"
     config AIRPLAY_PROTOCOL_TRACE
         bool "Log what the sender sends (protocol trace)"
         default n

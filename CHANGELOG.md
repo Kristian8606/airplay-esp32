@@ -1,3 +1,191 @@
+# v4.1.79-apap-pipeline-buildfix (based on v4.1.79-apap-pipeline)
+
+- ESP32-S3/Xtensa build fix: remove unsupported `__int128` from
+  `media_time_to_sample_index()`.
+- Preserve exact integer `mediaTime -> sample index` conversion using
+  quotient/remainder decomposition and 32-bit sample-address wrap semantics;
+  no floating-point timing conversion is introduced.
+- Verified the real trace conversion
+  `28019334008224/1000000000 @ 44100 Hz -> 1235652629` exactly.
+
+# v4.1.79-apap-pipeline (based on v4.1.78-apap-smoke-anch)
+
+- Promote Buffered APAP from the smoke experiment into the normal audio engine.
+  APAP now owns only TCP framing, stream-key authentication/decryption and AAC
+  access-unit decoding; decoded PCM is published into the existing timed PCM
+  ring instead of writing I2S directly.
+- Preserve the proven common playout path: APAP PCM now passes through the same
+  EQ, PCM ring, PTP presentation scheduler, tagged I2S path and ppm servo used
+  by buffered AirPlay audio.
+- Treat APAP `mediaTimeValue/mediaTimeScale` as the sample-domain address. At
+  44.1 kHz the observed iPhone timeline is directly sample-addressed; other
+  scales are converted with integer rational arithmetic before publication.
+- Receiver-chosen `anch` is now stable for a `strt` epoch: choose one PTP anchor
+  per `strt`, reuse it for repeated `anch` requests, and install the resulting
+  media-sample <-> PTP map in the normal buffered scheduler.
+- Add APAP-native `fshb` gating using the 24-bit APAP sequence carried in every
+  packet. Deferred ranges wait for `flushFromSeq`; immediate flushes invalidate
+  queued PCM and discard APAP frames until `flushUntilSeq`. A later immediate
+  transition supersedes the earlier deferred range for the same song change.
+- Parse and log `flushFromMediaTimeValue/Scale` and
+  `flushUntilMediaTimeValue/Scale`. Sequence is authoritative when present; the
+  media values are retained for diagnostics/future no-sequence fallback.
+- Accept an authenticated extension-only APAP packet at a flush boundary as a
+  valid control/boundary packet rather than an AAC decode failure.
+- Keep AAC decoder state across APAP timeline discontinuities and mute the first
+  post-boundary PCM access unit while resetting EQ history, matching the existing
+  Shairport-style discontinuity recovery policy.
+- Remove the smoke-only direct-I2S path, fixed -12 dB attenuation and smoke I2S
+  lifecycle. Legacy buffered RTP keeps its existing raw 6 MiB FIFO; APAP uses
+  TCP backpressure plus the finite timed PCM ring instead of creating a second
+  compressed-media byte FIFO.
+
+# v4.1.78-apap-smoke-anch (based on v4.1.77-apap-smoke)
+
+- Preserve the APAP smoke decrypt/AAC path from v4.1.77.
+- Fix stream-specific TEARDOWN: tearing down dedicated type-130 RemoteControl
+  no longer stops type-103 APAP audio, MediaDataControl, I2S or PTP.
+- MediaDataControl callbacks may return a bplist payload in the encrypted rply.
+- Handle `strt` and `anch`; `anch` returns a receiver-chosen PTP/media anchor.
+- Initialise the I2S playout backend on the APAP path before smoke playback;
+  PCM scratch is kept in PSRAM to preserve internal DMA memory.
+
+# v4.1.77-apap-smoke — 2026-10-01
+
+Experimental APAP audible-payload proof build. This intentionally ignores proper
+PTP/anchor scheduling and is only meant to prove that the HomePod-style Buffered
+APAP transport contains the expected AAC program audio.
+
+- Keeps the HomePod 27.2 feature/fex profile and APAP + MediaDataControl SETUP.
+- Copies the negotiated 32-byte `shk` stream key into the APAP endpoint.
+- Implements Apple BufferedAPAP framing (`BE32 total length` + APAP packet).
+- Implements the fixed 15-byte APAP header and varint extension terminator.
+- Mirrors Apple's `APSAPAPBBufEncode/Decode` crypto split: bytes 0..11 are AAD,
+  all 15 fixed header bytes stay clear, and bytes 15..end are protected.
+- Probes Apple's ChaCha20-Poly1305 64-bit-nonce explicit-8-byte-nonce form first,
+  then its internal-counter form; a candidate is accepted only when Poly1305
+  authentication succeeds and the resulting access unit decodes as AAC-LC.
+- Feeds successfully decoded stereo PCM directly to I2S at 44.1 kHz, attenuated
+  by about 12 dB. No PTP timing, `anch`, seek or flush correctness is claimed.
+- Drains I2S completion records in smoke mode so the normal diagnostic ring does
+  not overflow during continuous unsynchronised playback.
+
+## v4.1.76-apap-observer
+
+- Keep the exact HomePod 27.2 `features`/`fex` profile, including extended bit 72 (`SupportsBufferedAPAP`).
+- Parse `streamConnectionTypeAPAP` and `streamConnectionKeyUseStreamEncryptionKey` from type-103 SETUP.
+- Mirror APAP in the SETUP reply with its own `streamConnectionKeyPort` instead of silently substituting the legacy buffered TCP/RTP endpoint.
+- Add an isolated APAP TCP observer. APAP traffic is **not** fed to the AAC FIFO until the APTransport framing/stream-key cryptor is proven.
+- Recognise Apple's BufferedAPAP package envelope (4-byte BE total length) and APAP's 15-byte header when visible; otherwise log the raw prefix to identify the outer encryption/framing layer.
+- Leave the working Apple TV `RTP + MediaDataControl` path unchanged.
+
+# v4.1.75-dual-control
+
+- Restores `SETRATEANCHORTIME` to the RTSP `OPTIONS/Public` list. Direct
+  iPhone 27.2 captures use an RTP-only buffered stream (`MDC=0`) and the
+  RTSP `SETRATEANCHORTIME` + `FLUSHBUFFERED` timeline-control dialect.
+- Keeps the HomePod/Apple-TV negotiated MediaDataControl path unchanged:
+  when `streamConnectionTypeMediaDataControl` is present, encrypted `srat` /
+  `fshb` remain the timeline-control path.
+- Does not restore the speculative RTSP `SETRATE` / `GETANCHOR` experiment.
+- Adds a SETUP log line showing the buffered control dialect actually selected
+  by the sender.
+
+# v4.1.74-mdc-fshb-order
+
+- Keeps the working HomePod-27 MediaDataControl `srat` path unchanged.
+- Fixes immediate `fshb` arbitration for the ordering observed from tvOS 27.2:
+  a concrete `flushUntilSeq` followed by one or more `flushUntilSeq=0` marker
+  requests no longer loses the concrete raw-FIFO boundary.
+- This is an ESP buffering adaptation, not a claim that Apple's internal SBAR
+  stores the same state: Apple resets downstream queues per flush, while this
+  receiver may already hold megabytes of mixed old/future compressed TCP data.
+- A later concrete endpoint still replaces a seq-0 fallback; concrete-to-concrete
+  updates remain last-writer-wins.  Added a host regression test using the real
+  trace sequence 2757133 -> 0 -> 0.
+- Removes the old experimental RTSP `SETRATE` / `GETANCHOR` dispatch and its
+  per-connection receiver-anchor state.  Those verbs were inferred from Apple
+  internal names, not observed on this HomePod-27 wire trace.
+- `OPTIONS` no longer advertises legacy `SETRATEANCHORTIME`; its existing handler
+  remains only as an unadvertised compatibility fallback if Apple explicitly
+  sends it.  Negotiation is therefore driven by the exact HomePod feature mask
+  and the observed MediaDataControl transport.
+
+# v4.1.73-mdc-fshb (based on v4.1.72-mdc-srat)
+
+v4.1.72 log: HomePod/Apple TV group plays with the MDC `srat` anchor
+(sync within +-0.7 ms); pause is `srat {rate=0}`, then one or more
+`sync/fshb {flushUntilSeq, flushUntilTS}`, then `amsm` and a new `srat`.
+Later `srat` can also carry firstAudibleMediaTimeValue/Scale (logged only).
+
+- MDC `fshb` goes through the same code as RTSP FLUSHBUFFERED
+  (`apply_flushbuffered()`, shared; logs prefixed `MDC fshb`).
+
+# v4.1.72-mdc-srat (based on v4.1.71-datastream-keys)
+
+v4.1.71 log: DataStream keys now confirmed on the first frame (default
+derivation, full 64-byte IKM) for RemoteControl and MediaDataControl.
+What Apple sends there:
+- RemoteControl (type 130, iPhone): `sync/comm` with an MRP
+  DEVICE_INFO_MESSAGE (type 15). We only ack it (empty rply) so far.
+- MediaDataControl (HomePod as sender, Apple TV group): `sync/amsm`
+  {audioMode="default"} and then `sync/srat` {rate, networkTimeTimelineID,
+  networkTimeSecs, networkTimeFrac, rtpTime}: the rate/anchor that used to
+  come as the RTSP SETRATEANCHORTIME now comes over MDC.
+
+Change:
+- `rtsp_datastream_start()` takes a message callback (called from the
+  DataStream task for every fully captured message, before the rply).
+- MDC `srat` goes through the same code as SETRATEANCHORTIME
+  (`apply_rate_anchor()`, shared; RTSP handler only adds the 200 OK). Log
+  lines are prefixed `MDC srat`. `amsm` is logged/acked only; any other MDC
+  command is logged as `MDC <type>/<cmd>: no handler yet`.
+
+# v4.1.71-datastream-keys (based on v4.1.70-homepod)
+
+Fix: every DataStream (type 130 RemoteControl and the MediaDataControl
+connection) failed on the very first frame ("DataStream decrypt/
+authentication failed") and the sender tore the stream down.
+
+- Cause: after *transient* pair-setup (what iPhone and HomePod use) the
+  Control/Events keys are derived from the full 64-byte SRP session key, but
+  the DataStream keys were derived from `shared_secret`, a 32-byte truncated
+  copy. The session now keeps the full pairing IKM (`pairing_secret`, 64 B
+  after pair-setup, 32 B after pair-verify) and DataStream uses it.
+- Diagnostics (no masking): if the first frame still does not authenticate,
+  the receiver logs the frame header bytes and tries the other plausible
+  derivations (keys swapped, 32-byte IKM, signed seed in the salt); if one
+  matches it logs `DataStream keys matched variant N (...)` and uses it, so
+  the next log tells exactly which derivation Apple uses.
+  `DataStream keys confirmed` is logged on the first good frame.
+
+# v4.1.70-homepod (based on v4.1.68-rt2)
+
+ESP presents itself exactly as a HomePod mini on software 27.2 does
+(Discovery capture of "HomePod Withe R", 2026-09-30). Nothing the HomePod
+does not advertise is advertised.
+
+- Versions: srcvers/vs and `Server: AirTunes/` 377.40.00 -> **1005.8.1**;
+  new osvers/ov 27.2; protovers 1.1; vv 2 -> 1 (TXT, /info, updateInfo).
+- Features: new menuconfig "AirPlay identity (HomePod mini)" with
+  `AIRPLAY_FEATURES_HOMEPOD_MINI` (default y) = exactly
+  features=0x4A7FCA00,0x3C356BD0, fex=AMp/StBrNTwQoa7YDQ (bit 47 gone; 15,
+  16, 17, 21, 25, 27, 36, 39, 43, 45, 50, 53, 61 and the extended bits on).
+  The per-bit menu remains as "AirPlay feature bits (custom)" when it is off.
+- _airplay TXT now: acl, btaddr, c, cmv, deviceid, features, fex, flags,
+  gcgl, gid, [gpn], igl, model, osvers, pi, pk, protovers, psi, srcvers, vv.
+  pi/psi/gid are stable UUIDs from the MAC (psi begins with the device ID,
+  as on HomePods). Group/stereo keys (pgcgl, pgid, tsid, tsm) not published.
+- _raop TXT: ek removed, et=0,3,5 (no RSA), ov added, vv=1.
+- Status flags: `AIRPLAY_STATUS_FLAGS` (default 0x98004 = bits every HomePod
+  shows, without HomeKit bit 10 and group bits) in TXT flags, sf, /info.
+- `GET /info` with qualifier txtAirPlay also returns txtAirPlay; pi and
+  statusFlags in /info and updateInfo are the real values (were zeros / 4).
+- Trace: our own `GET /info reply` and `SETUP reply` bodies; the buffered
+  UDP control port watcher (`ap2_ctrl`) is back; every _airplay TXT key is
+  logged once at boot.
+- Protocol trace options moved to their own menu "AirPlay protocol trace".
+
 # v4.1.68-rt2 (based on v4.1.68-rxdiag-rt)
 
 - Fix: after the first ALAC (realtime) session an AAC SETUP failed -

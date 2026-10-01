@@ -10,6 +10,8 @@
 #include "ptp_clock.h"
 #include "settings.h"
 #include "rtsp_datastream.h"
+#include "rtsp_apap_observer.h"
+#include "ap2_control_watch.h"
 
 
 static int32_t volume_db_to_q15(float volume_db){
@@ -91,13 +93,14 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
     conn->event_socket = -1;
   }
   if (conn->buffered_control_socket >= 0) {
-    close(conn->buffered_control_socket);
-    conn->buffered_control_socket = -1;
+    rtsp_conn_close_buffered_control(conn);
   }
   rtsp_datastream_stop(&conn->media_data_control);
   rtsp_datastream_stop(&conn->remote_control_datastream);
+  rtsp_apap_observer_stop(&conn->apap_observer);
   conn->media_data_control_port = 0;
   conn->remote_control_data_port = 0;
+  conn->apap_port = 0;
 
   // Reset stream state
   conn->stream_active = false;
@@ -140,4 +143,11 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
 
   // Persist at disconnect.
   settings_set_volume(volume_db);
+}
+
+void rtsp_conn_close_buffered_control(rtsp_conn_t *conn) {
+  if (!conn || conn->buffered_control_socket < 0) return;
+  ap2_control_unwatch(conn->buffered_control_socket);
+  close(conn->buffered_control_socket);
+  conn->buffered_control_socket = -1;
 }

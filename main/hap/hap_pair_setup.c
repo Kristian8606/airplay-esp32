@@ -124,6 +124,11 @@ esp_err_t hap_pair_setup_m3(hap_session_t *session, const uint8_t *input,
     }
 
     memcpy(session->shared_secret, srp_key, 32);
+    session->pairing_secret_len =
+        srp_key_len < sizeof(session->pairing_secret)
+            ? srp_key_len
+            : sizeof(session->pairing_secret);
+    memcpy(session->pairing_secret, srp_key, session->pairing_secret_len);
     hap_hkdf_sha512((uint8_t *)"Control-Salt", 12, srp_key, srp_key_len,
                     (uint8_t *)"Control-Read-Encryption-Key", 27,
                     session->encrypt_key, 32);

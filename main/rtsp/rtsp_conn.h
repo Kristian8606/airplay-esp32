@@ -14,6 +14,7 @@
 // Forward declarations
 typedef struct rtsp_conn rtsp_conn_t;
 typedef struct rtsp_datastream rtsp_datastream_t;
+typedef struct rtsp_apap_observer rtsp_apap_observer_t;
 
 /**
  * Connection state struct - consolidates all session state
@@ -31,18 +32,15 @@ struct rtsp_conn {
   // Audio streaming state
   bool stream_active;
   bool stream_paused;
-  // SETRATE/GETANCHOR (receiver-placed anchor, iOS 27.2): SETRATE gives the
-  // RTP time to start from; the receiver chooses when it sounds and reports
-  // that anchor in the GETANCHOR reply.
-  bool setrate_pending;      // SETRATE rate>0 received, anchor not placed
-  bool anchor_placed;        // anchor below is valid for GETANCHOR replies
-  uint32_t setrate_ms;       // when the pending SETRATE arrived (ms since boot)
-  uint32_t anchor_wait_log_ms; // last "GETANCHOR: waiting" log (rate limit)
-  bool getanchor_traced;     // trace shows one GETANCHOR poll per SETRATE
-  uint32_t setrate_rtp;
-  uint64_t anchor_clock_id;
-  uint64_t anchor_ptp_ns;
-  bool anchor_reply_traced;  // protocol trace: first reply per anchor logged
+  /* iOS 27 Buffered APAP MediaDataControl start timeline.  `strt` gives the
+   * media point; `anch` asks the receiver to choose its PTP presentation
+   * point and return it in the DataStream rply. */
+  bool mdc_start_valid;
+  int64_t mdc_media_time_value;
+  int64_t mdc_media_time_scale;
+  bool mdc_anchor_valid;
+  uint64_t mdc_anchor_clock_id;
+  uint64_t mdc_anchor_ptp_ns;
   // Shairport AP2 TEARDOWN semantics: a valid plist without a streams item
   // requests the RTSP connection itself to close after the 200 response.
   bool close_after_response;
@@ -75,8 +73,10 @@ struct rtsp_conn {
    * type-130 RemoteControlOnly RTSP conversation. */
   rtsp_datastream_t *media_data_control;
   rtsp_datastream_t *remote_control_datastream;
+  rtsp_apap_observer_t *apap_observer;
   uint16_t media_data_control_port;
   uint16_t remote_control_data_port;
+  uint16_t apap_port;
 
   /* AirPlay 2 senders that advertise supportsDynamicStreamID expect the
    * receiver to assign a 32-bit streamID in the SETUP response. */
@@ -121,3 +121,7 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn);
  * @param volume_db Volume in dB (0 = max, -144 = mute)
  */
 void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db);
+
+/* Close the buffered stream's UDP control socket (stops its trace watcher
+ * first). No-op when none is open. */
+void rtsp_conn_close_buffered_control(rtsp_conn_t *conn);

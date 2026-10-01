@@ -140,6 +140,8 @@ esp_err_t hap_pair_verify_m3(hap_session_t *session, const uint8_t *input,
                   session->decrypt_key, 32);
   hap_derive_event_keys(session, session->shared_secret, HAP_X25519_KEY_SIZE,
                         true);
+  memcpy(session->pairing_secret, session->shared_secret, HAP_X25519_KEY_SIZE);
+  session->pairing_secret_len = HAP_X25519_KEY_SIZE;
 
   tlv8_encoder_t enc;
   tlv8_encoder_init(&enc, output, output_capacity);
@@ -309,6 +311,8 @@ esp_err_t hap_pair_verify_m3_raw(hap_session_t *session, const uint8_t *input,
    * are mirrored the same way. */
   hap_derive_event_keys(session, session->shared_secret, HAP_X25519_KEY_SIZE,
                         false);
+  memcpy(session->pairing_secret, session->shared_secret, HAP_X25519_KEY_SIZE);
+  session->pairing_secret_len = HAP_X25519_KEY_SIZE;
 
   session->encrypt_nonce = 0;
   session->decrypt_nonce = 0;

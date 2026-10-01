@@ -93,6 +93,42 @@ esp_err_t hap_derive_audio_key(hap_session_t *session, uint8_t *audio_key,
 }
 
 
+esp_err_t hap_derive_datastream_keys_ikm(const uint8_t *ikm, size_t ikm_len,
+                                         uint64_t seed, unsigned variant,
+                                         uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE],
+                                         uint8_t decrypt_key[HAP_CHACHA20_KEY_SIZE]) {
+  if (!ikm || ikm_len == 0 || !encrypt_key || !decrypt_key) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  if ((variant & HAP_DS_VARIANT_IKM32) && ikm_len > 32) ikm_len = 32;
+
+  char salt[64];
+  const int n = (variant & HAP_DS_VARIANT_SIGNED)
+                    ? snprintf(salt, sizeof(salt), "DataStream-Salt%lld",
+                               (long long)(int64_t)seed)
+                    : snprintf(salt, sizeof(salt), "DataStream-Salt%llu",
+                               (unsigned long long)seed);
+  if (n <= 0 || (size_t)n >= sizeof(salt)) {
+    return ESP_ERR_INVALID_SIZE;
+  }
+
+  static const char input_info[] = "DataStream-Input-Encryption-Key";
+  static const char output_info[] = "DataStream-Output-Encryption-Key";
+
+  /* The AirPlay sender opens the TCP connection.  Its output key is our
+   * decrypt key; its input key is our encrypt key (Shairport cipher channel 5). */
+  uint8_t *in_key = (variant & HAP_DS_VARIANT_SWAP) ? decrypt_key : encrypt_key;
+  uint8_t *out_key = (variant & HAP_DS_VARIANT_SWAP) ? encrypt_key : decrypt_key;
+  hap_hkdf_sha512((const uint8_t *)salt, (size_t)n, ikm, ikm_len,
+                  (const uint8_t *)input_info, sizeof(input_info) - 1,
+                  in_key, HAP_CHACHA20_KEY_SIZE);
+  hap_hkdf_sha512((const uint8_t *)salt, (size_t)n, ikm, ikm_len,
+                  (const uint8_t *)output_info, sizeof(output_info) - 1,
+                  out_key, HAP_CHACHA20_KEY_SIZE);
+  sodium_memzero(salt, sizeof(salt));
+  return ESP_OK;
+}
+
 esp_err_t hap_derive_datastream_keys(const hap_session_t *session, uint64_t seed,
                                      uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE],
                                      uint8_t decrypt_key[HAP_CHACHA20_KEY_SIZE]) {
@@ -103,27 +139,13 @@ esp_err_t hap_derive_datastream_keys(const hap_session_t *session, uint64_t seed
     ESP_LOGW(TAG, "Cannot derive DataStream keys before session established");
     return ESP_ERR_INVALID_STATE;
   }
-
-  char salt[64];
-  const int n = snprintf(salt, sizeof(salt), "DataStream-Salt%llu",
-                         (unsigned long long)seed);
-  if (n <= 0 || (size_t)n >= sizeof(salt)) {
-    return ESP_ERR_INVALID_SIZE;
-  }
-
-  static const char input_info[] = "DataStream-Input-Encryption-Key";
-  static const char output_info[] = "DataStream-Output-Encryption-Key";
-
-  /* The AirPlay sender opens the TCP connection.  Its output key is our
-   * decrypt key; its input key is our encrypt key (Shairport cipher channel 5). */
-  hap_hkdf_sha512((const uint8_t *)salt, (size_t)n,
-                  session->shared_secret, sizeof(session->shared_secret),
-                  (const uint8_t *)input_info, sizeof(input_info) - 1,
-                  encrypt_key, HAP_CHACHA20_KEY_SIZE);
-  hap_hkdf_sha512((const uint8_t *)salt, (size_t)n,
-                  session->shared_secret, sizeof(session->shared_secret),
-                  (const uint8_t *)output_info, sizeof(output_info) - 1,
-                  decrypt_key, HAP_CHACHA20_KEY_SIZE);
-  sodium_memzero(salt, sizeof(salt));
-  return ESP_OK;
+  /* Same IKM as the Control keys: after transient pair-setup that is the full
+   * 64-byte SRP session key, not the 32-byte shared_secret copy. */
+  const uint8_t *ikm = session->pairing_secret_len ? session->pairing_secret
+                                                   : session->shared_secret;
+  const size_t ikm_len = session->pairing_secret_len
+                             ? session->pairing_secret_len
+                             : sizeof(session->shared_secret);
+  return hap_derive_datastream_keys_ikm(ikm, ikm_len, seed, 0, encrypt_key,
+                                        decrypt_key);
 }

@@ -51,6 +51,9 @@ bool rtsp_connection_model_parse_audio_setup(
     out->has_stream_connections = true;
     out->stream_connection_rtp = sc_info.has_rtp;
     out->stream_connection_rtcp = sc_info.has_rtcp;
+    out->stream_connection_apap = sc_info.has_apap;
+    out->apap_use_stream_encryption_key =
+        sc_info.apap_use_stream_encryption_key;
     out->stream_connection_media_data_control = sc_info.has_media_data_control;
     out->media_data_control_seed_valid = sc_info.has_media_data_control_seed;
     out->media_data_control_seed = sc_info.media_data_control_seed;

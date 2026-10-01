@@ -35,6 +35,12 @@ typedef struct {
   // Shared secret from X25519
   uint8_t shared_secret[HAP_X25519_KEY_SIZE];
 
+  // Full key material the Control/Events keys were derived from: the 32-byte
+  // X25519 secret after pair-verify, or the whole 64-byte SRP session key
+  // after transient pair-setup.  DataStream keys must use the same IKM.
+  uint8_t pairing_secret[64];
+  size_t pairing_secret_len;
+
   // Derived session keys
   uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE];
   uint8_t decrypt_key[HAP_CHACHA20_KEY_SIZE];
@@ -157,6 +163,20 @@ esp_err_t hap_derive_audio_key(hap_session_t *session, uint8_t *audio_key,
 esp_err_t hap_derive_datastream_keys(const hap_session_t *session, uint64_t seed,
                                      uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE],
                                      uint8_t decrypt_key[HAP_CHACHA20_KEY_SIZE]);
+
+/* Diagnostic variants of the DataStream key derivation, tried only when the
+ * first frame does not authenticate with variant 0 (the default):
+ *   bit0 HAP_DS_VARIANT_SWAP    swap Input/Output keys
+ *   bit1 HAP_DS_VARIANT_IKM32   use only the first 32 bytes of the IKM
+ *   bit2 HAP_DS_VARIANT_SIGNED  salt prints the seed as signed int64 */
+#define HAP_DS_VARIANT_SWAP 0x1
+#define HAP_DS_VARIANT_IKM32 0x2
+#define HAP_DS_VARIANT_SIGNED 0x4
+#define HAP_DS_VARIANT_COUNT 8
+esp_err_t hap_derive_datastream_keys_ikm(const uint8_t *ikm, size_t ikm_len,
+                                         uint64_t seed, unsigned variant,
+                                         uint8_t encrypt_key[HAP_CHACHA20_KEY_SIZE],
+                                         uint8_t decrypt_key[HAP_CHACHA20_KEY_SIZE]);
 
 /**
  * Handle pair-setup M1 (client initiates SRP)

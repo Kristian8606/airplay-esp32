@@ -8,6 +8,7 @@
 #include "hap.h"
 #include "mdns_airplay.h"
 #include "airplay_version.h"
+#include "airplay_identity.h"
 #include "rtsp_handlers.h"
 #include "wifi.h"
 #include "settings.h"
@@ -15,12 +16,6 @@
 static const char *TAG = "mdns_airplay";
 
 // Feature flags are defined in rtsp_handlers.h (shared with /info handler)
-
-// Protocol version
-#define AIRPLAY_PROTOCOL_VERSION "2"
-
-// Flags: 0x4 = audio receiver
-#define AIRPLAY_FLAGS "0x4"
 
 // Metadata types advertised in the "md" txt record:
 //   0 = text (track title/artist/album), 1 = artwork (cover art images),
@@ -65,31 +60,48 @@ static void airplay_txt_values(airplay_txt_values_t *v) {
                     sodium_base64_VARIANT_ORIGINAL_NO_PADDING);
 }
 
-/* Published only when an extended feature bit (64+) is selected. */
+/* The _airplay._tcp keys a HomePod mini on software 27.2 publishes, in its
+ * order (Discovery, 2026-09-30). Group/stereo-pair keys (pgcgl, pgid, tsid,
+ * tsm) describe membership in a HomePod group and are not published. */
+#define AIRPLAY_TXT_MAX_ITEMS 24
+static size_t airplay_txt_items(const airplay_txt_values_t *v,
+                                mdns_txt_item_t *items) {
+  size_t n = 0;
+#define TXT(k, val) items[n++] = (mdns_txt_item_t){(k), (val)}
+  TXT("acl", "0");
+  TXT("btaddr", airplay_identity_btaddr());
+  TXT("c", CONFIG_AIRPLAY_TXT_COLOR);
+  TXT("cmv", "2");
+  TXT("deviceid", v->device_id);
+  TXT("features", v->features);
 #if AIRPLAY_FEATURES_EX != 0
-#define AIRPLAY_TXT_FEX(v) {"fex", (v).fex},
-#else
-#define AIRPLAY_TXT_FEX(v)
+  TXT("fex", v->fex);
 #endif
-
-#define AIRPLAY_TXT_ITEMS(v)                                             \
-  {                                                                      \
-    {"deviceid", (v).device_id}, {"features", (v).features},             \
-        AIRPLAY_TXT_FEX(v)                                               \
-        {"flags", AIRPLAY_FLAGS}, {"model", AIRPLAY_MODEL},              \
-        {"pk", (v).pk},                                                  \
-        {"pi", "00000000-0000-0000-0000-000000000000"},                  \
-        {"srcvers", AIRPLAY_SOURCE_VERSION},                             \
-        {"vv", AIRPLAY_PROTOCOL_VERSION}, {"acl", "0"},                  \
-  }
+  TXT("flags", airplay_identity_flags_str());
+  TXT("gcgl", "1");
+  TXT("gid", airplay_identity_gid());
+  if (CONFIG_AIRPLAY_TXT_GROUP_NAME[0]) TXT("gpn", CONFIG_AIRPLAY_TXT_GROUP_NAME);
+  TXT("igl", "1");
+  TXT("model", AIRPLAY_MODEL);
+  TXT("osvers", AIRPLAY_OS_VERSION);
+  TXT("pi", airplay_identity_pi());
+  TXT("pk", v->pk);
+  TXT("protovers", AIRPLAY_PROTOVERS);
+  TXT("psi", airplay_identity_psi());
+  TXT("srcvers", AIRPLAY_SOURCE_VERSION);
+  TXT("vv", AIRPLAY_VV_STR);
+#undef TXT
+  return n;
+}
 
 size_t mdns_airplay_txt_record_data(uint8_t *out, size_t capacity) {
   if (!out) return 0;
   airplay_txt_values_t v;
   airplay_txt_values(&v);
-  const mdns_txt_item_t items[] = AIRPLAY_TXT_ITEMS(v);
+  mdns_txt_item_t items[AIRPLAY_TXT_MAX_ITEMS];
+  const size_t count = airplay_txt_items(&v, items);
   size_t pos = 0;
-  for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); ++i) {
+  for (size_t i = 0; i < count; ++i) {
     const size_t klen = strlen(items[i].key);
     const size_t vlen = strlen(items[i].value);
     const size_t len = klen + 1 + vlen;
@@ -138,13 +150,19 @@ void mdns_airplay_init(void) {
   // ========================================
   // _airplay._tcp service (port 7000)
   // ========================================
+  airplay_identity_init();
   airplay_txt_values_t txt_values;
   airplay_txt_values(&txt_values);
-  mdns_txt_item_t airplay_txt[] = AIRPLAY_TXT_ITEMS(txt_values);
+  mdns_txt_item_t airplay_txt[AIRPLAY_TXT_MAX_ITEMS];
+  const size_t airplay_txt_count = airplay_txt_items(&txt_values, airplay_txt);
+  /* One line per key: compare 1:1 with a HomePod in Discovery. */
+  for (size_t i = 0; i < airplay_txt_count; ++i) {
+    ESP_LOGI(TAG, "_airplay TXT %s=%s", airplay_txt[i].key, airplay_txt[i].value);
+  }
 
   esp_err_t err =
       mdns_service_add(device_name, "_airplay", "_tcp", 7000, airplay_txt,
-                       sizeof(airplay_txt) / sizeof(airplay_txt[0]));
+                       airplay_txt_count);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to add _airplay._tcp service: %s",
              esp_err_to_name(err));
@@ -155,24 +173,23 @@ void mdns_airplay_init(void) {
   // RAOP = Remote Audio Output Protocol
   // Service name format: <MAC>@<DeviceName>
   // ========================================
-  // Dual-mode: include et=1 (RSA) so RAOP-only clients (TuneBlade, AirMusic,
-  // shairtunes2, etc.) accept the advertisement, while keeping et=3,5 for
-  // AirPlay 2 FairPlay/MFi-SAP. ek=1 advertises that an RSA-encrypted key
-  // can be supplied via SDP rsaaeskey: at ANNOUNCE time.
+  // The _raop._tcp keys of a HomePod mini on software 27.2: no ek, no RSA
+  // (et=0,3,5), plus ov. The HomePod has md=0,1,2; artwork ("1") follows
+  // CONFIG_ENABLE_AIRPLAY_ARTWORK (see AIRPLAY_METADATA_TYPES).
   mdns_txt_item_t raop_txt[] = {
       {"am", AIRPLAY_MODEL},
       {"cn", "0,1,2,3"},              // Audio codecs: PCM, ALAC, AAC, AAC-ELD
       {"da", "true"},                 // Digest auth
-      {"ek", "1"},                    // Encryption key available (RSA)
-      {"et", "0,1,3,5"},              // Encryption types
+      {"et", "0,3,5"},                // Encryption types
       {"ft", features_str},           // Features (same as airplay)
       {"md", AIRPLAY_METADATA_TYPES}, // Metadata types
+      {"ov", AIRPLAY_OS_VERSION},
       {"pk", pk_str},                 // Public key
-      {"sf", AIRPLAY_FLAGS},          // Status flags
+      {"sf", airplay_identity_flags_str()}, // Status flags
       {"tp", "UDP"},                  // Transport protocol
       {"vn", "65537"},                // Version number
       {"vs", AIRPLAY_SOURCE_VERSION},
-      {"vv", AIRPLAY_PROTOCOL_VERSION},
+      {"vv", AIRPLAY_VV_STR},
   };
 
   esp_err_t err_raop =

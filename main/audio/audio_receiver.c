@@ -258,6 +258,8 @@ typedef struct {
   uint16_t port;
   volatile bool engine_running;
   volatile bool rx_running;
+  volatile bool external_buffered_active;
+  volatile bool external_eq_reset_requested;
 
   SemaphoreHandle_t publish_mutex; /* producers/FLUSH only; never I2S */
   ap2_buffered_fifo_t *transport;
@@ -426,6 +428,35 @@ static void buffered_control_reset(void) {
   s_buffered_control.immediate_until_rtp = 0;
   memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
   xSemaphoreGive(s_buffered_control.mutex);
+}
+
+/* Arm/refresh an immediate FLUSH while s_buffered_control.mutex is held.
+ *
+ * Apple can emit a concrete fshb endpoint followed immediately by one or more
+ * marker-style fshb messages whose flushUntilSeq is 0.  Apple's SBAR layer can
+ * reset its downstream queues for every request; our architecture instead has
+ * a multi-megabyte raw compressed FIFO that can contain old and future media at
+ * the same time.  Once we have a concrete sequence boundary for that FIFO, a
+ * later seq-0 marker must not erase it or stale compressed packets can remain at
+ * the head indefinitely.  A later concrete endpoint still replaces a seq-0
+ * fallback (and another concrete endpoint replaces the previous concrete one).
+ *
+ * Returns true when the stored endpoint was updated, false when a seq-0 marker
+ * deliberately preserved an already-armed concrete endpoint. */
+static bool buffered_control_arm_immediate_locked(uint32_t until_seq,
+                                                  uint32_t until_rtp,
+                                                  bool until_seq_valid) {
+  if (!until_seq_valid && s_buffered_control.immediate_active &&
+      !s_buffered_control.immediate_by_ts) {
+    return false;
+  }
+
+  s_buffered_control.immediate_active = true;
+  __atomic_store_n(&s_buffered_control.immediate_by_ts, !until_seq_valid,
+                   __ATOMIC_RELEASE);
+  s_buffered_control.immediate_until_seq = until_seq & 0x007fffffU;
+  s_buffered_control.immediate_until_rtp = until_rtp;
+  return true;
 }
 
 /* Lock-free hint for the processor: is a timestamp-mode FLUSH armed? Only
@@ -3460,6 +3491,193 @@ void audio_receiver_set_stream_type(audio_stream_type_t t) {
   if (changed) audio_status_notify();
 }
 
+
+static bool media_time_to_sample_index(int64_t value, uint32_t scale,
+                                       int sample_rate, uint32_t *out) {
+  if (!out || scale == 0U || sample_rate <= 0 || value < 0) return false;
+
+  /* Xtensa/ESP32-S3 has no __int128.  Split the rational conversion so we
+   * never need the potentially overflowing value * sample_rate product:
+   *
+   *   floor(value * sr / scale)
+   *     = (value / scale) * sr
+   *       + floor((value % scale) * sr / scale)
+   *
+   * The PCM/RTP ring is intentionally addressed modulo 2^32, so only the
+   * low 32 bits of the whole-sample term are required.  The remainder term
+   * is bounded by (UINT32_MAX-1) * INT_MAX and fits in uint64_t.
+   */
+  const uint64_t uvalue = (uint64_t)value;
+  const uint64_t whole = uvalue / (uint64_t)scale;
+  const uint64_t rem = uvalue % (uint64_t)scale;
+  const uint64_t sr = (uint64_t)(uint32_t)sample_rate;
+
+  const uint64_t whole_low =
+      ((whole & 0xffffffffULL) * sr) & 0xffffffffULL;
+  const uint64_t frac = (rem * sr) / (uint64_t)scale;
+
+  *out = (uint32_t)(whole_low + (frac & 0xffffffffULL));
+  return true;
+}
+
+esp_err_t audio_receiver_start_external_buffered(void) {
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  if (strcmp(snap.format.codec, "AAC") != 0 ||
+      snap.format.sample_rate != 44100 || snap.format.channels != 2 ||
+      snap.format.bits_per_sample != 16 || snap.format.frame_size != 1024) {
+    ESP_LOGE(TAG,
+             "External buffered format rejected codec=%s sr=%d ch=%d bits=%d frame=%d",
+             snap.format.codec, snap.format.sample_rate, snap.format.channels,
+             snap.format.bits_per_sample, snap.format.frame_size);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+  if (!audio_receiver_is_initialized()) {
+    ESP_RETURN_ON_ERROR(audio_receiver_init(), TAG,
+                        "external buffered audio init failed");
+  }
+  if (!realtime_stage_stop_and_wait()) return ESP_ERR_INVALID_STATE;
+  if (!realtime_receiver_is_idle()) {
+    ESP_LOGE(TAG, "external buffered start refused: realtime receiver active");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  buffered_control_reset();
+  if (s.transport) ap2_buffered_fifo_clear(s.transport);
+  xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
+  (void)reset_buffered_pcm_store();
+  xSemaphoreGive(s.publish_mutex);
+  taskENTER_CRITICAL(&s.state_mux);
+  s.external_buffered_active = true;
+  s.playing = false;
+  taskEXIT_CRITICAL(&s.state_mux);
+  __atomic_store_n(&s.external_eq_reset_requested, true, __ATOMIC_RELEASE);
+  mark_timeline_discontinuity();
+  ESP_LOGI(TAG, "External buffered APAP pipeline ready");
+  return ESP_OK;
+}
+
+void audio_receiver_external_buffered_flush(void) {
+  if (!__atomic_load_n(&s.external_buffered_active, __ATOMIC_ACQUIRE)) {
+    audio_receiver_seek_flush();
+    return;
+  }
+  xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
+  (void)reset_buffered_pcm_store();
+  xSemaphoreGive(s.publish_mutex);
+  __atomic_store_n(&s.external_eq_reset_requested, true, __ATOMIC_RELEASE);
+  mark_timeline_discontinuity();
+  ESP_LOGI(TAG, "External buffered APAP flush: PCM generation reset");
+}
+
+bool audio_receiver_set_media_anchor(uint64_t clock_id, uint64_t network_time_ns,
+                                     int64_t media_time_value,
+                                     uint32_t media_time_scale) {
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+  uint32_t sample_index = 0;
+  if (!media_time_to_sample_index(media_time_value, media_time_scale, sr,
+                                  &sample_index)) {
+    ESP_LOGW(TAG, "APAP anchor rejected mediaTime=%lld/%u sr=%d",
+             (long long)media_time_value, (unsigned)media_time_scale, sr);
+    return false;
+  }
+  audio_receiver_set_anchor_time(clock_id, network_time_ns, sample_index);
+  audio_receiver_set_playing(true);
+  ESP_LOGI(TAG,
+           "APAP MEDIA ANCHOR media=%lld/%u -> sample=%" PRIu32
+           " ptp=%" PRIu64,
+           (long long)media_time_value, (unsigned)media_time_scale,
+           sample_index, network_time_ns);
+  return true;
+}
+
+bool audio_receiver_publish_timed_pcm(int64_t media_time_value,
+                                      uint32_t media_time_scale,
+                                      int16_t *pcm, size_t frames,
+                                      int channels) {
+  if (!pcm || frames == 0 || frames > PCM_RTP_SLOT_FRAMES || channels != 2)
+    return false;
+  if (!__atomic_load_n(&s.external_buffered_active, __ATOMIC_ACQUIRE))
+    return false;
+
+  timing_snapshot_t first;
+  snapshot_state(&first);
+  const int sr = first.format.sample_rate > 0 ? first.format.sample_rate : 44100;
+  uint32_t sample_index = 0;
+  if (!media_time_to_sample_index(media_time_value, media_time_scale, sr,
+                                  &sample_index)) {
+    return false;
+  }
+  const uint32_t pcm_generation = first.pcm_generation;
+
+  while (__atomic_load_n(&s.external_buffered_active, __ATOMIC_ACQUIRE) &&
+         s.engine_running) {
+    timing_snapshot_t snap;
+    snapshot_state(&snap);
+    if (snap.stream_type != AUDIO_STREAM_BUFFERED ||
+        snap.pcm_generation != pcm_generation) {
+      return false;
+    }
+    if (!snap.playing || !snap.anchor_valid || snap.timeline_reset_pending ||
+        !timing_clock_ready(&snap)) {
+      vTaskDelay(1);
+      continue;
+    }
+
+    uint32_t wanted = 0;
+    if (!wanted_rtp_now(&snap, &wanted)) {
+      vTaskDelay(1);
+      continue;
+    }
+    const int32_t max_lead =
+        (int32_t)(((int64_t)sr * AP2_BUFFERED_LEAD_MS) / 1000LL);
+    const int32_t lead = rtp_delta(sample_index, wanted);
+    if (lead >= max_lead) {
+      uint32_t wait_ms =
+          (uint32_t)(((uint64_t)frames * 1000ULL) / (uint64_t)sr);
+      if (wait_ms == 0U) wait_ms = 1U;
+      vTaskDelay(pdMS_TO_TICKS(wait_ms));
+      continue;
+    }
+    if (rtp_delta(sample_index + (uint32_t)frames, wanted) <= 0) {
+      return false;
+    }
+
+    if (__atomic_exchange_n(&s.external_eq_reset_requested, false,
+                            __ATOMIC_ACQ_REL)) {
+      audio_eq_reset_state();
+      /* Advance AAC/MDCT history but keep the first post-boundary output
+       * silent, matching the existing Shairport-style AAC path. */
+      memset(pcm, 0, frames * (size_t)channels * sizeof(int16_t));
+    }
+    pcm_process_common_eq(pcm, frames, channels, sr);
+
+    xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
+    timing_snapshot_t check;
+    snapshot_state(&check);
+    bool stored = false;
+    if (__atomic_load_n(&s.external_buffered_active, __ATOMIC_ACQUIRE) &&
+        check.stream_type == AUDIO_STREAM_BUFFERED &&
+        check.pcm_generation == pcm_generation &&
+        check.playing && check.anchor_valid && !check.timeline_reset_pending) {
+      uint32_t now_wanted = 0;
+      const bool wanted_valid = wanted_rtp_now(&check, &now_wanted);
+      stored = pcm_rtp_ring_write(s.pcm_ring, sample_index, pcm, frames,
+                                  channels, pcm_generation, now_wanted,
+                                  wanted_valid);
+    }
+    xSemaphoreGive(s.publish_mutex);
+    if (stored) {
+      playout_wake();
+      return true;
+    }
+    vTaskDelay(1);
+  }
+  return false;
+}
+
 esp_err_t audio_receiver_start_buffered(uint16_t port) {
   timing_snapshot_t fmt_snap;
   snapshot_state(&fmt_snap);
@@ -3640,6 +3858,7 @@ void audio_receiver_stop(void) {
   s.realtime_stage_cursor_valid = false;
   taskEXIT_CRITICAL(&s.state_mux);
   s.rx_running = false;
+  __atomic_store_n(&s.external_buffered_active, false, __ATOMIC_RELEASE);
   ap2_buffered_fifo_notify(s.transport);
 
   taskENTER_CRITICAL(&s.state_mux);
@@ -3804,11 +4023,15 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts,
   xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
   xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
   AUDIO_DIAG_FLUSH_IMMEDIATE_PUBLISH_ACQUIRED();
-  s_buffered_control.immediate_active = true;
-  __atomic_store_n(&s_buffered_control.immediate_by_ts, !until_seq_valid,
-                   __ATOMIC_RELEASE);
-  s_buffered_control.immediate_until_seq = until_seq & 0x007fffffU;
-  s_buffered_control.immediate_until_rtp = until_ts;
+  const bool endpoint_updated = buffered_control_arm_immediate_locked(
+      until_seq, until_ts, until_seq_valid);
+  if (!endpoint_updated) {
+    ESP_LOGI(TAG,
+             "AAC FLUSH seq=0 marker rtp=%" PRIu32
+             " preserves pending seq target=%" PRIu32 " rtp=%" PRIu32,
+             until_ts, s_buffered_control.immediate_until_seq,
+             s_buffered_control.immediate_until_rtp);
+  }
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);

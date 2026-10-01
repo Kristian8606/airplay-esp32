@@ -24,6 +24,8 @@ typedef struct {
   bool has_stream_connections;
   bool stream_connection_rtp;
   bool stream_connection_rtcp;
+  bool stream_connection_apap;
+  bool apap_use_stream_encryption_key;
   bool stream_connection_media_data_control;
   bool media_data_control_seed_valid;
   uint64_t media_data_control_seed;

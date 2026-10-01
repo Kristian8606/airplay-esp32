@@ -58,6 +58,32 @@ void audio_receiver_set_stream_type(audio_stream_type_t type);
 esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
                                       uint16_t tcp_port);
 esp_err_t audio_receiver_start_buffered(uint16_t tcp_port);
+
+
+/* Buffered APAP uses the receiver's existing PCM/EQ/PTP playout pipeline but
+ * supplies already-framed/decrypted AAC externally instead of the legacy raw
+ * RTP/TCP byte FIFO. */
+esp_err_t audio_receiver_start_external_buffered(void);
+
+/* Publish one decoded APAP PCM access unit using its media timestamp as the
+ * PCM-ring address. The buffer is modified in place by the common EQ path.
+ * Returns true when PCM was published, false when it was deliberately dropped
+ * (late/stale/timeline changed) or the external buffered path is inactive. */
+bool audio_receiver_publish_timed_pcm(int64_t media_time_value,
+                                      uint32_t media_time_scale,
+                                      int16_t *pcm, size_t frames,
+                                      int channels);
+
+/* Receiver-chosen APAP anchor. mediaTime is converted into the stream sample
+ * domain and then uses the normal buffered RTP<->PTP scheduler unchanged. */
+bool audio_receiver_set_media_anchor(uint64_t clock_id, uint64_t network_time_ns,
+                                     int64_t media_time_value,
+                                     uint32_t media_time_scale);
+
+/* APAP FLUSH/track boundary: invalidate current presentation timing and the
+ * finite PCM cache. The actual AAC decoder remains transport-owned so codec
+ * history can survive ordinary continuity where appropriate. */
+void audio_receiver_external_buffered_flush(void);
 void audio_receiver_stop(void);
 uint16_t audio_receiver_get_buffered_port(void);
 

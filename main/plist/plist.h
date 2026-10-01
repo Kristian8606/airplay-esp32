@@ -220,6 +220,8 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
 typedef struct {
   bool has_rtp;
   bool has_rtcp;
+  bool has_apap;
+  bool apap_use_stream_encryption_key;
   bool has_media_data_control;
   bool has_media_data_control_seed;
   uint64_t media_data_control_seed;
@@ -357,6 +359,8 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  uint32_t stream_id, bool include_stream_id,
                                  bool stream_connection_rtp,
                                  bool stream_connection_rtcp,
+                                 bool stream_connection_apap,
+                                 uint16_t apap_port,
                                  bool stream_connection_mdc,
                                  uint16_t media_data_control_port,
                                  uint64_t media_data_control_seed);
@@ -397,7 +401,10 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_name, const char *model,
                                   const uint8_t *public_key,
                                   size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version);
+                                  int64_t protocol_version,
+                                  uint64_t status_flags,
+                                  const char *pairing_id, const uint8_t *txt,
+                                  size_t txt_len);
 
 /**
  * Build the AirPlay 2 event-channel "updateInfo" plist, as Shairport Sync
@@ -410,7 +417,8 @@ size_t bplist_build_update_info(uint8_t *out, size_t capacity,
                                 const char *device_id, const char *device_name,
                                 const char *model, const uint8_t *public_key,
                                 size_t public_key_len, uint64_t features,
-                                int64_t protocol_version, const uint8_t *txt,
+                                int64_t protocol_version, uint64_t status_flags,
+                                const char *pairing_id, const uint8_t *txt,
                                 size_t txt_len);
 
 /**
@@ -424,12 +432,17 @@ size_t bplist_describe(const uint8_t *plist, size_t plist_len, char *out,
                        size_t out_capacity);
 
 /**
- * GETANCHOR reply (receiver-placed anchor): { rate, rtpTime, networkTimeSecs,
+ * Generic rate/anchor response dictionary: { rate, rtpTime, networkTimeSecs,
  * networkTimeFrac, networkTimeFlags, networkTimeTimelineID } with the same
- * encoding the sender uses in SETRATEANCHORTIME (frac = 2^-64 s units,
+ * field encoding used by AirPlay buffered rate/anchor control (frac = 2^-64 s units,
  * timeline id = PTP clock id as a 64-bit integer).
  * @return Length of generated bplist, or 0 on error
  */
+/** Build a flat dictionary of string keys to integer values. */
+size_t bplist_build_int_dict(uint8_t *out, size_t capacity,
+                             const char *const *keys, const uint64_t *values,
+                             size_t count);
+
 size_t bplist_build_anchor(uint8_t *out, size_t capacity, uint64_t rate,
                            uint64_t rtp_time, uint64_t network_time_secs,
                            uint64_t network_time_frac, uint64_t flags,
