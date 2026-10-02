@@ -12,6 +12,10 @@
 
 // Maximum size of an encrypted block
 #define RTSP_ENCRYPTED_BLOCK_MAX 0x400
+#define RTSP_SEND_BUDGET_US INT64_C(2000000)
+
+int rtsp_socket_send_all(int socket, const uint8_t *data, size_t len,
+                         int64_t deadline_us);
 
 /**
  * Read and decrypt a block from socket
@@ -21,7 +25,7 @@
  * @param conn Connection state (must have hap_session and encrypted_mode)
  * @param buffer Output buffer for decrypted data
  * @param buffer_size Size of output buffer
- * @return Decrypted length on success, -1 on error
+ * @return Decrypted length on success; -1 is terminal (never retry by errno)
  */
 int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
                            size_t buffer_size);

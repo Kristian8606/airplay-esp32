@@ -1,12 +1,15 @@
 #include "rtsp_message.h"
 
 #include <stdio.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "rtsp_crypto.h"
 
 static const char *TAG = "rtsp_message";
@@ -30,14 +33,33 @@ int rtsp_parse_cseq(const char *request) {
 }
 
 int rtsp_parse_content_length(const char *request) {
-  const char *cl = strstr(request, "Content-Length:");
-  if (!cl) {
-    cl = strstr(request, "content-length:");
+  if (!request) return -1;
+  const char *line = strstr(request, "\r\n");
+  if (!line) return 0;
+  line += 2;
+  int length = 0;
+  bool found = false;
+  while (*line && !(line[0] == '\r' && line[1] == '\n')) {
+    const char *end = strstr(line, "\r\n");
+    if (!end) return -1;
+    if ((size_t)(end - line) >= 15 &&
+        strncasecmp(line, "Content-Length:", 15) == 0) {
+      if (found) return -1;
+      const char *value = line + 15;
+      while (value < end && (*value == ' ' || *value == '\t')) value++;
+      if (value == end || *value < '0' || *value > '9') return -1;
+      errno = 0;
+      char *number_end;
+      long parsed = strtol(value, &number_end, 10);
+      if (errno == ERANGE || parsed > INT_MAX || number_end > end) return -1;
+      while (number_end < end && (*number_end == ' ' || *number_end == '\t')) number_end++;
+      if (number_end != end) return -1;
+      length = (int)parsed;
+      found = true;
+    }
+    line = end + 2;
   }
-  if (cl) {
-    return (int)strtol(cl + 15, NULL, 10);
-  }
-  return 0;
+  return length;
 }
 
 const uint8_t *rtsp_get_body(const char *request, size_t request_len,
@@ -128,7 +150,9 @@ int rtsp_request_parse(const uint8_t *data, size_t len, rtsp_request_t *req) {
   req->cseq = rtsp_parse_cseq((const char *)data);
 
   // Parse Content-Length
-  req->content_length = (size_t)rtsp_parse_content_length((const char *)data);
+  int content_length = rtsp_parse_content_length((const char *)data);
+  if (content_length < 0) return -1;
+  req->content_length = (size_t)content_length;
 
   // Parse Content-Type
   const char *ct = strstr((const char *)data, "Content-Type:");
@@ -139,19 +163,6 @@ int rtsp_request_parse(const uint8_t *data, size_t len, rtsp_request_t *req) {
   // Get body
   req->body = rtsp_get_body((const char *)data, len, &req->body_len);
 
-  return 0;
-}
-
-// Internal: send all data, handling partial sends
-static int send_all(int socket, const uint8_t *data, size_t len) {
-  size_t sent = 0;
-  while (sent < len) {
-    ssize_t r = send(socket, data + sent, len - sent, 0);
-    if (r <= 0) {
-      return -1;
-    }
-    sent += (size_t)r;
-  }
   return 0;
 }
 
@@ -197,6 +208,11 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
                           status_code, status_text, cseq);
   }
 
+  if (header_len < 0 || (size_t)header_len >= sizeof(header) ||
+      body_len > SIZE_MAX - (size_t)header_len || (!body && body_len)) {
+    return -1;
+  }
+
   // Build complete response
   size_t total_len = (size_t)header_len + body_len;
   uint8_t *response = malloc(total_len);
@@ -215,13 +231,18 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
   if (conn && conn->encrypted_mode) {
     result = rtsp_crypto_write_frame(socket, conn, response, total_len);
   } else {
-    result = (send_all(socket, response, total_len) < 0) ? -1 : 0;
+    result = (rtsp_socket_send_all(socket, response, total_len,
+                             esp_timer_get_time() + RTSP_SEND_BUDGET_US) < 0) ? -1 : 0;
     if (result < 0) {
       ESP_LOGE(TAG, "Failed to send RTSP response");
     }
   }
 
   free(response);
+  if (result < 0) {
+    if (conn) conn->close_after_response = true;
+    shutdown(socket, SHUT_RDWR);
+  }
   return result;
 }
 
@@ -242,6 +263,11 @@ int rtsp_send_http_response(int socket, rtsp_conn_t *conn, int status_code,
                             "\r\n",
                             status_code, status_text, content_type, body_len);
 
+  if (header_len < 0 || (size_t)header_len >= sizeof(header) ||
+      body_len > SIZE_MAX - (size_t)header_len || (!body && body_len)) {
+    return -1;
+  }
+
   // Build complete response
   size_t total_len = (size_t)header_len + body_len;
   uint8_t *response = malloc(total_len);
@@ -260,12 +286,17 @@ int rtsp_send_http_response(int socket, rtsp_conn_t *conn, int status_code,
   if (conn && conn->encrypted_mode) {
     result = rtsp_crypto_write_frame(socket, conn, response, total_len);
   } else {
-    result = (send_all(socket, response, total_len) < 0) ? -1 : 0;
+    result = (rtsp_socket_send_all(socket, response, total_len,
+                             esp_timer_get_time() + RTSP_SEND_BUDGET_US) < 0) ? -1 : 0;
     if (result < 0) {
       ESP_LOGE(TAG, "Failed to send HTTP response");
     }
   }
 
   free(response);
+  if (result < 0) {
+    if (conn) conn->close_after_response = true;
+    shutdown(socket, SHUT_RDWR);
+  }
   return result;
 }

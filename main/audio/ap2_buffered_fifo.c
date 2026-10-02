@@ -38,7 +38,6 @@ struct ap2_buffered_fifo {
 
 
   SemaphoreHandle_t fifo_mutex;
-  SemaphoreHandle_t not_empty;
   SemaphoreHandle_t not_full;
   SemaphoreHandle_t control_wake;
 
@@ -66,7 +65,6 @@ static uint32_t next_epoch(ap2_buffered_fifo_t *fifo) {
 
 static void signal_all(ap2_buffered_fifo_t *fifo) {
   if (!fifo) return;
-  if (fifo->not_empty) xSemaphoreGive(fifo->not_empty);
   if (fifo->not_full) xSemaphoreGive(fifo->not_full);
   if (fifo->control_wake) xSemaphoreGive(fifo->control_wake);
 }
@@ -92,74 +90,20 @@ static void fifo_discard_all(ap2_buffered_fifo_t *fifo) {
   signal_all(fifo);
 }
 
-static bool fifo_read_exact(ap2_buffered_fifo_t *fifo, uint8_t *dst,
-                            size_t len, uint32_t expected_epoch) {
-  size_t copied = 0;
-  while (copied < len && fifo->running) {
-    if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) != expected_epoch)
-      return false;
-
-    xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
-    if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) != expected_epoch) {
-      xSemaphoreGive(fifo->fifo_mutex);
-      return false;
-    }
-    if (fifo->occupancy == 0U) {
-      const bool connected = fifo->connected;
-      xSemaphoreGive(fifo->fifo_mutex);
-      if (!connected) return false;
-      (void)xSemaphoreTake(fifo->not_empty, pdMS_TO_TICKS(20));
-      continue;
-    }
-
-    size_t n = len - copied;
-    if (n > fifo->occupancy) n = fifo->occupancy;
-    const size_t to_end = fifo->capacity - fifo->read_pos;
-    if (n > to_end) n = to_end;
-    memcpy(dst + copied, fifo->buffer + fifo->read_pos, n);
-    fifo->read_pos += n;
-    if (fifo->read_pos == fifo->capacity) fifo->read_pos = 0;
-    fifo->occupancy -= n;
-    fifo->total_read += n;
-    xSemaphoreGive(fifo->fifo_mutex);
-    copied += n;
-    xSemaphoreGive(fifo->not_full);
-  }
-  return copied == len;
-}
-
-static bool wait_for_connected_epoch(ap2_buffered_fifo_t *fifo,
-                                     uint32_t *epoch) {
-  while (fifo->running) {
-    xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
-    const bool connected = fifo->connected;
-    const size_t occupancy = fifo->occupancy;
-    const uint32_t ep =
-        __atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE);
-    xSemaphoreGive(fifo->fifo_mutex);
-    if (connected || occupancy != 0U) {
-      *epoch = ep;
-      return true;
-    }
-    (void)xSemaphoreTake(fifo->not_empty, pdMS_TO_TICKS(20));
-  }
-  return false;
-}
-
 static void tcp_reader_task(void *arg) {
   ap2_buffered_fifo_t *fifo = (ap2_buffered_fifo_t *)arg;
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_TCP_READER,
                                     xPortGetCoreID(), fifo->task_priority, 0U);
 
-  while (fifo->running) {
+  while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
     struct sockaddr_storage addr;
     socklen_t alen = sizeof(addr);
     int c = accept(fifo->listen_sock, (struct sockaddr *)&addr, &alen);
     if (c < 0) {
-      if (fifo->running && errno != EAGAIN && errno != EWOULDBLOCK &&
+      if (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE) && errno != EAGAIN && errno != EWOULDBLOCK &&
           errno != EINTR)
         ESP_LOGW(TAG, "accept errno=%d", errno);
-      if (fifo->running) vTaskDelay(pdMS_TO_TICKS(20));
+      if (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
 
@@ -179,7 +123,7 @@ static void tcp_reader_task(void *arg) {
              (unsigned)(fifo->capacity / 1024U));
     signal_all(fifo);
 
-    while (fifo->running) {
+    while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
       size_t write_pos = 0;
       size_t request = 0;
       uint32_t write_epoch = 0;
@@ -216,7 +160,7 @@ static void tcp_reader_task(void *arg) {
       }
       const bool have_time_to_sleep = fifo->occupancy > FIFO_PACE_THRESHOLD;
       xSemaphoreGive(fifo->fifo_mutex);
-      xSemaphoreGive(fifo->not_empty);
+      xSemaphoreGive(fifo->control_wake);
 
       if (have_time_to_sleep) {
         TickType_t ticks = pdMS_TO_TICKS(FIFO_PACE_SLEEP_MS);
@@ -264,10 +208,9 @@ esp_err_t ap2_buffered_fifo_create_with_storage(
   fifo->client_sock = -1;
   fifo->stream_epoch = 1U;
   fifo->fifo_mutex = xSemaphoreCreateMutex();
-  fifo->not_empty = xSemaphoreCreateBinary();
   fifo->not_full = xSemaphoreCreateBinary();
   fifo->control_wake = xSemaphoreCreateBinary();
-  if (!fifo->fifo_mutex || !fifo->not_empty || !fifo->not_full ||
+  if (!fifo->fifo_mutex || !fifo->not_full ||
       !fifo->control_wake) {
     (void)ap2_buffered_fifo_destroy(fifo);
     return ESP_ERR_NO_MEM;
@@ -281,14 +224,13 @@ esp_err_t ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo) {
   if (fifo->fifo_mutex) {
     ap2_buffered_fifo_stop(fifo);
   } else {
-    fifo->running = false;
+    __atomic_store_n(&fifo->running, false, __ATOMIC_RELEASE);
   }
   if (__atomic_load_n(&fifo->reader_task, __ATOMIC_ACQUIRE)) {
     ESP_LOGE(TAG, "destroy refused: TCP reader still active");
     return ESP_ERR_TIMEOUT;
   }
   if (fifo->fifo_mutex) vSemaphoreDelete(fifo->fifo_mutex);
-  if (fifo->not_empty) vSemaphoreDelete(fifo->not_empty);
   if (fifo->not_full) vSemaphoreDelete(fifo->not_full);
   if (fifo->control_wake) vSemaphoreDelete(fifo->control_wake);
   free(fifo);
@@ -299,7 +241,7 @@ esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
                                   uint16_t requested_port,
                                   uint16_t *bound_port) {
   if (!fifo) return ESP_ERR_INVALID_ARG;
-  if (fifo->running) {
+  if (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
     if (bound_port) *bound_port = fifo->port;
     return ESP_OK;
   }
@@ -311,11 +253,11 @@ esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
       socket_utils_bind_tcp_listener(requested_port, 1, true, &bound);
   if (fifo->listen_sock < 0) return ESP_FAIL;
   fifo->port = bound;
-  fifo->running = true;
+  __atomic_store_n(&fifo->running, true, __ATOMIC_RELEASE);
   if (xTaskCreatePinnedToCore(tcp_reader_task, "aac_fifo_rx", fifo->task_stack,
                               fifo, fifo->task_priority, &fifo->reader_task,
                               fifo->task_core) != pdPASS) {
-    fifo->running = false;
+    __atomic_store_n(&fifo->running, false, __ATOMIC_RELEASE);
     close(fifo->listen_sock);
     fifo->listen_sock = -1;
     return ESP_FAIL;
@@ -326,7 +268,7 @@ esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
 
 void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
   if (!fifo) return;
-  fifo->running = false;
+  __atomic_store_n(&fifo->running, false, __ATOMIC_RELEASE);
 
   int client = -1;
   xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
@@ -341,20 +283,21 @@ void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
   xSemaphoreGive(fifo->fifo_mutex);
   signal_all(fifo);
 
-  if (fifo->listen_sock >= 0) {
-    shutdown(fifo->listen_sock, SHUT_RDWR);
-    close(fifo->listen_sock);
-    fifo->listen_sock = -1;
-  }
+  if (fifo->listen_sock >= 0) shutdown(fifo->listen_sock, SHUT_RDWR);
   for (int i = 0;
        __atomic_load_n(&fifo->reader_task, __ATOMIC_ACQUIRE) && i < 100; ++i)
     vTaskDelay(pdMS_TO_TICKS(10));
+  if (!__atomic_load_n(&fifo->reader_task, __ATOMIC_ACQUIRE) &&
+      fifo->listen_sock >= 0) {
+    close(fifo->listen_sock);
+    fifo->listen_sock = -1;
+  }
   fifo->port = 0;
 }
 
 bool ap2_buffered_fifo_is_idle(ap2_buffered_fifo_t *fifo) {
   if (!fifo) return true;
-  return !fifo->running &&
+  return !__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE) &&
          __atomic_load_n(&fifo->reader_task, __ATOMIC_ACQUIRE) == NULL;
 }
 
@@ -386,6 +329,12 @@ size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo) {
   return fifo ? fifo->capacity : 0U;
 }
 
+bool ap2_buffered_fifo_epoch_is_current(const ap2_buffered_fifo_t *fifo,
+                                        uint32_t stream_epoch) {
+  return fifo && __atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE) && stream_epoch ==
+      __atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE);
+}
+
 void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
                                  ap2_buffered_fifo_usage_t *out) {
   if (!out) return;
@@ -400,40 +349,111 @@ void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
 
 }
 
-esp_err_t ap2_buffered_fifo_read_block(ap2_buffered_fifo_t *fifo,
-                                       uint8_t *block_storage,
-                                       size_t block_capacity,
-                                       size_t *block_len,
-                                       uint32_t *stream_epoch) {
-  if (!fifo || !block_storage || !block_len || !stream_epoch ||
-      block_capacity < 12U)
+/* Called with fifo_mutex held. No cursor or media-policy change. */
+static void fifo_copy_at(const ap2_buffered_fifo_t *fifo, size_t pos,
+                         uint8_t *dst, size_t len) {
+  size_t first = fifo->capacity - pos;
+  if (first > len) first = len;
+  memcpy(dst, fifo->buffer + pos, first);
+  if (first < len) memcpy(dst + first, fifo->buffer, len - first);
+}
+
+esp_err_t ap2_buffered_fifo_peek_head(ap2_buffered_fifo_t *fifo,
+                                      size_t block_capacity,
+                                      ap2_buffered_fifo_head_t *head) {
+  if (!fifo || !head || block_capacity < sizeof(head->header))
     return ESP_ERR_INVALID_ARG;
 
-  for (;;) {
-    if (!fifo->running) return ESP_ERR_INVALID_STATE;
-    uint32_t epoch = 0;
-    if (!wait_for_connected_epoch(fifo, &epoch)) return ESP_ERR_INVALID_STATE;
-
-    uint8_t length_bytes[2];
-    if (!fifo_read_exact(fifo, length_bytes, sizeof(length_bytes), epoch))
-      continue;
-    const uint16_t wire_len =
-        ((uint16_t)length_bytes[0] << 8) | length_bytes[1];
-    if (wire_len < FIFO_MIN_WIRE_LEN || (size_t)wire_len > block_capacity + 2U) {
-      ESP_LOGW(TAG,
-               "invalid buffered block length=%u; aborting client to restore framing",
-               (unsigned)wire_len);
-      ap2_buffered_fifo_abort_client(fifo);
-      return ESP_ERR_INVALID_SIZE;
-    }
-
-    const size_t body_len = (size_t)wire_len - 2U;
-    if (!fifo_read_exact(fifo, block_storage, body_len, epoch)) continue;
-    if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) != epoch)
-      continue;
-
-    *block_len = body_len;
-    *stream_epoch = epoch;
-    return ESP_OK;
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  if (!__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
+    xSemaphoreGive(fifo->fifo_mutex);
+    return ESP_ERR_INVALID_STATE;
   }
+  if (fifo->occupancy < 2U) {
+    xSemaphoreGive(fifo->fifo_mutex);
+    return ESP_ERR_TIMEOUT;
+  }
+  uint8_t length_bytes[2];
+  fifo_copy_at(fifo, fifo->read_pos, length_bytes, sizeof(length_bytes));
+  const uint16_t wire_len = ((uint16_t)length_bytes[0] << 8) | length_bytes[1];
+  if (wire_len < FIFO_MIN_WIRE_LEN || wire_len > fifo->capacity ||
+      (size_t)wire_len - 2U > block_capacity) {
+    xSemaphoreGive(fifo->fifo_mutex);
+    ESP_LOGW(TAG, "invalid buffered block length=%u; aborting client to restore framing",
+             (unsigned)wire_len);
+    ap2_buffered_fifo_abort_client(fifo);
+    return ESP_ERR_INVALID_SIZE;
+  }
+  if (fifo->occupancy < wire_len) {
+    xSemaphoreGive(fifo->fifo_mutex);
+    return ESP_ERR_TIMEOUT;
+  }
+
+  head->wire_len = wire_len;
+  head->stream_epoch = __atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE);
+  head->read_pos = fifo->read_pos;
+  head->read_serial = fifo->total_read;
+  fifo_copy_at(fifo, (fifo->read_pos + 2U) % fifo->capacity,
+               head->header, sizeof(head->header));
+  xSemaphoreGive(fifo->fifo_mutex);
+  return ESP_OK;
+}
+
+/* Caller holds fifo_mutex. */
+static bool fifo_head_is_current_locked(const ap2_buffered_fifo_t *fifo,
+                                         const ap2_buffered_fifo_head_t *head) {
+  return __atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE) && head->stream_epoch ==
+      __atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) &&
+      head->read_pos == fifo->read_pos && head->read_serial == fifo->total_read &&
+      head->wire_len >= FIFO_MIN_WIRE_LEN && head->wire_len <= fifo->occupancy;
+}
+
+esp_err_t ap2_buffered_fifo_visit_head(ap2_buffered_fifo_t *fifo,
+                                       const ap2_buffered_fifo_head_t *head,
+                                       ap2_buffered_fifo_head_visit_t visit,
+                                       void *context) {
+  if (!fifo || !head || !visit) return ESP_ERR_INVALID_ARG;
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  const bool valid = fifo_head_is_current_locked(fifo, head);
+  if (valid) visit(context);
+  xSemaphoreGive(fifo->fifo_mutex);
+  return valid ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static esp_err_t fifo_consume_head(ap2_buffered_fifo_t *fifo,
+                                    const ap2_buffered_fifo_head_t *head,
+                                    uint8_t *dst, size_t capacity) {
+  if (!fifo || !head || head->wire_len < FIFO_MIN_WIRE_LEN)
+    return ESP_ERR_INVALID_ARG;
+  if (dst && (size_t)head->wire_len - 2U > capacity)
+    return ESP_ERR_INVALID_SIZE;
+
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  if (!fifo_head_is_current_locked(fifo, head)) {
+    xSemaphoreGive(fifo->fifo_mutex);
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (dst) {
+    fifo_copy_at(fifo, (fifo->read_pos + 2U) % fifo->capacity,
+                 dst, (size_t)head->wire_len - 2U);
+  }
+  fifo->read_pos = (fifo->read_pos + head->wire_len) % fifo->capacity;
+  fifo->occupancy -= head->wire_len;
+  fifo->total_read += head->wire_len;
+  xSemaphoreGive(fifo->fifo_mutex);
+  xSemaphoreGive(fifo->not_full);
+  return ESP_OK;
+}
+
+esp_err_t ap2_buffered_fifo_discard_head(ap2_buffered_fifo_t *fifo,
+                                         const ap2_buffered_fifo_head_t *head) {
+  return fifo_consume_head(fifo, head, NULL, 0U);
+}
+
+esp_err_t ap2_buffered_fifo_read_head(ap2_buffered_fifo_t *fifo,
+                                      const ap2_buffered_fifo_head_t *head,
+                                      uint8_t *block_storage,
+                                      size_t block_capacity) {
+  if (!block_storage) return ESP_ERR_INVALID_ARG;
+  return fifo_consume_head(fifo, head, block_storage, block_capacity);
 }

@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 #include <netinet/in.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "sodium.h"
 
 #include "audio_receiver.h"
@@ -187,8 +189,9 @@ static bool ap2_audio_format_supported(int64_t stream_type, int64_t codec_type,
 #define AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES 11025
 static int event_client_socket = -1;
 static int event_listen_socket = -1;
-static TaskHandle_t event_task_handle = NULL;
-static volatile bool event_task_should_stop = false;
+static _Atomic bool event_task_live;
+static _Atomic bool event_task_should_stop;
+static _Atomic(SemaphoreHandle_t) event_socket_mutex;
 
 void rtsp_get_device_id(char *device_id, size_t len) {
   uint8_t mac[6];
@@ -269,148 +272,128 @@ static bool start_audio_receiver_or_fail(int socket, rtsp_conn_t *conn,
   return true;
 }
 
-// Event port task - handles AirPlay 2 session persistence
+/* The event task alone closes transferred descriptors. Stop holds the mutex
+ * through shutdown; detach-before-close prevents descriptor reuse races. */
+static void event_close_client(void) {
+  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
+  int client = event_client_socket;
+  event_client_socket = -1;
+  xSemaphoreGive(event_socket_mutex);
+  if (client >= 0) close(client);
+}
+
 static void event_port_task(void *pvParameters) {
   int listen_socket = (int)(intptr_t)pvParameters;
-  event_listen_socket = listen_socket;
-
-  while (!event_task_should_stop && listen_socket >= 0) {
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(listen_socket, &read_fds);
-
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-    int ret = select(listen_socket + 1, &read_fds, NULL, NULL, &tv);
-
-    if (event_task_should_stop) {
-      break;
-    }
-
+  bool unsupported_logged = false;
+  while (!event_task_should_stop) {
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(listen_socket, &fds);
+    struct timeval tv = {.tv_sec = 1};
+    int ret = select(listen_socket + 1, &fds, NULL, NULL, &tv);
+    if (event_task_should_stop) break;
     if (ret < 0) {
-      if (errno != EINTR && !event_task_should_stop) {
-        ESP_LOGE(TAG, "Event port select error: %d", errno);
+      if (errno == EINTR) continue;
+      ESP_LOGE(TAG, "Event port select error: %d", errno);
+      break;
+    }
+    if (ret == 0) continue;
+    int client = accept(listen_socket, NULL, NULL);
+    if (client < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
+    event_client_socket = client;
+    xSemaphoreGive(event_socket_mutex);
+    rtsp_events_emit(RTSP_EVENT_CLIENT_CONNECTED, NULL);
+    while (!event_task_should_stop) {
+      FD_ZERO(&fds);
+      FD_SET(client, &fds);
+      tv = (struct timeval){.tv_sec = 1};
+      ret = select(client + 1, &fds, NULL, NULL, &tv);
+      if (event_task_should_stop) break;
+      if (ret < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      if (ret == 0) continue;
+      char byte;
+      ssize_t n = recv(client, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+      if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+        continue;
+      if (n > 0 && !unsupported_logged) {
+        /* There is no inbound event protocol implementation. Avoid peeking
+         * the same unread byte forever; close only this event connection. */
+        ESP_LOGW(TAG, "Unsupported inbound event data; closing event client");
+        unsupported_logged = true;
       }
       break;
     }
-
-    if (ret == 0) {
-      continue;
-    }
-
-    // Check stop flag after select unblocks (shutdown() makes socket readable)
-    if (event_task_should_stop) {
-      break;
-    }
-
-    if (FD_ISSET(listen_socket, &read_fds)) {
-      struct sockaddr_in client_addr;
-      socklen_t addr_len = sizeof(client_addr);
-      int client =
-          accept(listen_socket, (struct sockaddr *)&client_addr, &addr_len);
-      if (client < 0) {
-        if (!event_task_should_stop) {
-          ESP_LOGE(TAG, "Event port accept error: %d", errno);
-        }
-        break; // Don't continue - socket is likely invalid
-      }
-
-      if (event_client_socket >= 0) {
-        close(event_client_socket);
-      }
-      event_client_socket = client;
-      ESP_LOGI(TAG, "Event client connected");
-      rtsp_events_emit(RTSP_EVENT_CLIENT_CONNECTED, NULL);
-
-      // Monitor connection for disconnection
-      while (event_client_socket >= 0 && !event_task_should_stop) {
-        fd_set cfds;
-        FD_ZERO(&cfds);
-        FD_SET(event_client_socket, &cfds);
-        struct timeval ctv = {.tv_sec = 1, .tv_usec = 0};
-
-        ret = select(event_client_socket + 1, &cfds, NULL, NULL, &ctv);
-        if (ret < 0) {
-          break;
-        }
-        // Check stop flag after select unblocks
-        if (event_task_should_stop) {
-          break;
-        }
-        if (ret > 0 && FD_ISSET(event_client_socket, &cfds)) {
-          char buf[16];
-          ssize_t n = recv(event_client_socket, buf, sizeof(buf), MSG_PEEK);
-          if (n <= 0) {
-            close(event_client_socket);
-            event_client_socket = -1;
-            break;
-          }
-        }
-      }
-    }
+    event_close_client();
   }
-
-  if (event_client_socket >= 0) {
-    close(event_client_socket);
-    event_client_socket = -1;
-  }
+  event_close_client();
+  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
   event_listen_socket = -1;
-  event_task_handle = NULL;
+  xSemaphoreGive(event_socket_mutex);
+  close(listen_socket);
+  event_task_live = false;
   vTaskDelete(NULL);
 }
 
-static bool event_port_wait_for_task_stopped(int timeout_ticks) {
-  while (event_task_handle != NULL && timeout_ticks-- > 0) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  return event_task_handle == NULL;
+bool rtsp_event_port_is_idle(void) {
+  return !event_task_live;
 }
 
 esp_err_t rtsp_start_event_port_task(int listen_socket) {
-  if (event_task_handle != NULL) {
-    rtsp_stop_event_port_task();
-    if (!event_port_wait_for_task_stopped(20)) {
-      ESP_LOGE(TAG, "Previous event port task did not stop");
-      return ESP_ERR_INVALID_STATE;
-    }
+  if (listen_socket < 0 || event_task_live) return ESP_ERR_INVALID_STATE;
+  if (!event_socket_mutex) {
+    SemaphoreHandle_t created = xSemaphoreCreateMutex();
+    if (!created) return ESP_ERR_NO_MEM;
+    SemaphoreHandle_t expected = NULL;
+    if (!atomic_compare_exchange_strong(&event_socket_mutex, &expected, created))
+      vSemaphoreDelete(created);
+  }
+  if (!event_socket_mutex) return ESP_ERR_NO_MEM;
+  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
+  if (event_task_live) {
+    xSemaphoreGive(event_socket_mutex);
+    return ESP_ERR_INVALID_STATE;
   }
   event_task_should_stop = false;
-  event_listen_socket = -1;
-  event_task_handle = NULL;
-  BaseType_t ret =
-      xTaskCreatePinnedToCore(event_port_task, "event_port", EVENT_STACK_SIZE,
-                              (void *)(intptr_t)listen_socket, 5,
-                              &event_task_handle, 0);
+  event_listen_socket = listen_socket;
+  event_task_live = true;
+  BaseType_t ret = xTaskCreatePinnedToCore(
+      event_port_task, "event_port", EVENT_STACK_SIZE,
+      (void *)(intptr_t)listen_socket, 5, NULL, 0);
   if (ret != pdPASS) {
-    event_task_handle = NULL;
-    ESP_LOGE(TAG, "Failed to create event port task");
-    return ESP_FAIL;
+    event_listen_socket = -1;
+    event_task_live = false;
   }
-  return ESP_OK;
+  xSemaphoreGive(event_socket_mutex);
+  return ret == pdPASS ? ESP_OK : ESP_FAIL;
 }
 
 int rtsp_event_port_listen_socket(void) {
-  return event_listen_socket;
+  if (!event_socket_mutex) return -1;
+  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
+  int socket = event_listen_socket;
+  xSemaphoreGive(event_socket_mutex);
+  return socket;
 }
 
 void rtsp_stop_event_port_task(void) {
-  if (event_task_handle == NULL) {
-    return;
-  }
-
-  // Signal task to stop
+  if (!event_socket_mutex) return;
+  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
   event_task_should_stop = true;
-
-  // Shutdown sockets to unblock select()
-  if (event_client_socket >= 0) {
-    shutdown(event_client_socket, SHUT_RDWR);
-  }
-  if (event_listen_socket >= 0) {
-    shutdown(event_listen_socket, SHUT_RDWR);
-  }
-
-  if (!event_port_wait_for_task_stopped(20)) {
-    ESP_LOGW(TAG, "Event port task did not exit within timeout");
-  }
+  if (event_client_socket >= 0) shutdown(event_client_socket, SHUT_RDWR);
+  if (event_listen_socket >= 0) shutdown(event_listen_socket, SHUT_RDWR);
+  xSemaphoreGive(event_socket_mutex);
+  TickType_t start = xTaskGetTickCount();
+  while (event_task_live &&
+         (TickType_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(1000))
+    vTaskDelay(1);
+  if (event_task_live) ESP_LOGW(TAG, "Event task still stopping");
 }
 
 // Forward declarations of handlers
@@ -1093,6 +1076,12 @@ static void handle_announce(int socket, rtsp_conn_t *conn,
   (void)raw;
   (void)raw_len;
 
+  if (conn->stream_active || !audio_receiver_is_idle()) {
+    rtsp_send_response(socket, conn, 455, "Method Not Valid In This State",
+                       req->cseq, NULL, NULL, 0);
+    return;
+  }
+
   if (req->body && req->body_len > 0) {
     parse_sdp(conn, (const char *)req->body, req->body_len);
   }
@@ -1104,6 +1093,14 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
                          const rtsp_request_t *req, const uint8_t *raw,
                          size_t raw_len) {
   (void)raw_len;
+
+  audio_format_t proposed_format = {0};
+  audio_encrypt_t proposed_encryption = conn->setup_encryption;
+  int64_t proposed_type = conn->stream_type;
+  uint16_t proposed_control_port = conn->client_control_port;
+  uint32_t proposed_latency = conn->setup_latency;
+  bool has_format = false;
+  bool has_encryption = false;
 
   const uint8_t *body = req->body;
   size_t body_len = req->body_len;
@@ -1129,8 +1126,12 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       !request_has_streams &&
       parse_raw_header(raw, raw_len, "Transport:") != NULL;
 
+  if (is_v1_transport_setup) {
+    rtsp_send_response(socket, conn, 461, "Unsupported Transport", req->cseq, NULL, NULL, 0);
+    return;
+  }
+
   if (body && body_len > 0 && is_bplist && request_has_streams) {
-    conn->protocol_version = 2;
 
     /* This receiver owns one audio stream at a time. Validate the first
      * negotiated stream before committing any codec/stream state. Do not let
@@ -1149,6 +1150,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     bplist_kv_info_t kv[16];
     size_t kv_count = 0;
     int64_t codec_type = -1;
+    int64_t latency_min = 0;
     /* Keep the established 44.1 kHz / frame-size defaults when optional keys
      * are omitted, but never guess the codec itself. An explicitly supplied
      * unsupported rate/frame size is still rejected below. */
@@ -1174,7 +1176,13 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       } else if (strcmp(kv[k].key, "spf") == 0) {
         samples_per_frame = kv[k].int_value;
       } else if (strcmp(kv[k].key, "controlPort") == 0) {
-        conn->client_control_port = (uint16_t)kv[k].int_value;
+        if (kv[k].int_value < 0 || kv[k].int_value > UINT16_MAX) {
+          rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL, NULL, 0);
+          return;
+        }
+        proposed_control_port = (uint16_t)kv[k].int_value;
+      } else if (strcmp(kv[k].key, "latencyMin") == 0) {
+        latency_min = kv[k].int_value;
       }
     }
 
@@ -1198,9 +1206,12 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       return;
     }
 
-    conn->stream_type = stream_type;
-    audio_receiver_set_stream_type((audio_stream_type_t)stream_type);
-    audio_receiver_set_format(&format);
+    proposed_type = stream_type;
+    proposed_format = format;
+    has_format = true;
+    proposed_latency = stream_type == AUDIO_STREAM_BUFFERED ? 0 :
+        (latency_min > 0 && latency_min <= 5 * 44100 ?
+         (uint32_t)latency_min : AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES);
   }
 
   // Process encryption keys
@@ -1212,7 +1223,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     uint8_t shk[crypto_aead_chacha20poly1305_ietf_KEYBYTES];
     size_t shk_len = 0;
 
-    int64_t crypto_stream_type = conn->stream_type > 0 ? conn->stream_type : 96;
+    int64_t crypto_stream_type = proposed_type > 0 ? proposed_type : 96;
     bool has_stream_crypto = bplist_find_stream_crypto(
         body, body_len, crypto_stream_type, ekey_encrypted,
         sizeof(ekey_encrypted), &ekey_len, eiv, sizeof(eiv), &eiv_len, shk,
@@ -1225,6 +1236,10 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       bplist_find_data_deep(body, body_len, "shk", shk, sizeof(shk), &shk_len);
     }
 
+    if (eiv_len != 0 && eiv_len != 16) {
+      rtsp_send_response(socket, conn, 400, "Invalid Audio IV", req->cseq, NULL, NULL, 0);
+      return;
+    }
     audio_encrypt_t audio_encrypt = {0};
     bool encryption_set = false;
 
@@ -1237,12 +1252,12 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       if (eiv_len >= 16) {
         memcpy(audio_encrypt.iv, eiv, 16);
       }
-      audio_receiver_set_encryption(&audio_encrypt);
+      proposed_encryption = audio_encrypt;
+      has_encryption = true;
       encryption_set = true;
     } else if (shk_len != 0) {
-      ESP_LOGW(TAG, "SETUP: ignoring invalid shk length %zu (expected %u)",
-               shk_len,
-               (unsigned)crypto_aead_chacha20poly1305_ietf_KEYBYTES);
+      rtsp_send_response(socket, conn, 400, "Invalid Audio Key", req->cseq, NULL, NULL, 0);
+      return;
     } else if (ekey_len > 16 && conn->hap_session &&
                conn->hap_session->session_established) {
       uint8_t nonce[12] = {0};
@@ -1253,21 +1268,32 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       if (crypto_aead_chacha20poly1305_ietf_decrypt(
               decrypted_key, &decrypted_len, NULL, ekey_encrypted, ekey_len,
               NULL, 0, nonce, conn->hap_session->shared_secret) == 0 &&
-          decrypted_len >= 16) {
+          decrypted_len == sizeof(audio_encrypt.key)) {
         audio_encrypt.type = AUDIO_ENCRYPT_CHACHA20_POLY1305;
-        memcpy(audio_encrypt.key, decrypted_key,
-               decrypted_len > 32 ? 32 : decrypted_len);
-        audio_encrypt.key_len = decrypted_len > 32 ? 32 : decrypted_len;
+        memcpy(audio_encrypt.key, decrypted_key, sizeof(audio_encrypt.key));
+        audio_encrypt.key_len = sizeof(audio_encrypt.key);
         if (eiv_len >= 16) {
           memcpy(audio_encrypt.iv, eiv, 16);
         }
-        audio_receiver_set_encryption(&audio_encrypt);
+        proposed_encryption = audio_encrypt;
+        has_encryption = true;
         encryption_set = true;
       }
     }
 
-    if (!encryption_set && conn->hap_session &&
-        conn->hap_session->session_established) {
+    if (ekey_len && !encryption_set && !has_encryption) {
+      rtsp_send_response(socket, conn, 400, "Invalid Audio Key", req->cseq, NULL, NULL, 0);
+      return;
+    }
+
+    if (!encryption_set && conn->setup_encryption.type != AUDIO_ENCRYPT_NONE) {
+      /* Omitted keys retain the committed session key, including retries. */
+      if (eiv_len == 16) {
+        memcpy(proposed_encryption.iv, eiv, 16);
+        has_encryption = true;
+      }
+    } else if (!encryption_set && conn->hap_session &&
+               conn->hap_session->session_established) {
       audio_encrypt.type = AUDIO_ENCRYPT_CHACHA20_POLY1305;
       if (hap_derive_audio_key(conn->hap_session, audio_encrypt.key,
                                sizeof(audio_encrypt.key)) == ESP_OK) {
@@ -1275,17 +1301,91 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
         if (eiv_len >= 16) {
           memcpy(audio_encrypt.iv, eiv, 16);
         }
-        audio_receiver_set_encryption(&audio_encrypt);
+        proposed_encryption = audio_encrypt;
+        has_encryption = true;
       }
     }
+  }
+
+  if (request_has_streams && !has_format) {
+    rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL, NULL, 0);
+    return;
+  }
+
+  /* Validate the entire request before publishing format/key. A live stream
+   * only accepts the same negotiated configuration and returns its ports. */
+  if (conn->stream_active) {
+    const audio_format_t *old = &conn->setup_format;
+    bool same_format = !has_format || (conn->setup_format_valid &&
+        proposed_type == conn->stream_type &&
+        strcmp(proposed_format.codec, old->codec) == 0 &&
+        proposed_format.sample_rate == old->sample_rate &&
+        proposed_format.channels == old->channels &&
+        proposed_format.bits_per_sample == old->bits_per_sample &&
+        proposed_format.frame_size == old->frame_size &&
+        proposed_control_port == conn->client_control_port &&
+        proposed_latency == conn->setup_latency);
+    const audio_encrypt_t *old_key = &conn->setup_encryption;
+    bool same_key = !has_encryption || (
+        proposed_encryption.type == old_key->type &&
+        proposed_encryption.key_len == old_key->key_len &&
+        memcmp(proposed_encryption.key, old_key->key, sizeof(old_key->key)) == 0 &&
+        memcmp(proposed_encryption.iv, old_key->iv, sizeof(old_key->iv)) == 0);
+    if (!same_format || !same_key) {
+      rtsp_send_response(socket, conn, 455, "Method Not Valid In This State",
+                         req->cseq, NULL, NULL, 0);
+      return;
+    }
+    uint8_t reply[256];
+    size_t reply_len;
+    if (request_has_streams) {
+      bool buffered = conn->stream_type == AUDIO_STREAM_BUFFERED;
+      reply_len = bplist_build_stream_setup(reply, sizeof(reply), conn->stream_type,
+          buffered ? conn->buffered_port : conn->data_port, conn->control_port,
+          buffered ? (uint32_t)AP2_BUFFERED_AUDIO_ADVERTISED_BYTES : 0U);
+    } else {
+      reply_len = bplist_build_initial_setup(reply, sizeof(reply), conn->event_port);
+    }
+    if (!reply_len) {
+      rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
+      return;
+    }
+    rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+        "Content-Type: application/x-apple-binary-plist\r\n", (const char *)reply, reply_len);
+    return;
+  }
+  if ((has_format || has_encryption) && !audio_receiver_is_idle()) {
+    rtsp_send_response(socket, conn, 455, "Method Not Valid In This State",
+                       req->cseq, NULL, NULL, 0);
+    return;
+  }
+  if (has_format) {
+    conn->protocol_version = 2;
+    conn->stream_type = proposed_type;
+    conn->client_control_port = proposed_control_port;
+    conn->setup_format = proposed_format;
+    conn->setup_format_valid = true;
+    conn->setup_latency = proposed_latency;
+    audio_receiver_set_stream_type((audio_stream_type_t)proposed_type);
+    audio_receiver_set_format(&proposed_format);
+  }
+  if (has_encryption) {
+    conn->setup_encryption = proposed_encryption;
+    audio_receiver_set_encryption(&proposed_encryption);
   }
 
   // Create event port if needed
   if (!is_v1_transport_setup && conn->event_port == 0) {
     conn->event_socket = rtsp_create_event_socket(&conn->event_port);
+    if (conn->event_socket < 0) {
+      conn->event_port = 0;
+      rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
+      return;
+    }
     if (conn->event_socket >= 0) {
       if (rtsp_start_event_port_task(conn->event_socket) == ESP_OK) {
         ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
+        conn->event_socket = -1; /* Ownership transferred to event task. */
       } else {
         close(conn->event_socket);
         conn->event_socket = -1;
@@ -1299,51 +1399,6 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   // Handle initial SETUP vs stream SETUP
   if (!request_has_streams) {
-    // AirPlay v1: SETUP has no bplist body — transport info is in the header.
-    // Detected by request shape (Transport: header present); AirPlay 2's
-    // initial SETUP has neither streams nor a Transport header.
-    if (is_v1_transport_setup) {
-      ESP_LOGI(TAG, "SETUP: AirPlay v1 stream setup");
-      conn->protocol_version = 1;
-      int64_t stream_type = 96; // RTP
-      conn->stream_type = stream_type;
-
-      // Parse client's control and timing ports from Transport header
-      rtsp_parse_transport((const char *)raw, &conn->client_control_port,
-                           &conn->client_timing_port);
-      ESP_LOGI(TAG, "Client ports: control=%u timing=%u",
-               conn->client_control_port, conn->client_timing_port);
-
-      if (!start_ntp_timing_or_fail(socket, conn, req)) {
-        return;
-      }
-
-      ensure_stream_ports(conn, false);
-
-      char transport_response[256];
-      snprintf(transport_response, sizeof(transport_response),
-               "Transport: RTP/AVP/UDP;unicast;mode=record;"
-               "server_port=%d;control_port=%d;timing_port=%d\r\n"
-               "Session: 1\r\n",
-               conn->data_port, conn->control_port, conn->timing_port);
-      rtsp_send_response(socket, conn, 200, "OK", req->cseq, transport_response,
-                         NULL, 0);
-
-      // Configure audio format — RAOP default is ALAC 44100/352
-      audio_format_t format = {0};
-      rtsp_codec_configure(2, &format, 44100, 352); // ct=2 is ALAC
-      audio_receiver_set_format(&format);
-      audio_receiver_set_stream_type((audio_stream_type_t)stream_type);
-
-      // Stop PTP (AirPlay 2 timing) to free socket slots for audio.
-      // Audio stream will be started by the subsequent RECORD command.
-      ptp_clock_stop();
-
-      conn->stream_active = true;
-      amp_session_activate_once(conn);
-      return;
-    }
-
     reset_metadata_log_dedup();
     ESP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
 
@@ -1445,32 +1500,8 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   if (!is_bplist || buffered) {
     audio_receiver_set_playout_latency_samples(0);
   } else {
-    int64_t latency_min = 0;
-    const char *latency_src = "default";
-    // latencyMin is a per-stream key inside the SETUP streams[] dict, not a
-    // top-level key — read it the same way as ct/sr/spf above.
-    if (body && body_len > 0) {
-      bplist_kv_info_t kv[16];
-      size_t kv_count = 0;
-      if (bplist_get_stream_kv_info(body, body_len, 0, kv, 16, &kv_count)) {
-        for (size_t k = 0; k < kv_count; k++) {
-          if (kv[k].value_type == BPLIST_VALUE_INT &&
-              strcmp(kv[k].key, "latencyMin") == 0) {
-            latency_min = kv[k].int_value;
-            break;
-          }
-        }
-      }
-    }
-    if (latency_min > 0 && latency_min <= 5 * 44100) {
-      latency_src = "SETUP latencyMin";
-    } else {
-      latency_min = AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
-    }
-    audio_receiver_set_playout_latency_samples((uint32_t)latency_min);
-    ESP_LOGI(TAG, "Realtime playout latency: %lld samples (%lld ms, %s)",
-             (long long)latency_min, (long long)(latency_min * 1000 / 44100),
-             latency_src);
+    audio_receiver_set_playout_latency_samples(conn->setup_latency);
+    ESP_LOGI(TAG, "Realtime playout latency: %u samples", (unsigned)conn->setup_latency);
   }
 
   if (is_bplist) {
@@ -1709,8 +1740,13 @@ static void parse_progress(const char *progress_str, uint32_t sample_rate,
       sample_rate = 44100; // Default sample rate
     }
 
-    meta->position_secs = (uint32_t)((current - start) / sample_rate);
-    meta->duration_secs = (uint32_t)((end - start) / sample_rate);
+    if (start > UINT32_MAX || current > UINT32_MAX || end > UINT32_MAX) return;
+    uint32_t duration = (uint32_t)end - (uint32_t)start;
+    uint32_t position = (uint32_t)current - (uint32_t)start;
+    /* RTP arithmetic is modulo 2^32; half-range intervals are ambiguous. */
+    if (duration >= UINT32_C(0x80000000) || position > duration) return;
+    meta->position_secs = position / sample_rate;
+    meta->duration_secs = duration / sample_rate;
 
     char pos_str[16], dur_str[16];
     format_time_mmss(meta->position_secs, pos_str, sizeof(pos_str));
@@ -1929,7 +1965,7 @@ static void handle_flush(int socket, rtsp_conn_t *conn,
       audio_receiver_realtime_flush_wait_sender_anchor();
     }
   } else {
-    // Buffered/legacy behaviour is unchanged.
+    /* No buffered 23-bit endpoint: stop old media and wait for a real anchor. */
     audio_receiver_seek_flush();
   }
   /* no PCM/output path in AirPlay receiver build */
@@ -1966,10 +2002,8 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     bool got_until_ts =
         bplist_find_int(body, body_len, "flushUntilTS", &flush_until_ts);
 
-    /* Diagnostic only: an explicit zero endpoint is unusual enough to call
-     * out separately, but it does not change the Shairport-compatible
-     * sequential FLUSH semantics below. Keep this distinct from a missing
-     * flushUntilSeq, which also defaults to zero. */
+    /* Key presence is retained in diagnostics. A deferred zero endpoint may
+     * be real sequence wrap; only immediate no-boundary recovery is special. */
     if (got_until_seq && flush_until_seq == 0) {
       ESP_LOGW(TAG,
                "FLUSHBUFFERED explicit untilSeq=0 (%s); "
@@ -1982,8 +2016,6 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
 
     /* Shairport Sync 5.5.2 handle_flushbuffered(): deferred iff flushFromSeq is
      * present (the other fields default to 0 when missing). */
-    (void)got_from_ts;
-    (void)got_until_ts;
     if (got_from_seq) {
       ESP_LOGI(TAG,
                "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
@@ -1991,7 +2023,8 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
                flush_from_seq, flush_from_ts, flush_until_seq, flush_until_ts);
       esp_err_t flush_err = audio_receiver_set_deferred_flush_range(
           (uint32_t)flush_from_seq, (uint32_t)flush_from_ts,
-          (uint32_t)flush_until_seq, (uint32_t)flush_until_ts);
+          (uint32_t)flush_until_seq, (uint32_t)flush_until_ts,
+          got_from_ts && got_until_ts);
       if (flush_err != ESP_OK) {
         /* Shairport: "no more room for deferred flush request records" is
          * only logged; the reply is still 200. */
@@ -2001,12 +2034,12 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     } else {
       /* The absence of flushFromSeq selects immediate mode. Non-zero
        * flushUntilSeq follows Shairport sequence semantics. An explicit zero
-       * is handled by the receiver as a timeline transition: wait for the new
-       * anchor, then sequentially consume stale compressed packets. */
+       * uses the receiver's experimental no-boundary policy: wait for the new
+       * anchor, then sequentially classify compressed packets for admission. */
       if (!got_until_seq) {
         ESP_LOGW(TAG,
                  "FLUSHBUFFERED immediate without flushUntilSeq; "
-                 "Shairport-compatible endpoint defaults to seq=0");
+                 "no sequence boundary; waiting for fresh anchor");
       }
       ESP_LOGI(TAG,
                "FLUSHBUFFERED immediate: untilSeq=%" PRId64
@@ -2066,7 +2099,8 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
    * Clearing it here needlessly forces a new PTP STEP/relock before the next
    * buffered stream can produce PCM.  Only a full session boundary owns a
    * full PTP reset. */
-  if (!has_streams) {
+  /* Client cleanup remains the final reset owner when stop times out. */
+  if (!has_streams && audio_receiver_is_idle()) {
     ptp_clock_clear();
     audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
     audio_receiver_set_encryption(NULL);
@@ -2176,10 +2210,9 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 
     /* RTP is a wrapping 32-bit timeline. rtpTime==0 is therefore perfectly
      * valid; validity comes from key presence, not from the numeric value. */
-    /* Shairport Sync 5.5.2: the anchor is set whenever networkTimeSecs is
-     * present; rtpTime defaults to 0 if missing. */
-    (void)have_rtp_time;
-    if (have_network_time_secs) {
+    /* A real RTP key and timeline ID are required to commit a new map.
+     * Missing/default RTP must not release zero-seq recovery at timestamp 0. */
+    if (have_network_time_secs && have_rtp_time && clock_id != 0U) {
       uint64_t frac = network_time_frac >> 32;
       frac = (frac * 1000000000ULL) >> 32;
       uint64_t network_time_ns = network_time_secs * 1000000000ULL + frac;

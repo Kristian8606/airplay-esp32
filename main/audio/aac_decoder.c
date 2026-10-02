@@ -14,6 +14,7 @@
 struct aac_decoder {
   aac_decoder_config_t config;
   void *handle;
+  uint32_t decode_errors;
 };
 
 static const char *TAG = "aac_dec_v1";
@@ -138,7 +139,9 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
     /* Shairport keeps the AAC decoding chain alive across a bad access unit.
      * Dropping the AU here lets the codec preserve/recover its overlap history
      * on the following block instead of manufacturing a new decoder epoch. */
-    ESP_LOGW(TAG, "decode error=%d; dropping AAC block without decoder reset", err);
+    if ((++d->decode_errors & 63U) == 1U)
+      ESP_LOGW(TAG, "decode error=%d; dropping AAC block without decoder reset (%lu total)",
+               err, (unsigned long)d->decode_errors);
     return -1;
   }
 

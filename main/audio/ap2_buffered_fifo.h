@@ -8,6 +8,17 @@
 
 typedef struct ap2_buffered_fifo ap2_buffered_fifo_t;
 
+/* Transport token for one complete frame at the sole consumer's cursor.
+ * header contains the first 12 body bytes verbatim; media interpretation stays
+ * in audio_receiver. wire_len includes the two length bytes. */
+typedef struct {
+  uint16_t wire_len;
+  uint8_t header[12];
+  uint32_t stream_epoch;
+  size_t read_pos;
+  uint64_t read_serial;
+} ap2_buffered_fifo_head_t;
+
 typedef struct {
   size_t buffer_bytes;
   int task_core;
@@ -41,6 +52,9 @@ void ap2_buffered_fifo_clear(ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo);
 
 size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo);
+/* Revalidate an already-consumed packet before publishing decoded PCM. */
+bool ap2_buffered_fifo_epoch_is_current(const ap2_buffered_fifo_t *fifo,
+                                        uint32_t stream_epoch);
 void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
                                  ap2_buffered_fifo_usage_t *out);
 
@@ -48,12 +62,28 @@ void ap2_buffered_fifo_get_usage(ap2_buffered_fifo_t *fifo,
 void ap2_buffered_fifo_notify(ap2_buffered_fifo_t *fifo);
 void ap2_buffered_fifo_wait(ap2_buffered_fifo_t *fifo, uint32_t timeout_ms);
 
-/* Shairport buffered_read.c boundary: consume exactly one framed block from
- * [2-byte big-endian wire length][block bytes]. This layer does not parse RTP,
- * sequence numbers, SSRC or FLUSH state. stream_epoch identifies the accepted
- * TCP connection that supplied the block. */
-esp_err_t ap2_buffered_fifo_read_block(ap2_buffered_fifo_t *fifo,
-                                       uint8_t *block_storage,
-                                       size_t block_capacity,
-                                       size_t *block_len,
-                                       uint32_t *stream_epoch);
+/* Nonblocking inspect. ESP_ERR_TIMEOUT means an incomplete frame: no bytes
+ * have been consumed. Invalid framing aborts the current client. */
+esp_err_t ap2_buffered_fifo_peek_head(ap2_buffered_fifo_t *fifo,
+                                      size_t block_capacity,
+                                      ap2_buffered_fifo_head_t *head);
+
+/* Validate a peek token and run a short metadata transaction while the token
+ * remains current. The callback must not wait, log, decode or call FIFO APIs.
+ * It leaves the cursor unchanged; media policy belongs to the caller. */
+typedef void (*ap2_buffered_fifo_head_visit_t)(void *context);
+esp_err_t ap2_buffered_fifo_visit_head(ap2_buffered_fifo_t *fifo,
+                                       const ap2_buffered_fifo_head_t *head,
+                                       ap2_buffered_fifo_head_visit_t visit,
+                                       void *context);
+
+/* Commit exactly the inspected head. A reconnect, reset or cursor advance
+ * invalidates the token (ESP_ERR_INVALID_STATE). No partial frame commits.
+ * Discard only advances metadata; read performs one contiguous body copy
+ * (two memcpy spans when the circular storage wraps). */
+esp_err_t ap2_buffered_fifo_discard_head(ap2_buffered_fifo_t *fifo,
+                                         const ap2_buffered_fifo_head_t *head);
+esp_err_t ap2_buffered_fifo_read_head(ap2_buffered_fifo_t *fifo,
+                                      const ap2_buffered_fifo_head_t *head,
+                                      uint8_t *block_storage,
+                                      size_t block_capacity);

@@ -161,16 +161,17 @@ static esp_err_t audio_playout_init_current_core(void) {
     return ESP_OK;
   }
 
+  i2s_chan_handle_t tx = NULL;
   i2s_chan_config_t chan_cfg =
       I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
   chan_cfg.dma_frame_num = I2S_DMA_FRAME_NUM;
   chan_cfg.auto_clear = true;
 
-  esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx, NULL);
+  esp_err_t err = i2s_new_channel(&chan_cfg, &tx, NULL);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
-    return err;
+    goto fail;
   }
 
   i2s_std_config_t cfg = {
@@ -186,10 +187,10 @@ static esp_err_t audio_playout_init_current_core(void) {
       },
   };
 
-  err = i2s_channel_init_std_mode(s_tx, &cfg);
+  err = i2s_channel_init_std_mode(tx, &cfg);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(err));
-    return err;
+    goto fail;
   }
 
   const i2s_event_callbacks_t callbacks = {
@@ -198,10 +199,10 @@ static esp_err_t audio_playout_init_current_core(void) {
       .on_sent = on_sent,
       .on_send_q_ovf = on_send_q_ovf,
   };
-  err = i2s_channel_register_event_callback(s_tx, &callbacks, NULL);
+  err = i2s_channel_register_event_callback(tx, &callbacks, NULL);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "i2s callback registration failed: %s", esp_err_to_name(err));
-    return err;
+    goto fail;
   }
 
   queues_reset();
@@ -213,7 +214,7 @@ static esp_err_t audio_playout_init_current_core(void) {
    * i2s_channel_tune_rate(). Capture the actual nominal MCLK so ppm
    * corrections are relative to the hardware clock chosen by IDF. */
   i2s_tuning_info_t initial_tune = {0};
-  err = i2s_channel_tune_rate(s_tx, NULL, &initial_tune);
+  err = i2s_channel_tune_rate(tx, NULL, &initial_tune);
   if (err == ESP_OK) {
     s_nominal_mclk_hz = initial_tune.curr_mclk_hz;
   } else {
@@ -234,7 +235,12 @@ static esp_err_t audio_playout_init_current_core(void) {
       0U
 #endif
   );
+  s_tx = tx; /* Publish only a fully initialised channel. */
   return ESP_OK;
+
+fail:
+  if (tx) (void)i2s_del_channel(tx);
+  return err;
 }
 
 typedef struct {

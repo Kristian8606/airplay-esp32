@@ -13,11 +13,14 @@
 /**
  * Initialize and start PTP clock synchronization.
  * Creates a task that listens for PTP multicast messages.
+ * Returns ESP_ERR_INVALID_STATE while an earlier task is running or stopping.
  */
 esp_err_t ptp_clock_init(void);
 
 /**
- * Stop PTP clock and free resources.
+ * Request PTP stop and wait up to one second for owner socket cleanup.
+ * If the task has not acknowledged stop, resources remain owned by it and
+ * initialization remains blocked until it finishes.
  */
 void ptp_clock_stop(void);
 

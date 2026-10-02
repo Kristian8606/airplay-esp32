@@ -109,6 +109,13 @@ static esp_err_t captive_404_handler(httpd_req_t *req, httpd_err_code_t error){
   return httpd_resp_sendstr(req,"Not Found");
 }
 
+static esp_err_t airplay_still_stopping(httpd_req_t *req) {
+  httpd_resp_set_status(req, "503 Service Unavailable");
+  httpd_resp_set_type(req, "text/plain");
+  (void)httpd_resp_sendstr(req, "AirPlay clients are still stopping; retry later");
+  return ESP_FAIL;
+}
+
 static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   wifi_ap_record_t *ap_list = NULL;
   uint16_t ap_count = 0;
@@ -121,6 +128,9 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
   if (restore_airplay) {
     ESP_LOGI(TAG, "WiFi scan: pausing AirPlay and releasing audio memory");
     rtsp_server_stop();
+    if (!rtsp_server_is_idle()) {
+      return airplay_still_stopping(req);
+    }
     esp_err_t release_err = audio_receiver_release_for_wifi_scan();
     if (release_err != ESP_OK) {
       ESP_LOGE(TAG, "WiFi scan: audio memory release failed: %s",
@@ -343,6 +353,9 @@ static esp_err_t latency_measure_handler(httpd_req_t *req) {
   if (restore_airplay) {
     ESP_LOGI(TAG, "Latency test: pausing AirPlay and releasing audio memory");
     rtsp_server_stop();
+    if (!rtsp_server_is_idle()) {
+      return airplay_still_stopping(req);
+    }
     const esp_err_t rel = audio_receiver_release_for_wifi_scan();
     if (rel != ESP_OK) {
       ESP_LOGE(TAG, "Latency test: audio release failed: %s", esp_err_to_name(rel));
@@ -556,7 +569,7 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
   return httpd_resp_sendstr(req, response);
 }
 
-static esp_err_t ota_handler(httpd_req_t *req){ if(!admin_ok(req)) return ESP_OK; if(req->content_len==0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"No firmware uploaded");return ESP_FAIL;} ESP_LOGI(TAG,"Stopping RTSP for OTA"); rtsp_server_stop(); esp_err_t e=ota_start_from_http(req); if(e!=ESP_OK){ ESP_LOGE(TAG,"OTA failed (%s); restarting RTSP",esp_err_to_name(e)); esp_err_t re=rtsp_server_start(); if(re!=ESP_OK){ESP_LOGE(TAG,"RTSP restart after OTA failure failed: %s",esp_err_to_name(re));} httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,esp_err_to_name(e));return e;} httpd_resp_sendstr(req,"Firmware update complete, rebooting now!\n"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK; }
+static esp_err_t ota_handler(httpd_req_t *req){ if(!admin_ok(req)) return ESP_OK; if(req->content_len==0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"No firmware uploaded");return ESP_FAIL;} ESP_LOGI(TAG,"Stopping RTSP for OTA"); rtsp_server_stop(); if(!rtsp_server_is_idle()) return airplay_still_stopping(req); esp_err_t e=ota_start_from_http(req); if(e!=ESP_OK){ ESP_LOGE(TAG,"OTA failed (%s); restarting RTSP",esp_err_to_name(e)); esp_err_t re=rtsp_server_start(); if(re!=ESP_OK){ESP_LOGE(TAG,"RTSP restart after OTA failure failed: %s",esp_err_to_name(re));} httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,esp_err_to_name(e));return e;} httpd_resp_sendstr(req,"Firmware update complete, rebooting now!\n"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK; }
 static const char *reset_reason_str(esp_reset_reason_t r){switch(r){case ESP_RST_POWERON:return"poweron";case ESP_RST_EXT:return"external";case ESP_RST_SW:return"software";case ESP_RST_PANIC:return"panic";case ESP_RST_INT_WDT:return"int_wdt";case ESP_RST_TASK_WDT:return"task_wdt";case ESP_RST_WDT:return"other_wdt";case ESP_RST_DEEPSLEEP:return"deepsleep";case ESP_RST_BROWNOUT:return"brownout";case ESP_RST_SDIO:return"sdio";default:return"unknown";}}
 static esp_err_t system_info_handler(httpd_req_t *req){
   cJSON *root=cJSON_CreateObject(),*i=cJSON_CreateObject(); char ip[16]={0},mac[18]={0},name[65]={0}; bool connected=wifi_is_connected(); wifi_get_ip_str(ip,sizeof(ip)); wifi_get_mac_str(mac,sizeof(mac)); settings_get_device_name(name,sizeof(name)); cJSON_AddStringToObject(i,"ip",ip);cJSON_AddStringToObject(i,"mac",mac);cJSON_AddStringToObject(i,"device_name",name);cJSON_AddBoolToObject(i,"wifi_connected",connected);cJSON_AddNumberToObject(i,"free_heap",esp_get_free_heap_size());
@@ -591,4 +604,4 @@ esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_conf
   ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
 #undef REG
   e=log_stream_register(s_server);if(e!=ESP_OK)ESP_LOGW(TAG,"log stream register failed: %s",esp_err_to_name(e));ESP_LOGI(TAG,"Web UI started on port %u",port);return ESP_OK; }
-void web_server_stop(void){if(s_server){httpd_stop(s_server);s_server=NULL;}}
+void web_server_stop(void){if(s_server){log_stream_detach(s_server);httpd_stop(s_server);s_server=NULL;}}

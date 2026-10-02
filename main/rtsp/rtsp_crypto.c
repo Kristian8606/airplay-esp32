@@ -7,21 +7,46 @@
 
 #include "audio_diag.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include <sys/select.h>
 #include "sodium.h"
 
 static const char *TAG = "rtsp_crypto";
 
-// Send all data, handling partial sends
-static int send_all(int socket, const uint8_t *data, size_t len) {
+/* A response has one wall-clock budget across every partial send/block.
+ * Nonblocking sends keep the budget independent of peer socket behavior. */
+int rtsp_socket_send_all(int socket, const uint8_t *data, size_t len,
+                         int64_t deadline_us) {
   size_t sent = 0;
   while (sent < len) {
-    ssize_t r = send(socket, data + sent, len - sent, 0);
-    if (r <= 0) {
-      return -1;
-    }
+    int64_t remaining = deadline_us - esp_timer_get_time();
+    if (remaining <= 0) { errno = ETIMEDOUT; return -1; }
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(socket, &fds);
+    struct timeval tv = {.tv_sec = remaining / 1000000,
+                         .tv_usec = remaining % 1000000};
+    int ready = select(socket + 1, NULL, &fds, NULL, &tv);
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0) return -1;
+    ssize_t r = send(socket, data + sent, len - sent, MSG_DONTWAIT);
+    if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+      continue;
+    if (r <= 0) return -1;
     sent += (size_t)r;
   }
   return 0;
+}
+
+static uint8_t *crypto_scratch(rtsp_conn_t *conn) {
+  if (!conn->crypto_scratch) {
+    conn->crypto_scratch = heap_caps_malloc(RTSP_ENCRYPTED_BLOCK_MAX + 16,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!conn->crypto_scratch)
+      conn->crypto_scratch = malloc(RTSP_ENCRYPTED_BLOCK_MAX + 16);
+  }
+  return conn->crypto_scratch;
 }
 
 int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
@@ -66,9 +91,9 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
     return -1;
   }
 
-  // Allocate temporary buffer for encrypted data
+  // Reuse the per-connection read/write scratch; dispatch runs after read.
   size_t encrypted_len = block_len + 16; // +16 for Poly1305 tag
-  uint8_t *encrypted = malloc(encrypted_len);
+  uint8_t *encrypted = crypto_scratch(conn);
   if (!encrypted) {
     ESP_LOGE(TAG, "Failed to allocate encrypted buffer");
     return -1;
@@ -82,13 +107,11 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
       continue;
     }
     if (r == 0) {
-      free(encrypted);
       return -1; // peer closed
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
       continue;
     }
-    free(encrypted);
     return -1;
   }
 
@@ -102,11 +125,9 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
   if (crypto_aead_chacha20poly1305_ietf_decrypt(
           buffer, &plaintext_len, NULL, encrypted, encrypted_len, len_buf,
           sizeof(len_buf), nonce, conn->hap_session->decrypt_key) != 0) {
-    free(encrypted);
     ESP_LOGE(TAG, "Failed to decrypt frame");
     return -1;
   }
-  free(encrypted);
 
   conn->hap_session->decrypt_nonce++;
   AUDIO_DIAG_FLUSH_CONTROL_RX_END(socket, (uint32_t)plaintext_len);
@@ -121,6 +142,7 @@ int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
     return -1;
   }
 
+  int64_t deadline_us = esp_timer_get_time() + RTSP_SEND_BUDGET_US;
   size_t offset = 0;
   while (offset < data_len) {
     uint16_t block_len = (data_len - offset) > RTSP_ENCRYPTED_BLOCK_MAX
@@ -135,7 +157,7 @@ int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
     memcpy(nonce + 4, &conn->hap_session->encrypt_nonce, 8);
 
     size_t encrypted_len = block_len + 16; // +16 for Poly1305 tag
-    uint8_t *encrypted = malloc(encrypted_len);
+    uint8_t *encrypted = crypto_scratch(conn);
     if (!encrypted) {
       ESP_LOGE(TAG, "Failed to allocate encrypted buffer");
       return -1;
@@ -148,18 +170,17 @@ int rtsp_crypto_write_frame(int socket, rtsp_conn_t *conn, const uint8_t *data,
 
     if (ct_len != encrypted_len) {
       ESP_LOGE(TAG, "Unexpected encrypted length: %llu", ct_len);
-      free(encrypted);
       return -1;
     }
 
-    if (send_all(socket, len_buf, sizeof(len_buf)) != 0 ||
-        send_all(socket, encrypted, encrypted_len) != 0) {
+    if (rtsp_socket_send_all(socket, len_buf, sizeof(len_buf), deadline_us) != 0 ||
+        rtsp_socket_send_all(socket, encrypted, encrypted_len, deadline_us) != 0) {
       ESP_LOGE(TAG, "Failed to send encrypted block");
-      free(encrypted);
+      conn->close_after_response = true;
+      shutdown(socket, SHUT_RDWR);
       return -1;
     }
 
-    free(encrypted);
     conn->hap_session->encrypt_nonce++;
     offset += block_len;
   }

@@ -9,11 +9,12 @@
 #include "freertos/semphr.h"
 
 #define PCM_SLOT_SAMPLES (PCM_RTP_SLOT_FRAMES * PCM_RTP_CHANNELS)
-#define PCM_RING_MASK    (PCM_RTP_SLOT_COUNT - 1U)
 #define VALID_WORDS      (PCM_RTP_SLOT_FRAMES / 32U)
 
 _Static_assert((PCM_RTP_SLOT_COUNT & (PCM_RTP_SLOT_COUNT - 1U)) == 0,
                "PCM_RTP_SLOT_COUNT must be power of two");
+_Static_assert((PCM_RTP_FINAL_SLOT_COUNT & (PCM_RTP_FINAL_SLOT_COUNT - 1U)) == 0,
+               "PCM_RTP_FINAL_SLOT_COUNT must be power of two");
 _Static_assert((PCM_RTP_SLOT_FRAMES & (PCM_RTP_SLOT_FRAMES - 1U)) == 0,
                "PCM_RTP_SLOT_FRAMES must be power of two");
 _Static_assert((PCM_RTP_SLOT_FRAMES % 32U) == 0,
@@ -32,6 +33,7 @@ struct pcm_rtp_ring {
   int16_t *pcm;
   bool owns_pcm;
   pcm_slot_tag_t *tags;
+  uint32_t slot_count; /* immutable; each ring has its own address mask */
   uint32_t generation;
 };
 
@@ -39,8 +41,8 @@ static inline uint32_t page_base(uint32_t rtp) {
   return rtp & ~(PCM_RTP_SLOT_FRAMES - 1U);
 }
 
-static inline uint32_t slot_for_page(uint32_t page_rtp) {
-  return (page_rtp >> 10) & PCM_RING_MASK;
+static inline uint32_t slot_for_page(const pcm_rtp_ring_t *r, uint32_t page_rtp) {
+  return (page_rtp >> 10) & (r->slot_count - 1U);
 }
 
 static inline int32_t rtp_delta(uint32_t a, uint32_t b) {
@@ -134,13 +136,15 @@ size_t pcm_rtp_ring_storage_bytes(void) {
 }
 
 static esp_err_t pcm_rtp_ring_create_internal(
-    pcm_rtp_ring_t **out, void *storage, size_t storage_bytes) {
+    pcm_rtp_ring_t **out, void *storage, size_t storage_bytes,
+    uint32_t slot_count) {
   if (!out) {
     return ESP_ERR_INVALID_ARG;
   }
   *out = NULL;
 
-  const size_t pcm_bytes = pcm_rtp_ring_storage_bytes();
+  const size_t pcm_bytes =
+      (size_t)slot_count * PCM_SLOT_SAMPLES * sizeof(int16_t);
   if (storage && (storage_bytes < pcm_bytes ||
                   ((uintptr_t)storage % _Alignof(int16_t)) != 0U)) {
     return ESP_ERR_INVALID_ARG;
@@ -151,6 +155,7 @@ static esp_err_t pcm_rtp_ring_create_internal(
     return ESP_ERR_NO_MEM;
   }
 
+  r->slot_count = slot_count;
   if (storage) {
     r->pcm = (int16_t *)storage;
     r->owns_pcm = false;
@@ -159,10 +164,10 @@ static esp_err_t pcm_rtp_ring_create_internal(
                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     r->owns_pcm = true;
   }
-  r->tags = heap_caps_calloc(PCM_RTP_SLOT_COUNT, sizeof(pcm_slot_tag_t),
+  r->tags = heap_caps_calloc(slot_count, sizeof(pcm_slot_tag_t),
                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!r->tags) {
-    r->tags = calloc(PCM_RTP_SLOT_COUNT, sizeof(pcm_slot_tag_t));
+    r->tags = calloc(slot_count, sizeof(pcm_slot_tag_t));
   }
   r->writer_mutex = xSemaphoreCreateMutex();
   if (!r->pcm || !r->tags || !r->writer_mutex) {
@@ -174,9 +179,9 @@ static esp_err_t pcm_rtp_ring_create_internal(
   const audio_diag_pcm_ring_id_t diag_ring_id =
       storage ? AUDIO_DIAG_PCM_RING_ALAC_STAGE : AUDIO_DIAG_PCM_RING_FINAL;
   AUDIO_DIAG_BUFFER_PCM_RING(diag_ring_id,
-                             (uint32_t)PCM_RTP_SLOT_COUNT,
+                             slot_count,
                              (uint32_t)PCM_RTP_SLOT_FRAMES,
-                             (uint32_t)PCM_RTP_RING_FRAMES,
+                             slot_count * PCM_RTP_SLOT_FRAMES,
                              (uint32_t)pcm_bytes);
 #endif
   *out = r;
@@ -184,14 +189,14 @@ static esp_err_t pcm_rtp_ring_create_internal(
 }
 
 esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out) {
-  return pcm_rtp_ring_create_internal(out, NULL, 0U);
+  return pcm_rtp_ring_create_internal(out, NULL, 0U, PCM_RTP_FINAL_SLOT_COUNT);
 }
 
 esp_err_t pcm_rtp_ring_create_with_storage(pcm_rtp_ring_t **out,
                                            void *storage,
                                            size_t storage_bytes) {
   if (!storage) return ESP_ERR_INVALID_ARG;
-  return pcm_rtp_ring_create_internal(out, storage, storage_bytes);
+  return pcm_rtp_ring_create_internal(out, storage, storage_bytes, PCM_RTP_SLOT_COUNT);
 }
 
 void pcm_rtp_ring_destroy(pcm_rtp_ring_t *r) {
@@ -218,7 +223,8 @@ void pcm_rtp_ring_set_generation(pcm_rtp_ring_t *r, uint32_t generation) {
  * history and may be evicted immediately.  This prevents an unrelated RTP
  * universe from looking "future forever" merely because signed 32-bit RTP
  * ordering happens to put its page above wanted_rtp. */
-static bool page_has_protected_future(const pcm_slot_tag_t *tag,
+static bool page_has_protected_future(const pcm_rtp_ring_t *r,
+                                      const pcm_slot_tag_t *tag,
                                       uint32_t wanted_rtp) {
   if (!validity_any(tag->valid)) return false;
 
@@ -226,14 +232,14 @@ static bool page_has_protected_future(const pcm_slot_tag_t *tag,
   const int64_t end_delta =
       (int64_t)start_delta + (int64_t)PCM_RTP_SLOT_FRAMES;
   if (end_delta <= 0) return false;
-  if ((int64_t)start_delta >= (int64_t)PCM_RTP_RING_FRAMES) return false;
+  if ((int64_t)start_delta >= ((int64_t)r->slot_count * PCM_RTP_SLOT_FRAMES)) return false;
 
   uint32_t off = 0U;
   if (start_delta < 0) off = (uint32_t)(-start_delta);
 
   uint32_t end_off = PCM_RTP_SLOT_FRAMES;
   const int64_t horizon_left =
-      (int64_t)PCM_RTP_RING_FRAMES - (int64_t)start_delta;
+      ((int64_t)r->slot_count * PCM_RTP_SLOT_FRAMES) - (int64_t)start_delta;
   if (horizon_left <= 0) return false;
   if (horizon_left < (int64_t)end_off) end_off = (uint32_t)horizon_left;
   if (off >= end_off) return false;
@@ -303,7 +309,7 @@ static bool pcm_rtp_ring_write_locked(pcm_rtp_ring_t *r, uint32_t first_rtp,
     if ((size_t)chunk > remain) {
       chunk = (uint32_t)remain;
     }
-    uint32_t slot = slot_for_page(base);
+    uint32_t slot = slot_for_page(r, base);
     chunks[chunk_count++] = (pcm_write_chunk_t){
         .tag = &r->tags[slot],
         .slot = slot,
@@ -352,7 +358,7 @@ static bool pcm_rtp_ring_write_locked(pcm_rtp_ring_t *r, uint32_t first_rtp,
        * playhead's finite future cache window.  FLUSH can therefore make a
        * physical slot reusable immediately without changing the PCM session
        * generation, and unrelated RTP address spaces cannot pin the ring. */
-      if (wanted_valid && page_has_protected_future(tag, wanted_rtp)) {
+      if (wanted_valid && page_has_protected_future(r, tag, wanted_rtp)) {
         for (unsigned j = 0; j < chunk_count; ++j) {
           __atomic_store_n(&chunks[j].tag->seq, chunks[j].seq_even + 2U,
                            __ATOMIC_RELEASE);
@@ -411,7 +417,7 @@ static bool read_page_range(const pcm_rtp_ring_t *r, uint32_t rtp,
     return false;
   }
 
-  uint32_t slot = slot_for_page(base);
+  uint32_t slot = slot_for_page(r, base);
   const pcm_slot_tag_t *tag = &r->tags[slot];
   for (int retry = 0; retry < 2; ++retry) {
     uint32_t seq1 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
@@ -444,7 +450,7 @@ static bool has_page_range(const pcm_rtp_ring_t *r, uint32_t rtp,
     return false;
   }
 
-  uint32_t slot = slot_for_page(base);
+  uint32_t slot = slot_for_page(r, base);
   const pcm_slot_tag_t *tag = &r->tags[slot];
   for (int retry = 0; retry < 2; ++retry) {
     uint32_t seq1 = __atomic_load_n(&tag->seq, __ATOMIC_ACQUIRE);
@@ -499,7 +505,7 @@ uint32_t pcm_rtp_ring_contiguous_frames(const pcm_rtp_ring_t *r,
   while (total < max_frames) {
     const uint32_t base = page_base(cur);
     const uint32_t offset = cur - base;
-    const uint32_t slot = slot_for_page(base);
+    const uint32_t slot = slot_for_page(r, base);
     const pcm_slot_tag_t *tag = &r->tags[slot];
     uint32_t valid_copy[VALID_WORDS];
     bool stable = false;
@@ -521,13 +527,20 @@ uint32_t pcm_rtp_ring_contiguous_frames(const pcm_rtp_ring_t *r,
     uint32_t limit = PCM_RTP_SLOT_FRAMES - offset;
     const uint32_t remain = max_frames - total;
     if (limit > remain) limit = remain;
-    for (uint32_t i = 0; i < limit; ++i) {
-      const uint32_t bit = offset + i;
-      if ((valid_copy[bit >> 5] & (1U << (bit & 31U))) == 0U) {
-        return total;
+    uint32_t bit = offset;
+    while (limit) {
+      const uint32_t shift = bit & 31U;
+      uint32_t count = 32U - shift;
+      if (count > limit) count = limit;
+      const uint32_t mask = count == 32U ? UINT32_MAX : (1U << count) - 1U;
+      const uint32_t holes = ~(valid_copy[bit >> 5] >> shift) & mask;
+      if (holes) {
+        return total + (uint32_t)__builtin_ctz(holes);
       }
-      ++total;
-      ++cur;
+      total += count;
+      cur += count;
+      bit += count;
+      limit -= count;
     }
   }
   return total;
@@ -572,7 +585,7 @@ static bool read_page_range_conceal(const pcm_rtp_ring_t *r, uint32_t rtp,
   const uint32_t offset = rtp - base;
   if (offset + frames > PCM_RTP_SLOT_FRAMES) return false;
 
-  const uint32_t slot = slot_for_page(base);
+  const uint32_t slot = slot_for_page(r, base);
   const pcm_slot_tag_t *tag = &r->tags[slot];
   uint32_t valid_copy[VALID_WORDS];
 
@@ -642,7 +655,7 @@ void pcm_rtp_ring_invalidate_range(pcm_rtp_ring_t *r, uint32_t from_rtp,
 
   xSemaphoreTake(r->writer_mutex, portMAX_DELAY);
   /* Visit physical tags once, even if the sender names hours of RTP time. */
-  for (uint32_t i = 0; i < PCM_RTP_SLOT_COUNT; ++i) {
+  for (uint32_t i = 0; i < r->slot_count; ++i) {
     pcm_slot_tag_t *tag = &r->tags[i];
     if (tag->generation != generation) continue;
     const int64_t start = (int32_t)(tag->page_rtp - from_rtp);
@@ -671,7 +684,7 @@ void pcm_rtp_ring_invalidate_before(pcm_rtp_ring_t *r, uint32_t until_rtp,
     xSemaphoreGive(r->writer_mutex);
     return;
   }
-  for (uint32_t i = 0; i < PCM_RTP_SLOT_COUNT; ++i) {
+  for (uint32_t i = 0; i < r->slot_count; ++i) {
     pcm_slot_tag_t *tag = &r->tags[i];
     if (tag->generation != generation) continue;
     const int32_t before = rtp_delta(until_rtp, tag->page_rtp);

@@ -45,6 +45,8 @@ typedef enum {
 
 esp_err_t audio_receiver_init(void);
 bool audio_receiver_is_initialized(void);
+/* True only at a completed media stop boundary; persistent workers may exist. */
+bool audio_receiver_is_idle(void);
 /* Wi-Fi scans need temporary heap headroom. This is a full audio-engine
  * memory release (except for the already-created I2S driver itself): current
  * media is stopped, audio worker tasks exit, all large codec/PCM stores are
@@ -69,15 +71,18 @@ size_t audio_receiver_get_buffered_audio_buffer_size(void);
 void audio_receiver_set_volume_q15(int32_t volume_q15);
 int32_t audio_receiver_get_volume_q15(void);
 
-/* Timeline/generation control. These invalidate old PCM in O(1), no scan. */
+/* Buffered no-boundary FLUSH: invalidate PCM and wait for a fresh anchor. */
 void audio_receiver_flush(void);
 void audio_receiver_seek_flush(void);
 /* AP2 realtime FLUSH with RTP-Info: discard audio older than the sender's
  * RTP boundary while preserving the validated D7/SETRATE RTP<->PTP map. */
 void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp);
 void audio_receiver_realtime_flush_wait_sender_anchor(void);
+/* timestamps_valid is key presence, not numeric nonzero: RTP zero is valid.
+ * A usable timestamp interval additionally invalidates the matching PCM range. */
 esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t from_ts,
-                                                   uint32_t until_seq, uint32_t until_ts);
+                                                   uint32_t until_seq, uint32_t until_ts,
+                                                   bool timestamps_valid);
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts);
 void audio_receiver_pause(void);
 void audio_receiver_set_playing(bool playing);

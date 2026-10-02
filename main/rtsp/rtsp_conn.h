@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "hap.h"
+#include "audio_receiver.h"
 
 /**
  * RTSP Connection State Management
@@ -20,6 +21,8 @@ struct rtsp_conn {
   // HAP session for pairing/encryption
   hap_session_t *hap_session;
   bool encrypted_mode;
+  /* One serialized client task owns read/write crypto scratch. */
+  uint8_t *crypto_scratch;
 
   // Volume control: Q15 fixed-point (0-32768)
   // 32768 = 0 dB (unity), 0 = mute
@@ -37,6 +40,11 @@ struct rtsp_conn {
   bool ptp_session_fresh;
   bool amp_session_active;
   int64_t pause_started_us;
+  /* Last committed AP2 setup; only the RTSP owner changes this snapshot. */
+  bool setup_format_valid;
+  audio_format_t setup_format;
+  audio_encrypt_t setup_encryption;
+  uint32_t setup_latency;
   int64_t stream_type;    // 96=UDP realtime, 103=TCP buffered
   uint16_t data_port;     // UDP port for audio data (type 96)
   uint16_t control_port;  // UDP port for control (retransmit requests)

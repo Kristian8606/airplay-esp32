@@ -13,6 +13,7 @@
 struct alac_decoder {
   alac_decoder_config_t config;
   void *handle;
+  uint32_t decode_errors;
   uint8_t cookie[ALAC_COOKIE_LEN];
 };
 
@@ -122,7 +123,9 @@ int alac_decoder_decode(alac_decoder_t *d, const uint8_t *input,
 
   esp_audio_err_t err = esp_alac_dec_decode(d->handle, &raw, &frame, &dec_info);
   if (err != ESP_AUDIO_ERR_OK) {
-    ESP_LOGW(TAG, "decode error=%d; resetting ALAC decoder", err);
+    if ((++d->decode_errors & 63U) == 1U)
+      ESP_LOGW(TAG, "decode error=%d; resetting ALAC decoder (%lu total)",
+               err, (unsigned long)d->decode_errors);
     esp_alac_dec_reset(d->handle);
     return -1;
   }

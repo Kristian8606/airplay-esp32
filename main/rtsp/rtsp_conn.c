@@ -70,6 +70,7 @@ void rtsp_conn_free(rtsp_conn_t *conn) {
     conn->hap_session = NULL;
   }
 
+  free(conn->crypto_scratch);
   free(conn);
 }
 

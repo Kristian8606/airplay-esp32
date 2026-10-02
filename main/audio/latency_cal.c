@@ -76,7 +76,8 @@ static void reader_task(void *arg) {
     if (err != ESP_OK) {
       /* v4.1.22: never spin on an error. The driver logs every failed read,
        * and a tight loop of those logs overflowed this task's stack. */
-      vTaskDelay(pdMS_TO_TICKS(5));
+      const TickType_t delay = pdMS_TO_TICKS(5);
+      vTaskDelay(delay ? delay : 1);
       continue;
     }
     for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= got;

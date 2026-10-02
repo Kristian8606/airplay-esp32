@@ -24,3 +24,8 @@ esp_err_t log_stream_init(void);
  * and start the broadcast task.
  */
 esp_err_t log_stream_register(httpd_handle_t server);
+
+/** Detach before httpd_stop(); waits for broadcaster server access to finish.
+ * Call from the server lifecycle owner, outside HTTPD request handlers.
+ */
+void log_stream_detach(httpd_handle_t server);

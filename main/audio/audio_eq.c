@@ -616,6 +616,21 @@ static inline void process_right_bypass(int16_t *pcm, size_t frames) {
   }
 }
 
+/* Neutral EQ does not advance RNG/filter states. Preserve precisely the
+ * trailing-silence counter without float conversion/quantisation per sample. */
+static void neutral_update_silence(const int16_t *pcm, size_t frames,
+                                   unsigned channel, eq_dither_t *d) {
+  size_t tail = 0;
+  while (tail < frames && tail < EQ_DITHER_SILENCE_SAMPLES &&
+         pcm[(frames - 1U - tail) * 2U + channel] == 0) {
+    ++tail;
+  }
+  uint32_t zeros = (uint32_t)tail;
+  if (tail == frames) zeros += d->zero_run;
+  d->zero_run = zeros < EQ_DITHER_SILENCE_SAMPLES
+                    ? zeros : EQ_DITHER_SILENCE_SAMPLES;
+}
+
 void audio_eq_process(int16_t *pcm, size_t frames, int channels,
                       int sample_rate) {
   if (!pcm || frames == 0 || channels != 2) return;
@@ -644,6 +659,14 @@ void audio_eq_process(int16_t *pcm, size_t frames, int channels,
       default:
         break;
     }
+    eq_unlock();
+    return;
+  }
+
+  if (mode == AUDIO_EQ_CHANNEL_STEREO && s_eq.active_l == 0U &&
+      s_eq.active_r == 0U && s_eq.preamp_gain == 1.0f) {
+    neutral_update_silence(pcm, frames, 0U, &s_eq.dith_l);
+    neutral_update_silence(pcm, frames, 1U, &s_eq.dith_r);
     eq_unlock();
     return;
   }

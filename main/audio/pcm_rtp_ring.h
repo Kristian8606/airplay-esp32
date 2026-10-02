@@ -9,7 +9,8 @@
 /*
  * Direct RTP-addressed PCM store.
  *
- * 128 slots x 1024 stereo frames = 131072 frames = 2.97 s @ 44.1 kHz.
+ * Final playout: 128 slots x 1024 stereo frames = 2.97 s @ 44.1 kHz.
+ * Caller-backed ALAC staging: 128 slots x 1024 frames = 2.97 s.
  * A slot is keyed by absolute RTP page base (rtp & ~1023). RTP itself is the
  * address: no sorting, no scan, no linked list, no binary search.
  *
@@ -19,19 +20,22 @@
  */
 
 #define PCM_RTP_SLOT_FRAMES 1024U
-#define PCM_RTP_SLOT_COUNT  128U
+#define PCM_RTP_SLOT_COUNT  128U /* caller-backed ALAC staging */
+#define PCM_RTP_FINAL_SLOT_COUNT 128U
 #define PCM_RTP_RING_FRAMES (PCM_RTP_SLOT_FRAMES * PCM_RTP_SLOT_COUNT)
+#define PCM_RTP_FINAL_RING_FRAMES (PCM_RTP_SLOT_FRAMES * PCM_RTP_FINAL_SLOT_COUNT)
 #define PCM_RTP_CHANNELS    2U
 
 typedef struct pcm_rtp_ring pcm_rtp_ring_t;
 
+/* Allocate the final playout ring; tags remain in internal RAM. */
 esp_err_t pcm_rtp_ring_create(pcm_rtp_ring_t **out);
 
-/* Size of the large stereo PCM backing array only. Tags/mutex/control state
+/* Size of the 128-page ALAC staging stereo PCM backing array only. Tags/mutex/control state
  * are deliberately excluded and retain their normal ownership. */
 size_t pcm_rtp_ring_storage_bytes(void);
 
-/* Construct the same RTP-addressed ring on caller-owned PCM storage. The
+/* Construct the 128-page ALAC staging ring on caller-owned PCM storage. The
  * storage must remain valid until the ring is destroyed and must not be
  * concurrently reused by another codec while this ring is active. */
 esp_err_t pcm_rtp_ring_create_with_storage(pcm_rtp_ring_t **out,

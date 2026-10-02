@@ -25,6 +25,10 @@ typedef bool (*realtime_deadline_cb_t)(uint32_t rtp,
 typedef struct {
   uint32_t work_queue_depth;
   uint32_t work_queue_capacity;
+  uint32_t dropped_data;
+  uint32_t dropped_rtx;
+  uint32_t missing_backpressure;
+  uint32_t received_backpressure;
 } realtime_receiver_usage_t;
 
 typedef struct {
@@ -46,6 +50,10 @@ esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
 /* Detach caller-owned DATA/RTX packet storage before that shared workspace is
  * freed. The realtime receiver must already be fully stopped. */
 esp_err_t realtime_receiver_clear_packet_workspace(void);
+
+/* Reserve the DATA task's internal stack/TCB before sessions fragment RAM.
+ * The reservation survives stop/start and audio release for Wi-Fi scanning. */
+esp_err_t realtime_receiver_reserve_data_task_memory(void);
 
 esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
                                   const realtime_receiver_config_t *config);

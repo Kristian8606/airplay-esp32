@@ -1,6 +1,7 @@
 #include "rtsp_server.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "rtsp_conn.h"
 #include "rtsp_crypto.h"
@@ -40,8 +42,9 @@ static const char *TAG = "rtsp_server";
 #define RTSP_SERVER_TASK_PRIORITY 5
 
 static int server_socket = -1;
-static TaskHandle_t server_task_handle = NULL;
-static bool server_running = false;
+static _Atomic bool server_task_live;
+static _Atomic bool server_running;
+static _Atomic(SemaphoreHandle_t) lifecycle_mutex;
 
 // RTSP tasks are restartable. Use dynamic TCB allocation so
 // reconnect/start-stop paths cannot reuse static task memory before FreeRTOS
@@ -50,29 +53,46 @@ static bool server_running = false;
 // Client slot for tracking connections
 typedef struct {
   rtsp_conn_t *conn;
-  TaskHandle_t task;
+  _Atomic bool live;
   int socket;
-  volatile bool should_stop;
-  volatile bool is_old; // Marked as old client being killed
+  _Atomic bool should_stop;
+  _Atomic bool is_old; // Marked as old client being killed
 } client_slot_t;
 
-static client_slot_t clients[2] = {0}; // Current and old
+static client_slot_t clients[2] = {{.socket = -1}, {.socket = -1}}; // Current and old
 static int current_slot = 0;
 
-// Public API for volume control
+// Hold the lifetime mutex while accessing a public connection pointer.
 void airplay_set_volume(float volume_db) {
+  if (!lifecycle_mutex) return;
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
   client_slot_t *c = &clients[current_slot];
-  if (c->conn && !c->is_old) {
-    rtsp_conn_set_volume(c->conn, volume_db);
-  }
+  if (c->conn && !c->is_old) rtsp_conn_set_volume(c->conn, volume_db);
+  xSemaphoreGive(lifecycle_mutex);
 }
 
 int32_t airplay_get_volume_q15(void) {
+  if (!lifecycle_mutex) return 16384;
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
   client_slot_t *c = &clients[current_slot];
-  if (c->conn && !c->is_old) {
-    return rtsp_conn_get_volume_q15(c->conn);
-  }
-  return 16384; // 50% volume for new clients
+  int32_t volume = c->conn && !c->is_old ?
+      rtsp_conn_get_volume_q15(c->conn) : 16384;
+  xSemaphoreGive(lifecycle_mutex);
+  return volume;
+}
+
+static void detach_client_socket(client_slot_t *slot) {
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  int socket = slot->socket;
+  slot->socket = -1;
+  xSemaphoreGive(lifecycle_mutex);
+  if (socket >= 0) close(socket);
+}
+
+static void detach_client_conn(client_slot_t *slot) {
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  slot->conn = NULL;
+  xSemaphoreGive(lifecycle_mutex);
 }
 
 // Helper to grow buffer
@@ -108,27 +128,18 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     }
 
     size_t header_len = (size_t)(header_end - buffer) + 4;
-    char *header_str = malloc(header_len + 1);
-    if (!header_str) {
-      *buf_len = 0;
-      break;
+    /* One guard byte already exists; inspect only the header in place. */
+    uint8_t header_saved = buffer[header_len];
+    buffer[header_len] = '\0';
+    int content_len = rtsp_parse_content_length((const char *)buffer);
+    buffer[header_len] = header_saved;
+    if (content_len < 0 || header_len > RTSP_BUFFER_LARGE ||
+        (size_t)content_len > RTSP_BUFFER_LARGE - header_len) {
+      slot->conn->close_after_response = true;
+      return; /* Never reinterpret an invalid body as a new request. */
     }
-    memcpy(header_str, buffer, header_len);
-    header_str[header_len] = '\0';
-
-    int content_len = rtsp_parse_content_length(header_str);
-    if (content_len < 0) {
-      content_len = 0;
-    }
-
     size_t total_len = header_len + (size_t)content_len;
-    if (total_len > RTSP_BUFFER_LARGE || *buf_len < total_len) {
-      free(header_str);
-      if (total_len > RTSP_BUFFER_LARGE) {
-        *buf_len = 0;
-      }
-      break;
-    }
+    if (*buf_len < total_len) break;
 
     // Null-terminate so strcasestr in parse_raw_header won't read past
     // the message boundary. The allocation always has one guard byte beyond
@@ -137,7 +148,6 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     buffer[total_len] = '\0';
     rtsp_dispatch(slot->socket, slot->conn, buffer, total_len);
     buffer[total_len] = saved;
-    free(header_str);
 
     if (slot->conn->close_after_response) {
       // Shairport handle_teardown_2() sets conn->stop after returning the
@@ -163,13 +173,14 @@ static void client_task(void *pvParameters) {
   rtsp_conn_t *conn = rtsp_conn_create();
   if (!conn) {
     ESP_LOGE(TAG, "Failed to create connection state");
-    close(slot->socket);
-    slot->socket = -1;
-    slot->task = NULL;
+    detach_client_socket(slot);
+    slot->live = false;
     vTaskDelete(NULL);
     return;
   }
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
   slot->conn = conn;
+  xSemaphoreGive(lifecycle_mutex);
   AUDIO_DIAG_FLUSH_RTSP_SESSION_RESET(slot->socket);
 
   // Get client IP address for timing requests
@@ -191,11 +202,10 @@ static void client_task(void *pvParameters) {
   uint8_t *buffer = malloc(buf_capacity + 1U);
   if (!buffer) {
     ESP_LOGE(TAG, "Failed to allocate buffer");
+    detach_client_conn(slot);
     rtsp_conn_free(conn);
-    slot->conn = NULL;
-    close(slot->socket);
-    slot->socket = -1;
-    slot->task = NULL;
+    detach_client_socket(slot);
+    slot->live = false;
     vTaskDelete(NULL);
     return;
   }
@@ -234,10 +244,9 @@ static void client_task(void *pvParameters) {
         int block_len = rtsp_crypto_read_block(
             slot->socket, conn, buffer + buf_len, buf_capacity - buf_len);
         if (block_len <= 0) {
-          if (slot->should_stop || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-            goto cleanup;
-          }
-          continue;
+          /* The helper consumes timeouts internally to preserve framing.
+           * Every failure is terminal, independently of stale errno. */
+          goto cleanup;
         }
 
         buf_len += (size_t)block_len;
@@ -267,7 +276,7 @@ static void client_task(void *pvParameters) {
     ssize_t recv_len =
         recv(slot->socket, buffer + buf_len, buf_capacity - buf_len, 0);
     if (recv_len <= 0) {
-      if (recv_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      if (recv_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         continue;
       }
       break;
@@ -282,31 +291,29 @@ static void client_task(void *pvParameters) {
 cleanup:
   ESP_LOGI(TAG, "Client slot %d disconnected", slot_idx);
   free(buffer);
-  close(slot->socket);
-  slot->socket = -1;
+  detach_client_socket(slot);
 
   // Immediate: stop audio and NTP
   audio_receiver_stop();
-  /* Unexpected socket loss is a full AirPlay session boundary.  Do not let
-   * the next client inherit the previous stream selector or session key. */
+  rtsp_stop_event_port_task();
+  /* A timeout requests cancellation, but does not release ownership. Keep
+   * this slot live until every producer and event socket actually exits. */
+  while (!audio_receiver_is_idle() || !rtsp_event_port_is_idle()) {
+    /* A late static DATA-task suspension must be reaped by another stop. */
+    if (!audio_receiver_is_idle()) audio_receiver_stop();
+    if (!rtsp_event_port_is_idle()) rtsp_stop_event_port_task();
+    vTaskDelay(1);
+  }
   audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
   audio_receiver_set_encryption(NULL);
 
-  // Stop the AirPlay 2 event listener before rtsp_conn_free() closes its
-  // listening socket.  Closing it first can wake select()/accept() on a
-  // descriptor that is being torn down and report EINVAL on a normal
-  // disconnect.  rtsp_stop_event_port_task() sets the stop flag first,
-  // shuts down the sockets to unblock the task, and waits for it to exit.
-  rtsp_stop_event_port_task();
-
   // AirPlay receiver: no AirPlay 1 DACP grace/reconnect path.
+  detach_client_conn(slot);
   rtsp_conn_free(conn);
 
-  slot->conn = NULL;
-  slot->socket = -1;
-  slot->task = NULL;
   slot->should_stop = false;
   slot->is_old = false;
+  slot->live = false;
 
   vTaskDelete(NULL);
 }
@@ -315,7 +322,7 @@ cleanup:
 // global audio/PTP cleanup before giving a replacement client stream ownership.
 static void signal_client_stop(int slot_idx) {
   client_slot_t *slot = &clients[slot_idx];
-  if (slot->task == NULL) {
+  if (!slot->live) {
     return;
   }
 
@@ -323,17 +330,17 @@ static void signal_client_stop(int slot_idx) {
   slot->is_old = true;
   slot->should_stop = true;
 
-  // Shutdown socket to unblock recv/crypto read immediately.
-  if (slot->socket >= 0) {
-    shutdown(slot->socket, SHUT_RDWR);
-  }
+  // Serialize shutdown with descriptor detach; only the owner closes.
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  if (slot->socket >= 0) shutdown(slot->socket, SHUT_RDWR);
+  xSemaphoreGive(lifecycle_mutex);
 }
 
 static bool wait_client_stopped(int slot_idx, TickType_t timeout_ticks) {
   client_slot_t *slot = &clients[slot_idx];
   TickType_t start = xTaskGetTickCount();
 
-  while (slot->task != NULL) {
+  while (slot->live) {
     if ((TickType_t)(xTaskGetTickCount() - start) >= timeout_ticks) {
       return false;
     }
@@ -348,63 +355,49 @@ static void server_task(void *pvParameters) {
   struct sockaddr_in server_addr, client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
 
-  // Initialize slots
-  for (int i = 0; i < 2; i++) {
-    clients[i].socket = -1;
-    clients[i].conn = NULL;
-    clients[i].task = NULL;
-    clients[i].should_stop = false;
-    clients[i].is_old = false;
-  }
-
-  server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (server_socket < 0) {
+  int listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (listen_socket < 0) {
     ESP_LOGE(TAG, "Failed to create socket: %d", errno);
-    server_task_handle = NULL;
-    vTaskDelete(NULL);
-    return;
+    goto server_exit;
   }
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  server_socket = listen_socket;
+  bool stopping = !server_running;
+  xSemaphoreGive(lifecycle_mutex);
+  if (stopping) goto server_close;
 
   int opt = 1;
-  setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
   server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
   server_addr.sin_port = htons(RTSP_PORT);
 
-  if (bind(server_socket, (struct sockaddr *)&server_addr,
+  if (bind(listen_socket, (struct sockaddr *)&server_addr,
            sizeof(server_addr)) < 0) {
     ESP_LOGE(TAG, "Failed to bind: %d", errno);
-    close(server_socket);
-    server_socket = -1;
-    server_task_handle = NULL;
-    vTaskDelete(NULL);
-    return;
+    goto server_close;
   }
 
-  if (listen(server_socket, 5) < 0) {
+  if (listen(listen_socket, 5) < 0) {
     ESP_LOGE(TAG, "Failed to listen: %d", errno);
-    close(server_socket);
-    server_socket = -1;
-    server_task_handle = NULL;
-    vTaskDelete(NULL);
-    return;
+    goto server_close;
   }
 
   ESP_LOGI(TAG, "RTSP server listening on port %d", RTSP_PORT);
-  server_running = true;
-
   while (server_running) {
-    int new_socket = accept(server_socket, (struct sockaddr *)&client_addr,
+    int new_socket = accept(listen_socket, (struct sockaddr *)&client_addr,
                             &client_addr_len);
     if (new_socket < 0) {
       if (server_running) {
         ESP_LOGE(TAG, "Failed to accept: %d", errno);
       }
-      continue;
+      if (errno == EINTR) continue;
+      break;
     }
 
+    if (!server_running) { close(new_socket); break; }
     ESP_LOGI(TAG, "New client connected");
 
     // Find slot for new client (alternate between 0 and 1)
@@ -412,7 +405,7 @@ static void server_task(void *pvParameters) {
 
     // A spare slot should normally already be free.  If a stale task is still
     // finishing there, do not reuse its slot until cleanup is complete.
-    if (clients[new_slot].task != NULL) {
+    if (clients[new_slot].live) {
       signal_client_stop(new_slot);
       if (!wait_client_stopped(new_slot, pdMS_TO_TICKS(3000))) {
         ESP_LOGE(TAG, "Slot %d task did not exit in time", new_slot);
@@ -424,7 +417,7 @@ static void server_task(void *pvParameters) {
     // Serialize RTSP ownership.  client_task cleanup performs global
     // audio_receiver_stop() and rtsp_conn_free() -> ptp_clock_clear().
     // The replacement must not start until those operations are complete.
-    if (clients[current_slot].task != NULL) {
+    if (clients[current_slot].live) {
       signal_client_stop(current_slot);
       ESP_LOGI(TAG,
                "Waiting for old client slot %d cleanup before replacement",
@@ -441,97 +434,92 @@ static void server_task(void *pvParameters) {
 
     // Setup new slot only after the previous owner has completed all global
     // audio/PTP cleanup.
+    xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+    if (!server_running) {
+      xSemaphoreGive(lifecycle_mutex);
+      close(new_socket);
+      break;
+    }
     clients[new_slot].socket = new_socket;
     clients[new_slot].should_stop = false;
     clients[new_slot].is_old = false;
-
-    // Start new client task immediately.
-    clients[new_slot].task = NULL;
-    BaseType_t task_ret =
-        xTaskCreatePinnedToCore(client_task, "rtsp_client", CLIENT_STACK_SIZE,
-                                (void *)(intptr_t)new_slot, RTSP_CLIENT_TASK_PRIORITY,
-                                &clients[new_slot].task, 0);
-    if (task_ret != pdPASS || clients[new_slot].task == NULL) {
-      ESP_LOGE(TAG, "Failed to create client task");
-      close(new_socket);
+    clients[new_slot].live = true;
+    BaseType_t task_ret = xTaskCreatePinnedToCore(
+        client_task, "rtsp_client", CLIENT_STACK_SIZE,
+        (void *)(intptr_t)new_slot, RTSP_CLIENT_TASK_PRIORITY, NULL, 0);
+    if (task_ret != pdPASS) {
       clients[new_slot].socket = -1;
+      clients[new_slot].live = false;
     } else {
       current_slot = new_slot;
     }
-  }
-
-  // Stop all clients
-  for (int i = 0; i < 2; i++) {
-    if (clients[i].task != NULL) {
-      clients[i].should_stop = true;
-      if (clients[i].socket >= 0) {
-        shutdown(clients[i].socket, SHUT_RDWR);
-      }
+    xSemaphoreGive(lifecycle_mutex);
+    if (task_ret != pdPASS) {
+      ESP_LOGE(TAG, "Failed to create client task");
+      close(new_socket);
     }
   }
 
-  vTaskDelay(pdMS_TO_TICKS(500));
+  for (int i = 0; i < 2; i++) signal_client_stop(i);
 
-  if (server_socket >= 0) {
-    close(server_socket);
-    server_socket = -1;
-  }
-
-  server_task_handle = NULL;
+server_close:
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  server_socket = -1;
+  xSemaphoreGive(lifecycle_mutex);
+  close(listen_socket);
+server_exit:
+  server_running = false;
+  server_task_live = false;
   vTaskDelete(NULL);
 }
 
-static bool rtsp_server_wait_for_task_stopped(int timeout_ticks) {
-  while (server_task_handle != NULL && timeout_ticks-- > 0) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  return server_task_handle == NULL;
+bool rtsp_server_is_idle(void) {
+  return !server_task_live && !clients[0].live && !clients[1].live &&
+         rtsp_event_port_is_idle();
 }
 
 esp_err_t rtsp_server_start(void) {
-  if (server_task_handle != NULL) {
-    if (server_running) {
-      return ESP_ERR_INVALID_STATE;
-    }
-    ESP_LOGW(TAG, "RTSP server task still stopping, waiting");
-    if (!rtsp_server_wait_for_task_stopped(40)) {
-      ESP_LOGE(TAG, "Previous RTSP server task did not stop");
-      return ESP_ERR_INVALID_STATE;
-    }
+  if (!lifecycle_mutex) {
+    SemaphoreHandle_t created = xSemaphoreCreateMutex();
+    if (!created) return ESP_ERR_NO_MEM;
+    SemaphoreHandle_t expected = NULL;
+    if (!atomic_compare_exchange_strong(&lifecycle_mutex, &expected, created))
+      vSemaphoreDelete(created);
   }
-
-  BaseType_t task_ret =
-      xTaskCreatePinnedToCore(server_task, "rtsp_server", SERVER_STACK_SIZE, NULL,
-                              RTSP_SERVER_TASK_PRIORITY, &server_task_handle, 0);
-  if (task_ret != pdPASS || server_task_handle == NULL) {
-    return ESP_FAIL;
+  if (!lifecycle_mutex) return ESP_ERR_NO_MEM;
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  if (!rtsp_server_is_idle()) {
+    xSemaphoreGive(lifecycle_mutex);
+    return ESP_ERR_INVALID_STATE;
   }
-
-  return ESP_OK;
+  server_running = true;
+  server_task_live = true;
+  BaseType_t ret = xTaskCreatePinnedToCore(
+      server_task, "rtsp_server", SERVER_STACK_SIZE, NULL,
+      RTSP_SERVER_TASK_PRIORITY, NULL, 0);
+  if (ret != pdPASS) {
+    server_running = false;
+    server_task_live = false;
+  }
+  xSemaphoreGive(lifecycle_mutex);
+  return ret == pdPASS ? ESP_OK : ESP_FAIL;
 }
 
 void rtsp_server_stop(void) {
+  if (!lifecycle_mutex) return;
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
   server_running = false;
-
-  if (server_socket >= 0) {
-    shutdown(server_socket, SHUT_RDWR);
-    close(server_socket);
-    server_socket = -1;
-  }
-
-  if (server_task_handle != NULL) {
-    if (!rtsp_server_wait_for_task_stopped(40)) {
-      ESP_LOGW(TAG, "RTSP server task did not exit within timeout");
-    }
-  }
-
-  /* server_task asks every client to stop, but its fixed grace delay is not
-   * an ownership barrier. Callers that are about to free global audio memory
-   * must not return until client cleanup has completed audio_receiver_stop(). */
+  if (server_socket >= 0) shutdown(server_socket, SHUT_RDWR);
+  xSemaphoreGive(lifecycle_mutex);
+  for (int i = 0; i < 2; ++i) signal_client_stop(i);
+  TickType_t start = xTaskGetTickCount();
+  while (server_task_live &&
+         (TickType_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(2000))
+    vTaskDelay(1);
   for (int i = 0; i < 2; ++i) {
-    if (clients[i].task != NULL &&
-        !wait_client_stopped(i, pdMS_TO_TICKS(3000))) {
-      ESP_LOGW(TAG, "RTSP client slot %d did not exit within stop timeout", i);
-    }
+    if (!wait_client_stopped(i, pdMS_TO_TICKS(3000)))
+      ESP_LOGW(TAG, "RTSP client slot %d still stopping", i);
   }
+  if (!rtsp_server_is_idle())
+    ESP_LOGW(TAG, "RTSP owners still stopping; restart/resource release forbidden");
 }

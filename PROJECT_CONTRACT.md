@@ -4,9 +4,9 @@
 > Edit this file in place. Never create `PROJECT_CONTRACT_v2.md`, dated copies,
 > “new” copies, or parallel contracts. Git history is the history.
 
-**Last reviewed against project:** `v4.1.43-zero-seq-warn`  
+**Last reviewed against project:** `v4.1.45-flush-head-test`  
 **Behavioural reference:** Shairport Sync `5.5.2`  
-**Reference review date:** 2026-09-25
+**Reference review date:** 2026-10-02
 
 ---
 
@@ -19,10 +19,12 @@
    FIFO. It does not understand RTP, SSRC, FLUSH, timing, decode or play state.
 3. **Buffered Processor = the only sequential compressed-audio consumer.** No
    second cursor, FIFO scan, fast-skip path or transport-layer media discard.
-4. **FLUSH is applied only by the Buffered Processor.** RTSP records requests and
+4. **Compressed-packet FLUSH is applied only by the Buffered Processor.** RTSP
+   records requests, invalidates affected PCM through the receiver API and
    wakes the processor; the raw FIFO never applies FLUSH.
 5. **Future audio is not stale audio.** AutoMix may preload roughly 90–120 s and
-   then stop sending. A large positive lead alone must never delete audio.
+   then stop sending. Normal playback never drops packets for positive lead.
+   The experimental no-boundary admission exception is documented in Section 6.
 6. **Keep future audio compressed.** The large FIFO stores preload; decode only
    near presentation time.
 7. **Preserve AAC decoder history across normal discontinuities.** Timestamp
@@ -100,6 +102,14 @@ Before changing the reference version:
 - ESP32 task priorities/core pinning.
 - ESP32 I2S/APLL sync strategy instead of Linux backend correction methods.
 - Narrower codec/rate support than desktop Shairport.
+- Transport-only head peek and whole-frame cursor discard before payload copy.
+- Late deferred activation inside a wrap-safe sequence interval, plus targeted
+  PCM invalidation and publication rechecks.
+- Preservation of the FIFO endpoint across resume; ordinary pause preserves
+  received PCM rather than depending on a sampled stop transition.
+- Experimental zero/missing-sequence-boundary recovery, as detailed in Section 6.
+- Anchor publication requires RTP key presence and a nonzero timeline ID; a
+  default zero from a missing key cannot release no-boundary recovery.
 
 Any other behavioural difference should be treated as suspicious until reviewed.
 
@@ -135,8 +145,8 @@ Playout / PTP / I2S         physical output owner
 
 - read the buffered TCP connection;
 - preserve byte order;
-- assemble `[2-byte big-endian length][block bytes]`;
-- write complete raw blocks to FIFO;
+- move arbitrary TCP chunks of `[2-byte big-endian length][block bytes]` into
+  the FIFO without interpreting or rebuilding media frames;
 - apply normal backpressure;
 - report connection/stream epoch;
 - stop a broken transport connection.
@@ -153,7 +163,7 @@ Playout / PTP / I2S         physical output owner
 
 ### Buffered Processor OWNS
 
-- one current/held packet;
+- one inspected FIFO head, retained there until discarded or ready to decode;
 - sequence/timestamp interpretation;
 - SSRC recognition;
 - immediate/deferred FLUSH application;
@@ -232,8 +242,11 @@ RTSP_CONNECTED
 
 State rules:
 
-- Pause/play stop may clear decoded PCM/sequence-facing state but does not reset
-  AAC merely because playback stopped.
+- Ordinary pause stops presentation and resets sequence/EQ history while
+  preserving received RTP-addressed PCM and the AAC chain.
+- Immediate FLUSH invalidates PCM synchronously at registration, independent
+  of whether the consumer observes a stopped play flag.
+- A new compressed TCP epoch rebuilds codec history and invalidates old PCM.
 - New accepted buffered TCP epoch is a true compressed-stream boundary.
 - Full session boundary clears session-owned state.
 - Stream TEARDOWN and full-session TEARDOWN must stay distinct.
@@ -260,19 +273,24 @@ The early wait must be interruptible by control events.
 
 When a valid packet is too far in the future:
 
-1. Hold at most that one packet outside the FIFO.
-2. Keep it compressed.
+1. Leave that whole packet at the single FIFO head.
+2. Inspect only the 14 length/header bytes; keep the payload compressed.
 3. Do not decode yet.
 4. Do not drop merely because it is far ahead.
 5. Wait for timing/control progress.
 6. Re-evaluate the same packet.
 
-The rest of the long preload stays compressed in FIFO.
+The rest of the long preload stays compressed in FIFO. A newly arriving FLUSH
+can reclassify the same head before any payload copy. Cursor-only discard is
+committed only for a complete frame and matching epoch/position/read serial;
+a newer control revision requires reclassification.
+Sequence-request activation/completion also validates that head under control
+-> FIFO locks before changing state. An obsolete peek cannot end a request.
 
 Forbidden:
 
-- future-time drop thresholds used as “stale” detection;
-- FIFO RTP searching/fast skip;
+- normal-play future-time drop thresholds used as “stale” detection;
+- FIFO RTP searching or independent fast-skip cursors;
 - decoding the whole preload to PCM;
 - purging FIFO to catch up;
 - a second compressed cursor.
@@ -287,7 +305,8 @@ Processor applies it to the one sequential packet stream.
 ### Immediate FLUSH
 
 1. Disable playback immediately.
-2. Invalidate buffered PTP/audio anchor immediately.
+2. Invalidate buffered audio anchor and PCM generation immediately, under
+   control -> publication locking. Do not rely on a sampled play transition.
 3. Wake processor.
 4. Processor continues consuming compressed packets even with play disabled.
 5. Drop packets before `flushUntilSeq`.
@@ -298,26 +317,44 @@ Processor applies it to the one sequential packet stream.
 For a normal non-zero `flushUntilSeq`, immediate FLUSH must not wait for a new
 anchor before draining.
 
-### Explicit immediate `flushUntilSeq == 0`
+### Immediate zero or missing sequence boundary — EXPERIMENTAL TEST POLICY
 
-An explicit zero endpoint is treated as a timeline-transition sentinel rather
-than as literal 23-bit sequence number zero. This is a narrow, intentional
-deviation from Shairport Sync 5.5.2: its modulo-23 comparison assumes the two
-sequence numbers are within half the sequence space and can falsely complete a
-zero endpoint immediately.
+External source review on 2026-10-02 did not prove that Apple's numeric zero is
+an official timeline-reset sentinel. Shairport applies modulo-23 sequence
+comparison to zero too; OpenAirPlay's buffered receiver treats zero as a false
+flush target. Neither proves how all Apple timeline transitions should be
+classified. No new device capture accompanies this test build.
 
-1. Disable playback and invalidate the old anchor exactly like normal immediate
-   FLUSH.
-2. Do **not** compare packets against sequence zero and do **not** drain before
-   a new anchor is known. TCP ingress may continue filling the raw FIFO.
-3. When the next buffered anchor is committed, resume the single sequential
-   consumer.
-4. Before decrypt/decode, compare each packet RTP with the old `flushUntilTS`
-   and the new anchor RTP using modulo-2^32 distance. Packets closer to the old
-   timeline are consumed/dropped.
-5. The first packet at least as close to the new anchor as to the old endpoint
-   ends resync and survives into the normal timing/decode path.
-6. No second cursor, FIFO search, rewind or physical byte purge is permitted.
+For compatibility with this project's observed no-boundary stalls, immediate
+`untilSeq == 0` (including a missing/default endpoint), and plain buffered
+FLUSH without a 23-bit endpoint, use this explicit ESP-specific test policy:
+
+1. Stop play, invalidate old presentation timing and all old PCM immediately.
+2. Do not compare packet sequence against zero. Preserve the raw FIFO while
+   waiting for a fresh, complete anchor and qualified presentation timing.
+3. Use ONLY the new anchor's RTP/time map. The old `flushUntilTS` is logged
+   for diagnosis and never selects or rejects a new packet.
+4. Set the admission floor to the later, wrap-safe RTP of the new anchor and
+   the current wanted RTP derived from that map. This floor moves with time,
+   so a delayed anchor/first packet cannot freeze admission in the past.
+5. During admission only, cursor-discard unsupported packets and packets
+   outside `[floor, floor + 850 ms)`, using the existing decode-lead limit.
+6. A supported AAC candidate inside that interval enters the normal timing
+   gate while remaining at FIFO head. Admission ends only when its full read
+   succeeds with the same control revision and a valid FIFO token. A reconnect,
+   new anchor or discard cannot falsely complete admission. Normal future
+   holding then applies again, including long AutoMix preload.
+7. A new FLUSH replaces pending recovery. A new anchor during admission updates
+   its authoritative map. No search, rewind, second cursor or byte purge.
+
+**Known limit:** RTP/time alone cannot prove compressed-packet membership of a
+new timeline. A legitimate first new-timeline packet more than 850 ms beyond
+the admission floor can be discarded by this test policy. This is deliberately
+NOT claimed as verified Apple semantics. Test forward/backward seek, long
+AutoMix gaps and repeated zero FLUSH on real hardware before accepting it as a
+production rule. Logs show anchor, admission floor, packet RTP, lead and drops.
+
+A deferred `untilSeq == 0` retains literal wrap-safe sequence semantics.
 
 ### Deferred FLUSH
 
@@ -327,18 +364,27 @@ Current interval semantics:
 [fromSeq, untilSeq)
 ```
 
-- `fromSeq` activates.
+- First observed packet inside the interval activates, including late arrival.
+- Late activation and already-obsolete requests are logged separately.
 - Active-range packets are dropped.
 - `untilSeq` survives and ends the range.
 - Overshoot ends the range and survives.
 - Active deferred FLUSH may drain while normal play is disabled.
 - Maximum deferred requests: **10**.
+- With both timestamp keys present and a positive wrap-safe RTP interval,
+  registration invalidates ONLY cached PCM in `[fromTS, untilTS)`.
+- Missing/ambiguous timestamps retain sequence-only discard; they cannot select
+  a trustworthy already-decoded PCM range. Numeric RTP zero itself is valid.
+- Registration and PCM publication use control -> publication -> ring ordering.
+  A decoded AU whose sequence was flushed while decode ran cannot reappear.
+- Already committed DMA samples cannot be selectively recalled by invalidating
+  PCM validity; late control is bounded by the hardware queue, not retroactive.
 
 Forbidden:
 
-- FIFO fast skip;
+- independent FIFO fast skip;
 - FIFO RTP/sequence search;
-- stale-FLUSH rescue heuristics outside the explicit zero-sequence transition above;
+- stale-FLUSH rescue heuristics outside the explicit test policy above;
 - fixed RTP plausibility windows used to guess a FLUSH endpoint;
 - raw-FIFO purge as normal FLUSHBUFFERED implementation.
 
@@ -402,7 +448,12 @@ without proving a true decoder/session boundary.
 - Buffered audio is not released for presentation without valid qualified timing.
 - Immediate FLUSH invalidates buffered anchor **when requested**, not later at
   FLUSH completion.
-- Generations invalidate stale PCM in O(1); do not replace this with PCM scans.
+- Generations invalidate whole stale PCM stores in O(1). Deferred FLUSH uses
+  a bounded validity-tag scan of the existing finite ring for its RTP range.
+- Recheck compressed stream epoch before and after PCM publication; a new
+  observed TCP epoch also invalidates old cached PCM.
+- Same-map anchor refreshes preserve an in-flight AU. A material map movement
+  is checked using the existing playout anchor comparison before publication.
 - Old PCM must not become audible after seek, immediate FLUSH, session
   replacement or incompatible timeline change.
 - GM/master changes must not reuse old mapping as though it were still valid.
@@ -415,6 +466,11 @@ When changing GM/PTP behaviour, test startup and long-running multiroom playback
 ## 10. Playout / Sync Contract
 
 - Playout alone commits PCM to I2S.
+- Buffered startup uses the existing eight-block short prime guard from the
+  predicted first-real RTP, two silent phase-probe descriptors, and mandatory
+  exact first-real `read_256()` after the measured EOF boundary. The legacy
+  separate 250 ms contiguous reserve is removed.
+- Decode lead remains 850 ms. Live I2S divider tuning is unchanged.
 - If code blocks/waits while control state may change, revalidate timeline/
   generation before committing output.
 - Hard resync may briefly silence/re-prime instead of knowingly playing at the
@@ -463,6 +519,20 @@ Do not perform decode or long waits at priority 17.
   `Connection: close`, then terminate RTSP connection.
 
 ### Session replacement
+
+A stop timeout does not release ownership. Replacement and server restart are
+refused until the old client, event task and audio producers acknowledge idle.
+Maintenance/OTA callers verify this boundary before freeing stores or writing
+firmware. Event-task ownership includes closing its transferred listener and
+client sockets; control only requests shutdown under the lifetime mutex.
+
+Repeated live SETUP is idempotent only for an identical negotiated format,
+key, control port and latency: it returns the existing ports. Changed live
+configuration is rejected with 455 until a completed stream stop. Configuration
+is validated locally before publication; each media producer holds an immutable
+session encryption snapshot. RTSP response transmission has one 2-second budget;
+partial/fatal encrypted failures terminate the connection rather than retrying
+broken framing. The crypto read helper's negative result is terminal.
 
 A new true session must not inherit:
 
@@ -549,6 +619,9 @@ build/config/sdkconfig.h
   exclusive ownership.
 - Realtime start must not reuse shared workspace while buffered transport/
   processor still owns it.
+- AAC decode and ordered ALAC staging share one 4096-byte internal PCM scratch.
+  Codec start requires the previous producer to acknowledge idle; the shared
+  allocation has one owner/free. ALAC WORK retains a separate concurrent buffer.
 - Hard session-boundary cleanup may clear FIFO; live FLUSHBUFFERED may not use a
   FIFO clear as its normal behaviour.
 - Before enlarging buffers, account for FIFO, PCM, decoder, realtime pools,
@@ -566,6 +639,14 @@ A larger buffer is not an optimisation if it reduces long-session stability.
   waits or I2S operations.
 - Event-driven wakeups are preferred to tight polling.
 - Arbitrary sleeps are not a correctness mechanism for races.
+- Semantic ALAC recovery events have bounded-batch servicing. When their queue
+  is full, only the WORK producer retries in cancellation-aware one-tick waits;
+  UDP DATA/CTRL remain nonblocking. Missing ranges are bounded by the existing
+  512-slot tracking horizon. Counters report packet drops and event backpressure
+  at status cadence; NACK/deadline margins remain unchanged.
+- The log broadcaster uses a separate HTTP-server lifetime mutex around bounded
+  client-list/send calls. It does not hold the log-hook or audio/control mutex
+  while sending. Detach runs before httpd_stop and outside HTTPD handlers.
 - After a blocking wait, revalidate generation/timeline before committing media
   if control state could have changed.
 

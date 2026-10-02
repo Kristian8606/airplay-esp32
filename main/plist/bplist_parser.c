@@ -29,7 +29,7 @@ static bool bplist_parse_trailer(const uint8_t *plist, size_t plist_len,
                                  uint8_t *offset_size, uint8_t *ref_size,
                                  uint64_t *num_objects, uint64_t *top_object,
                                  uint64_t *offset_table_offset) {
-  if (plist_len < 32) {
+  if (!plist || plist_len < 40) {
     return false;
   }
 
@@ -46,7 +46,7 @@ static bool bplist_parse_trailer(const uint8_t *plist, size_t plist_len,
     return false;
   }
   const uint64_t trailer_offset = (uint64_t)plist_len - 32U;
-  if (*offset_table_offset > trailer_offset ||
+  if (*offset_table_offset < 8 || *offset_table_offset > trailer_offset ||
       *num_objects > (UINT64_MAX - *offset_table_offset) / *offset_size) {
     return false;
   }
@@ -81,273 +81,177 @@ static uint64_t bplist_get_offset(const uint8_t *plist, size_t plist_len,
 
   const uint64_t object_offset =
       read_be_int(plist + (size_t)entry_offset, offset_size);
-  if (object_offset >= offset_table_offset || object_offset >= trailer_offset) {
+  if (object_offset < 8 || object_offset >= offset_table_offset ||
+      object_offset >= trailer_offset) {
     return UINT64_MAX;
   }
   return object_offset;
 }
 
-static bool bplist_read_string(const uint8_t *plist, size_t plist_len,
-                               uint64_t offset, char *out,
-                               size_t out_capacity) {
-  if (offset >= plist_len) {
+// Every object reader uses the object area, never the offset table/trailer.
+// Trailer validation proves these conversions fit size_t even on ESP32.
+typedef struct {
+  size_t end;
+  uint8_t ref_size;
+} bplist_object_context_t;
+
+static bool bplist_object_context(const uint8_t *plist, size_t plist_len,
+                                   bplist_object_context_t *ctx) {
+  uint8_t offset_size = 0, ref_size = 0;
+  uint64_t objects = 0, top = 0, table = 0;
+  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
+                            &objects, &top, &table) || table > SIZE_MAX)
     return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
-      return false;
-    }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (type == BPLIST_STRING) {
-    if (pos + len > plist_len || len >= out_capacity) {
-      return false;
-    }
-    memcpy(out, plist + pos, len);
-    out[len] = '\0';
-    return true;
-  }
-
-  if (type == BPLIST_UNICODE) {
-    size_t bytes = len * 2;
-    if (pos + bytes > plist_len || len >= out_capacity) {
-      return false;
-    }
-    for (size_t i = 0; i < len; i++) {
-      uint16_t code =
-          (uint16_t)(plist[pos + i * 2] << 8) | plist[pos + i * 2 + 1];
-      if (code > 0x7F) {
-        return false;
-      }
-      out[i] = (char)code;
-    }
-    out[len] = '\0';
-    return true;
-  }
-
-  return false;
+  ctx->end = (size_t)table;
+  ctx->ref_size = ref_size;
+  return true;
 }
 
-static bool bplist_read_data(const uint8_t *plist, size_t plist_len,
-                             uint64_t offset, uint8_t *out, size_t out_capacity,
-                             size_t *out_len) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
-      return false;
-    }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (type == BPLIST_DATA) {
-    if (pos + len > plist_len || len > out_capacity) {
-      return false;
-    }
-    memcpy(out, plist + pos, len);
-    *out_len = len;
-    return true;
-  }
-
-  return false;
-}
-
-static bool bplist_read_data_len(const uint8_t *plist, size_t plist_len,
-                                 uint64_t offset, size_t *out_len) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
-      return false;
-    }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (type == BPLIST_DATA) {
-    if (pos + len > plist_len) {
-      return false;
-    }
-    *out_len = len;
-    return true;
-  }
-
-  return false;
-}
-
-static bool bplist_read_string_len(const uint8_t *plist, size_t plist_len,
-                                   uint64_t offset, size_t *out_len) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-  size_t len = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (len == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    if ((len_marker & 0xF0) != BPLIST_INT) {
-      return false;
-    }
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    len = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (type == BPLIST_STRING) {
-    if (pos + len > plist_len) {
-      return false;
-    }
-    *out_len = len;
-    return true;
-  }
-  if (type == BPLIST_UNICODE) {
-    size_t bytes = len * 2;
-    if (pos + bytes > plist_len) {
-      return false;
-    }
-    *out_len = len;
-    return true;
-  }
-
-  return false;
-}
-
-static bool bplist_read_int(const uint8_t *plist, size_t plist_len,
-                            uint64_t offset, int64_t *out) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-
-  if (type == BPLIST_INT) {
-    size_t len = 1 << (marker & 0x0F);
-    if (offset + 1 + len > plist_len) {
-      return false;
-    }
-    *out = (int64_t)read_be_int(plist + offset + 1, len);
-    return true;
-  }
-
-  return false;
-}
-
-static bool bplist_read_real(const uint8_t *plist, size_t plist_len,
-                             uint64_t offset, double *out) {
-  if (offset >= plist_len) {
-    return false;
-  }
-
-  uint8_t marker = plist[offset];
-  uint8_t type = marker & 0xF0;
-
-  if (type == BPLIST_REAL) {
-    size_t len = 1 << (marker & 0x0F);
-    if (offset + 1 + len > plist_len) {
-      return false;
-    }
-
-    if (len == 4) {
-      uint32_t bits = (uint32_t)read_be_int(plist + offset + 1, 4);
-      float f;
-      memcpy(&f, &bits, sizeof(f));
-      *out = (double)f;
-      return true;
-    } else if (len == 8) {
-      uint64_t bits = read_be_int(plist + offset + 1, 8);
-      memcpy(out, &bits, sizeof(*out));
-      return true;
-    }
-  }
-
-  return false;
+static bool bplist_payload_fits(const uint8_t *plist, size_t plist_len,
+                                uint64_t pos, size_t count, size_t width) {
+  bplist_object_context_t ctx;
+  return width != 0 && bplist_object_context(plist, plist_len, &ctx) &&
+         pos >= 8 && pos <= ctx.end && count <= (ctx.end - (size_t)pos) / width;
 }
 
 static bool bplist_parse_count(const uint8_t *plist, size_t plist_len,
                                uint64_t offset, size_t *count,
                                size_t *header_len) {
-  if (offset >= plist_len) {
+  bplist_object_context_t ctx;
+  if (!bplist_object_context(plist, plist_len, &ctx) ||
+      offset < 8 || offset >= ctx.end)
+    return false;
+
+  const uint8_t marker = plist[(size_t)offset];
+  size_t pos = (size_t)offset + 1;
+  uint64_t value = marker & 0x0F;
+  if (value == 0x0F) {
+    if (pos >= ctx.end) return false;
+    const uint8_t len_marker = plist[pos++];
+    const unsigned exponent = len_marker & 0x0F;
+    if ((len_marker & 0xF0) != BPLIST_INT || exponent > 3) return false;
+    const size_t len_bytes = (size_t)1U << exponent;
+    if (len_bytes > ctx.end - pos) return false;
+    value = read_be_int(plist + pos, len_bytes);
+    if (value > SIZE_MAX) return false;
+    pos += len_bytes;
+  }
+
+  size_t width;
+  switch (marker & 0xF0) {
+    case BPLIST_DATA:
+    case BPLIST_STRING: width = 1; break;
+    case BPLIST_UNICODE: width = 2; break;
+    case BPLIST_ARRAY:
+    case BPLIST_SET: width = ctx.ref_size; break;
+    case BPLIST_DICT: width = 2U * ctx.ref_size; break;
+    default: return false;
+  }
+  if (value > (ctx.end - pos) / width) return false;
+  *count = (size_t)value;
+  *header_len = pos - (size_t)offset;
+  return true;
+}
+
+static bool bplist_read_string(const uint8_t *plist, size_t plist_len,
+                               uint64_t offset, char *out,
+                               size_t out_capacity) {
+  size_t len = 0, header_len = 0;
+  if (!out || !bplist_parse_count(plist, plist_len, offset, &len, &header_len) ||
+      len >= out_capacity)
+    return false;
+  const uint8_t type = plist[(size_t)offset] & 0xF0;
+  const size_t pos = (size_t)offset + header_len;
+  if (type == BPLIST_STRING) {
+    memcpy(out, plist + pos, len);
+  } else if (type == BPLIST_UNICODE) {
+    for (size_t i = 0; i < len; i++) {
+      uint16_t code =
+          (uint16_t)(plist[pos + i * 2] << 8) | plist[pos + i * 2 + 1];
+      if (code > 0x7F) return false;
+      out[i] = (char)code;
+    }
+  } else {
     return false;
   }
-
-  uint8_t marker = plist[offset];
-  size_t info = marker & 0x0F;
-  size_t pos = offset + 1;
-
-  if (info == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    *count = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  } else {
-    *count = info;
-  }
-
-  *header_len = pos - offset;
+  out[len] = '\0';
   return true;
+}
+
+static bool bplist_read_data_len(const uint8_t *plist, size_t plist_len,
+                                 uint64_t offset, size_t *out_len) {
+  size_t len = 0, header_len = 0;
+  if (!out_len || !bplist_parse_count(plist, plist_len, offset, &len, &header_len) ||
+      (plist[(size_t)offset] & 0xF0) != BPLIST_DATA)
+    return false;
+  *out_len = len;
+  return true;
+}
+
+static bool bplist_read_data(const uint8_t *plist, size_t plist_len,
+                             uint64_t offset, uint8_t *out, size_t out_capacity,
+                             size_t *out_len) {
+  size_t len = 0, header_len = 0;
+  if (!out || !out_len ||
+      !bplist_parse_count(plist, plist_len, offset, &len, &header_len) ||
+      (plist[(size_t)offset] & 0xF0) != BPLIST_DATA || len > out_capacity)
+    return false;
+  memcpy(out, plist + (size_t)offset + header_len, len);
+  *out_len = len;
+  return true;
+}
+
+static bool bplist_read_string_len(const uint8_t *plist, size_t plist_len,
+                                   uint64_t offset, size_t *out_len) {
+  size_t len = 0, header_len = 0;
+  if (!out_len || !bplist_parse_count(plist, plist_len, offset, &len, &header_len))
+    return false;
+  const uint8_t type = plist[(size_t)offset] & 0xF0;
+  if (type != BPLIST_STRING && type != BPLIST_UNICODE) return false;
+  *out_len = len;
+  return true;
+}
+
+static bool bplist_scalar_payload(const uint8_t *plist, size_t plist_len,
+                                   uint64_t offset, uint8_t type, size_t *len) {
+  bplist_object_context_t ctx;
+  if (!bplist_object_context(plist, plist_len, &ctx) ||
+      offset < 8 || offset >= ctx.end)
+    return false;
+  const uint8_t marker = plist[(size_t)offset];
+  const unsigned exponent = marker & 0x0F;
+  if ((marker & 0xF0) != type || exponent > 3) return false;
+  *len = (size_t)1U << exponent;
+  return *len <= ctx.end - (size_t)offset - 1;
+}
+
+static bool bplist_read_int(const uint8_t *plist, size_t plist_len,
+                            uint64_t offset, int64_t *out) {
+  size_t len = 0;
+  if (!out || !bplist_scalar_payload(plist, plist_len, offset, BPLIST_INT, &len))
+    return false;
+  *out = (int64_t)read_be_int(plist + (size_t)offset + 1, len);
+  return true;
+}
+
+static bool bplist_read_real(const uint8_t *plist, size_t plist_len,
+                             uint64_t offset, double *out) {
+  size_t len = 0;
+  if (!out || !bplist_scalar_payload(plist, plist_len, offset, BPLIST_REAL, &len))
+    return false;
+  if (len == 4) {
+    uint32_t bits = (uint32_t)read_be_int(plist + (size_t)offset + 1, 4);
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    *out = (double)f;
+    return true;
+  }
+  if (len == 8) {
+    uint64_t bits = read_be_int(plist + (size_t)offset + 1, 8);
+    memcpy(out, &bits, sizeof(*out));
+    return true;
+  }
+  return false;
 }
 
 static bool bplist_read_u64_flexible(const uint8_t *plist, size_t plist_len,
@@ -414,8 +318,7 @@ static bool bplist_read_string_array(const uint8_t *plist, size_t plist_len,
   if (!bplist_parse_count(plist, plist_len, array_offset, &count, &header_len))
     return false;
   const uint64_t refs_offset = array_offset + header_len;
-  if (refs_offset > plist_len ||
-      count > ((uint64_t)plist_len - refs_offset) / ref_size)
+  if (!bplist_payload_fits(plist, plist_len, refs_offset, count, ref_size))
     return false;
 
   size_t written = 0;
@@ -461,8 +364,8 @@ static bool bplist_read_peer_dict(const uint8_t *plist, size_t plist_len,
                           &header_len))
     return false;
   const uint64_t refs_offset = dict_offset + header_len;
-  if (refs_offset > plist_len ||
-      dict_size > ((uint64_t)plist_len - refs_offset) / (2U * ref_size))
+  if (!bplist_payload_fits(plist, plist_len, refs_offset, dict_size,
+                           2U * ref_size))
     return false;
 
   const uint8_t *key_refs = plist + (size_t)refs_offset;
@@ -524,8 +427,7 @@ bool bplist_get_peer_list(const uint8_t *plist, size_t plist_len,
   if (!bplist_parse_count(plist, plist_len, top_offset, &count, &header_len))
     return false;
   const uint64_t refs_offset = top_offset + header_len;
-  if (refs_offset > plist_len ||
-      count > ((uint64_t)plist_len - refs_offset) / ref_size)
+  if (!bplist_payload_fits(plist, plist_len, refs_offset, count, ref_size))
     return false;
 
   const size_t to_write = count < out_capacity ? count : out_capacity;
@@ -580,7 +482,7 @@ static bool bplist_find_data_in_dict(const uint8_t *plist, size_t plist_len,
   }
 
   size_t pos = dict_offset + header_len;
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
     return false;
   }
 
@@ -608,14 +510,31 @@ static bool bplist_find_data_in_dict(const uint8_t *plist, size_t plist_len,
   return false;
 }
 
+// Depth alone cannot bound a graph with shared references. Charge object visits
+// and reference scans to one search budget, and reject cycles on the active path.
+#define BPLIST_SEARCH_MAX_DEPTH 10U
+#define BPLIST_SEARCH_MAX_WORK 65536U
+
+typedef struct {
+  size_t remaining;
+  uint64_t path[BPLIST_SEARCH_MAX_DEPTH + 1U];
+} bplist_search_context_t;
+
+static bool bplist_search_step(bplist_search_context_t *ctx) {
+  if (ctx->remaining == 0) return false;
+  ctx->remaining--;
+  return true;
+}
+
 static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
                                        uint64_t obj_idx,
                                        uint64_t offset_table_offset,
                                        uint8_t offset_size, uint8_t ref_size,
                                        const char *key, uint8_t *out_data,
                                        size_t out_capacity, size_t *out_len,
-                                       int depth) {
-  if (depth > 10) {
+                                       unsigned depth,
+                                       bplist_search_context_t *search) {
+  if (depth > BPLIST_SEARCH_MAX_DEPTH || !bplist_search_step(search)) {
     return false;
   }
 
@@ -624,6 +543,11 @@ static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
   if (offset >= plist_len) {
     return false;
   }
+
+  for (unsigned i = 0; i < depth; ++i) {
+    if (search->path[i] == offset) return false;
+  }
+  search->path[depth] = offset;
 
   uint8_t marker = plist[offset];
   uint8_t type = marker & 0xF0;
@@ -637,7 +561,7 @@ static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
     }
 
     size_t pos = offset + header_len;
-    if (pos + dict_size * 2 * ref_size > plist_len) {
+    if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
       return false;
     }
 
@@ -645,6 +569,7 @@ static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
     const uint8_t *val_refs = plist + pos + dict_size * ref_size;
 
     for (size_t i = 0; i < dict_size; i++) {
+      if (!bplist_search_step(search)) return false;
       uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
       uint64_t key_offset =
           bplist_get_offset(plist, plist_len, offset_table_offset, offset_size, key_idx);
@@ -663,10 +588,11 @@ static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
     }
 
     for (size_t i = 0; i < dict_size; i++) {
+      if (!bplist_search_step(search)) return false;
       uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
       if (bplist_find_data_recursive(
               plist, plist_len, val_idx, offset_table_offset, offset_size,
-              ref_size, key, out_data, out_capacity, out_len, depth + 1)) {
+              ref_size, key, out_data, out_capacity, out_len, depth + 1, search)) {
         return true;
       }
     }
@@ -678,15 +604,16 @@ static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
     }
 
     size_t pos = offset + header_len;
-    if (pos + count * ref_size > plist_len) {
+    if (!bplist_payload_fits(plist, plist_len, pos, count, ref_size)) {
       return false;
     }
 
     for (size_t i = 0; i < count; i++) {
+      if (!bplist_search_step(search)) return false;
       uint64_t idx = read_be_int(plist + pos + i * ref_size, ref_size);
       if (bplist_find_data_recursive(plist, plist_len, idx, offset_table_offset,
                                      offset_size, ref_size, key, out_data,
-                                     out_capacity, out_len, depth + 1)) {
+                                     out_capacity, out_len, depth + 1, search)) {
         return true;
       }
     }
@@ -697,7 +624,8 @@ static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
 
 bool bplist_find_data(const uint8_t *plist, size_t plist_len, const char *key,
                       uint8_t *out_data, size_t out_capacity, size_t *out_len) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!key || !out_data || !out_len) return false;
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -725,7 +653,8 @@ bool bplist_find_data(const uint8_t *plist, size_t plist_len, const char *key,
 bool bplist_find_data_deep(const uint8_t *plist, size_t plist_len,
                            const char *key, uint8_t *out_data,
                            size_t out_capacity, size_t *out_len) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!key || !out_data || !out_len) return false;
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -739,15 +668,25 @@ bool bplist_find_data_deep(const uint8_t *plist, size_t plist_len,
     return false;
   }
 
-  (void)num_objects;
+  // Four steps per encoded object/reference byte accommodate ordinary schema
+  // traversal. Saturate before multiplication so malformed DAGs have a fixed
+  // upper bound on RTSP task work, without allocation or per-object stack use.
+  // The validated table has at least one byte per object, so their sum is
+  // no larger than the trailer offset and cannot overflow uint64_t.
+  const uint64_t units = offset_table_offset + num_objects;
+  bplist_search_context_t search = {
+      .remaining = units >= BPLIST_SEARCH_MAX_WORK / 4U
+                       ? BPLIST_SEARCH_MAX_WORK : (size_t)units * 4U,
+  };
   return bplist_find_data_recursive(plist, plist_len, top_object,
                                     offset_table_offset, offset_size, ref_size,
-                                    key, out_data, out_capacity, out_len, 0);
+                                    key, out_data, out_capacity, out_len, 0, &search);
 }
 
 bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
                      int64_t *out_value) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!key || !out_value) return false;
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -772,23 +711,12 @@ bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
     return false;
   }
 
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_offset + 1;
+  size_t dict_size = 0, header_len = 0;
+  if (!bplist_parse_count(plist, plist_len, top_offset, &dict_size,
+                          &header_len)) return false;
+  size_t pos = (size_t)top_offset + header_len;
 
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
     return false;
   }
 
@@ -817,7 +745,8 @@ bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
 
 bool bplist_find_real(const uint8_t *plist, size_t plist_len, const char *key,
                       double *out_value) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!key || !out_value) return false;
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -842,23 +771,12 @@ bool bplist_find_real(const uint8_t *plist, size_t plist_len, const char *key,
     return false;
   }
 
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_offset + 1;
+  size_t dict_size = 0, header_len = 0;
+  if (!bplist_parse_count(plist, plist_len, top_offset, &dict_size,
+                          &header_len)) return false;
+  size_t pos = (size_t)top_offset + header_len;
 
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
     return false;
   }
 
@@ -895,7 +813,8 @@ bool bplist_find_real(const uint8_t *plist, size_t plist_len, const char *key,
 
 bool bplist_find_string(const uint8_t *plist, size_t plist_len, const char *key,
                         char *out_str, size_t out_capacity) {
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!key || !out_str) return false;
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -920,23 +839,12 @@ bool bplist_find_string(const uint8_t *plist, size_t plist_len, const char *key,
     return false;
   }
 
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_offset + 1;
+  size_t dict_size = 0, header_len = 0;
+  if (!bplist_parse_count(plist, plist_len, top_offset, &dict_size,
+                          &header_len)) return false;
+  size_t pos = (size_t)top_offset + header_len;
 
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
-
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
     return false;
   }
 
@@ -972,7 +880,7 @@ bool bplist_get_streams_count(const uint8_t *plist, size_t plist_len,
 
   *count = 0;
 
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -1023,22 +931,12 @@ bool bplist_get_streams_count(const uint8_t *plist, size_t plist_len,
     return false;
   }
 
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_dict_offset + 1;
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
+  size_t dict_size = 0, header_len = 0;
+  if (!bplist_parse_count(plist, plist_len, top_dict_offset, &dict_size,
+                          &header_len)) return false;
+  size_t pos = (size_t)top_dict_offset + header_len;
 
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
     return false;
   }
 
@@ -1094,7 +992,7 @@ bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
     *shk_len = 0;
   }
 
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -1145,22 +1043,12 @@ bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
     return false;
   }
 
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_dict_offset + 1;
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
+  size_t dict_size = 0, header_len = 0;
+  if (!bplist_parse_count(plist, plist_len, top_dict_offset, &dict_size,
+                          &header_len)) return false;
+  size_t pos = (size_t)top_dict_offset + header_len;
 
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
     return false;
   }
 
@@ -1195,7 +1083,7 @@ bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
       }
 
       size_t array_pos = val_offset + header_len;
-      if (array_pos + array_count * ref_size > plist_len) {
+      if (!bplist_payload_fits(plist, plist_len, array_pos, array_count, ref_size)) {
         return false;
       }
 
@@ -1218,7 +1106,8 @@ bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
       }
 
       size_t stream_pos = stream_offset + stream_header_len;
-      if (stream_pos + stream_dict_size * 2 * ref_size > plist_len) {
+      if (!bplist_payload_fits(plist, plist_len, stream_pos, stream_dict_size,
+                               2U * ref_size)) {
         return false;
       }
 
@@ -1273,7 +1162,7 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
 
   *out_count = 0;
 
-  if (plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
     return false;
   }
 
@@ -1324,22 +1213,12 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
     return false;
   }
 
-  size_t dict_size = marker & 0x0F;
-  size_t pos = top_dict_offset + 1;
-  if (dict_size == 0x0F) {
-    if (pos >= plist_len) {
-      return false;
-    }
-    uint8_t len_marker = plist[pos++];
-    size_t len_bytes = 1 << (len_marker & 0x0F);
-    if (pos + len_bytes > plist_len) {
-      return false;
-    }
-    dict_size = (size_t)read_be_int(plist + pos, len_bytes);
-    pos += len_bytes;
-  }
+  size_t dict_size = 0, header_len = 0;
+  if (!bplist_parse_count(plist, plist_len, top_dict_offset, &dict_size,
+                          &header_len)) return false;
+  size_t pos = (size_t)top_dict_offset + header_len;
 
-  if (pos + dict_size * 2 * ref_size > plist_len) {
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
     return false;
   }
 
@@ -1374,7 +1253,7 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
       }
 
       size_t array_pos = val_offset + header_len;
-      if (array_pos + array_count * ref_size > plist_len) {
+      if (!bplist_payload_fits(plist, plist_len, array_pos, array_count, ref_size)) {
         return false;
       }
 
@@ -1397,7 +1276,8 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
       }
 
       size_t stream_pos = stream_offset + stream_header_len;
-      if (stream_pos + stream_dict_size * 2 * ref_size > plist_len) {
+      if (!bplist_payload_fits(plist, plist_len, stream_pos, stream_dict_size,
+                               2U * ref_size)) {
         return false;
       }
 

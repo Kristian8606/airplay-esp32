@@ -62,6 +62,32 @@
 
 static const char *TAG = "airplay_rt";
 
+/* Reserved once during audio init, before RTSP sessions fragment internal RAM.
+ * Keep these allocations across codec changes and Wi-Fi scan release/reinit. */
+static StackType_t *s_data_task_stack;
+static StaticTask_t *s_data_task_tcb;
+static TaskHandle_t s_data_task;
+
+esp_err_t realtime_receiver_reserve_data_task_memory(void) {
+  if (s_data_task_stack && s_data_task_tcb) return ESP_OK;
+  StackType_t *stack = heap_caps_malloc(
+      RT_DATA_RX_STACK, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  StaticTask_t *tcb = heap_caps_malloc(
+      sizeof(*tcb), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!stack || !tcb) {
+    heap_caps_free(stack);
+    heap_caps_free(tcb);
+    ESP_LOGE(TAG, "alac_data memory reservation failed: stack=%u TCB=%u bytes",
+             (unsigned)RT_DATA_RX_STACK, (unsigned)sizeof(*tcb));
+    return ESP_ERR_NO_MEM;
+  }
+  s_data_task_stack = stack;
+  s_data_task_tcb = tcb;
+  ESP_LOGI(TAG, "alac_data memory reserved: internal stack=%u TCB=%u bytes",
+           (unsigned)RT_DATA_RX_STACK, (unsigned)sizeof(*tcb));
+  return ESP_OK;
+}
+
 typedef enum {
   RT_POOL_DATA = 0,
   RT_POOL_RTX = 1,
@@ -112,6 +138,10 @@ typedef struct {
   QueueHandle_t rtx_free_q;
   QueueHandle_t work_q;
   QueueHandle_t resend_event_q;
+  /* Event payloads are task-only; keep queue control in internal RAM.
+   * Both allocations survive stop/start, just like the other RT queues. */
+  uint8_t *resend_event_storage;
+  StaticQueue_t *resend_event_control;
 
   rt_packet_slot_t *data_pool;
   rt_packet_slot_t *rtx_pool;
@@ -128,6 +158,10 @@ typedef struct {
 
   uint32_t decrypt_errors;
   uint32_t decode_errors;
+  uint32_t dropped_data;
+  uint32_t dropped_rtx;
+  uint32_t missing_backpressure;
+  uint32_t received_backpressure;
   struct sockaddr_in client_control_addr;
   bool client_control_valid;
   uint16_t nack_request_seq;
@@ -354,7 +388,13 @@ static void release_packet_slot(rt_packet_slot_t *slot) {
 
 static bool queue_work_packet(rt_packet_slot_t *slot) {
   if (!slot || !s_rt.work_q) return false;
-  return xQueueSend(s_rt.work_q, &slot, 0) == pdTRUE;
+  const bool queued = xQueueSend(s_rt.work_q, &slot, 0) == pdTRUE;
+  if (!queued) {
+    uint32_t *counter = slot->pool_kind == RT_POOL_RTX
+                            ? &s_rt.dropped_rtx : &s_rt.dropped_data;
+    (void)__atomic_add_fetch(counter, 1U, __ATOMIC_RELAXED);
+  }
+  return queued;
 }
 
 static bool queue_resend_event(uint8_t kind, uint32_t ext_seq, uint16_t count,
@@ -363,7 +403,18 @@ static bool queue_resend_event(uint8_t kind, uint32_t ext_seq, uint16_t count,
   rt_resend_event_t ev = {
       .kind = kind, .count = count, .ext_seq = ext_seq, .rtp = rtp,
   };
-  return xQueueSend(s_rt.resend_event_q, &ev, pdMS_TO_TICKS(2)) == pdTRUE;
+  if (xQueueSend(s_rt.resend_event_q, &ev, 0) == pdTRUE) return true;
+  uint32_t *counter = kind == RT_RESEND_EVENT_MISSING
+                          ? &s_rt.missing_backpressure : &s_rt.received_backpressure;
+  (void)__atomic_add_fetch(counter, 1U, __ATOMIC_RELAXED);
+  /* Only WORK produces semantic events. Backpressure this consumer, never
+   * UDP DATA/CTRL, instead of silently losing a missing/received transition.
+   * One-tick retries remain cancellation-aware; RESEND owns the state and
+   * drains bounded batches before servicing deadlines. */
+  while (rt_running()) {
+    if (xQueueSend(s_rt.resend_event_q, &ev, 1) == pdTRUE) return true;
+  }
+  return false;
 }
 
 static bool missing_time_to_play_us(const missing_slot_t *slot,
@@ -410,6 +461,15 @@ static void missing_add_range(uint32_t first_ext, uint16_t count,
 
   uint32_t min_active = 0;
   const bool have_min = missing_find_min(&min_active);
+  /* A range cannot occupy more than the finite tracker. Avoid thousands of
+   * alias/collision iterations on a large sequence jump. Keep oldest holes. */
+  if (count > RT_MISSING_SLOTS) {
+    count = RT_MISSING_SLOTS;
+    if (!s_rt.missing_overflow_logged) {
+      s_rt.missing_overflow_logged = true;
+      ESP_LOGW(TAG, "ALAC missing tracker overflow");
+    }
+  }
   const uint32_t frame_samples = s_rt.cfg.format.frame_size > 0
                                      ? (uint32_t)s_rt.cfg.format.frame_size
                                      : 352U;
@@ -617,8 +677,9 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
     }
 
     rt_packet_slot_t *slot = NULL;
-    if (xQueueReceive(s_rt.rtx_free_q, &slot, pdMS_TO_TICKS(2)) != pdTRUE ||
+    if (xQueueReceive(s_rt.rtx_free_q, &slot, 0) != pdTRUE ||
         !slot) {
+      (void)__atomic_add_fetch(&s_rt.dropped_rtx, 1U, __ATOMIC_RELAXED);
       return;
     }
     slot->pool_kind = RT_POOL_RTX;
@@ -729,8 +790,10 @@ static void data_rx_task(void *arg) {
     }
   }
 
-  rt_task_release();
-  vTaskDelete(NULL);
+  /* The control path deletes this task only after it is truly suspended.
+   * Self-deletion would leave idle-task cleanup referencing the static TCB
+   * after live_tasks reached zero and the next session reused that memory. */
+  for (;;) vTaskSuspend(NULL);
 }
 
 static void control_rx_task(void *arg) {
@@ -868,7 +931,9 @@ static void resend_task(void *arg) {
 
     if (xQueueReceive(s_rt.resend_event_q, &ev, wait_ticks) == pdTRUE) {
       resend_process_event(&ev);
-      while (xQueueReceive(s_rt.resend_event_q, &ev, 0) == pdTRUE) {
+      /* Deadline service must run even if WORK continuously fills events. */
+      for (unsigned batch = 1; batch < 32U && rt_running(); ++batch) {
+        if (xQueueReceive(s_rt.resend_event_q, &ev, 0) != pdTRUE) break;
         resend_process_event(&ev);
       }
     }
@@ -981,8 +1046,34 @@ static esp_err_t ensure_transport_resources(void) {
   if (!s_rt.data_free_q) s_rt.data_free_q = xQueueCreate(RT_DATA_POOL_SLOTS, sizeof(rt_packet_slot_t *));
   if (!s_rt.rtx_free_q) s_rt.rtx_free_q = xQueueCreate(RT_RTX_POOL_SLOTS, sizeof(rt_packet_slot_t *));
   if (!s_rt.work_q) s_rt.work_q = xQueueCreate(RT_WORK_QUEUE_SLOTS, sizeof(rt_packet_slot_t *));
-  if (!s_rt.resend_event_q)
-    s_rt.resend_event_q = xQueueCreate(RT_RESEND_EVENT_SLOTS, sizeof(rt_resend_event_t));
+  if (!s_rt.resend_event_q) {
+    const size_t event_bytes =
+        RT_RESEND_EVENT_SLOTS * sizeof(rt_resend_event_t);
+    uint8_t *storage = heap_caps_malloc(
+        event_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    StaticQueue_t *control = heap_caps_malloc(
+        sizeof(*control), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!storage || !control) {
+      heap_caps_free(storage);
+      heap_caps_free(control);
+      ESP_LOGE(TAG, "ALAC resend queue allocation failed: PSRAM=%u internal=%u bytes",
+               (unsigned)event_bytes, (unsigned)sizeof(*control));
+      return ESP_ERR_NO_MEM;
+    }
+    QueueHandle_t queue = xQueueCreateStatic(
+        RT_RESEND_EVENT_SLOTS, sizeof(rt_resend_event_t), storage, control);
+    if (!queue) {
+      heap_caps_free(storage);
+      heap_caps_free(control);
+      ESP_LOGE(TAG, "ALAC resend static queue creation failed");
+      return ESP_FAIL;
+    }
+    s_rt.resend_event_storage = storage;
+    s_rt.resend_event_control = control;
+    s_rt.resend_event_q = queue;
+    ESP_LOGI(TAG, "ALAC resend queue: %u events, %u bytes in PSRAM; control internal",
+             (unsigned)RT_RESEND_EVENT_SLOTS, (unsigned)event_bytes);
+  }
 
   if (!s_rt.data_pool || !s_rt.rtx_pool || !s_rt.control_packet ||
       !s_rt.decrypt_buf || !s_rt.pcm || !s_rt.seen || !s_rt.missing ||
@@ -1001,13 +1092,15 @@ static void reset_transport_queues(void) {
 
   for (uint32_t i = 0; i < RT_DATA_POOL_SLOTS; ++i) {
     rt_packet_slot_t *slot = &s_rt.data_pool[i];
-    memset(slot, 0, sizeof(*slot));
+    slot->len = 0;
+    slot->retransmitted = false;
     slot->pool_kind = RT_POOL_DATA;
     (void)xQueueSend(s_rt.data_free_q, &slot, 0);
   }
   for (uint32_t i = 0; i < RT_RTX_POOL_SLOTS; ++i) {
     rt_packet_slot_t *slot = &s_rt.rtx_pool[i];
-    memset(slot, 0, sizeof(*slot));
+    slot->len = 0;
+    slot->retransmitted = false;
     slot->pool_kind = RT_POOL_RTX;
     (void)xQueueSend(s_rt.rtx_free_q, &slot, 0);
   }
@@ -1021,6 +1114,8 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   }
   if (rt_running()) return ESP_OK;
   if (!all_tasks_stopped()) return ESP_ERR_INVALID_STATE;
+  esp_err_t reserve_err = realtime_receiver_reserve_data_task_memory();
+  if (reserve_err != ESP_OK) return reserve_err;
 
   memset(&s_rt.cfg, 0, sizeof(s_rt.cfg));
   s_rt.cfg = *config;
@@ -1043,6 +1138,10 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   s_rt.unhandled_control_seen[0] = 0;
   s_rt.unhandled_control_seen[1] = 0;
   s_rt.missing_overflow_logged = false;
+  __atomic_store_n(&s_rt.dropped_data, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_rt.dropped_rtx, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_rt.missing_backpressure, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_rt.received_backpressure, 0U, __ATOMIC_RELAXED);
 
   esp_err_t err = ensure_transport_resources();
   if (err != ESP_OK) return err;
@@ -1082,6 +1181,12 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   rt_task_reserve();
   if (xTaskCreatePinnedToCore(alac_worker_task, "alac_work", RT_WORK_STACK, NULL,
                               RT_WORK_PRIORITY, NULL, RT_TASK_CORE) != pdPASS) {
+    ESP_LOGE(TAG, "Task start failed: alac_work stack=%u bytes "
+                 "internalFree=%u internalLargest=%u internalMin=%u bytes",
+             (unsigned)RT_WORK_STACK,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     rt_task_release();
     realtime_receiver_stop();
     return ESP_FAIL;
@@ -1089,6 +1194,12 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   rt_task_reserve();
   if (xTaskCreatePinnedToCore(resend_task, "alac_resend", RT_RESEND_STACK, NULL,
                               RT_RESEND_PRIORITY, NULL, RT_TASK_CORE) != pdPASS) {
+    ESP_LOGE(TAG, "Task start failed: alac_resend stack=%u bytes "
+                 "internalFree=%u internalLargest=%u internalMin=%u bytes",
+             (unsigned)RT_RESEND_STACK,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     rt_task_release();
     realtime_receiver_stop();
     return ESP_FAIL;
@@ -1098,14 +1209,28 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
     if (xTaskCreatePinnedToCore(control_rx_task, "alac_ctrl", RT_CTRL_RX_STACK,
                                 NULL, RT_CTRL_RX_PRIORITY, NULL,
                                 RT_TASK_CORE) != pdPASS) {
+      ESP_LOGE(TAG, "Task start failed: alac_ctrl stack=%u bytes "
+                   "internalFree=%u internalLargest=%u internalMin=%u bytes",
+               (unsigned)RT_CTRL_RX_STACK,
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
       rt_task_release();
       realtime_receiver_stop();
       return ESP_FAIL;
     }
   }
   rt_task_reserve();
-  if (xTaskCreatePinnedToCore(data_rx_task, "alac_data", RT_DATA_RX_STACK, NULL,
-                              RT_DATA_RX_PRIORITY, NULL, RT_TASK_CORE) != pdPASS) {
+  s_data_task = xTaskCreateStaticPinnedToCore(
+      data_rx_task, "alac_data", RT_DATA_RX_STACK, NULL, RT_DATA_RX_PRIORITY,
+      s_data_task_stack, s_data_task_tcb, RT_TASK_CORE);
+  if (!s_data_task) {
+    ESP_LOGE(TAG, "Task start failed: alac_data stack=%u bytes "
+                 "internalFree=%u internalLargest=%u internalMin=%u bytes",
+             (unsigned)RT_DATA_RX_STACK,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     rt_task_release();
     realtime_receiver_stop();
     return ESP_FAIL;
@@ -1117,23 +1242,34 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
 
 void realtime_receiver_stop(void) {
   rt_request_stop();
-  if (s_rt.data_sock >= 0) {
-    shutdown(s_rt.data_sock, SHUT_RDWR);
-    close(s_rt.data_sock);
-    s_rt.data_sock = -1;
-  }
-  if (s_rt.control_sock >= 0) {
-    shutdown(s_rt.control_sock, SHUT_RDWR);
-    close(s_rt.control_sock);
-    s_rt.control_sock = -1;
-  }
+  /* Interrupt reads without releasing descriptor numbers while a producer
+   * may still hold a socket snapshot. Close only after every task is idle. */
+  if (s_rt.data_sock >= 0) shutdown(s_rt.data_sock, SHUT_RDWR);
+  if (s_rt.control_sock >= 0) shutdown(s_rt.control_sock, SHUT_RDWR);
 
   for (int i = 0; !all_tasks_stopped() && i < 100; ++i) {
-    vTaskDelay(pdMS_TO_TICKS(10));
+    /* No caller resumes this task. eSuspended means it has left the receive
+     * loop and is no longer executing on either core. External deletion then
+     * completes kernel/TLS cleanup synchronously before the TCB can be reused. */
+    if (s_data_task && eTaskGetState(s_data_task) == eSuspended) {
+      vTaskDelete(s_data_task);
+      s_data_task = NULL;
+      rt_task_release();
+    }
+    if (!all_tasks_stopped()) vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  if (!all_tasks_stopped()) {
+    ESP_LOGE(TAG, "Realtime stop timed out: liveTasks=%u dataTask=%p; restart blocked",
+             (unsigned)__atomic_load_n(&s_rt.live_tasks, __ATOMIC_ACQUIRE),
+             (void *)s_data_task);
   }
 
-  AUDIO_DIAG_LIFECYCLE_REALTIME_STOPPED();
-
+  if (all_tasks_stopped()) {
+    if (s_rt.data_sock >= 0) close(s_rt.data_sock);
+    if (s_rt.control_sock >= 0) close(s_rt.control_sock);
+    s_rt.data_sock = s_rt.control_sock = -1;
+    AUDIO_DIAG_LIFECYCLE_REALTIME_STOPPED();
+  }
 }
 
 void realtime_receiver_set_client_control(uint32_t client_ip,
@@ -1161,6 +1297,10 @@ void realtime_receiver_get_usage(realtime_receiver_usage_t *out) {
   if (!out) return;
   memset(out, 0, sizeof(*out));
   out->work_queue_capacity = RT_WORK_QUEUE_SLOTS;
+  out->dropped_data = __atomic_load_n(&s_rt.dropped_data, __ATOMIC_RELAXED);
+  out->dropped_rtx = __atomic_load_n(&s_rt.dropped_rtx, __ATOMIC_RELAXED);
+  out->missing_backpressure = __atomic_load_n(&s_rt.missing_backpressure, __ATOMIC_RELAXED);
+  out->received_backpressure = __atomic_load_n(&s_rt.received_backpressure, __ATOMIC_RELAXED);
   if (s_rt.work_q)
     out->work_queue_depth = (uint32_t)uxQueueMessagesWaiting(s_rt.work_q);
 }

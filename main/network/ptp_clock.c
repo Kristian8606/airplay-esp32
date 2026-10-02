@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "audio_diag.h"
 #include "ptp_clock.h"
@@ -104,11 +105,6 @@ static struct {
   int64_t filtered_offset_ns; // PTP_time = local_time + offset
   uint32_t sample_count;
 
-  // Asymmetric smoothing state (replaces median ring buffer)
-  int64_t previous_offset;
-  uint32_t previous_offset_time_ms; // 0 = no previous sample yet
-  uint32_t mastership_start_ms;     // when continuous tracking began
-
   // Two-step sync tracking
   uint16_t last_sync_seq;
   int64_t last_sync_local_ns;
@@ -173,6 +169,23 @@ static struct {
  * lock-free across cores. Keep this lock extremely short: no socket I/O, task
  * delays or logging is performed while it is held. */
 static portMUX_TYPE ptp_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Serialize init/stop/priority changes; the task alone closes live sockets. */
+static StaticSemaphore_t ptp_lifecycle_storage;
+static SemaphoreHandle_t ptp_lifecycle_mutex;
+static SemaphoreHandle_t ptp_lifecycle_lock(void) {
+  taskENTER_CRITICAL(&ptp_state_mux);
+  if (!ptp_lifecycle_mutex)
+    ptp_lifecycle_mutex = xSemaphoreCreateMutexStatic(&ptp_lifecycle_storage);
+  SemaphoreHandle_t mutex = ptp_lifecycle_mutex;
+  taskEXIT_CRITICAL(&ptp_state_mux);
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  return mutex;
+}
+
+static bool ptp_is_running(void) {
+  return __atomic_load_n(&ptp.running, __ATOMIC_ACQUIRE);
+}
 
 // Parse 8-byte clockIdentity (big-endian) from PTP sourcePortIdentity
 // (header bytes 20-27).
@@ -437,9 +450,6 @@ static void realtime_reset_master_estimator_locked(uint64_t new_gm,
   ptp.locked = false;
   ptp.filtered_offset_ns = 0;
   ptp.sample_count = 0;
-  ptp.previous_offset = 0;
-  ptp.previous_offset_time_ms = 0;
-  ptp.mastership_start_ms = 0;
   ptp.last_sync_ms = 0;
 }
 
@@ -488,10 +498,6 @@ static bool realtime_update_offset_locked(int64_t raw_offset_ns,
 
   /* Publish the same filtered estimate to audio and diagnostics. */
   ptp.filtered_offset_ns = smoothed;
-  ptp.previous_offset = smoothed;
-  ptp.previous_offset_time_ms = (uint32_t)(reception_ns / 1000000LL);
-  ptp.mastership_start_ms =
-      (uint32_t)(ptp.rt_mastership_start_ns / 1000000LL);
 
   const uint32_t master_age_ms =
       ptp.rt_mastership_start_ns > 0 && reception_ns >= ptp.rt_mastership_start_ns
@@ -948,23 +954,30 @@ static int create_ptp_socket(uint16_t port) {
 // PTP task - listens for messages on both ports
 static void ptp_task(void *pvParameters) {
   (void)pvParameters;
+  /* Creation may schedule us before init has published the handle. Wait for
+   * publication before any exit path can acknowledge completion. */
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   uint8_t buffer[256];
 
-  while (ptp.running) {
+  /* These descriptors belong to this task until its cleanup. Stop requests
+   * never close them, so select/recv cannot observe a reused descriptor. */
+  const int event_socket = ptp.event_socket;
+  const int general_socket = ptp.general_socket;
+  while (ptp_is_running()) {
     fd_set read_fds;
     FD_ZERO(&read_fds);
 
     int max_fd = -1;
-    if (ptp.event_socket >= 0) {
-      FD_SET(ptp.event_socket, &read_fds);
-      if (ptp.event_socket > max_fd) {
-        max_fd = ptp.event_socket;
+    if (event_socket >= 0) {
+      FD_SET(event_socket, &read_fds);
+      if (event_socket > max_fd) {
+        max_fd = event_socket;
       }
     }
-    if (ptp.general_socket >= 0) {
-      FD_SET(ptp.general_socket, &read_fds);
-      if (ptp.general_socket > max_fd) {
-        max_fd = ptp.general_socket;
+    if (general_socket >= 0) {
+      FD_SET(general_socket, &read_fds);
+      if (general_socket > max_fd) {
+        max_fd = general_socket;
       }
     }
 
@@ -976,10 +989,9 @@ static void ptp_task(void *pvParameters) {
     struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
     int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
 
+    if (!ptp_is_running()) break;
+
     if (ret < 0) {
-      if (!ptp.running) {
-        break; // Sockets closed during shutdown
-      }
       if (errno != EINTR) {
         ESP_LOGE(TAG, "select error: %d", errno);
       }
@@ -995,10 +1007,10 @@ static void ptp_task(void *pvParameters) {
       const int64_t reception_ns = get_local_time_ns();
 
       // Check event port (SYNC messages)
-      if (ptp.event_socket >= 0 && FD_ISSET(ptp.event_socket, &read_fds)) {
+      if (event_socket >= 0 && FD_ISSET(event_socket, &read_fds)) {
         struct sockaddr_in src = {0};
         socklen_t src_len = sizeof(src);
-        ssize_t len = recvfrom(ptp.event_socket, buffer, sizeof(buffer), 0,
+        ssize_t len = recvfrom(event_socket, buffer, sizeof(buffer), 0,
                                (struct sockaddr *)&src, &src_len);
         if (len > 0) {
           process_ptp_message(buffer, (size_t)len, true,
@@ -1007,10 +1019,10 @@ static void ptp_task(void *pvParameters) {
       }
 
       // Check general port (FOLLOW_UP messages)
-      if (ptp.general_socket >= 0 && FD_ISSET(ptp.general_socket, &read_fds)) {
+      if (general_socket >= 0 && FD_ISSET(general_socket, &read_fds)) {
         struct sockaddr_in src = {0};
         socklen_t src_len = sizeof(src);
-        ssize_t len = recvfrom(ptp.general_socket, buffer, sizeof(buffer), 0,
+        ssize_t len = recvfrom(general_socket, buffer, sizeof(buffer), 0,
                                (struct sockaddr *)&src, &src_len);
         if (len > 0) {
           process_ptp_message(buffer, (size_t)len, false,
@@ -1030,76 +1042,68 @@ static void ptp_task(void *pvParameters) {
     ptp.general_socket = -1;
   }
 
-  ptp.task_handle = NULL;
+  __atomic_store_n(&ptp.task_handle, NULL, __ATOMIC_RELEASE);
   vTaskDelete(NULL);
 }
 
 esp_err_t ptp_clock_init(void) {
-  if (ptp.running) {
+  SemaphoreHandle_t lifecycle = ptp_lifecycle_lock();
+  if (ptp_is_running() ||
+      __atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE) != NULL) {
+    xSemaphoreGive(lifecycle);
     return ESP_ERR_INVALID_STATE;
   }
 
+  taskENTER_CRITICAL(&ptp_state_mux);
   memset(&ptp, 0, sizeof(ptp));
   ptp.event_socket = -1;
   ptp.general_socket = -1;
   ptp_clock_engine_init(&ptp.legacy_engine, OUTLIER_THRESHOLD_NS);
+  taskEXIT_CRITICAL(&ptp_state_mux);
 
-  // Create sockets
   ptp.event_socket = create_ptp_socket(PTP_EVENT_PORT);
-  if (ptp.event_socket < 0) {
-    return ESP_FAIL;
-  }
-
+  if (ptp.event_socket < 0) goto failed;
   ptp.general_socket = create_ptp_socket(PTP_GENERAL_PORT);
-  if (ptp.general_socket < 0) {
-    close(ptp.event_socket);
-    ptp.event_socket = -1;
-    return ESP_FAIL;
-  }
+  if (ptp.general_socket < 0) goto failed;
 
-  // Start task
-  ptp.running = true;
+  __atomic_store_n(&ptp.running, true, __ATOMIC_RELEASE);
+  TaskHandle_t task_handle = NULL;
   BaseType_t ret = task_create_pinned_spiram(ptp_task, "ptp_clock", 4096, NULL,
                                              PTP_TASK_PRIORITY_LEGACY,
-                                             &ptp.task_handle, 0, &ptp.task_mem);
+                                             &task_handle, 0, &ptp.task_mem);
   if (ret != pdPASS) {
+    __atomic_store_n(&ptp.running, false, __ATOMIC_RELEASE);
     ESP_LOGE(TAG, "Failed to create PTP task");
-    close(ptp.event_socket);
-    close(ptp.general_socket);
-    ptp.event_socket = -1;
-    ptp.general_socket = -1;
-    ptp.running = false;
-    return ESP_FAIL;
+    goto failed;
   }
-
+  __atomic_store_n(&ptp.task_handle, task_handle, __ATOMIC_RELEASE);
+  xTaskNotifyGive(task_handle);
+  xSemaphoreGive(lifecycle);
   return ESP_OK;
+
+failed:
+  if (ptp.event_socket >= 0) close(ptp.event_socket);
+  if (ptp.general_socket >= 0) close(ptp.general_socket);
+  ptp.event_socket = ptp.general_socket = -1;
+  xSemaphoreGive(lifecycle);
+  return ESP_FAIL;
 }
 
 void ptp_clock_stop(void) {
-  if (!ptp.running) {
-    return;
-  }
-
-  ptp.running = false;
-
-  // Close sockets to unblock select
-  if (ptp.event_socket >= 0) {
-    close(ptp.event_socket);
-    ptp.event_socket = -1;
-  }
-  if (ptp.general_socket >= 0) {
-    close(ptp.general_socket);
-    ptp.general_socket = -1;
-  }
-
-  // Wait for task to exit (task sets task_handle = NULL before vTaskDelete)
-  for (int i = 0; i < 20 && ptp.task_handle != NULL; i++) {
+  SemaphoreHandle_t lifecycle = ptp_lifecycle_lock();
+  __atomic_store_n(&ptp.running, false, __ATOMIC_RELEASE);
+  /* Keep owner-only close. The existing one-second select/receive timeouts
+   * bound exit; timeout is never permission to reset a still-live task. */
+  for (int i = 0; i < 20 &&
+       __atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE) != NULL; i++) {
     vTaskDelay(pdMS_TO_TICKS(50));
   }
-  if (ptp.task_handle != NULL) {
-    ESP_LOGW(TAG, "PTP task did not exit in time");
+  if (__atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE) != NULL) {
+    ESP_LOGW(TAG, "PTP task did not exit in time; restart remains blocked");
+  } else {
+    task_free_spiram(&ptp.task_mem);
   }
-  task_free_spiram(&ptp.task_mem);
+  xSemaphoreGive(lifecycle);
 }
 
 /* Estimator reset without the lock; caller holds ptp_state_mux. */
@@ -1109,9 +1113,6 @@ static void ptp_clear_estimators_locked(void) {
   ptp.last_sync_ms = 0;
   ptp.filtered_offset_ns = 0;
   ptp.sample_count = 0;
-  ptp.previous_offset = 0;
-  ptp.previous_offset_time_ms = 0;
-  ptp.mastership_start_ms = 0;
   ptp.last_sync_seq = 0;
   ptp.last_sync_local_ns = 0;
   ptp.last_sync_correction_ns = 0;
@@ -1295,6 +1296,8 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
 
   const int64_t now_ns = get_local_time_ns();
   const uint32_t now_ms = (uint32_t)(now_ns / 1000000LL);
+  int64_t sample_time_ns = 0;
+  int64_t mastership_time_ns = 0;
   taskENTER_CRITICAL(&ptp_state_mux);
 
   /* Snapshot is the buffered timing read boundary, so expire a stale lock
@@ -1318,15 +1321,8 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
     snapshot->epoch = ptp.grandmaster_clock_id ? ptp.rt_gm_changes + 1U : 0U;
     snapshot->raw_offset_ns = ptp.rt_raw_offset_ns;
     snapshot->filtered_offset_ns = ptp.rt_master_offset_ns;
-    snapshot->raw_filter_delta_ns =
-        ptp.rt_raw_offset_ns - ptp.rt_master_offset_ns;
     snapshot->sample_count = ptp.rt_sample_count;
-    if (ptp.rt_last_followup_rx_ns > 0 && now_ns >= ptp.rt_last_followup_rx_ns) {
-      const uint64_t age_ms = (uint64_t)((now_ns - ptp.rt_last_followup_rx_ns) /
-                                         1000000LL);
-      snapshot->sample_age_ms = age_ms > UINT32_MAX ? UINT32_MAX
-                                                    : (uint32_t)age_ms;
-    }
+    sample_time_ns = ptp.rt_last_followup_rx_ns;
   } else {
     snapshot->valid = ptp.legacy_engine.valid;
     snapshot->source_clock_id = ptp.legacy_engine.source_clock_id;
@@ -1334,30 +1330,25 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
     snapshot->epoch = ptp.legacy_engine.epoch;
     snapshot->raw_offset_ns = ptp.legacy_engine.raw_offset_ns;
     snapshot->filtered_offset_ns = ptp.legacy_engine.filtered_offset_ns;
-    snapshot->raw_filter_delta_ns =
-        ptp.legacy_engine.raw_offset_ns - ptp.legacy_engine.filtered_offset_ns;
-    if (ptp.legacy_engine.mastership_start_time_ns > 0 &&
-        now_ns >= ptp.legacy_engine.mastership_start_time_ns) {
-      const uint64_t age_ms =
-          (uint64_t)((now_ns - ptp.legacy_engine.mastership_start_time_ns) /
-                     1000000LL);
-      snapshot->mastership_age_ms = age_ms > UINT32_MAX ? UINT32_MAX
-                                                        : (uint32_t)age_ms;
-    }
+    mastership_time_ns = ptp.legacy_engine.mastership_start_time_ns;
     snapshot->sample_count = ptp.legacy_engine.accepted_samples;
-    if (ptp.legacy_engine.last_accepted_time_ns > 0 &&
-        now_ns >= ptp.legacy_engine.last_accepted_time_ns) {
-      const uint64_t age_ms =
-          (uint64_t)((now_ns - ptp.legacy_engine.last_accepted_time_ns) /
-                     1000000LL);
-      snapshot->sample_age_ms = age_ms > UINT32_MAX ? UINT32_MAX
-                                                    : (uint32_t)age_ms;
-    }
+    sample_time_ns = ptp.legacy_engine.last_accepted_time_ns;
   }
   taskEXIT_CRITICAL(&ptp_state_mux);
+  snapshot->raw_filter_delta_ns =
+      snapshot->raw_offset_ns - snapshot->filtered_offset_ns;
+  if (sample_time_ns > 0 && now_ns >= sample_time_ns) {
+    const uint64_t age_ms = (uint64_t)((now_ns - sample_time_ns) / 1000000LL);
+    snapshot->sample_age_ms = age_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)age_ms;
+  }
+  if (mastership_time_ns > 0 && now_ns >= mastership_time_ns) {
+    const uint64_t age_ms = (uint64_t)((now_ns - mastership_time_ns) / 1000000LL);
+    snapshot->mastership_age_ms = age_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)age_ms;
+  }
 }
 
 void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
+  SemaphoreHandle_t lifecycle = ptp_lifecycle_lock();
   bool changed = false;
   TaskHandle_t task_handle = NULL;
   taskENTER_CRITICAL(&ptp_state_mux);
@@ -1374,9 +1365,6 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.last_sync_ms = 0;
     ptp.filtered_offset_ns = 0;
     ptp.sample_count = 0;
-    ptp.previous_offset = 0;
-    ptp.previous_offset_time_ms = 0;
-    ptp.mastership_start_ms = 0;
     ptp.last_sync_seq = 0;
     ptp.last_sync_local_ns = 0;
     ptp.last_sync_correction_ns = 0;
@@ -1405,13 +1393,14 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
     ptp.rt_sync_source_ip = 0;
     ptp.rt_awaiting_followup = false;
   }
-  task_handle = ptp.task_handle;
+  task_handle = __atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE);
   taskEXIT_CRITICAL(&ptp_state_mux);
 
-  if (changed && task_handle) {
+  if (changed && task_handle && ptp_is_running()) {
     vTaskPrioritySet(task_handle, enabled ? PTP_TASK_PRIORITY_REALTIME
                                          : PTP_TASK_PRIORITY_LEGACY);
   }
+  xSemaphoreGive(lifecycle);
 #if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
   if (changed) {
     struct in_addr peer = {.s_addr = timing_peer_ip};
@@ -1450,22 +1439,24 @@ void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
   taskENTER_CRITICAL(&ptp_state_mux);
   const int64_t now_ns = get_local_time_ns();
   snapshot->realtime_mode = ptp.realtime_mode;
-  const int64_t age_ns = now_ns - ptp.rt_last_followup_rx_ns;
-  snapshot->sample_age_ms = ptp.rt_last_followup_rx_ns > 0 && age_ns >= 0
-      ? (uint32_t)((uint64_t)(age_ns / 1000000LL) > UINT32_MAX
-                       ? UINT32_MAX : (uint64_t)(age_ns / 1000000LL))
-      : UINT32_MAX;
-  snapshot->master_ready = ptp.rt_master_ready &&
-      snapshot->sample_age_ms <= LOCK_TIMEOUT_MS;
+  const int64_t sample_time_ns = ptp.rt_last_followup_rx_ns;
+  const int64_t mastership_time_ns = ptp.rt_mastership_start_ns;
+  const bool master_ready = ptp.rt_master_ready;
   snapshot->master_clock_id = ptp.grandmaster_clock_id;
   snapshot->source_clock_id = ptp.source_clock_id;
   snapshot->master_offset_ns = ptp.rt_master_offset_ns;
   snapshot->sample_count = ptp.rt_sample_count;
   snapshot->gm_change_count = ptp.rt_gm_changes;
-  if (ptp.rt_mastership_start_ns > 0 && now_ns >= ptp.rt_mastership_start_ns)
-    snapshot->mastership_age_ms =
-        (uint32_t)((now_ns - ptp.rt_mastership_start_ns) / 1000000LL);
   taskEXIT_CRITICAL(&ptp_state_mux);
+  const int64_t age_ns = now_ns - sample_time_ns;
+  snapshot->sample_age_ms = UINT32_MAX;
+  if (sample_time_ns > 0 && age_ns >= 0) {
+    const uint64_t age_ms = (uint64_t)(age_ns / 1000000LL);
+    snapshot->sample_age_ms = age_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)age_ms;
+  }
+  snapshot->master_ready = master_ready && snapshot->sample_age_ms <= LOCK_TIMEOUT_MS;
+  if (mastership_time_ns > 0 && now_ns >= mastership_time_ns)
+    snapshot->mastership_age_ms = (uint32_t)((now_ns - mastership_time_ns) / 1000000LL);
 }
 
 void ptp_clock_set_master_clock_id(uint64_t clock_id) {
