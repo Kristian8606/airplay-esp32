@@ -1,12 +1,13 @@
 #include "rtsp_rsa.h"
 
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/pk.h"
-#include "mbedtls/rsa.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "psa/crypto.h"
 #include "sodium/utils.h" // sodium_base642bin, sodium_bin2base64
 
 static const char *TAG = "rtsp_rsa";
@@ -41,39 +42,91 @@ static const char airplay_rsa_private_key[] =
     "XqFKA4zaaSrw622wDniAK5MlIE0tIAKKP4yxNGjoD2QYjhBGuhvkWKY=\n"
     "-----END RSA PRIVATE KEY-----";
 
-// Parsed RSA context and RNG (initialized once)
-static mbedtls_pk_context s_pk_ctx;
-static mbedtls_entropy_context s_entropy;
-static mbedtls_ctr_drbg_context s_ctr_drbg;
+// Serialize key initialization and RSA operations across RTSP clients.
+static StaticSemaphore_t s_rsa_mutex_storage;
+static SemaphoreHandle_t s_rsa_mutex;
+static portMUX_TYPE s_rsa_mutex_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t lock_rsa(void) {
+  portENTER_CRITICAL(&s_rsa_mutex_mux);
+  if (!s_rsa_mutex) {
+    s_rsa_mutex = xSemaphoreCreateMutexStatic(&s_rsa_mutex_storage);
+  }
+  SemaphoreHandle_t mutex = s_rsa_mutex;
+  portEXIT_CRITICAL(&s_rsa_mutex_mux);
+
+  if (!mutex || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
+    return NULL;
+  }
+  return mutex;
+}
+
 static bool s_pk_initialized = false;
+
+#define AIRPLAY_RSA_BITS 2048
+
+// Keep separate PSA handles with an explicit algorithm policy for
+// the Apple-Challenge signature and the RAOP AES key decryption.
+static mbedtls_svc_key_id_t s_sign_key;
+static mbedtls_svc_key_id_t s_decrypt_key;
 
 static int ensure_pk_initialized(void) {
   if (s_pk_initialized) {
     return 0;
   }
 
-  // Initialize RNG (required by mbedtls 3.x for key parsing and RSA ops)
-  mbedtls_entropy_init(&s_entropy);
-  mbedtls_ctr_drbg_init(&s_ctr_drbg);
-  int ret = mbedtls_ctr_drbg_seed(&s_ctr_drbg, mbedtls_entropy_func, &s_entropy,
-                                  NULL, 0);
-  if (ret != 0) {
-    ESP_LOGE(TAG, "Failed to seed RNG: -0x%04x", -ret);
-    mbedtls_ctr_drbg_free(&s_ctr_drbg);
-    mbedtls_entropy_free(&s_entropy);
+  psa_status_t status = psa_crypto_init();
+  if (status != PSA_SUCCESS) {
+    ESP_LOGE(TAG, "Failed to initialize PSA crypto: %d", (int)status);
     return -1;
   }
 
-  mbedtls_pk_init(&s_pk_ctx);
-  ret = mbedtls_pk_parse_key(&s_pk_ctx,
-                             (const unsigned char *)airplay_rsa_private_key,
-                             sizeof(airplay_rsa_private_key), NULL, 0,
-                             mbedtls_ctr_drbg_random, &s_ctr_drbg);
-  if (ret != 0) {
-    ESP_LOGE(TAG, "Failed to parse RSA private key: -0x%04x", -ret);
-    mbedtls_pk_free(&s_pk_ctx);
-    mbedtls_ctr_drbg_free(&s_ctr_drbg);
-    mbedtls_entropy_free(&s_entropy);
+  // The embedded PEM contains a PKCS#1 RSAPrivateKey, the binary format
+  // accepted by psa_import_key for PSA_KEY_TYPE_RSA_KEY_PAIR.
+  const char *body = strchr(airplay_rsa_private_key, '\n');
+  const char *footer = strstr(airplay_rsa_private_key,
+                              "-----END RSA PRIVATE KEY-----");
+  if (!body || !footer) {
+    return -1;
+  }
+  ++body;
+  if (footer <= body) {
+    return -1;
+  }
+  size_t der_size = (size_t)(footer - body);
+  uint8_t *der = malloc(der_size);
+  if (!der) {
+    return -1;
+  }
+  size_t der_len = 0;
+  if (sodium_base642bin(der, der_size, body, der_size, "\r\n \t", &der_len,
+                        NULL, sodium_base64_VARIANT_ORIGINAL) != 0) {
+    ESP_LOGE(TAG, "Failed to decode RSA private key");
+    sodium_memzero(der, der_size);
+    free(der);
+    return -1;
+  }
+
+  psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+  psa_set_key_type(&attributes, PSA_KEY_TYPE_RSA_KEY_PAIR);
+  psa_set_key_bits(&attributes, AIRPLAY_RSA_BITS);
+  psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_HASH);
+  psa_set_key_algorithm(&attributes, PSA_ALG_RSA_PKCS1V15_SIGN_RAW);
+  status = psa_import_key(&attributes, der, der_len, &s_sign_key);
+  if (status == PSA_SUCCESS) {
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, PSA_ALG_RSA_OAEP(PSA_ALG_SHA_1));
+    status = psa_import_key(&attributes, der, der_len, &s_decrypt_key);
+  }
+  psa_reset_key_attributes(&attributes);
+  sodium_memzero(der, der_size);
+  free(der);
+  if (status != PSA_SUCCESS) {
+    ESP_LOGE(TAG, "Failed to import RSA private key: %d", (int)status);
+    psa_destroy_key(s_sign_key);
+    psa_destroy_key(s_decrypt_key);
+    s_sign_key = 0;
+    s_decrypt_key = 0;
     return -1;
   }
 
@@ -104,7 +157,7 @@ static int b64_encode(const uint8_t *data, size_t data_len, char *out,
   return result ? 0 : -1;
 }
 
-int rsa_apple_challenge_response(const char *challenge_b64, uint32_t ip_addr,
+static int apple_challenge_response_locked(const char *challenge_b64, uint32_t ip_addr,
                                  const uint8_t mac[6], char *out_b64,
                                  size_t out_b64_size) {
   if (ensure_pk_initialized() != 0) {
@@ -137,26 +190,27 @@ int rsa_apple_challenge_response(const char *challenge_b64, uint32_t ip_addr,
   memcpy(data + pos, mac, 6);
   // pos is now at most 32, rest is zero-padded
 
-  // RSA PKCS1 v1.5 "private encrypt" — equivalent to OpenSSL's
-  // RSA_private_encrypt(..., RSA_PKCS1_PADDING).
-  // mbedtls_rsa_pkcs1_sign with MBEDTLS_MD_NONE applies type-1 padding
-  // (0x00 0x01 0xFF..0xFF 0x00 <data>) then the private key operation.
-  mbedtls_rsa_context *rsa = mbedtls_pk_rsa(s_pk_ctx);
-  mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V15, MBEDTLS_MD_NONE);
-
-  size_t rsa_len = mbedtls_rsa_get_len(rsa);
+  // RAW applies type-1 padding directly to the 32-byte response data, without
+  // hashing or adding DigestInfo, matching RSA_private_encrypt in RAOP.
+  size_t rsa_len = PSA_SIGN_OUTPUT_SIZE(PSA_KEY_TYPE_RSA_KEY_PAIR,
+                                       AIRPLAY_RSA_BITS,
+                                       PSA_ALG_RSA_PKCS1V15_SIGN_RAW);
   uint8_t *rsa_out = malloc(rsa_len);
   if (!rsa_out) {
     return -1;
   }
-
-  int ret = mbedtls_rsa_pkcs1_sign(rsa, mbedtls_ctr_drbg_random, &s_ctr_drbg,
-                                   MBEDTLS_MD_NONE, 32, data, rsa_out);
-  if (ret != 0) {
-    ESP_LOGE(TAG, "RSA sign failed: -0x%04x", -ret);
+  size_t signature_len = 0;
+  psa_status_t status = psa_sign_hash(s_sign_key,
+                                      PSA_ALG_RSA_PKCS1V15_SIGN_RAW,
+                                      data, sizeof(data), rsa_out, rsa_len,
+                                      &signature_len);
+  if (status != PSA_SUCCESS) {
+    ESP_LOGE(TAG, "RSA sign failed: %d", (int)status);
     free(rsa_out);
     return -1;
   }
+  rsa_len = signature_len;
+  int ret;
 
   // Base64 encode result without padding
   ret = b64_encode(rsa_out, rsa_len, out_b64, out_b64_size);
@@ -170,7 +224,7 @@ int rsa_apple_challenge_response(const char *challenge_b64, uint32_t ip_addr,
   return 0;
 }
 
-int rsa_decrypt_aes_key(const char *encrypted_b64, uint8_t *out_key,
+static int decrypt_aes_key_locked(const char *encrypted_b64, uint8_t *out_key,
                         size_t out_key_size, size_t *out_key_len) {
   if (ensure_pk_initialized() != 0) {
     return -1;
@@ -188,19 +242,42 @@ int rsa_decrypt_aes_key(const char *encrypted_b64, uint8_t *out_key,
   ESP_LOGI(TAG, "RSA-encrypted AES key: %zu bytes (expected 256)",
            encrypted_len);
 
-  // RSA OAEP-SHA1 decrypt (RAOP uses OAEP padding for the AES key)
-  mbedtls_rsa_context *rsa = mbedtls_pk_rsa(s_pk_ctx);
-  mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
-
+  // RSA OAEP-SHA1 decrypt (RAOP uses OAEP padding for the AES key).
   size_t olen = 0;
-  int ret = mbedtls_rsa_pkcs1_decrypt(rsa, mbedtls_ctr_drbg_random, &s_ctr_drbg,
-                                      &olen, encrypted, out_key, out_key_size);
-  if (ret != 0) {
-    ESP_LOGE(TAG, "RSA AES key decrypt failed: -0x%04x", -ret);
+  psa_status_t status = psa_asymmetric_decrypt(
+      s_decrypt_key, PSA_ALG_RSA_OAEP(PSA_ALG_SHA_1), encrypted, encrypted_len,
+      NULL, 0, out_key, out_key_size, &olen);
+  if (status != PSA_SUCCESS) {
+    ESP_LOGE(TAG, "RSA AES key decrypt failed: %d", (int)status);
     return -1;
   }
 
   *out_key_len = olen;
   ESP_LOGI(TAG, "Decrypted AES key: %zu bytes", olen);
   return 0;
+}
+
+int rsa_apple_challenge_response(const char *challenge_b64, uint32_t ip_addr,
+                                 const uint8_t mac[6], char *out_b64,
+                                 size_t out_b64_size) {
+  SemaphoreHandle_t mutex = lock_rsa();
+  if (!mutex) {
+    return -1;
+  }
+  int ret = apple_challenge_response_locked(challenge_b64, ip_addr, mac,
+                                             out_b64, out_b64_size);
+  xSemaphoreGive(mutex);
+  return ret;
+}
+
+int rsa_decrypt_aes_key(const char *encrypted_b64, uint8_t *out_key,
+                        size_t out_key_size, size_t *out_key_len) {
+  SemaphoreHandle_t mutex = lock_rsa();
+  if (!mutex) {
+    return -1;
+  }
+  int ret = decrypt_aes_key_locked(encrypted_b64, out_key, out_key_size,
+                                   out_key_len);
+  xSemaphoreGive(mutex);
+  return ret;
 }

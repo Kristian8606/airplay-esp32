@@ -6,7 +6,7 @@
 
 #include "esp_log.h"
 #include "esp_mac.h"
-#include "mbedtls/aes.h"
+#include "aes/esp_aes.h"
 #include "sodium.h"
 
 static const char *TAG = "hap_verify";
@@ -215,18 +215,27 @@ esp_err_t hap_pair_verify_m1_raw(hap_session_t *session, const uint8_t *input,
 
   memcpy(output, session->session_public_key, 32);
 
-  mbedtls_aes_context aes_ctx;
-  mbedtls_aes_init(&aes_ctx);
-  mbedtls_aes_setkey_enc(&aes_ctx, aes_key, 128);
+  esp_aes_context aes_ctx;
+  esp_aes_init(&aes_ctx);
+  int aes_ret = esp_aes_setkey(&aes_ctx, aes_key, 128);
+  if (aes_ret != 0) {
+    esp_aes_free(&aes_ctx);
+    ESP_LOGE(TAG, "Pair-Verify AES key setup failed: %d", aes_ret);
+    return ESP_FAIL;
+  }
 
   uint8_t stream_block[16] = {0};
   size_t nc_off = 0;
   uint8_t nonce_counter[16];
   memcpy(nonce_counter, aes_iv, sizeof(nonce_counter));
 
-  mbedtls_aes_crypt_ctr(&aes_ctx, sizeof(signature), &nc_off, nonce_counter,
+  aes_ret = esp_aes_crypt_ctr(&aes_ctx, sizeof(signature), &nc_off, nonce_counter,
                         stream_block, signature, output + 32);
-  mbedtls_aes_free(&aes_ctx);
+  esp_aes_free(&aes_ctx);
+  if (aes_ret != 0) {
+    ESP_LOGE(TAG, "Pair-Verify AES encryption failed: %d", aes_ret);
+    return ESP_FAIL;
+  }
 
   *output_len = 96;
   session->pair_verify_state = PAIR_VERIFY_STATE_M2;
@@ -279,19 +288,28 @@ esp_err_t hap_pair_verify_m3_raw(hap_session_t *session, const uint8_t *input,
   }
 
   uint8_t client_signature[64];
-  mbedtls_aes_context aes_ctx;
-  mbedtls_aes_init(&aes_ctx);
-  mbedtls_aes_setkey_enc(&aes_ctx, aes_key, 128);
+  esp_aes_context aes_ctx;
+  esp_aes_init(&aes_ctx);
+  int aes_ret = esp_aes_setkey(&aes_ctx, aes_key, 128);
+  if (aes_ret != 0) {
+    esp_aes_free(&aes_ctx);
+    ESP_LOGE(TAG, "Pair-Verify AES key setup failed: %d", aes_ret);
+    return ESP_FAIL;
+  }
 
   uint8_t stream_block[16] = {0};
   size_t nc_off = 0;
   uint8_t nonce_counter[16];
   memcpy(nonce_counter, aes_iv, sizeof(nonce_counter));
 
-  mbedtls_aes_crypt_ctr(&aes_ctx, sizeof(client_signature), &nc_off,
+  aes_ret = esp_aes_crypt_ctr(&aes_ctx, sizeof(client_signature), &nc_off,
                         nonce_counter, stream_block, encrypted_sig,
                         client_signature);
-  mbedtls_aes_free(&aes_ctx);
+  esp_aes_free(&aes_ctx);
+  if (aes_ret != 0) {
+    ESP_LOGE(TAG, "Pair-Verify AES decryption failed: %d", aes_ret);
+    return ESP_FAIL;
+  }
 
   ESP_LOGW(TAG, "Skipping signature verification (transient pairing)");
 

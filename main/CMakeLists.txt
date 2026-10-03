@@ -59,7 +59,8 @@ idf_component_register(
     SRCS ${SRC_FILES}
     INCLUDE_DIRS "." "audio" "rtsp" "plist" "hap" "network"
     PRIV_REQUIRES
-        driver
+        esp_driver_gpio
+        esp_driver_i2s
         nvs_flash
         esp_wifi
         esp_netif
@@ -67,8 +68,8 @@ idf_component_register(
         esp_timer
         esp_http_server
         app_update
+        esp_app_format
         mbedtls
-        json
         spiffs_storage
         esp_adc
 )

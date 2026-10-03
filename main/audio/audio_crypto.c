@@ -2,7 +2,7 @@
 
 #include "audio_crypto.h"
 
-#include "mbedtls/aes.h"
+#include "aes/esp_aes.h"
 #include "sodium.h"
 
 int audio_crypto_decrypt_rtp(const audio_encrypt_t *encrypt,
@@ -35,18 +35,18 @@ int audio_crypto_decrypt_rtp(const audio_encrypt_t *encrypt,
     size_t encrypted_len = num_blocks * 16;
 
     if (encrypted_len > 0) {
-      mbedtls_aes_context aes;
-      mbedtls_aes_init(&aes);
+      esp_aes_context aes;
+      esp_aes_init(&aes);
 
-      int ret = mbedtls_aes_setkey_dec(&aes, encrypt->key, 128);
+      int ret = esp_aes_setkey(&aes, encrypt->key, 128);
       if (ret != 0) {
-        mbedtls_aes_free(&aes);
+        esp_aes_free(&aes);
         return -1;
       }
 
-      ret = mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, encrypted_len, iv,
+      ret = esp_aes_crypt_cbc(&aes, ESP_AES_DECRYPT, encrypted_len, iv,
                                   input, output);
-      mbedtls_aes_free(&aes);
+      esp_aes_free(&aes);
       if (ret != 0) {
         return -1;
       }
