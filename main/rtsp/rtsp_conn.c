@@ -133,7 +133,7 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
 }
 
 void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
-  if (!conn) {
+  if (!conn || !isfinite(volume_db)) {
     return;
   }
 

@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdatomic.h>
 #include <inttypes.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1798,7 +1799,16 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
       if (strstr((const char *)body, "volume:")) {
         const char *vol = strstr((const char *)body, "volume:");
         if (vol) {
-          float volume = strtof(vol + 7, NULL);
+          char *end = NULL;
+          errno = 0;
+          float volume = strtof(vol + 7, &end);
+          const bool parsed = end != vol + 7 && errno != ERANGE && isfinite(volume);
+          while (*end == ' ' || *end == '\t') ++end;
+          if (!parsed || (*end != '\0' && *end != '\r' && *end != '\n')) {
+            rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq,
+                               NULL, NULL, 0);
+            return;
+          }
           rtsp_conn_set_volume(conn, volume);
         }
       }

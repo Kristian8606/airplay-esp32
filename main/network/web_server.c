@@ -112,7 +112,29 @@ static esp_err_t captive_404_handler(httpd_req_t *req, httpd_err_code_t error){
 static esp_err_t airplay_still_stopping(httpd_req_t *req) {
   httpd_resp_set_status(req, "503 Service Unavailable");
   httpd_resp_set_type(req, "text/plain");
-  (void)httpd_resp_sendstr(req, "AirPlay clients are still stopping; retry later");
+  (void)httpd_resp_sendstr(req,
+                          "AirPlay clients are still stopping; recovering service");
+  /* Refusing maintenance must not strand the listener after delayed owners
+   * finish. Keep this rare recovery in the HTTP owner: no additional stack or
+   * timer callback is needed, and audio memory remains untouched. */
+  const int64_t deadline = esp_timer_get_time() + 30000000LL;
+  while (!rtsp_server_is_idle() && esp_timer_get_time() < deadline) {
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  if (rtsp_server_is_idle()) {
+    const esp_err_t err = rtsp_server_start();
+    if (err == ESP_OK) {
+      ESP_LOGI(TAG, "AirPlay restored after delayed maintenance stop");
+      return ESP_FAIL;
+    }
+    ESP_LOGE(TAG, "AirPlay restart after delayed stop failed: %s",
+             esp_err_to_name(err));
+  }
+  /* A stuck owner cannot safely have its buffers freed or reused. Follow the
+   * existing maintenance recovery policy and reboot with resources intact. */
+  ESP_LOGE(TAG, "AirPlay delayed stop recovery failed; rebooting");
+  vTaskDelay(pdMS_TO_TICKS(250));
+  esp_restart();
   return ESP_FAIL;
 }
 

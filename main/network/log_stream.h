@@ -8,7 +8,8 @@
  *
  * Hooks into esp_log via esp_log_set_vprintf() to capture all log output
  * into a ring buffer. Connected WebSocket clients on /ws/logs receive
- * log lines in real-time. Logs continue to go to UART as normal.
+ * valid UTF-8 text frames. Capture truncation or ring overwrite can lose
+ * bytes, which are replaced with question marks. UART output is unchanged.
  *
  * Requires CONFIG_HTTPD_WS_SUPPORT=y in sdkconfig.
  */
@@ -25,7 +26,7 @@ esp_err_t log_stream_init(void);
  */
 esp_err_t log_stream_register(httpd_handle_t server);
 
-/** Detach before httpd_stop(); waits for broadcaster server access to finish.
+/** Detach before httpd_stop(); drains queued/in-flight HTTPD broadcast work.
  * Call from the server lifecycle owner, outside HTTPD request handlers.
  */
 void log_stream_detach(httpd_handle_t server);

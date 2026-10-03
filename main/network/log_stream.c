@@ -37,13 +37,64 @@ static size_t s_head; /* next write position  */
 static size_t s_tail; /* next read position   */
 static SemaphoreHandle_t s_mutex;
 
-/* Separate lifetime mutex: never held by the log hook. Socket sends are
- * synchronous in this IDF API and bounded by HTTPD's send timeout. */
+/* Serialize scheduling and detach; HTTPD work never takes this mutex. */
 static SemaphoreHandle_t s_server_mutex;
 static httpd_handle_t s_server;
 static TaskHandle_t s_broadcast_task;
 static bool s_initialized;
 static bool s_initializing;
+static bool s_work_pending;
+static bool s_has_viewers;
+static bool s_detaching;
+
+typedef struct {
+  httpd_handle_t server;
+  char payload[MAX_SEND_CHUNK + 3];
+} log_broadcast_work_t;
+
+/* Only HTTPD work touches these bytes; detach resets them after draining. */
+static uint8_t s_utf8_pending[3];
+static size_t s_utf8_pending_len;
+
+/* Emit complete canonical UTF-8 only. Replace lost/malformed bytes in place
+ * without expansion and retain a valid incomplete suffix for the next chunk. */
+static size_t sanitize_utf8(char *buf, size_t len) {
+  size_t read = 0, written = 0;
+  s_utf8_pending_len = 0;
+  while (read < len) {
+    uint8_t lead = (uint8_t)buf[read];
+    size_t width = lead <= 0x7f ? 1 :
+        (lead >= 0xc2 && lead <= 0xdf ? 2 :
+         (lead >= 0xe0 && lead <= 0xef ? 3 :
+          (lead >= 0xf0 && lead <= 0xf4 ? 4 : 0)));
+    bool valid = width != 0;
+    size_t available = len - read;
+    size_t check = available < width ? available : width;
+    for (size_t i = 1; valid && i < check; ++i) {
+      uint8_t byte = (uint8_t)buf[read + i];
+      valid = byte >= 0x80 && byte <= 0xbf;
+      if (i == 1) {
+        if (lead == 0xe0 && byte < 0xa0) valid = false; /* overlong */
+        if (lead == 0xed && byte > 0x9f) valid = false; /* surrogate */
+        if (lead == 0xf0 && byte < 0x90) valid = false; /* overlong */
+        if (lead == 0xf4 && byte > 0x8f) valid = false; /* > U+10FFFF */
+      }
+    }
+    if (!valid) {
+      buf[written++] = '?';
+      ++read;
+    } else if (available < width) {
+      memcpy(s_utf8_pending, buf + read, available);
+      s_utf8_pending_len = available; /* A valid incomplete suffix is <= 3. */
+      break;
+    } else {
+      memmove(buf + written, buf + read, width);
+      written += width;
+      read += width;
+    }
+  }
+  return written;
+}
 
 static vprintf_like_t s_orig_vprintf;
 
@@ -185,68 +236,63 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
 /*  Broadcast task                                                     */
 /* ------------------------------------------------------------------ */
 
-static void broadcast_task(void *arg) {
-  (void)arg;
-  char buf[MAX_SEND_CHUNK];
-  TickType_t interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
-
-  while (1) {
-    vTaskDelay(interval);
-
-    xSemaphoreTake(s_server_mutex, portMAX_DELAY);
-    if (!s_server) {
-      xSemaphoreGive(s_server_mutex);
-      interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
-      continue;
+/* Run session lookup and every frame write on HTTPD's own task. The work
+ * owns its payload until synchronous sends finish; only one work item exists. */
+static void broadcast_work(void *arg) {
+  log_broadcast_work_t *work = arg;
+  int fds[CONFIG_LWIP_MAX_SOCKETS];
+  size_t fd_count = CONFIG_LWIP_MAX_SOCKETS;
+  size_t ws_count = 0;
+  if (httpd_get_client_list(work->server, &fd_count, fds) == ESP_OK) {
+    for (size_t i = 0; i < fd_count; ++i) {
+      if (httpd_ws_get_fd_info(work->server, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET)
+        fds[ws_count++] = fds[i];
     }
-
-    /* Discover active WebSocket sessions fresh each pass. With no viewer the
-     * task wakes only once per second; while a viewer is connected it returns
-     * to the 100 ms cadence used for live log streaming. */
-    int fds[CONFIG_LWIP_MAX_SOCKETS];
-    size_t fd_count = CONFIG_LWIP_MAX_SOCKETS;
-    if (httpd_get_client_list(s_server, &fd_count, fds) != ESP_OK) {
-      interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
-      xSemaphoreGive(s_server_mutex);
-      continue;
-    }
-
-    int ws_fds[CONFIG_LWIP_MAX_SOCKETS];
-    size_t ws_count = 0;
-    for (size_t i = 0; i < fd_count; i++) {
-      if (httpd_ws_get_fd_info(s_server, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) {
-        ws_fds[ws_count++] = fds[i];
-      }
-    }
-    if (ws_count == 0) {
-      interval = pdMS_TO_TICKS(BROADCAST_IDLE_INTERVAL_MS);
-      xSemaphoreGive(s_server_mutex);
-      continue; /* leave data in the ring as backlog for the next viewer */
-    }
-    interval = pdMS_TO_TICKS(BROADCAST_ACTIVE_INTERVAL_MS);
-
-    size_t len = 0;
-    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-      len = ring_read(buf, sizeof(buf));
-      xSemaphoreGive(s_mutex);
-    }
-    if (len == 0) {
-      xSemaphoreGive(s_server_mutex);
-      continue;
-    }
-
+  }
+  __atomic_store_n(&s_has_viewers, ws_count != 0, __ATOMIC_RELEASE);
+  size_t len = 0;
+  if (ws_count && xSemaphoreTake(s_mutex, 0) == pdTRUE) {
+    memcpy(work->payload, s_utf8_pending, s_utf8_pending_len);
+    len = s_utf8_pending_len + ring_read(
+        work->payload + s_utf8_pending_len, MAX_SEND_CHUNK);
+    xSemaphoreGive(s_mutex);
+  }
+  if (len) len = sanitize_utf8(work->payload, len);
+  if (len) {
+    /* TEXT remains compatible with UI assets retained by firmware-only OTA. */
     httpd_ws_frame_t frame = {
         .type = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)buf,
+        .payload = (uint8_t *)work->payload,
         .len = len,
     };
+    for (size_t i = 0; i < ws_count; ++i) {
+      if (httpd_ws_send_frame_async(work->server, fds[i], &frame) != ESP_OK)
+        close_ws_session(work->server, fds[i], "send-failed");
+    }
+  }
+  free(work);
+  /* Release only after the last use of the server, including close requests. */
+  __atomic_store_n(&s_work_pending, false, __ATOMIC_RELEASE);
+}
 
-    for (size_t i = 0; i < ws_count; i++) {
-      esp_err_t err = httpd_ws_send_frame_async(s_server, ws_fds[i], &frame);
-      if (err != ESP_OK) {
-        /* Do not keep a dead browser session around. It otherwise remains in
-         * the client list long enough to generate repeated send/recv warnings. */
-        close_ws_session(s_server, ws_fds[i], "send-failed");
+static void broadcast_task(void *arg) {
+  (void)arg;
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(__atomic_load_n(&s_has_viewers, __ATOMIC_ACQUIRE)
+        ? BROADCAST_ACTIVE_INTERVAL_MS : BROADCAST_IDLE_INTERVAL_MS));
+    xSemaphoreTake(s_server_mutex, portMAX_DELAY);
+    if (s_server && !__atomic_load_n(&s_work_pending, __ATOMIC_ACQUIRE)) {
+      log_broadcast_work_t *work = heap_caps_malloc(sizeof(*work),
+          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!work) work = malloc(sizeof(*work));
+      if (work) {
+        work->server = s_server;
+        __atomic_store_n(&s_work_pending, true, __ATOMIC_RELEASE);
+        /* This project's nonblocking HTTPD queue fails fast when full. */
+        if (httpd_queue_work(s_server, broadcast_work, work) != ESP_OK) {
+          free(work);
+          __atomic_store_n(&s_work_pending, false, __ATOMIC_RELEASE);
+        }
       }
     }
     xSemaphoreGive(s_server_mutex);
@@ -291,6 +337,10 @@ esp_err_t log_stream_register(httpd_handle_t server) {
   if (!__atomic_load_n(&s_initialized, __ATOMIC_ACQUIRE))
     return ESP_ERR_INVALID_STATE;
   xSemaphoreTake(s_server_mutex, portMAX_DELAY);
+  if (s_detaching) {
+    xSemaphoreGive(s_server_mutex);
+    return ESP_ERR_INVALID_STATE;
+  }
   if (s_server) {
     esp_err_t result = s_server == server ? ESP_OK : ESP_ERR_INVALID_STATE;
     xSemaphoreGive(s_server_mutex);
@@ -324,9 +374,25 @@ esp_err_t log_stream_register(httpd_handle_t server) {
 
 void log_stream_detach(httpd_handle_t server) {
   if (!__atomic_load_n(&s_initialized, __ATOMIC_ACQUIRE)) return;
-  /* Wait for any in-flight synchronous send/client-list access. The caller
-   * must invoke this before httpd_stop(), outside an HTTPD request handler. */
+  /* Stop scheduling first, then drain without holding the mutex. HTTPD
+   * remains alive until this returns and work never waits on this mutex. */
   xSemaphoreTake(s_server_mutex, portMAX_DELAY);
-  if (s_server == server) s_server = NULL;
+  while (s_detaching) {
+    xSemaphoreGive(s_server_mutex);
+    vTaskDelay(1);
+    xSemaphoreTake(s_server_mutex, portMAX_DELAY);
+  }
+  if (s_server != server) {
+    xSemaphoreGive(s_server_mutex);
+    return;
+  }
+  s_detaching = true;
+  s_server = NULL;
+  xSemaphoreGive(s_server_mutex);
+  while (__atomic_load_n(&s_work_pending, __ATOMIC_ACQUIRE)) vTaskDelay(1);
+  xSemaphoreTake(s_server_mutex, portMAX_DELAY);
+  __atomic_store_n(&s_has_viewers, false, __ATOMIC_RELEASE);
+  s_utf8_pending_len = 0;
+  s_detaching = false;
   xSemaphoreGive(s_server_mutex);
 }

@@ -49,10 +49,12 @@ typedef struct {
   biquad_coeff_t coeff_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   biquad_state_t state_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   biquad_state_t state_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
-  /* Filter type at each ACTIVE position, so a live config change can tell
+  /* Filter identity at each ACTIVE position, so a live config change can tell
    * which delay-line states are still meaningful. */
   uint8_t type_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   uint8_t type_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  uint8_t slot_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  uint8_t slot_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   uint8_t active_l;
   uint8_t active_r;
   int sample_rate;
@@ -288,6 +290,7 @@ void audio_eq_reset_state(void) {
 
 static bool prepare_output(const audio_eq_output_config_t *cfg,
                            biquad_coeff_t *coeff, uint8_t *types,
+                           uint8_t *slots,
                            uint8_t *active_count, int sample_rate,
                            const char *name) {
   uint8_t active = 0;
@@ -303,6 +306,7 @@ static bool prepare_output(const audio_eq_output_config_t *cfg,
       return false;
     }
     types[active] = f->type;
+    slots[active] = i;
     ++active;
   }
   *active_count = active;
@@ -314,9 +318,9 @@ static bool prepare_for_rate_unlocked(int sample_rate) {
   if (s_eq.ready && s_eq.sample_rate == sample_rate) return true;
 
   if (!prepare_output(&s_eq.config.left, s_eq.coeff_l, s_eq.type_l,
-                      &s_eq.active_l, sample_rate, "left") ||
+                      s_eq.slot_l, &s_eq.active_l, sample_rate, "left") ||
       !prepare_output(&s_eq.config.right, s_eq.coeff_r, s_eq.type_r,
-                      &s_eq.active_r, sample_rate, "right")) {
+                      s_eq.slot_r, &s_eq.active_r, sample_rate, "right")) {
     s_eq.ready = false;
     return false;
   }
@@ -358,16 +362,18 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
   biquad_coeff_t coeff_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
   uint8_t type_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
   uint8_t type_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
+  uint8_t slot_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
+  uint8_t slot_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
   uint8_t active_l = 0;
   uint8_t active_r = 0;
   float preamp_gain = powf(10.0f, config->preamp_db / 20.0f);
   bool prepared = false;
 
   if (sample_rate > 0) {
-    if (!prepare_output(&config->left, coeff_l, type_l, &active_l, sample_rate,
-                        "left") ||
-        !prepare_output(&config->right, coeff_r, type_r, &active_r, sample_rate,
-                        "right")) {
+    if (!prepare_output(&config->left, coeff_l, type_l, slot_l, &active_l,
+                        sample_rate, "left") ||
+        !prepare_output(&config->right, coeff_r, type_r, slot_r, &active_r,
+                        sample_rate, "right")) {
       return ESP_ERR_INVALID_ARG;
     }
     prepared = true;
@@ -381,8 +387,12 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
   const uint8_t old_active_r = s_eq.active_r;
   uint8_t old_type_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   uint8_t old_type_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  uint8_t old_slot_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
+  uint8_t old_slot_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   memcpy(old_type_l, s_eq.type_l, sizeof(old_type_l));
   memcpy(old_type_r, s_eq.type_r, sizeof(old_type_r));
+  memcpy(old_slot_l, s_eq.slot_l, sizeof(old_slot_l));
+  memcpy(old_slot_r, s_eq.slot_r, sizeof(old_slot_r));
 
   s_eq.config = *config;
   if (prepared && s_eq.sample_rate == sample_rate) {
@@ -390,6 +400,8 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
     memcpy(s_eq.coeff_r, coeff_r, sizeof(coeff_r));
     memcpy(s_eq.type_l, type_l, sizeof(type_l));
     memcpy(s_eq.type_r, type_r, sizeof(type_r));
+    memcpy(s_eq.slot_l, slot_l, sizeof(slot_l));
+    memcpy(s_eq.slot_r, slot_r, sizeof(slot_r));
     s_eq.active_l = active_l;
     s_eq.active_r = active_r;
     s_eq.preamp_gain = preamp_gain;
@@ -403,12 +415,15 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
       /* Live tweak while audio is playing. Zeroing the delay lines here used
        * to inject a step into the signal (an audible click on every slider
        * move). A biquad in transposed direct form II tolerates coefficient
-       * changes, so keep the state of every filter whose slot and type are
-       * unchanged and clear only slots that changed meaning. */
+       * changes, so retain a state only when its configured slot and type
+       * still occupy the same active position. Enabling/disabling an earlier
+       * filter shifts this position and changes its cascade input. */
       for (uint8_t i = 0; i < AUDIO_EQ_MAX_FILTERS_PER_CHANNEL; ++i) {
-        if (i >= active_l || i >= old_active_l || type_l[i] != old_type_l[i])
+        if (i >= active_l || i >= old_active_l || type_l[i] != old_type_l[i] ||
+            slot_l[i] != old_slot_l[i])
           memset(&s_eq.state_l[i], 0, sizeof(s_eq.state_l[i]));
-        if (i >= active_r || i >= old_active_r || type_r[i] != old_type_r[i])
+        if (i >= active_r || i >= old_active_r || type_r[i] != old_type_r[i] ||
+            slot_r[i] != old_slot_r[i])
           memset(&s_eq.state_r[i], 0, sizeof(s_eq.state_r[i]));
       }
     }

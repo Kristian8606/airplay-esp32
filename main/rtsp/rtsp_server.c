@@ -211,6 +211,7 @@ static void client_task(void *pvParameters) {
   }
 
   size_t buf_len = 0;
+  uint8_t *decrypted = NULL; /* Lazy bounded encrypted-frame staging. */
 
   // Socket timeout for stop signal responsiveness
   struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
@@ -226,45 +227,45 @@ static void client_task(void *pvParameters) {
     if (conn->encrypted_mode) {
       // Encrypted mode
       while (server_running && conn->encrypted_mode && !slot->should_stop) {
-        if (buf_len >= buf_capacity - 1024) {
-          size_t new_cap = buf_capacity < RTSP_BUFFER_LARGE ? RTSP_BUFFER_LARGE
-                                                            : buf_capacity * 2;
-          if (new_cap > RTSP_BUFFER_LARGE) {
-            goto cleanup;
-          }
-          uint8_t *new_buf =
-              grow_buffer(buffer, buf_capacity, new_cap, buf_len);
-          if (!new_buf) {
-            goto cleanup;
-          }
-          buffer = new_buf;
-          buf_capacity = new_cap;
+        /* Read one bounded frame separately so a frame that also contains
+         * the next request can straddle the receive-capacity boundary. */
+        if (!decrypted) {
+          decrypted = heap_caps_malloc(RTSP_ENCRYPTED_BLOCK_MAX,
+              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+          if (!decrypted) decrypted = malloc(RTSP_ENCRYPTED_BLOCK_MAX);
+          if (!decrypted) goto cleanup;
         }
-
         int block_len = rtsp_crypto_read_block(
-            slot->socket, conn, buffer + buf_len, buf_capacity - buf_len);
-        if (block_len <= 0) {
-          /* The helper consumes timeouts internally to preserve framing.
-           * Every failure is terminal, independently of stale errno. */
-          goto cleanup;
-        }
-
-        buf_len += (size_t)block_len;
-        process_rtsp_buffer(slot, buffer, &buf_len);
-        if (conn->close_after_response) {
-          goto cleanup;
+            slot->socket, conn, decrypted, RTSP_ENCRYPTED_BLOCK_MAX);
+        if (block_len <= 0) goto cleanup;
+        size_t offset = 0;
+        while (offset < (size_t)block_len) {
+          if (buf_len == buf_capacity) {
+            if (buf_capacity == RTSP_BUFFER_LARGE) goto cleanup;
+            size_t new_cap = buf_capacity * 2;
+            if (new_cap > RTSP_BUFFER_LARGE) new_cap = RTSP_BUFFER_LARGE;
+            uint8_t *new_buf = grow_buffer(buffer, buf_capacity, new_cap, buf_len);
+            if (!new_buf) goto cleanup;
+            buffer = new_buf;
+            buf_capacity = new_cap;
+          }
+          size_t chunk = (size_t)block_len - offset;
+          if (chunk > buf_capacity - buf_len) chunk = buf_capacity - buf_len;
+          memcpy(buffer + buf_len, decrypted + offset, chunk);
+          buf_len += chunk;
+          offset += chunk;
+          process_rtsp_buffer(slot, buffer, &buf_len);
+          if (conn->close_after_response) goto cleanup;
         }
       }
       goto cleanup;
     }
 
     // Plain-text mode
-    if (buf_len >= buf_capacity - 1024) {
-      size_t new_cap = buf_capacity < RTSP_BUFFER_LARGE ? RTSP_BUFFER_LARGE
-                                                        : buf_capacity * 2;
-      if (new_cap > RTSP_BUFFER_LARGE) {
-        break;
-      }
+    if (buf_len == buf_capacity) {
+      if (buf_capacity == RTSP_BUFFER_LARGE) break;
+      size_t new_cap = buf_capacity * 2;
+      if (new_cap > RTSP_BUFFER_LARGE) new_cap = RTSP_BUFFER_LARGE;
       uint8_t *new_buf = grow_buffer(buffer, buf_capacity, new_cap, buf_len);
       if (!new_buf) {
         break;
@@ -290,6 +291,7 @@ static void client_task(void *pvParameters) {
 
 cleanup:
   ESP_LOGI(TAG, "Client slot %d disconnected", slot_idx);
+  free(decrypted);
   free(buffer);
   detach_client_socket(slot);
 
@@ -368,6 +370,15 @@ static void server_task(void *pvParameters) {
 
   int opt = 1;
   setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  /* lwIP accept waits on the listener's mailbox. Do not rely on shutdown
+   * alone to wake that wait: the owner must observe cancellation even with
+   * no incoming clients, then close its own descriptor. */
+  const struct timeval accept_timeout = {.tv_sec = 0, .tv_usec = 250000};
+  if (setsockopt(listen_socket, SOL_SOCKET, SO_RCVTIMEO,
+                 &accept_timeout, sizeof(accept_timeout)) < 0) {
+    ESP_LOGE(TAG, "Failed to set accept timeout: %d", errno);
+    goto server_close;
+  }
 
   memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
@@ -387,13 +398,15 @@ static void server_task(void *pvParameters) {
 
   ESP_LOGI(TAG, "RTSP server listening on port %d", RTSP_PORT);
   while (server_running) {
+    client_addr_len = sizeof(client_addr);
     int new_socket = accept(listen_socket, (struct sockaddr *)&client_addr,
                             &client_addr_len);
     if (new_socket < 0) {
-      if (server_running) {
-        ESP_LOGE(TAG, "Failed to accept: %d", errno);
-      }
-      if (errno == EINTR) continue;
+      const int accept_error = errno;
+      if (!server_running) break;
+      if (accept_error == EINTR || accept_error == EAGAIN ||
+          accept_error == EWOULDBLOCK || accept_error == ETIMEDOUT) continue;
+      ESP_LOGE(TAG, "Failed to accept: %d", accept_error);
       break;
     }
 
@@ -521,5 +534,9 @@ void rtsp_server_stop(void) {
       ESP_LOGW(TAG, "RTSP client slot %d still stopping", i);
   }
   if (!rtsp_server_is_idle())
-    ESP_LOGW(TAG, "RTSP owners still stopping; restart/resource release forbidden");
+    ESP_LOGW(TAG,
+             "RTSP owners still stopping: listener=%d client0=%d client1=%d event=%d; "
+             "restart/resource release forbidden",
+             (int)atomic_load(&server_task_live), (int)atomic_load(&clients[0].live),
+             (int)atomic_load(&clients[1].live), !rtsp_event_port_is_idle());
 }

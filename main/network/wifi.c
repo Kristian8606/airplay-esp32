@@ -198,8 +198,16 @@ static void event_handler(void *arg, esp_event_base_t event_base,
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
     // Scan once at boot. Choose the strongest AP among all saved SSIDs, then
     // lock to that BSSID for the lifetime of this boot (no roaming).
-    xTaskCreatePinnedToCore(scan_and_connect_task, "wifi_scan", 4096, NULL, 3,
-                            NULL, 0);
+    if (xTaskCreatePinnedToCore(scan_and_connect_task, "wifi_scan", 4096, NULL,
+                                3, NULL, 0) != pdPASS) {
+      ESP_LOGE(TAG,
+               "Task start failed: wifi_scan stack=4096 bytes "
+               "internalFree=%u internalLargest=%u bytes",
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+               (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+      enable_ap_mode();
+    }
   } else if (event_base == WIFI_EVENT &&
              event_id == WIFI_EVENT_STA_DISCONNECTED) {
     s_sta_connected = false;

@@ -1941,6 +1941,13 @@ static void ap2_buffered_processor_task(void *arg) {
     if (stored == PCM_STORE_PUBLISHED) {
       expected_timestamp = packet.rtp + (uint32_t)frames;
       packets_played_in_sequence++;
+    } else {
+      /* EQ already consumed this AU, but FLUSH/anchor changes may cancel its
+       * publication without changing the PCM generation. Discard that filter
+       * history before the next surviving block starts a new play sequence. */
+      audio_eq_reset_state();
+      expected_timestamp = 0;
+      packets_played_in_sequence = 0;
     }
 
     /* No manual yield: RTSP/control runs at priority 17 above both TCP reader and
@@ -3731,15 +3738,12 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
     xSemaphoreGive(s.publish_mutex);
     return;
   }
-  const uint32_t from_rtp = flush_rtp - PCM_RTP_RING_FRAMES;
   if (s.realtime_stage_ring) {
-    pcm_rtp_ring_invalidate_range(s.realtime_stage_ring, from_rtp, flush_rtp,
-                                  snap.generation);
+    pcm_rtp_ring_invalidate_before(s.realtime_stage_ring, flush_rtp,
+                                   snap.generation);
   }
   if (s.pcm_ring) {
-    pcm_rtp_ring_invalidate_range(s.pcm_ring,
-                                  flush_rtp - PCM_RTP_FINAL_RING_FRAMES, flush_rtp,
-                                  snap.generation);
+    pcm_rtp_ring_invalidate_before(s.pcm_ring, flush_rtp, snap.generation);
   }
 
   uint32_t old_cursor = 0;

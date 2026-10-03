@@ -6,6 +6,9 @@
 #include "lwip/sockets.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include <stdint.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <string.h>
@@ -30,7 +33,18 @@ typedef struct __attribute__((packed)) {
 static int s_dns_socket = -1;
 static TaskHandle_t s_dns_task = NULL;
 static uint32_t s_redirect_ip = 0;
-static volatile bool s_dns_stop_requested = false;
+static atomic_bool s_dns_stop_requested;
+static atomic_bool s_dns_task_live;
+static StaticSemaphore_t s_lifecycle_storage;
+static SemaphoreHandle_t s_lifecycle_mutex;
+static portMUX_TYPE s_init_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void dns_lifecycle_init(void) {
+  taskENTER_CRITICAL(&s_init_mux);
+  if (!s_lifecycle_mutex)
+    s_lifecycle_mutex = xSemaphoreCreateMutexStatic(&s_lifecycle_storage);
+  taskEXIT_CRITICAL(&s_init_mux);
+}
 
 /* Return the first byte after QNAME, or NULL for a malformed/truncated name.
  * Compression pointers are accepted. Since the response preserves the DNS
@@ -133,23 +147,23 @@ static bool dns_build_response(const uint8_t *request, size_t request_len,
 }
 
 static void dns_server_task(void *pvParameters) {
-  (void)pvParameters;
+  const int sock = (int)(intptr_t)pvParameters;
+  /* The creator publishes the handle before allowing this owner to exit. */
+  (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   uint8_t rx_buffer[DNS_MAX_LEN];
   uint8_t tx_buffer[DNS_MAX_LEN];
   struct sockaddr_in client_addr;
 
   ESP_LOGI(TAG, "DNS server task started");
 
-  while (!s_dns_stop_requested) {
-    const int sock = s_dns_socket;
-    if (sock < 0) break;
+  while (!atomic_load_explicit(&s_dns_stop_requested, memory_order_acquire)) {
 
     socklen_t addr_len = sizeof(client_addr);
     int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0,
                        (struct sockaddr *)&client_addr, &addr_len);
     if (len < 0) {
-      if (s_dns_stop_requested || s_dns_socket < 0 || errno == EBADF ||
-          errno == ENOTSOCK) {
+      if (atomic_load_explicit(&s_dns_stop_requested, memory_order_acquire) ||
+          errno == EBADF || errno == ENOTSOCK) {
         break;
       }
       if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
@@ -157,6 +171,7 @@ static void dns_server_task(void *pvParameters) {
       break;
     }
 
+    if (atomic_load_explicit(&s_dns_stop_requested, memory_order_acquire)) break;
     size_t resp_len = 0;
     if (!dns_build_response(rx_buffer, (size_t)len, tx_buffer,
                             sizeof(tx_buffer), &resp_len)) {
@@ -165,58 +180,72 @@ static void dns_server_task(void *pvParameters) {
 
     if (sendto(sock, tx_buffer, resp_len, 0,
                (struct sockaddr *)&client_addr, addr_len) < 0 &&
-        !s_dns_stop_requested) {
+        !atomic_load_explicit(&s_dns_stop_requested, memory_order_acquire)) {
       ESP_LOGW(TAG, "sendto failed: %d", errno);
     }
   }
 
   ESP_LOGI(TAG, "DNS server task exiting");
+  xSemaphoreTake(s_lifecycle_mutex, portMAX_DELAY);
+  /* Only this task closes its descriptor. stop() only interrupts recvfrom. */
+  close(sock);
+  s_dns_socket = -1;
   s_dns_task = NULL;
+  atomic_store_explicit(&s_dns_task_live, false, memory_order_release);
+  xSemaphoreGive(s_lifecycle_mutex);
   vTaskDelete(NULL);
 }
 
 esp_err_t dns_server_start(uint32_t redirect_ip) {
-  if (s_dns_socket >= 0 || s_dns_task != NULL) {
-    ESP_LOGW(TAG, "DNS server already running or still stopping");
-    return ESP_OK;
+  dns_lifecycle_init();
+  xSemaphoreTake(s_lifecycle_mutex, portMAX_DELAY);
+  if (atomic_load_explicit(&s_dns_task_live, memory_order_acquire)) {
+    const bool stopping = atomic_load_explicit(&s_dns_stop_requested,
+                                               memory_order_acquire);
+    xSemaphoreGive(s_lifecycle_mutex);
+    return stopping ? ESP_ERR_INVALID_STATE : ESP_OK;
   }
 
   s_redirect_ip = redirect_ip;
-  s_dns_stop_requested = false;
-
-  s_dns_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (s_dns_socket < 0) {
+  atomic_store_explicit(&s_dns_stop_requested, false, memory_order_release);
+  const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0) {
     ESP_LOGE(TAG, "Failed to create socket: %d", errno);
+    xSemaphoreGive(s_lifecycle_mutex);
     return ESP_FAIL;
   }
 
   struct timeval timeout = {.tv_sec = 0, .tv_usec = 100000};
-  setsockopt(s_dns_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
   int opt = 1;
-  setsockopt(s_dns_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-  struct sockaddr_in server_addr = {
+  const struct sockaddr_in server_addr = {
       .sin_family = AF_INET,
       .sin_port = htons(DNS_PORT),
       .sin_addr.s_addr = htonl(INADDR_ANY),
   };
-
-  if (bind(s_dns_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-    ESP_LOGE(TAG, "Failed to bind socket: %d", errno);
-    close(s_dns_socket);
-    s_dns_socket = -1;
+  if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+      setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0 ||
+      bind(sock, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    ESP_LOGE(TAG, "Failed to configure DNS socket: %d", errno);
+    close(sock);
+    xSemaphoreGive(s_lifecycle_mutex);
     return ESP_FAIL;
   }
 
-  if (task_create_pinned_spiram(dns_server_task, "dns_server", 4096, NULL, 5,
+  s_dns_socket = sock;
+  atomic_store_explicit(&s_dns_task_live, true, memory_order_release);
+  if (task_create_pinned_spiram(dns_server_task, "dns_server", 4096,
+                                (void *)(intptr_t)sock, 5,
                                 &s_dns_task, 0, NULL) != pdPASS) {
     ESP_LOGE(TAG, "Failed to create DNS server task");
-    close(s_dns_socket);
+    close(sock);
     s_dns_socket = -1;
     s_dns_task = NULL;
+    atomic_store_explicit(&s_dns_task_live, false, memory_order_release);
+    xSemaphoreGive(s_lifecycle_mutex);
     return ESP_FAIL;
   }
+  xTaskNotifyGive(s_dns_task);
+  xSemaphoreGive(s_lifecycle_mutex);
 
   ESP_LOGI(TAG, "DNS server started, redirecting to " IPSTR,
            IP2STR((esp_ip4_addr_t *)&redirect_ip));
@@ -224,21 +253,22 @@ esp_err_t dns_server_start(uint32_t redirect_ip) {
 }
 
 void dns_server_stop(void) {
-  if (s_dns_socket < 0 && s_dns_task == NULL) return;
-
-  s_dns_stop_requested = true;
-  const int sock = s_dns_socket;
-  s_dns_socket = -1;
-  if (sock >= 0) {
-    shutdown(sock, SHUT_RDWR);
-    close(sock);
+  dns_lifecycle_init();
+  xSemaphoreTake(s_lifecycle_mutex, portMAX_DELAY);
+  const bool live = atomic_load_explicit(&s_dns_task_live, memory_order_acquire);
+  if (live) {
+    atomic_store_explicit(&s_dns_stop_requested, true, memory_order_release);
+    if (s_dns_socket >= 0) shutdown(s_dns_socket, SHUT_RDWR);
   }
+  xSemaphoreGive(s_lifecycle_mutex);
+  if (!live) return;
 
-  const int wait_steps = DNS_STOP_WAIT_MS / 10;
-  for (int i = 0; s_dns_task != NULL && i < wait_steps; ++i) {
-    vTaskDelay(pdMS_TO_TICKS(10));
+  const TickType_t started = xTaskGetTickCount();
+  while (atomic_load_explicit(&s_dns_task_live, memory_order_acquire) &&
+         (TickType_t)(xTaskGetTickCount() - started) < pdMS_TO_TICKS(DNS_STOP_WAIT_MS)) {
+    vTaskDelay(1);
   }
-  if (s_dns_task != NULL) {
+  if (atomic_load_explicit(&s_dns_task_live, memory_order_acquire)) {
     ESP_LOGW(TAG, "DNS server task did not stop within %d ms", DNS_STOP_WAIT_MS);
   } else {
     ESP_LOGI(TAG, "DNS server stopped");
