@@ -9,6 +9,9 @@
 #include "amp_control.h"
 #include "ptp_clock.h"
 #include "settings.h"
+#include "freertos/FreeRTOS.h"
+
+static portMUX_TYPE volume_lock = portMUX_INITIALIZER_UNLOCKED;
 
 
 static int32_t volume_db_to_q15(float volume_db){
@@ -132,26 +135,47 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->encrypted_mode = false;
 }
 
-void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
-  if (!conn || !isfinite(volume_db)) {
-    return;
-  }
-
-  // AirPlay uses dB attenuation: 0 dB is full scale and -30 dB is mute.
+static bool conn_update_volume(rtsp_conn_t *conn, float volume_db,
+                               bool conditional, float expected_db) {
+  if (!conn || !isfinite(volume_db)) return false;
   if (volume_db > 0.0f) volume_db = 0.0f;
   if (volume_db < -144.0f) volume_db = -144.0f;
+  int32_t gain = volume_db_to_q15(volume_db);
+  portENTER_CRITICAL(&volume_lock);
+  if (conditional && conn->volume_db != expected_db) {
+    portEXIT_CRITICAL(&volume_lock);
+    return false;
+  }
   conn->volume_db = volume_db;
-  conn->volume_q15 = volume_db_to_q15(volume_db);
-  audio_receiver_set_volume_q15(conn->volume_q15);
-
-
-  // Persist at disconnect.
+  conn->volume_q15 = gain;
+  audio_receiver_set_volume_q15(gain); /* Atomic target; existing output ramp. */
+  /* This setter only updates the cached float; NVS is written at disconnect. */
   settings_set_volume(volume_db);
+  portEXIT_CRITICAL(&volume_lock);
+  return true;
+}
+
+void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
+  conn_update_volume(conn, volume_db, false, 0.0f);
+}
+
+bool rtsp_conn_set_volume_if_unchanged(rtsp_conn_t *conn, float expected_db,
+                                      float volume_db) {
+  return conn_update_volume(conn, volume_db, true, expected_db);
+}
+
+float rtsp_conn_get_volume_db(rtsp_conn_t *conn) {
+  if (!conn) return -144.0f;
+  portENTER_CRITICAL(&volume_lock);
+  float volume = conn->volume_db;
+  portEXIT_CRITICAL(&volume_lock);
+  return volume;
 }
 
 int32_t rtsp_conn_get_volume_q15(rtsp_conn_t *conn) {
-  if (!conn) {
-    return 32768; // Default full volume
-  }
-  return conn->volume_q15;
+  if (!conn) return 32768;
+  portENTER_CRITICAL(&volume_lock);
+  int32_t gain = conn->volume_q15;
+  portEXIT_CRITICAL(&volume_lock);
+  return gain;
 }

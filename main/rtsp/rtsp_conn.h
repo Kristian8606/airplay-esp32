@@ -113,3 +113,9 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db);
  * @return Q15 fixed-point multiplier (0 = mute, 32768 = unity)
  */
 int32_t rtsp_conn_get_volume_q15(rtsp_conn_t *conn);
+
+/* Event volume acknowledgments can race sender SET_PARAMETER. These APIs
+ * serialize scalar gain state; the conditional update preserves newer input. */
+float rtsp_conn_get_volume_db(rtsp_conn_t *conn);
+bool rtsp_conn_set_volume_if_unchanged(rtsp_conn_t *conn, float expected_db,
+                                      float volume_db);

@@ -2,7 +2,6 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <stdatomic.h>
 #include <inttypes.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -18,7 +17,6 @@
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 #include "sodium.h"
 
 #include "audio_receiver.h"
@@ -180,20 +178,11 @@ static bool ap2_audio_format_supported(int64_t stream_type, int64_t codec_type,
   return false;
 }
 
-// Event port task state
-#define EVENT_STACK_SIZE 3072
-
 // Default playout latency for realtime (type 96) streams when SETUP does not
 // carry a usable latencyMin: 11025 samples = 250 ms at 44.1 kHz.  This is the
 // standard AirPlay realtime-stream minimum latency; senders transmit audio
 // ~2 s (88200 samples) ahead of this deadline.
 #define AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES 11025
-static int event_client_socket = -1;
-static int event_listen_socket = -1;
-static _Atomic bool event_task_live;
-static _Atomic bool event_task_should_stop;
-static _Atomic(SemaphoreHandle_t) event_socket_mutex;
-
 void rtsp_get_device_id(char *device_id, size_t len) {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -271,130 +260,6 @@ static bool start_audio_receiver_or_fail(int socket, rtsp_conn_t *conn,
     return false;
   }
   return true;
-}
-
-/* The event task alone closes transferred descriptors. Stop holds the mutex
- * through shutdown; detach-before-close prevents descriptor reuse races. */
-static void event_close_client(void) {
-  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
-  int client = event_client_socket;
-  event_client_socket = -1;
-  xSemaphoreGive(event_socket_mutex);
-  if (client >= 0) close(client);
-}
-
-static void event_port_task(void *pvParameters) {
-  int listen_socket = (int)(intptr_t)pvParameters;
-  bool unsupported_logged = false;
-  while (!event_task_should_stop) {
-    fd_set fds;
-    FD_ZERO(&fds);
-    FD_SET(listen_socket, &fds);
-    struct timeval tv = {.tv_sec = 1};
-    int ret = select(listen_socket + 1, &fds, NULL, NULL, &tv);
-    if (event_task_should_stop) break;
-    if (ret < 0) {
-      if (errno == EINTR) continue;
-      ESP_LOGE(TAG, "Event port select error: %d", errno);
-      break;
-    }
-    if (ret == 0) continue;
-    int client = accept(listen_socket, NULL, NULL);
-    if (client < 0) {
-      if (errno == EINTR) continue;
-      break;
-    }
-    xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
-    event_client_socket = client;
-    xSemaphoreGive(event_socket_mutex);
-    rtsp_events_emit(RTSP_EVENT_CLIENT_CONNECTED, NULL);
-    while (!event_task_should_stop) {
-      FD_ZERO(&fds);
-      FD_SET(client, &fds);
-      tv = (struct timeval){.tv_sec = 1};
-      ret = select(client + 1, &fds, NULL, NULL, &tv);
-      if (event_task_should_stop) break;
-      if (ret < 0) {
-        if (errno == EINTR) continue;
-        break;
-      }
-      if (ret == 0) continue;
-      char byte;
-      ssize_t n = recv(client, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
-      if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
-        continue;
-      if (n > 0 && !unsupported_logged) {
-        /* There is no inbound event protocol implementation. Avoid peeking
-         * the same unread byte forever; close only this event connection. */
-        ESP_LOGW(TAG, "Unsupported inbound event data; closing event client");
-        unsupported_logged = true;
-      }
-      break;
-    }
-    event_close_client();
-  }
-  event_close_client();
-  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
-  event_listen_socket = -1;
-  xSemaphoreGive(event_socket_mutex);
-  close(listen_socket);
-  event_task_live = false;
-  vTaskDelete(NULL);
-}
-
-bool rtsp_event_port_is_idle(void) {
-  return !event_task_live;
-}
-
-esp_err_t rtsp_start_event_port_task(int listen_socket) {
-  if (listen_socket < 0 || event_task_live) return ESP_ERR_INVALID_STATE;
-  if (!event_socket_mutex) {
-    SemaphoreHandle_t created = xSemaphoreCreateMutex();
-    if (!created) return ESP_ERR_NO_MEM;
-    SemaphoreHandle_t expected = NULL;
-    if (!atomic_compare_exchange_strong(&event_socket_mutex, &expected, created))
-      vSemaphoreDelete(created);
-  }
-  if (!event_socket_mutex) return ESP_ERR_NO_MEM;
-  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
-  if (event_task_live) {
-    xSemaphoreGive(event_socket_mutex);
-    return ESP_ERR_INVALID_STATE;
-  }
-  event_task_should_stop = false;
-  event_listen_socket = listen_socket;
-  event_task_live = true;
-  BaseType_t ret = xTaskCreatePinnedToCore(
-      event_port_task, "event_port", EVENT_STACK_SIZE,
-      (void *)(intptr_t)listen_socket, 5, NULL, 0);
-  if (ret != pdPASS) {
-    event_listen_socket = -1;
-    event_task_live = false;
-  }
-  xSemaphoreGive(event_socket_mutex);
-  return ret == pdPASS ? ESP_OK : ESP_FAIL;
-}
-
-int rtsp_event_port_listen_socket(void) {
-  if (!event_socket_mutex) return -1;
-  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
-  int socket = event_listen_socket;
-  xSemaphoreGive(event_socket_mutex);
-  return socket;
-}
-
-void rtsp_stop_event_port_task(void) {
-  if (!event_socket_mutex) return;
-  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
-  event_task_should_stop = true;
-  if (event_client_socket >= 0) shutdown(event_client_socket, SHUT_RDWR);
-  if (event_listen_socket >= 0) shutdown(event_listen_socket, SHUT_RDWR);
-  xSemaphoreGive(event_socket_mutex);
-  TickType_t start = xTaskGetTickCount();
-  while (event_task_live &&
-         (TickType_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(1000))
-    vTaskDelay(1);
-  if (event_task_live) ESP_LOGW(TAG, "Event task still stopping");
 }
 
 // Forward declarations of handlers
@@ -897,9 +762,9 @@ static void handle_post(int socket, rtsp_conn_t *conn,
 
   } else if (strstr(req->path, "/command")) {
     if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-      int64_t cmd_type = 0;
-      if (bplist_find_int(body, body_len, "type", &cmd_type)) {
-        ESP_LOGI(TAG, "/command type=%lld", (long long)cmd_type);
+      char cmd_type[64];
+      if (bplist_find_string(body, body_len, "type", cmd_type, sizeof(cmd_type))) {
+        ESP_LOGI(TAG, "Sender /command type=%s", cmd_type);
       }
     }
     rtsp_send_ok(socket, conn, req->cseq);
@@ -1384,7 +1249,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       return;
     }
     if (conn->event_socket >= 0) {
-      if (rtsp_start_event_port_task(conn->event_socket) == ESP_OK) {
+      if (rtsp_start_event_port_task(conn->event_socket, conn) == ESP_OK) {
         ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
         conn->event_socket = -1; /* Ownership transferred to event task. */
       } else {
@@ -1923,7 +1788,7 @@ static void handle_get_parameter(int socket, rtsp_conn_t *conn,
     if (strstr((const char *)req->body, "volume")) {
       char vol_response[32];
       int vol_len = snprintf(vol_response, sizeof(vol_response),
-                             "volume: %.2f\r\n", conn->volume_db);
+                             "volume: %.2f\r\n", rtsp_conn_get_volume_db(conn));
       rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                          "Content-Type: text/parameters\r\n", vol_response,
                          vol_len);

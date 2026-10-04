@@ -87,7 +87,7 @@ void rtsp_get_device_id(char *device_id, size_t len);
 // Event port task management
 // Successful start transfers listening descriptor ownership to the task.
 // Stop requests cancellation; is_idle reports actual close/completion.
-esp_err_t rtsp_start_event_port_task(int listen_socket);
+esp_err_t rtsp_start_event_port_task(int listen_socket, rtsp_conn_t *conn);
 void rtsp_stop_event_port_task(void);
 bool rtsp_event_port_is_idle(void);
 int rtsp_event_port_listen_socket(void);

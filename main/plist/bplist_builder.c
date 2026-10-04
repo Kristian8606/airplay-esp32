@@ -1,4 +1,5 @@
 #include <string.h>
+#include <math.h>
 
 #include "audio_receiver.h"
 #include "plist.h"
@@ -658,5 +659,54 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
 
+  return pos;
+}
+
+size_t bplist_build_media_remote_command(uint8_t *out, size_t capacity,
+                                        uint8_t command) {
+  if (!out || capacity < 8 || command > 5) return 0;
+  memcpy(out, "bplist00", 8);
+  size_t pos = 8;
+  size_t offsets[5];
+  offsets[0] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "type")) return 0;
+  offsets[1] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "modernMediaRemoteCommand")) return 0;
+  offsets[2] = pos;
+  if (!bplist_write_ascii_string(out, capacity, &pos, "sendMediaRemoteCommand")) return 0;
+  offsets[3] = pos;
+  if (!bplist_write_int(out, capacity, &pos, command)) return 0;
+  offsets[4] = pos;
+  const uint8_t keys[] = {0, 1}, values[] = {2, 3};
+  if (!bplist_write_dict(out, capacity, &pos, keys, values, 2) ||
+      !bplist_finish(out, capacity, &pos, offsets, 5, 4)) return 0;
+  return pos;
+}
+
+size_t bplist_build_media_remote_volume(uint8_t *out, size_t capacity,
+                                       double volume) {
+  if (!out || capacity < 8 || !isfinite(volume) || volume < 0.0 || volume > 1.0)
+    return 0;
+  memcpy(out, "bplist00", 8);
+  size_t pos = 8;
+  size_t offsets[9];
+  const char *strings[] = {"type", "value", "volume", "params",
+                           "sendMediaRemoteCommand", "dvlc"};
+  for (size_t i = 0; i < 6; i++) {
+    offsets[i] = pos;
+    if (!bplist_write_ascii_string(out, capacity, &pos, strings[i])) return 0;
+  }
+  offsets[6] = pos;
+  if (!bplist_has_room(pos, 9, capacity)) return 0;
+  out[pos++] = 0x23; /* IEEE-754 double, big endian. */
+  union { double value; uint64_t bits; } real = {.value = volume};
+  if (!bplist_write_u64(out, capacity, &pos, real.bits)) return 0;
+  offsets[7] = pos;
+  const uint8_t param_keys[] = {2}, param_values[] = {6};
+  if (!bplist_write_dict(out, capacity, &pos, param_keys, param_values, 1)) return 0;
+  offsets[8] = pos;
+  const uint8_t keys[] = {0, 1, 2, 3}, values[] = {4, 5, 6, 7};
+  if (!bplist_write_dict(out, capacity, &pos, keys, values, 4) ||
+      !bplist_finish(out, capacity, &pos, offsets, 9, 8)) return 0;
   return pos;
 }

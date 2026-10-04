@@ -337,3 +337,11 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const uint8_t *public_key,
                                   size_t public_key_len, uint64_t features,
                                   int64_t protocol_version);
+
+/* Receiver-to-sender command on the AirPlay 2 audio event connection. */
+size_t bplist_build_media_remote_command(uint8_t *out, size_t capacity,
+                                        uint8_t command);
+
+/* AirPlay dvlc volume notification, normalized 0..1, including params.volume. */
+size_t bplist_build_media_remote_volume(uint8_t *out, size_t capacity,
+                                       double volume);

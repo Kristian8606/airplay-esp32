@@ -6,6 +6,7 @@
 #include "settings.h"
 #include "log_stream.h"
 #include "rtsp_server.h"
+#include "rtsp_remote.h"
 #include "esp_http_server.h"
 #include "esp_app_desc.h"
 #include "esp_heap_caps.h"
@@ -485,6 +486,57 @@ static void eq_config_to_json(const audio_eq_config_t *cfg, cJSON *root) {
   eq_output_to_json(&cfg->right, right);
 }
 
+static void remote_to_json(cJSON *root, const rtsp_remote_status_t *status) {
+  cJSON_AddBoolToObject(root, "connected", status->connected);
+  cJSON_AddNumberToObject(root, "id", status->id);
+  cJSON_AddNumberToObject(root, "command", status->command);
+  cJSON_AddStringToObject(root, "result", rtsp_remote_result_name(status->result));
+  cJSON_AddNumberToObject(root, "rtsp_status", status->response_code);
+}
+
+static esp_err_t remote_get_handler(httpd_req_t *req) {
+  rtsp_remote_status_t status;
+  rtsp_remote_get_status(&status);
+  cJSON *root = cJSON_CreateObject();
+  if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+  remote_to_json(root, &status);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  send_json_obj(req, root);
+  return ESP_OK;
+}
+
+static esp_err_t remote_post_handler(httpd_req_t *req) {
+  char body[96];
+  if (recv_json(req, body, sizeof(body)) != ESP_OK)
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid command");
+  cJSON *root = cJSON_Parse(body);
+  const cJSON *value = cJSON_GetObjectItemCaseSensitive(root, "command");
+  static const char *const names[] = {"play", "pause", "toggle", "stop", "next", "previous", "volume_down", "volume_up"};
+  int command = -1;
+  if (cJSON_IsObject(root) && cJSON_IsString(value)) {
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+      if (strcmp(value->valuestring, names[i]) == 0) command = (int)i;
+  }
+  cJSON_Delete(root);
+  if (command < 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Unknown command");
+  root = cJSON_CreateObject();
+  if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+  uint32_t id;
+  esp_err_t err = rtsp_remote_enqueue((uint8_t)command, &id);
+  if (err != ESP_OK) {
+    cJSON_Delete(root);
+    httpd_resp_set_status(req, err == ESP_ERR_INVALID_STATE ? "409 Conflict" : "503 Service Unavailable");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, err == ESP_ERR_INVALID_STATE ?
+        "A command is already pending" : "No AirPlay event connection. Start AirPlay from your phone.");
+  }
+  cJSON_AddNumberToObject(root, "id", id);
+  cJSON_AddStringToObject(root, "result", "queued");
+  httpd_resp_set_status(req, "202 Accepted");
+  send_json_obj(req, root);
+  return ESP_OK;
+}
+
 static void output_mute_to_json(cJSON *root) {
   const uint32_t mask = audio_receiver_get_output_mute_mask();
   cJSON_AddBoolToObject(root, "left_muted", (mask & 1U) != 0U);
@@ -689,7 +741,7 @@ static esp_err_t speed_upload(httpd_req_t *req){
 
 esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=30;c.stack_size=8192;c.lru_purge_enable=true;c.task_priority=HTTP_SERVER_TASK_PRIORITY;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
 #define REG(U,M,H) do{httpd_uri_t x={.uri=U,.method=M,.handler=H};ESP_ERROR_CHECK(httpd_register_uri_handler(s_server,&x));}while(0)
-  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/audio/mute",HTTP_POST,output_mute_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);REG("/api/audio/latency",HTTP_GET,latency_get_handler);REG("/api/audio/latency",HTTP_POST,latency_post_handler);REG("/api/audio/latency/measure",HTTP_POST,latency_measure_handler);
+  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/audio/mute",HTTP_POST,output_mute_post_handler);REG("/api/audio/remote",HTTP_GET,remote_get_handler);REG("/api/audio/remote",HTTP_POST,remote_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);REG("/api/audio/latency",HTTP_GET,latency_get_handler);REG("/api/audio/latency",HTTP_POST,latency_post_handler);REG("/api/audio/latency/measure",HTTP_POST,latency_measure_handler);
   ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
 #undef REG
   e=log_stream_register(s_server);if(e!=ESP_OK)ESP_LOGW(TAG,"log stream register failed: %s",esp_err_to_name(e));ESP_LOGI(TAG,"Web UI started on port %u",port);return ESP_OK; }
