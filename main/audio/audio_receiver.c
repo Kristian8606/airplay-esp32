@@ -216,6 +216,8 @@ static const char *STATUS_TAG = "audio_status";
 
 /* Updated by RTSP control on Core0, consumed by playout on Core1. */
 static volatile int32_t s_volume_target_q15 = 32768;
+/* Independent physical-output mute; survives stream changes, not reboot. */
+static uint32_t s_output_mute_mask;
 
 typedef struct {
   bool anchor_valid;
@@ -2278,22 +2280,27 @@ static inline int32_t vol_dither_tpdf_q15(uint32_t *st) {
 }
 
 static void apply_output_volume(int16_t *pcm, uint32_t frames,
-                                int32_t *current_q15) {
+                                int32_t current_q15[2]) {
   if (!pcm || !current_q15 || frames == 0U) return;
-  int32_t target = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
-  if (target < 0) target = 0;
-  if (target > 32768) target = 32768;
-  const int32_t start = *current_q15;
-  if (start == target) {
-    if (target == 32768) return;
-    if (target == 0) {
+  int32_t volume = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
+  if (volume < 0) volume = 0;
+  if (volume > 32768) volume = 32768;
+  const uint32_t muted = audio_receiver_get_output_mute_mask();
+  const int32_t target[2] = {
+      (muted & 1U) ? 0 : volume, (muted & 2U) ? 0 : volume};
+  const int32_t start[2] = {current_q15[0], current_q15[1]};
+  if (start[0] == target[0] && start[1] == target[1]) {
+    if (target[0] == 32768 && target[1] == 32768) return;
+    if (target[0] == 0 && target[1] == 0) {
       memset(pcm, 0, (size_t)frames * 2U * sizeof(*pcm));
       return;
     }
     for (uint32_t i = 0; i < frames * 2U; ++i) {
-      const int32_t x = pcm[i];
-      if (x == 0) continue;
-      int32_t y = (x * target + vol_dither_tpdf_q15(&s_vol_dither_state[i & 1U]) +
+      const uint32_t ch = i & 1U;
+      const int32_t gain = target[ch];
+      if (gain == 0) { pcm[i] = 0; continue; }
+      if (gain == 32768 || pcm[i] == 0) continue;
+      int32_t y = (pcm[i] * gain + vol_dither_tpdf_q15(&s_vol_dither_state[ch]) +
                    16384) >> 15;
       if (y > INT16_MAX) y = INT16_MAX;
       else if (y < INT16_MIN) y = INT16_MIN;
@@ -2301,14 +2308,18 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
     }
     return;
   }
-  const int64_t dg = (int64_t)target - (int64_t)start;
+  /* Fade each changed output over one DMA block, like volume changes.
+   * Leave an unchanged unity-gain channel bit-exact, even during a fade. */
+  const int64_t dg[2] = {
+      (int64_t)target[0] - start[0], (int64_t)target[1] - start[1]};
   for (uint32_t f = 0; f < frames; ++f) {
-    const int32_t gain =
-        start + (int32_t)((dg * (int64_t)(f + 1U)) / (int64_t)frames);
     for (uint32_t ch = 0; ch < 2U; ++ch) {
       const uint32_t i = f * 2U + ch;
-      if (pcm[i] == 0) continue;
-      int64_t y = (int64_t)pcm[i] * (int64_t)gain +
+      const int32_t gain = start[ch] +
+          (int32_t)((dg[ch] * (int64_t)(f + 1U)) / (int64_t)frames);
+      if (gain == 0) { pcm[i] = 0; continue; }
+      if (gain == 32768 || pcm[i] == 0) continue;
+      int64_t y = (int64_t)pcm[i] * gain +
                   vol_dither_tpdf_q15(&s_vol_dither_state[ch]);
       y = (y + 16384) >> 15;
       if (y > INT16_MAX) y = INT16_MAX;
@@ -2316,7 +2327,8 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
       pcm[i] = (int16_t)y;
     }
   }
-  *current_q15 = target;
+  current_q15[0] = target[0];
+  current_q15[1] = target[1];
 }
 
 
@@ -2404,7 +2416,6 @@ static esp_err_t playout_run_latency_calibration(void) {
   static int16_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
   static int16_t burst[AUDIO_PLAYOUT_FRAMES * 2U];
   memset(silence, 0, sizeof(silence));
-  latency_cal_fill_burst(burst, AUDIO_PLAYOUT_FRAMES, CAL_I2S_RATE_HZ);
   s_cal.n_emit = 0;
   for (int k = 0; k < LATENCY_CAL_BURSTS; ++k) s_cal.emit_us[k] = 0;
 
@@ -2419,7 +2430,16 @@ static esp_err_t playout_run_latency_calibration(void) {
   }
   audio_playout_completion_t d;
   for (uint32_t idx = 2U; idx < CAL_TOTAL_BLOCKS; ++idx) {
-    const int16_t *blk = cal_block_is_burst(idx, NULL) ? burst : silence;
+    const bool is_burst = cal_block_is_burst(idx, NULL);
+    if (is_burst) {
+      latency_cal_fill_burst(burst, AUDIO_PLAYOUT_FRAMES, CAL_I2S_RATE_HZ);
+      const uint32_t muted = audio_receiver_get_output_mute_mask();
+      for (uint32_t f = 0; muted && f < AUDIO_PLAYOUT_FRAMES; ++f) {
+        if (muted & 1U) burst[f * 2U] = 0;
+        if (muted & 2U) burst[f * 2U + 1U] = 0;
+      }
+    }
+    const int16_t *blk = is_burst ? burst : silence;
     if (audio_playout_write_tagged(blk, AUDIO_PLAYOUT_FRAMES, idx,
                                    CAL_GENERATION) != ESP_OK ||
         audio_playout_has_fault()) {
@@ -2462,7 +2482,12 @@ static void ap2_playout_task(void *arg) {
   uint32_t cursor_rtp = 0; /* next block to submit after two preloaded blocks */
   uint32_t cursor_generation = 0;
   timing_snapshot_t cursor_timing = {0};
-  int32_t volume_current_q15 = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
+  const int32_t initial_volume =
+      __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
+  const uint32_t initial_mute = audio_receiver_get_output_mute_mask();
+  int32_t volume_current_q15[2] = {
+      (initial_mute & 1U) ? 0 : initial_volume,
+      (initial_mute & 2U) ? 0 : initial_volume};
   playout_state_t state = PLAYOUT_STOPPED;
   int32_t servo_ppm = 0;
   int32_t servo_target_ppm = 0;
@@ -2796,7 +2821,7 @@ static void ap2_playout_task(void *arg) {
         vTaskDelay(1);
         continue;
       }
-      apply_output_volume(block, AUDIO_PLAYOUT_FRAMES, &volume_current_q15);
+      apply_output_volume(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
       if (audio_playout_write_tagged(block, AUDIO_PLAYOUT_FRAMES,
                                      real_start_rtp,
                                      snap.generation) != ESP_OK) {
@@ -2907,7 +2932,7 @@ static void ap2_playout_task(void *arg) {
     if (!have_pcm) {
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
     }
-    apply_output_volume(block, AUDIO_PLAYOUT_FRAMES, &volume_current_q15);
+    apply_output_volume(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
 
     const esp_err_t write_err = audio_playout_write_tagged(
         block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
@@ -3703,6 +3728,18 @@ void audio_receiver_set_volume_q15(int32_t volume_q15) {
 
 int32_t audio_receiver_get_volume_q15(void) {
   return __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
+}
+
+uint32_t audio_receiver_get_output_mute_mask(void) {
+  return __atomic_load_n(&s_output_mute_mask, __ATOMIC_ACQUIRE);
+}
+
+esp_err_t audio_receiver_set_output_muted(uint32_t channel, bool muted) {
+  if (channel > 1U) return ESP_ERR_INVALID_ARG;
+  const uint32_t bit = 1U << channel;
+  if (muted) __atomic_fetch_or(&s_output_mute_mask, bit, __ATOMIC_ACQ_REL);
+  else __atomic_fetch_and(&s_output_mute_mask, ~bit, __ATOMIC_ACQ_REL);
+  return ESP_OK;
 }
 
 void audio_receiver_seek_flush(void) {

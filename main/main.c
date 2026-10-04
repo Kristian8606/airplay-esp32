@@ -11,7 +11,6 @@
 #include "ptp_clock.h"
 #include "rtsp_server.h"
 #include "settings.h"
-#include "spiffs_storage.h"
 #include "web_server.h"
 #include "wifi.h"
 #include "esp_app_desc.h"
@@ -60,7 +59,6 @@ void app_main(void) {
   ESP_ERROR_CHECK(e);
   ESP_ERROR_CHECK(settings_init());
   ESP_ERROR_CHECK(audio_eq_init());
-  ESP_ERROR_CHECK(spiffs_storage_init());
   ESP_ERROR_CHECK(log_stream_init());
 
   const bool provisioning_only = !settings_has_wifi_credentials();

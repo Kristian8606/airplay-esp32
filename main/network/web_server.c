@@ -25,7 +25,7 @@
 
 static const char *TAG = "web_server";
 static httpd_handle_t s_server = NULL;
-#define FILE_CHUNK 1024
+#define WEB_PAGE_CHUNK 1024
 #define SPEEDTEST_CHUNK 2048
 #define SPEEDTEST_MAX_BYTES ((size_t)16 * 1024 * 1024)
 #define HTTP_SERVER_TASK_PRIORITY 3
@@ -83,20 +83,44 @@ static void reboot_after_wifi_scan_restore_failure(void) {
   esp_restart();
 }
 
-static esp_err_t serve_file(httpd_req_t *req, const char *path, const char *type) {
-  FILE *f = fopen(path, "r");
-  if (!f) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found"); return ESP_FAIL; }
-  httpd_resp_set_type(req, type);
-  char buf[FILE_CHUNK]; size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-    if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) { fclose(f); return ESP_FAIL; }
+/* Linker-backed read-only HTML in flash, included in the firmware OTA slot. */
+extern const uint8_t web_index_start[] asm("_binary_web_index_html_start");
+extern const uint8_t web_index_end[] asm("_binary_web_index_html_end");
+extern const uint8_t web_logs_start[] asm("_binary_web_logs_html_start");
+extern const uint8_t web_logs_end[] asm("_binary_web_logs_html_end");
+extern const uint8_t web_speedtest_start[] asm("_binary_web_speedtest_html_start");
+extern const uint8_t web_speedtest_end[] asm("_binary_web_speedtest_html_end");
+extern const uint8_t web_eq_start[] asm("_binary_web_eq_html_start");
+extern const uint8_t web_eq_end[] asm("_binary_web_eq_html_end");
+
+static esp_err_t serve_embedded_page(httpd_req_t *req, const uint8_t *start,
+                                      const uint8_t *end) {
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  /* A reload after OTA must load the UI matching the running firmware. */
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  size_t remaining = (size_t)(end - start);
+  while (remaining > 0U) {
+    const size_t chunk = remaining < WEB_PAGE_CHUNK ? remaining : WEB_PAGE_CHUNK;
+    /* No page-sized RAM allocation or filesystem buffer. */
+    esp_err_t err = httpd_resp_send_chunk(req, (const char *)start, chunk);
+    if (err != ESP_OK) return err;
+    start += chunk;
+    remaining -= chunk;
   }
-  fclose(f); return httpd_resp_send_chunk(req, NULL, 0);
+  return httpd_resp_send_chunk(req, NULL, 0);
 }
-static esp_err_t root_handler(httpd_req_t *req){ return serve_file(req,"/spiffs/www/index.html","text/html"); }
-static esp_err_t logs_handler(httpd_req_t *req){ return serve_file(req,"/spiffs/www/logs.html","text/html"); }
-static esp_err_t speedtest_handler(httpd_req_t *req){ return serve_file(req,"/spiffs/www/speedtest.html","text/html"); }
-static esp_err_t eq_page_handler(httpd_req_t *req){ return serve_file(req,"/spiffs/www/eq.html","text/html"); }
+static esp_err_t root_handler(httpd_req_t *req) {
+  return serve_embedded_page(req, web_index_start, web_index_end);
+}
+static esp_err_t logs_handler(httpd_req_t *req) {
+  return serve_embedded_page(req, web_logs_start, web_logs_end);
+}
+static esp_err_t speedtest_handler(httpd_req_t *req) {
+  return serve_embedded_page(req, web_speedtest_start, web_speedtest_end);
+}
+static esp_err_t eq_page_handler(httpd_req_t *req) {
+  return serve_embedded_page(req, web_eq_start, web_eq_end);
+}
 static esp_err_t favicon_handler(httpd_req_t *req){ httpd_resp_set_status(req,"204 No Content"); return httpd_resp_send(req,NULL,0); }
 static esp_err_t captive_redirect(httpd_req_t *req){ httpd_resp_set_status(req,"302 Found"); httpd_resp_set_hdr(req,"Location","http://192.168.4.1/"); return httpd_resp_send(req,NULL,0); }
 static esp_err_t captive_404_handler(httpd_req_t *req, httpd_err_code_t error){
@@ -453,11 +477,51 @@ static void eq_config_to_json(const audio_eq_config_t *cfg, cJSON *root) {
   cJSON_AddStringToObject(
       root, "channel_mode",
       audio_eq_channel_mode_name((audio_eq_channel_mode_t)cfg->channel_mode));
-  cJSON_AddNumberToObject(root, "preamp_db", cfg->preamp_db);
+  cJSON_AddNumberToObject(root, "left_preamp_db", cfg->left_preamp_db);
+  cJSON_AddNumberToObject(root, "right_preamp_db", cfg->right_preamp_db);
   cJSON *left = cJSON_AddArrayToObject(root, "left_filters");
   cJSON *right = cJSON_AddArrayToObject(root, "right_filters");
   eq_output_to_json(&cfg->left, left);
   eq_output_to_json(&cfg->right, right);
+}
+
+static void output_mute_to_json(cJSON *root) {
+  const uint32_t mask = audio_receiver_get_output_mute_mask();
+  cJSON_AddBoolToObject(root, "left_muted", (mask & 1U) != 0U);
+  cJSON_AddBoolToObject(root, "right_muted", (mask & 2U) != 0U);
+}
+
+static esp_err_t output_mute_post_handler(httpd_req_t *req) {
+  char body[128];
+  if (recv_json(req, body, sizeof(body)) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid mute body");
+    return ESP_ERR_INVALID_ARG;
+  }
+  cJSON *root = cJSON_Parse(body);
+  const cJSON *channel = cJSON_GetObjectItemCaseSensitive(root, "channel");
+  const cJSON *muted = cJSON_GetObjectItemCaseSensitive(root, "muted");
+  const bool valid = cJSON_IsObject(root) && cJSON_IsString(channel) &&
+      cJSON_IsBool(muted) &&
+      (strcmp(channel->valuestring, "left") == 0 ||
+       strcmp(channel->valuestring, "right") == 0);
+  if (!valid) {
+    cJSON_Delete(root);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid mute settings");
+    return ESP_ERR_INVALID_ARG;
+  }
+  const uint32_t ch = strcmp(channel->valuestring, "left") == 0 ? 0U : 1U;
+  const bool mute = cJSON_IsTrue(muted);
+  cJSON_Delete(root);
+  root = cJSON_CreateObject();
+  if (!root) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+    return ESP_ERR_NO_MEM;
+  }
+  audio_receiver_set_output_muted(ch, mute);
+  cJSON_AddBoolToObject(root, "success", true);
+  output_mute_to_json(root);
+  send_json_obj(req, root);
+  return ESP_OK;
 }
 
 static esp_err_t eq_get_handler(httpd_req_t *req) {
@@ -472,8 +536,10 @@ static esp_err_t eq_get_handler(httpd_req_t *req) {
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "success", true);
   eq_config_to_json(&cfg, root);
+  output_mute_to_json(root);
   char *out = cJSON_PrintUnformatted(root);
   httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   esp_err_t send_err = httpd_resp_sendstr(req, out ? out : "{}");
   free(out);
   cJSON_Delete(root);
@@ -548,7 +614,8 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
 
   bool valid = cJSON_IsBool(enabled) && cJSON_IsString(mode) &&
                audio_eq_channel_mode_from_name(mode->valuestring, &parsed_mode) &&
-               json_number(root, "preamp_db", &cfg.preamp_db) &&
+               json_number(root, "left_preamp_db", &cfg.left_preamp_db) &&
+               json_number(root, "right_preamp_db", &cfg.right_preamp_db) &&
                parse_eq_output(left, &cfg.left) &&
                parse_eq_output(right, &cfg.right);
 
@@ -622,7 +689,7 @@ static esp_err_t speed_upload(httpd_req_t *req){
 
 esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=30;c.stack_size=8192;c.lru_purge_enable=true;c.task_priority=HTTP_SERVER_TASK_PRIORITY;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
 #define REG(U,M,H) do{httpd_uri_t x={.uri=U,.method=M,.handler=H};ESP_ERROR_CHECK(httpd_register_uri_handler(s_server,&x));}while(0)
-  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);REG("/api/audio/latency",HTTP_GET,latency_get_handler);REG("/api/audio/latency",HTTP_POST,latency_post_handler);REG("/api/audio/latency/measure",HTTP_POST,latency_measure_handler);
+  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/audio/mute",HTTP_POST,output_mute_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);REG("/api/audio/latency",HTTP_GET,latency_get_handler);REG("/api/audio/latency",HTTP_POST,latency_post_handler);REG("/api/audio/latency/measure",HTTP_POST,latency_measure_handler);
   ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
 #undef REG
   e=log_stream_register(s_server);if(e!=ESP_OK)ESP_LOGW(TAG,"log stream register failed: %s",esp_err_to_name(e));ESP_LOGI(TAG,"Web UI started on port %u",port);return ESP_OK; }

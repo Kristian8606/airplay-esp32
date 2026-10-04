@@ -58,7 +58,8 @@ typedef struct {
   uint8_t active_l;
   uint8_t active_r;
   int sample_rate;
-  float preamp_gain;
+  float preamp_gain_l;
+  float preamp_gain_r;
   bool ready;
   eq_dither_t dith_l;
   eq_dither_t dith_r;
@@ -83,14 +84,17 @@ void audio_eq_default_config(audio_eq_config_t *out) {
   out->version = AUDIO_EQ_CONFIG_VERSION;
   out->enabled = 0;
   out->channel_mode = AUDIO_EQ_CHANNEL_STEREO;
-  out->preamp_db = 0.0f;
+  out->left_preamp_db = 0.0f;
+  out->right_preamp_db = 0.0f;
 }
 
 bool audio_eq_validate_config(const audio_eq_config_t *config) {
   if (!config || config->version != AUDIO_EQ_CONFIG_VERSION ||
       config->enabled > 1 || config->channel_mode >= AUDIO_EQ_CHANNEL_COUNT ||
-      !eq_is_finite(config->preamp_db) || config->preamp_db < -24.0f ||
-      config->preamp_db > 0.0f ||
+      !eq_is_finite(config->left_preamp_db) || config->left_preamp_db < -24.0f ||
+      config->left_preamp_db > 0.0f ||
+      !eq_is_finite(config->right_preamp_db) || config->right_preamp_db < -24.0f ||
+      config->right_preamp_db > 0.0f ||
       config->left.filter_count > AUDIO_EQ_MAX_FILTERS_PER_CHANNEL ||
       config->right.filter_count > AUDIO_EQ_MAX_FILTERS_PER_CHANNEL) {
     return false;
@@ -113,6 +117,17 @@ bool audio_eq_validate_config(const audio_eq_config_t *config) {
   return true;
 }
 
+/* Exact version-2 NVS layout, before splitting the shared preamp. */
+typedef struct {
+  uint32_t version;
+  uint8_t enabled;
+  uint8_t channel_mode;
+  uint16_t reserved;
+  float preamp_db;
+  audio_eq_output_config_t left;
+  audio_eq_output_config_t right;
+} audio_eq_config_v2_t;
+
 esp_err_t audio_eq_load_config(audio_eq_config_t *out) {
   if (!out) return ESP_ERR_INVALID_ARG;
   audio_eq_default_config(out);
@@ -122,20 +137,43 @@ esp_err_t audio_eq_load_config(audio_eq_config_t *out) {
   if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
   if (err != ESP_OK) return err;
 
-  audio_eq_config_t saved;
+  union {
+    audio_eq_config_t current;
+    audio_eq_config_v2_t legacy;
+  } saved;
   size_t len = sizeof(saved);
   err = nvs_get_blob(h, EQ_KEY, &saved, &len);
   nvs_close(h);
 
   if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
-  if (err != ESP_OK) return err;
-  if (len != sizeof(saved) || !audio_eq_validate_config(&saved)) {
-    ESP_LOGW(TAG, "Ignoring invalid/old EQ config (size=%u)",
-             (unsigned)len);
+  if (err == ESP_ERR_NVS_INVALID_LENGTH) {
+    ESP_LOGW(TAG, "Ignoring unsupported EQ config size=%u", (unsigned)len);
     return ESP_OK;
   }
+  if (err != ESP_OK) return err;
+  if (len == sizeof(saved.current) &&
+      audio_eq_validate_config(&saved.current)) {
+    *out = saved.current;
+  } else if (len == sizeof(saved.legacy) && saved.legacy.version == 2U) {
+    /* Convert in RAM; the next explicit Save writes version 3. */
+    audio_eq_default_config(out);
+    out->enabled = saved.legacy.enabled;
+    out->channel_mode = saved.legacy.channel_mode;
+    out->left_preamp_db = saved.legacy.preamp_db;
+    out->right_preamp_db = saved.legacy.preamp_db;
+    out->left = saved.legacy.left;
+    out->right = saved.legacy.right;
+    if (!audio_eq_validate_config(out)) {
+      audio_eq_default_config(out);
+      ESP_LOGW(TAG, "Ignoring invalid version-2 EQ config");
+    } else {
+      ESP_LOGI(TAG, "Shared preamp migrated to both output channels");
+    }
+  } else {
+    ESP_LOGW(TAG, "Ignoring invalid/old EQ config (size=%u)",
+             (unsigned)len);
+  }
 
-  *out = saved;
   return ESP_OK;
 }
 
@@ -325,19 +363,20 @@ static bool prepare_for_rate_unlocked(int sample_rate) {
     return false;
   }
 
-  s_eq.preamp_gain = powf(10.0f, s_eq.config.preamp_db / 20.0f);
+  s_eq.preamp_gain_l = powf(10.0f, s_eq.config.left_preamp_db / 20.0f);
+  s_eq.preamp_gain_r = powf(10.0f, s_eq.config.right_preamp_db / 20.0f);
   s_eq.sample_rate = sample_rate;
   s_eq.ready = true;
   reset_state_unlocked();
   ESP_LOGI(TAG,
-           "Ready: enabled=%u mode=%s left=%u/%u right=%u/%u preamp=%.2fdB sr=%d",
+           "Ready: enabled=%u mode=%s left=%u/%u right=%u/%u preamp L=%.2fdB R=%.2fdB sr=%d",
            (unsigned)s_eq.config.enabled,
            audio_eq_channel_mode_name(
                (audio_eq_channel_mode_t)s_eq.config.channel_mode),
            (unsigned)s_eq.active_l,
            (unsigned)s_eq.config.left.filter_count,
            (unsigned)s_eq.active_r,
-           (unsigned)s_eq.config.right.filter_count, s_eq.config.preamp_db,
+           (unsigned)s_eq.config.right.filter_count, s_eq.config.left_preamp_db, s_eq.config.right_preamp_db,
            sample_rate);
   return true;
 }
@@ -366,7 +405,8 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
   uint8_t slot_r[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL] = {0};
   uint8_t active_l = 0;
   uint8_t active_r = 0;
-  float preamp_gain = powf(10.0f, config->preamp_db / 20.0f);
+  const float preamp_gain_l = powf(10.0f, config->left_preamp_db / 20.0f);
+  const float preamp_gain_r = powf(10.0f, config->right_preamp_db / 20.0f);
   bool prepared = false;
 
   if (sample_rate > 0) {
@@ -404,7 +444,8 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
     memcpy(s_eq.slot_r, slot_r, sizeof(slot_r));
     s_eq.active_l = active_l;
     s_eq.active_r = active_r;
-    s_eq.preamp_gain = preamp_gain;
+    s_eq.preamp_gain_l = preamp_gain_l;
+    s_eq.preamp_gain_r = preamp_gain_r;
     s_eq.ready = true;
 
     if (!was_ready || !was_enabled || !config->enabled || mode_changed) {
@@ -436,12 +477,12 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
   eq_unlock();
 
   ESP_LOGI(TAG,
-           "Live apply: enabled=%u mode=%s left=%u right=%u preamp=%.2fdB%s",
+           "Live apply: enabled=%u mode=%s left=%u right=%u preamp L=%.2fdB R=%.2fdB%s",
            (unsigned)config->enabled,
            audio_eq_channel_mode_name(
                (audio_eq_channel_mode_t)config->channel_mode),
            (unsigned)config->left.filter_count,
-           (unsigned)config->right.filter_count, config->preamp_db,
+           (unsigned)config->right.filter_count, config->left_preamp_db, config->right_preamp_db,
            prepared ? "" : " (coefficients deferred until audio)" );
   return ESP_OK;
 }
@@ -464,12 +505,12 @@ esp_err_t audio_eq_init(void) {
     return ESP_OK;
   }
   ESP_LOGI(TAG,
-           "Config loaded: enabled=%u mode=%s left=%u right=%u preamp=%.2fdB",
+           "Config loaded: enabled=%u mode=%s left=%u right=%u preamp L=%.2fdB R=%.2fdB",
            (unsigned)s_eq.config.enabled,
            audio_eq_channel_mode_name(
                (audio_eq_channel_mode_t)s_eq.config.channel_mode),
            (unsigned)s_eq.config.left.filter_count,
-           (unsigned)s_eq.config.right.filter_count, s_eq.config.preamp_db);
+           (unsigned)s_eq.config.right.filter_count, s_eq.config.left_preamp_db, s_eq.config.right_preamp_db);
   return ESP_OK;
 }
 
@@ -483,8 +524,8 @@ static inline float biquad_process(float x, const biquad_coeff_t *c,
 
 static inline float process_chain_hot(float x, const biquad_coeff_t *coeff,
                                       biquad_state_t *states,
-                                      uint8_t active_count) {
-  x *= s_eq.preamp_gain;
+                                      uint8_t active_count, float preamp_gain) {
+  x *= preamp_gain;
   for (uint8_t i = 0; i < active_count; ++i) {
     x = biquad_process(x, &coeff[i], &states[i]);
   }
@@ -536,21 +577,21 @@ static inline int16_t eq_quantize(float y, bool in_zero, bool alters,
   return saturate_s16(y);
 }
 
-static inline bool eq_chain_alters(uint8_t active_count) {
-  return active_count > 0U || s_eq.preamp_gain != 1.0f;
+static inline bool eq_chain_alters(uint8_t active_count, float preamp_gain) {
+  return active_count > 0U || preamp_gain != 1.0f;
 }
 
 static inline void process_stereo_eq(int16_t *pcm, size_t frames) {
-  const bool alters_l = eq_chain_alters(s_eq.active_l);
-  const bool alters_r = eq_chain_alters(s_eq.active_r);
+  const bool alters_l = eq_chain_alters(s_eq.active_l, s_eq.preamp_gain_l);
+  const bool alters_r = eq_chain_alters(s_eq.active_r, s_eq.preamp_gain_r);
   for (size_t i = 0; i < frames; ++i) {
     const size_t p = i * 2;
     const int16_t in_l = pcm[p];
     const int16_t in_r = pcm[p + 1];
     const float out_l = process_chain_hot((float)in_l, s_eq.coeff_l,
-                                          s_eq.state_l, s_eq.active_l);
+                                          s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
     const float out_r = process_chain_hot((float)in_r, s_eq.coeff_r,
-                                          s_eq.state_r, s_eq.active_r);
+                                          s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
     pcm[p] = eq_quantize(out_l, in_l == 0, alters_l, &s_eq.dith_l);
     pcm[p + 1] = eq_quantize(out_r, in_r == 0, alters_r, &s_eq.dith_r);
   }
@@ -562,9 +603,9 @@ static inline void process_mono_eq(int16_t *pcm, size_t frames) {
     const int32_t sum = (int32_t)pcm[p] + (int32_t)pcm[p + 1];
     const float source = 0.5f * (float)sum;
     const float out_l =
-        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l);
+        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
     const float out_r =
-        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r);
+        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
     /* The mono mix itself can land on a half LSB, so it always counts as an
      * altering stage. */
     pcm[p] = eq_quantize(out_l, sum == 0, true, &s_eq.dith_l);
@@ -573,32 +614,32 @@ static inline void process_mono_eq(int16_t *pcm, size_t frames) {
 }
 
 static inline void process_left_eq(int16_t *pcm, size_t frames) {
-  const bool alters_l = eq_chain_alters(s_eq.active_l);
-  const bool alters_r = eq_chain_alters(s_eq.active_r);
+  const bool alters_l = eq_chain_alters(s_eq.active_l, s_eq.preamp_gain_l);
+  const bool alters_r = eq_chain_alters(s_eq.active_r, s_eq.preamp_gain_r);
   for (size_t i = 0; i < frames; ++i) {
     const size_t p = i * 2;
     const int16_t in = pcm[p];
     const float source = (float)in;
     const float out_l =
-        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l);
+        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
     const float out_r =
-        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r);
+        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
     pcm[p] = eq_quantize(out_l, in == 0, alters_l, &s_eq.dith_l);
     pcm[p + 1] = eq_quantize(out_r, in == 0, alters_r, &s_eq.dith_r);
   }
 }
 
 static inline void process_right_eq(int16_t *pcm, size_t frames) {
-  const bool alters_l = eq_chain_alters(s_eq.active_l);
-  const bool alters_r = eq_chain_alters(s_eq.active_r);
+  const bool alters_l = eq_chain_alters(s_eq.active_l, s_eq.preamp_gain_l);
+  const bool alters_r = eq_chain_alters(s_eq.active_r, s_eq.preamp_gain_r);
   for (size_t i = 0; i < frames; ++i) {
     const size_t p = i * 2;
     const int16_t in = pcm[p + 1];
     const float source = (float)in;
     const float out_l =
-        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l);
+        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
     const float out_r =
-        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r);
+        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
     pcm[p] = eq_quantize(out_l, in == 0, alters_l, &s_eq.dith_l);
     pcm[p + 1] = eq_quantize(out_r, in == 0, alters_r, &s_eq.dith_r);
   }
@@ -679,7 +720,8 @@ void audio_eq_process(int16_t *pcm, size_t frames, int channels,
   }
 
   if (mode == AUDIO_EQ_CHANNEL_STEREO && s_eq.active_l == 0U &&
-      s_eq.active_r == 0U && s_eq.preamp_gain == 1.0f) {
+      s_eq.active_r == 0U && s_eq.preamp_gain_l == 1.0f &&
+      s_eq.preamp_gain_r == 1.0f) {
     neutral_update_silence(pcm, frames, 0U, &s_eq.dith_l);
     neutral_update_silence(pcm, frames, 1U, &s_eq.dith_r);
     eq_unlock();

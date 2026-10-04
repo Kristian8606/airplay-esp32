@@ -17,11 +17,8 @@ endif()
 
 # ESP-IDF stores PROJECT_VER in esp_app_desc_t::version.
 set(PROJECT_VER "${AIRPLAY_PROJECT_VERSION}")
-set(EXTRA_COMPONENT_DIRS "${CMAKE_SOURCE_DIR}/components")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # The project name is also the generated .bin basename, so the version is
 # automatically reflected in build/airplay-esp32_vX.Y.Z.bin.
 project("airplay-esp32_${AIRPLAY_PROJECT_VERSION}")
-
-spiffs_create_partition_image(storage "${CMAKE_SOURCE_DIR}/data" FLASH_IN_PROJECT)

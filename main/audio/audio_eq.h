@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define AUDIO_EQ_CONFIG_VERSION 2U
+#define AUDIO_EQ_CONFIG_VERSION 3U
 #define AUDIO_EQ_MAX_FILTERS_PER_CHANNEL 24U
 
 typedef enum {
@@ -52,7 +52,8 @@ typedef struct {
   uint8_t enabled;
   uint8_t channel_mode;
   uint16_t reserved;
-  float preamp_db;
+  float left_preamp_db;
+  float right_preamp_db;
   audio_eq_output_config_t left;
   audio_eq_output_config_t right;
 } audio_eq_config_t;

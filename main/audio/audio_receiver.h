@@ -70,6 +70,10 @@ size_t audio_receiver_get_buffered_audio_buffer_size(void);
 /* Software output volume. Q15: 0=mute, 32768=0 dB/full scale. */
 void audio_receiver_set_volume_q15(int32_t volume_q15);
 int32_t audio_receiver_get_volume_q15(void);
+/* Physical outputs: channel 0 = left, 1 = right. Applied after the PCM ring,
+ * independently of EQ/source mode and RTSP volume. Runtime only, no NVS. */
+uint32_t audio_receiver_get_output_mute_mask(void);
+esp_err_t audio_receiver_set_output_muted(uint32_t channel, bool muted);
 
 /* Buffered no-boundary FLUSH: invalidate PCM and wait for a fresh anchor. */
 void audio_receiver_flush(void);

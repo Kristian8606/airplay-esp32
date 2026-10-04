@@ -70,6 +70,13 @@ idf_component_register(
         app_update
         esp_app_format
         mbedtls
-        spiffs_storage
         esp_adc
 )
+
+# Embed the UI into the OTA application image. File changes automatically
+# regenerate the embedded data; no separate filesystem upload is needed.
+foreach(page index logs speedtest eq)
+    target_add_binary_data(${COMPONENT_LIB}
+        "${CMAKE_CURRENT_SOURCE_DIR}/../data/www/${page}.html" BINARY
+        RENAME_TO "web_${page}_html")
+endforeach()
