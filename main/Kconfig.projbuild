@@ -78,6 +78,57 @@ menu "AirPlay Receiver"
     config ENABLE_AIRPLAY_ARTWORK
         bool "Advertise artwork support"
         default n
+
+    menu "Hardware playback buttons"
+        config AIRPLAY_HARDWARE_BUTTONS
+            bool "Enable GPIO playback buttons (PSRAM task)"
+            depends on SPIRAM && FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+            default n
+            help
+                Connect each momentary button between its GPIO and GND.
+                Inputs use internal pull-ups and software debounce.
+                Commands go through the existing AirPlay event worker.
+                A low-priority polling task uses a 3072-byte stack in PSRAM;
+                its control structure remains in internal RAM.
+                No task is created if all GPIOs are -1.
+
+                Use free GPIOs exposed by your board. Avoid flash/PSRAM,
+                I2S, console, amplifier and LED pins. Strapping pins may
+                change the boot mode if their button is held during reset.
+
+        if AIRPLAY_HARDWARE_BUTTONS
+            config AIRPLAY_BUTTON_PLAY_PAUSE_GPIO
+                int "Play/Pause GPIO (-1 = disabled)"
+                range -1 48
+                default -1
+            config AIRPLAY_BUTTON_NEXT_GPIO
+                int "Next GPIO (-1 = disabled)"
+                range -1 48
+                default -1
+            config AIRPLAY_BUTTON_PREVIOUS_GPIO
+                int "Previous GPIO (-1 = disabled)"
+                range -1 48
+                default -1
+            config AIRPLAY_BUTTON_VOLUME_DOWN_GPIO
+                int "Volume - GPIO (-1 = disabled)"
+                range -1 48
+                default -1
+            config AIRPLAY_BUTTON_VOLUME_UP_GPIO
+                int "Volume + GPIO (-1 = disabled)"
+                range -1 48
+                default -1
+            config AIRPLAY_BUTTON_DEBOUNCE_MS
+                int "Button debounce (milliseconds)"
+                range 10 200
+                default 30
+                help
+                    Both press and release must stay stable for this long.
+                    Sends one command per press. Holding a button does not
+                    repeat commands. A button held at boot is ignored until
+                    released and pressed again. A busy or disconnected
+                    AirPlay command is logged and dropped, never retried.
+        endif
+    endmenu
 endmenu
 
 menu "Amplifier Power Control"

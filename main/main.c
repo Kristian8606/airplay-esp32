@@ -10,6 +10,7 @@
 #include "nvs_flash.h"
 #include "ptp_clock.h"
 #include "rtsp_server.h"
+#include "playback_buttons.h"
 #include "settings.h"
 #include "web_server.h"
 #include "wifi.h"
@@ -95,6 +96,10 @@ void app_main(void) {
     log_memory_state("post-audio-init");
     mdns_airplay_init();
     ESP_ERROR_CHECK(rtsp_server_start());
+    esp_err_t buttons_err = playback_buttons_init();
+    if (buttons_err != ESP_OK) {
+      ESP_LOGW(TAG, "Playback buttons unavailable: %s", esp_err_to_name(buttons_err));
+    }
   }
 
   const esp_app_desc_t *app = esp_app_get_description();

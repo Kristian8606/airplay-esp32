@@ -43,6 +43,10 @@ set(SRC_FILES
 )
 
 
+if(CONFIG_AIRPLAY_HARDWARE_BUTTONS)
+    list(APPEND SRC_FILES "playback_buttons.c")
+endif()
+
 # Temporary diagnostics are a true compile-time feature. When the master
 # switch is off, or all categories are off, audio_diag.c is not compiled.
 if(CONFIG_AIRPLAY_DIAG_ACTIVE)
