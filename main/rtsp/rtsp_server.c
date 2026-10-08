@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -64,6 +65,9 @@ typedef struct {
   _Atomic bool should_stop;
   _Atomic bool is_old; // Marked as old client being killed
   _Atomic bool audio_owner;
+  /* Body bytes of an oversized request still to be dropped (owned by the
+   * client task). */
+  size_t discard_left;
 } client_slot_t;
 
 static client_slot_t clients[MAX_CLIENTS] = {
@@ -106,10 +110,34 @@ static uint8_t *grow_buffer(uint8_t *old_buf, size_t old_size, size_t new_size,
   return new_buf;
 }
 
+/* First request line ("POST /command RTSP/1.0") for log messages. */
+static void request_line(const uint8_t *buffer, size_t len, char *out, size_t cap) {
+  size_t n = 0;
+  while (n < len && n + 1 < cap && buffer[n] != '\r' && buffer[n] != '\n') {
+    out[n] = (buffer[n] >= 0x20 && buffer[n] < 0x7f) ? (char)buffer[n] : '?';
+    n++;
+  }
+  out[n] = '\0';
+}
+
+static int request_cseq(const char *header) {
+  const char *c = strcasestr(header, "\r\nCSeq:");
+  return c ? atoi(c + 7) : -1;
+}
+
 // Process buffered RTSP requests
 static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
                                 size_t *buf_len) {
   while (*buf_len > 0 && !slot->should_stop) {
+    if (slot->discard_left > 0) {
+      /* Drop the body of an oversized request that was already answered. */
+      size_t n = *buf_len < slot->discard_left ? *buf_len : slot->discard_left;
+      if (*buf_len > n) memmove(buffer, buffer + n, *buf_len - n);
+      *buf_len -= n;
+      slot->discard_left -= n;
+      if (slot->discard_left == 0) ESP_LOGI(TAG, "Oversized request body skipped");
+      continue;
+    }
     const uint8_t *header_end = rtsp_find_header_end(buffer, *buf_len);
     if (!header_end) {
       break;
@@ -121,10 +149,31 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     buffer[header_len] = '\0';
     int content_len = rtsp_parse_content_length((const char *)buffer);
     buffer[header_len] = header_saved;
-    if (content_len < 0 || header_len > RTSP_BUFFER_LARGE ||
-        (size_t)content_len > RTSP_BUFFER_LARGE - header_len) {
+    if (content_len < 0 || header_len > RTSP_BUFFER_LARGE) {
+      char line[96];
+      request_line(buffer, *buf_len, line, sizeof(line));
+      ESP_LOGW(TAG, "Malformed request header (Content-Length %d, header %u B): "
+               "closing connection | %s", content_len, (unsigned)header_len, line);
       slot->conn->close_after_response = true;
       return; /* Never reinterpret an invalid body as a new request. */
+    }
+    if ((size_t)content_len > RTSP_BUFFER_LARGE - header_len) {
+      /* Too large to buffer (e.g. now-playing info with big artwork). Answer
+       * it without reading the body and drop the body bytes as they arrive;
+       * closing the connection here ends the sender's whole session. */
+      char line[96];
+      request_line(buffer, *buf_len, line, sizeof(line));
+      buffer[header_len] = '\0';
+      const int cseq = request_cseq((const char *)buffer);
+      buffer[header_len] = header_saved;
+      ESP_LOGW(TAG, "RTSP <- %s cseq=%d body=%d B is over the %u KiB limit: "
+               "answered 200 OK, body skipped", line, cseq, content_len,
+               (unsigned)(RTSP_BUFFER_LARGE / 1024U));
+      rtsp_send_ok(slot->socket, slot->conn, cseq);
+      slot->discard_left = (size_t)content_len;
+      if (*buf_len > header_len) memmove(buffer, buffer + header_len, *buf_len - header_len);
+      *buf_len -= header_len;
+      continue;
     }
     size_t total_len = header_len + (size_t)content_len;
     if (*buf_len < total_len) break;
@@ -200,6 +249,10 @@ static void client_task(void *pvParameters) {
 
   size_t buf_len = 0;
   uint8_t *decrypted = NULL; /* Lazy bounded encrypted-frame staging. */
+  slot->discard_left = 0;
+  /* Why the loop ended, for the disconnect log line. */
+  const char *why = "stop requested";
+  int why_errno = 0;
 
   // Socket timeout for stop signal responsiveness
   struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
@@ -221,19 +274,23 @@ static void client_task(void *pvParameters) {
           decrypted = heap_caps_malloc(RTSP_ENCRYPTED_BLOCK_MAX,
               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
           if (!decrypted) decrypted = malloc(RTSP_ENCRYPTED_BLOCK_MAX);
-          if (!decrypted) goto cleanup;
+          if (!decrypted) { why = "out of memory"; goto cleanup; }
         }
         int block_len = rtsp_crypto_read_block(
             slot->socket, conn, decrypted, RTSP_ENCRYPTED_BLOCK_MAX);
-        if (block_len <= 0) goto cleanup;
+        if (block_len <= 0) {
+          why_errno = errno;
+          why = slot->should_stop ? "stop requested" : "sender closed or read failed";
+          goto cleanup;
+        }
         size_t offset = 0;
         while (offset < (size_t)block_len) {
           if (buf_len == buf_capacity) {
-            if (buf_capacity == RTSP_BUFFER_LARGE) goto cleanup;
+            if (buf_capacity == RTSP_BUFFER_LARGE) { why = "receive buffer full"; goto cleanup; }
             size_t new_cap = buf_capacity * 2;
             if (new_cap > RTSP_BUFFER_LARGE) new_cap = RTSP_BUFFER_LARGE;
             uint8_t *new_buf = grow_buffer(buffer, buf_capacity, new_cap, buf_len);
-            if (!new_buf) goto cleanup;
+            if (!new_buf) { why = "out of memory"; goto cleanup; }
             buffer = new_buf;
             buf_capacity = new_cap;
           }
@@ -243,7 +300,7 @@ static void client_task(void *pvParameters) {
           buf_len += chunk;
           offset += chunk;
           process_rtsp_buffer(slot, buffer, &buf_len);
-          if (conn->close_after_response) goto cleanup;
+          if (conn->close_after_response) { why = "closed after response"; goto cleanup; }
         }
       }
       goto cleanup;
@@ -251,11 +308,12 @@ static void client_task(void *pvParameters) {
 
     // Plain-text mode
     if (buf_len == buf_capacity) {
-      if (buf_capacity == RTSP_BUFFER_LARGE) break;
+      if (buf_capacity == RTSP_BUFFER_LARGE) { why = "receive buffer full"; break; }
       size_t new_cap = buf_capacity * 2;
       if (new_cap > RTSP_BUFFER_LARGE) new_cap = RTSP_BUFFER_LARGE;
       uint8_t *new_buf = grow_buffer(buffer, buf_capacity, new_cap, buf_len);
       if (!new_buf) {
+        why = "out of memory";
         break;
       }
       buffer = new_buf;
@@ -268,18 +326,26 @@ static void client_task(void *pvParameters) {
       if (recv_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         continue;
       }
+      why_errno = recv_len < 0 ? errno : 0;
+      why = recv_len == 0 ? "sender closed" : "read failed";
       break;
     }
     buf_len += (size_t)recv_len;
     process_rtsp_buffer(slot, buffer, &buf_len);
     if (conn->close_after_response) {
+      why = "closed after response";
       goto cleanup;
     }
   }
 
 cleanup:
-  ESP_LOGI(TAG, "Client slot %d disconnected%s", slot_idx,
-           conn->owns_audio ? "" : (conn->rc_only ? " (remote control)" : " (no audio)"));
+  {
+    char err[16] = "";
+    if (why_errno) snprintf(err, sizeof(err), " (errno %d)", why_errno);
+    ESP_LOGI(TAG, "Client slot %d disconnected%s: %s%s", slot_idx,
+             conn->owns_audio ? "" : (conn->rc_only ? " (remote control)" : " (no audio)"),
+             why, err);
+  }
   free(decrypted);
   free(buffer);
   detach_client_socket(slot);

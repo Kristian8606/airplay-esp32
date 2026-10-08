@@ -55,6 +55,8 @@ typedef struct {
    * forever; a long enough run restarts the estimator. */
   uint32_t outlier_run;
   int64_t outlier_run_start_ns;
+  int64_t outlier_run_level_ns; /* raw offset level of the current run */
+  uint32_t outlier_agree;       /* consecutive outliers at that level */
 } ptp_clock_engine_t;
 
 void ptp_clock_engine_init(ptp_clock_engine_t *engine,

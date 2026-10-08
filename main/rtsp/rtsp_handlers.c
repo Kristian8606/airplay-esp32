@@ -2118,7 +2118,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
 
 /* SETRATEANCHORTIME body, or the same plist as MediaDataControl "srat". */
 static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
-                              size_t body_len) {
+                              size_t body_len, const char *src) {
   double rate = 1.0;
   bool have_rate = false;
   uint64_t clock_id = 0;
@@ -2157,8 +2157,8 @@ static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
     }
 
     ESP_LOGI(TAG,
-             "SETRATEANCHORTIME: secs=%llu frac=0x%016llx rtp=%llu"
-             " clock=%016llx rate=%.1f stream=%lld",
+             "%s: secs=%llu frac=0x%016llx rtp=%llu"
+             " clock=%016llx rate=%.1f stream=%lld", src,
              (unsigned long long)network_time_secs,
              (unsigned long long)network_time_frac,
              (unsigned long long)rtp_time,
@@ -2168,7 +2168,7 @@ static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
     /* Pause first.  Do not publish an anchor from a rate=0 message and wake a
      * processor immediately before closing the play gate. */
     if (have_rate && rate == 0.0) {
-      ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
+      ESP_LOGI(TAG, "%s: rate=0 -> PAUSING", src);
       note_stream_pause_started(conn);
       conn->stream_paused = true;
       audio_receiver_pause();
@@ -2185,7 +2185,7 @@ static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
       frac = (frac * 1000000000ULL) >> 32;
       uint64_t network_time_ns = network_time_secs * 1000000000ULL + frac;
       ESP_LOGI(TAG,
-               "SETRATEANCHORTIME MAP: clock=%016llx ptp=%llu rtp=%llu",
+               "%s MAP: clock=%016llx ptp=%llu rtp=%llu", src,
                (unsigned long long)clock_id,
                (unsigned long long)network_time_ns,
                (unsigned long long)rtp_time);
@@ -2202,7 +2202,7 @@ static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
         if (ptp_clock_realtime_snapshot_to_local(&ps, clock_id, network_time_ns,
                                               &local_ns)) {
           ESP_LOGI(TAG,
-                   "SETRATEANCHORTIME RT local raw=%llu local=%llu gm=%016llx age=%lums",
+                   "%s RT local raw=%llu local=%llu gm=%016llx age=%lums", src,
                    (unsigned long long)network_time_ns,
                    (unsigned long long)local_ns,
                    (unsigned long long)ps.master_clock_id,
@@ -2213,7 +2213,7 @@ static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
                   network_time_ns, local_ns, (uint32_t)rtp_time,
                   &anchor_result)) {
             ESP_LOGI(TAG,
-                     "SETRATEANCHORTIME RT media rebase deferred clock=%016llx gm=%016llx epoch=%lu age=%lums",
+                     "%s RT media rebase deferred clock=%016llx gm=%016llx epoch=%lu age=%lums", src,
                      (unsigned long long)clock_id,
                      (unsigned long long)ps.master_clock_id,
                      (unsigned long)ps.gm_change_count,
@@ -2221,7 +2221,7 @@ static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
           }
         } else {
           ESP_LOGI(TAG,
-                   "SETRATEANCHORTIME RT deferred clock=%016llx gm=%016llx ready=%d age=%lums",
+                   "%s RT deferred clock=%016llx gm=%016llx ready=%d age=%lums", src,
                    (unsigned long long)clock_id,
                    (unsigned long long)ps.master_clock_id,
                    ps.master_ready ? 1 : 0,
@@ -2238,10 +2238,10 @@ static void apply_rate_anchor(rtsp_conn_t *conn, const uint8_t *body,
    * when "rate" is present. Without rate, update any supplied anchor and
    * leave the play state unchanged. */
   if (!have_rate) {
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: no rate -> play state unchanged");
+    ESP_LOGI(TAG, "%s: no rate -> play state unchanged", src);
     return;
   }
-  ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
+  ESP_LOGI(TAG, "%s: rate=%.1f -> RESUMING (was_paused=%d)", src,
            rate, conn->stream_paused);
   if (conn->stream_paused) notify_timing_resume(conn);
   conn->stream_paused = false;
@@ -2255,7 +2255,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
                                      const uint8_t *raw, size_t raw_len) {
   (void)raw;
   (void)raw_len;
-  apply_rate_anchor(conn, req->body, req->body_len);
+  apply_rate_anchor(conn, req->body, req->body_len, "SETRATEANCHORTIME");
   rtsp_send_ok(socket, conn, req->cseq);
 }
 
@@ -2323,10 +2323,14 @@ static size_t mdc_anchor_reply(rtsp_conn_t *conn, uint8_t *reply, size_t cap) {
     for (;;) {
       ptp_clock_get_snapshot(&ps);
       waited_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+      /* Answer quickly: the sender closes the connection when the reply
+       * takes ~1.5 s. Lock is not needed -- the anchor is a definition in
+       * the sender's PTP time; later estimator corrections only change how
+       * we map it to local time, not what it means. */
       const bool usable = !ps.realtime_mode && ps.valid &&
                           ps.grandmaster_clock_id != 0 && ps.sample_age_ms <= 1500U;
-      if (usable && (ps.locked || waited_ms >= 1500U)) break;
-      if (waited_ms >= 3000U) {
+      if (usable) break;
+      if (waited_ms >= 1000U) {
         ESP_LOGW(TAG, "MDC anch: no usable PTP after %u ms (valid=%d locked=%d "
                  "gm=%016llx sampleAge=%u) -> empty rply",
                  (unsigned)waited_ms, ps.valid, ps.locked,
@@ -2402,7 +2406,7 @@ static size_t mdc_on_message(rtsp_conn_t *conn, const char *cmd,
   if (strcmp(cmd, "magc") != 0) log_plist_body(what, payload, len);
 
   if (strcmp(cmd, "srat") == 0) {
-    apply_rate_anchor(conn, payload, len);
+    apply_rate_anchor(conn, payload, len, "MDC srat");
   } else if (strcmp(cmd, "fshb") == 0) {
     mdc_fshb(payload, len);
   } else if (strcmp(cmd, "strt") == 0) {

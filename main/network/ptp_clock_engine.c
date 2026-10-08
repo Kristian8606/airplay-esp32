@@ -7,10 +7,13 @@
 #define PTP_ENGINE_POS_STEADY_DIV    16LL
 #define PTP_ENGINE_NEG_DIV           256LL
 #define PTP_ENGINE_NEG_CLAMP_NS      (-2500000LL)
-/* Restart after this many consecutive outliers spanning at least this long
- * (AirPlay senders send ~8 Sync/s). */
-#define PTP_ENGINE_REACQUIRE_COUNT   8U
-#define PTP_ENGINE_REACQUIRE_NS      1000000000LL
+/* Restart after a run of consecutive outliers that agree with each other
+ * (a real step of the sender's clock, seen at every iPhone session start), or
+ * after a long run of any outliers. AirPlay senders send ~8 Sync/s. */
+#define PTP_ENGINE_REACQUIRE_COUNT     8U
+#define PTP_ENGINE_REACQUIRE_NS        1000000000LL
+#define PTP_ENGINE_STEP_COUNT          3U
+#define PTP_ENGINE_STEP_AGREE_NS       10000000LL /* 10 ms */
 
 static uint32_t next_epoch(uint32_t epoch) {
   epoch++;
@@ -28,6 +31,8 @@ static void clear_filter_state(ptp_clock_engine_t *engine) {
   engine->accepted_samples = 0;
   engine->outlier_run = 0;
   engine->outlier_run_start_ns = 0;
+  engine->outlier_run_level_ns = 0;
+  engine->outlier_agree = 0;
 }
 
 void ptp_clock_engine_init(ptp_clock_engine_t *engine,
@@ -117,10 +122,23 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
     int64_t diff = raw_offset_ns - engine->filtered_offset_ns;
     if (diff < 0) diff = -diff;
     if (diff > engine->outlier_threshold_ns) {
-      if (engine->outlier_run == 0) engine->outlier_run_start_ns = reception_time_ns;
+      if (engine->outlier_run == 0) {
+        engine->outlier_run_start_ns = reception_time_ns;
+        engine->outlier_run_level_ns = raw_offset_ns;
+      }
       engine->outlier_run++;
-      if (engine->outlier_run >= PTP_ENGINE_REACQUIRE_COUNT &&
-          reception_time_ns - engine->outlier_run_start_ns >= PTP_ENGINE_REACQUIRE_NS) {
+      int64_t level_diff = raw_offset_ns - engine->outlier_run_level_ns;
+      if (level_diff < 0) level_diff = -level_diff;
+      if (engine->outlier_run == 1 || level_diff > PTP_ENGINE_STEP_AGREE_NS) {
+        engine->outlier_run_level_ns = raw_offset_ns;
+        engine->outlier_agree = 1;
+      } else {
+        engine->outlier_agree++;
+      }
+      const bool step = engine->outlier_agree >= PTP_ENGINE_STEP_COUNT;
+      const bool stuck = engine->outlier_run >= PTP_ENGINE_REACQUIRE_COUNT &&
+          reception_time_ns - engine->outlier_run_start_ns >= PTP_ENGINE_REACQUIRE_NS;
+      if (step || stuck) {
         /* The estimator is the odd one out: start again from this sample. */
         result.reacquired = true;
         result.reacquire_jump_ns = raw_offset_ns - engine->filtered_offset_ns;
