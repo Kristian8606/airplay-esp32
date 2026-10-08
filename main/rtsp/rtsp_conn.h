@@ -51,6 +51,41 @@ struct rtsp_conn {
   uint16_t buffered_port; // TCP port for buffered audio (type 103)
   int event_socket;       // TCP listener for event port (until handed over)
 
+  /* Remote-control-only connection (initial SETUP with isRemoteControlOnly):
+   * never owns audio, PTP or the audio event channel. */
+  bool rc_only;
+  /* This connection did an audio SETUP and is the single owner of the global
+   * audio / PTP / event-channel state. Only the owner resets them on close. */
+  bool owns_audio;
+  /* Remote control (type 130) channels of this connection, if any. */
+  struct rtsp_rc *rc;
+  uint16_t rc_event_port;
+
+  /* Buffered APAP + MediaDataControl (lab, streamConnections). */
+  bool apap;                  /* current 103 stream uses APAP framing */
+  bool mdc;                   /* MediaDataControl channel open */
+  uint16_t mdc_port;
+  uint64_t mdc_seed;
+  int apap_ctrl_sock;         /* UDP controlPort socket, -1 = none */
+  uint16_t apap_ctrl_port;
+  uint64_t apap_stream_id;
+  bool mdc_start_valid;       /* "strt" seen */
+  int64_t mdc_media_time_value;
+  int64_t mdc_media_time_scale;
+  bool mdc_anchor_valid;      /* receiver-chosen anchor ("anch") */
+  uint64_t mdc_anchor_ptp_ns;
+  uint64_t mdc_anchor_clock_id;
+  /* An isRemoteControlOnly session SETUP happened on this connection
+   * (lab: its later session TEARDOWN may be meant for that session only). */
+  bool rc_session_seen;
+  /* Session diagnostics (lab). */
+  int64_t diag_setup103_us;   /* type 103 SETUP answered */
+  int64_t diag_rc_down_us;    /* type 130 TEARDOWN */
+  int64_t diag_last_req_us;
+  uint32_t diag_requests;
+  uint32_t diag_feedback;
+  int64_t diag_last_feedback_us;
+
   uint32_t client_ip;           // Sender IP (network byte order): PTP peer,
                                 // event-port filter, realtime retransmits
   uint16_t client_control_port; // Sender's realtime control port

@@ -73,6 +73,9 @@ typedef struct {
 /* Coherent status/diagnostic snapshot for either buffered or realtime mode. */
 void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot);
 
+/* Lab diagnostics: log PTP packet counters, drop reasons and the last source. */
+void ptp_clock_log_rx_stats(const char *why);
+
 /**
  * Notify the PTP clock that playback is resuming after a pause.
  *

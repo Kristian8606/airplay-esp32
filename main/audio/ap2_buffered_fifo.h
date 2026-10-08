@@ -43,6 +43,13 @@ esp_err_t ap2_buffered_fifo_start(ap2_buffered_fifo_t *fifo,
 void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo);
 bool ap2_buffered_fifo_is_idle(ap2_buffered_fifo_t *fifo);
 
+/* Buffered APAP mode (lab). key32 = the stream key (shk), NULL = classic
+ * buffered packets. Only while stopped. In APAP mode the queued packets carry
+ * clear-text AAC (the reader has already authenticated and decrypted them). */
+esp_err_t ap2_buffered_fifo_set_apap(ap2_buffered_fifo_t *fifo,
+                                     const uint8_t *key32);
+bool ap2_buffered_fifo_is_apap(const ap2_buffered_fifo_t *fifo);
+
 /* Hard session-boundary reset. Call only while the buffered transport is
  * stopped/idle; live FLUSHBUFFERED never rewinds or purges this byte FIFO. */
 void ap2_buffered_fifo_clear(ap2_buffered_fifo_t *fifo);

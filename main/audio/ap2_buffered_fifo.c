@@ -10,11 +10,13 @@
 #include <unistd.h>
 
 #include "audio_diag.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "network/socket_utils.h"
+#include "sodium.h"
 
 /* Match Shairport Sync 5.x buffered_read.c: recv at most 4096 bytes, and once
  * more than 16 KiB is queued, sleep 10 ms after each recv. This intentionally
@@ -24,6 +26,24 @@
 #define FIFO_PACE_THRESHOLD  16384U
 #define FIFO_PACE_SLEEP_MS      10U
 #define FIFO_MIN_WIRE_LEN       14U
+
+/* Buffered APAP (lab): the sender's TCP stream is a sequence of packages
+ *   4-byte big-endian total length (including itself)
+ *   15-byte clear header: mediaTime i64 BE, timescale u32 BE, seq u24 BE
+ *   ciphertext || Poly1305 tag (16) || nonce (8)
+ * ChaCha20-Poly1305-IETF with the stream key (shk), AAD = header bytes 0..11,
+ * nonce = 4 zero bytes + the trailing 8. The plaintext is a list of
+ * extensions (uintv key, uintv length, value; key 0 ends the list) followed
+ * by one AAC access unit (absent in metadata-only packages).
+ *
+ * The reader turns each package into the classic buffered packet the
+ * processor already understands -- [2-byte length][seq][rtp][ssrc][AAC] --
+ * with rtp = mediaTime in samples and the AAC already in clear text, so
+ * timing, FLUSH and decoding stay unchanged. */
+#define APAP_HEADER_BYTES       15U
+#define APAP_PACKAGE_MAX     16384U
+#define APAP_AAC_MAX          8180U /* processor block limit minus header */
+#define APAP_SSRC_AAC_44100 0x16000000U
 
 static const char *TAG = "aac_fifo";
 
@@ -52,6 +72,14 @@ struct ap2_buffered_fifo {
   int task_core;
   int task_priority;
   uint32_t task_stack;
+
+  /* Buffered APAP mode; set only while stopped. */
+  bool apap;
+  uint8_t apap_key[32];
+  uint8_t *apap_pkg;   /* APAP_PACKAGE_MAX, one package being received */
+  uint8_t *apap_out;   /* 2 + 12 + APAP_PACKAGE_MAX, converted packet */
+  uint32_t apap_packages;
+  uint32_t apap_auth_failures;
 };
 
 static uint32_t next_epoch(ap2_buffered_fifo_t *fifo) {
@@ -90,6 +118,197 @@ static void fifo_discard_all(ap2_buffered_fifo_t *fifo) {
   signal_all(fifo);
 }
 
+static uint32_t rd_be32(const uint8_t *p) {
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static bool apap_read_uintv(const uint8_t *p, size_t n, size_t *io, uint64_t *out) {
+  uint64_t v = 0;
+  for (unsigned count = 0; count < 10 && *io < n; ++count) {
+    const uint8_t b = p[(*io)++];
+    v = (v << 7) | (uint64_t)(b & 0x7fU);
+    if ((b & 0x80U) == 0) {
+      *out = v;
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Offset of the AAC access unit after the extension list. */
+static bool apap_media_offset(const uint8_t *plain, size_t n, size_t *off) {
+  size_t pos = 0;
+  for (unsigned items = 0; pos < n && items < 32U; ++items) {
+    uint64_t key = 0, len = 0;
+    if (!apap_read_uintv(plain, n, &pos, &key)) return false;
+    if (key == 0) {
+      *off = pos;
+      return true;
+    }
+    if (!apap_read_uintv(plain, n, &pos, &len) || len > n - pos) return false;
+    pos += (size_t)len;
+  }
+  return false;
+}
+
+/* Copy one complete converted packet into the ring, waiting for room.
+ * Returns false when the stream ended (stop, reconnect or reset). */
+static bool fifo_write_packet(ap2_buffered_fifo_t *fifo, const uint8_t *data,
+                              size_t len, uint32_t epoch) {
+  if (len > fifo->capacity) return true; /* cannot ever fit: drop */
+  while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
+    xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+    if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) != epoch ||
+        !fifo->connected) {
+      xSemaphoreGive(fifo->fifo_mutex);
+      return false;
+    }
+    if (fifo->capacity - fifo->occupancy >= len) {
+      size_t first = fifo->capacity - fifo->write_pos;
+      if (first > len) first = len;
+      memcpy(fifo->buffer + fifo->write_pos, data, first);
+      if (first < len) memcpy(fifo->buffer, data + first, len - first);
+      fifo->write_pos = (fifo->write_pos + len) % fifo->capacity;
+      fifo->occupancy += len;
+      fifo->total_written += len;
+      xSemaphoreGive(fifo->fifo_mutex);
+      xSemaphoreGive(fifo->control_wake);
+      return true;
+    }
+    xSemaphoreGive(fifo->fifo_mutex);
+    (void)xSemaphoreTake(fifo->not_full, pdMS_TO_TICKS(100));
+  }
+  return false;
+}
+
+/* Decrypt one APAP package and queue it as a classic buffered packet.
+ * Returns false only when the stream ended. */
+static bool apap_convert(ap2_buffered_fifo_t *fifo, size_t pkg_len,
+                         uint32_t epoch) {
+  const uint8_t *pkg = fifo->apap_pkg;
+  if (pkg_len < APAP_HEADER_BYTES + 24U) return true;
+  const int64_t media_time = (int64_t)(((uint64_t)rd_be32(pkg) << 32) | rd_be32(pkg + 4));
+  const uint32_t timescale = rd_be32(pkg + 8);
+  const uint32_t seq = ((uint32_t)pkg[12] << 16) | ((uint32_t)pkg[13] << 8) | pkg[14];
+  if (media_time < 0 || timescale == 0) return true;
+  uint64_t sample = (uint64_t)media_time;
+  if (timescale != 44100U) {
+    const uint64_t whole = sample / timescale, rem = sample % timescale;
+    sample = whole * 44100U + (rem * 44100U) / timescale;
+  }
+
+  const uint8_t *body = pkg + APAP_HEADER_BYTES;
+  const size_t body_len = pkg_len - APAP_HEADER_BYTES;
+  uint8_t nonce[12] = {0};
+  memcpy(nonce + 4, body + body_len - 8U, 8);
+  uint8_t *out = fifo->apap_out;
+  uint8_t *plain = out + 14;
+  unsigned long long plain_len = 0;
+  if (crypto_aead_chacha20poly1305_ietf_decrypt(plain, &plain_len, NULL, body,
+                                                body_len - 8U, pkg, 12, nonce,
+                                                fifo->apap_key) != 0) {
+    if ((fifo->apap_auth_failures++ % 100U) == 0U)
+      ESP_LOGW(TAG, "APAP authentication failed seq=%lu len=%u (%lu total)",
+               (unsigned long)seq, (unsigned)pkg_len,
+               (unsigned long)fifo->apap_auth_failures);
+    return true;
+  }
+  size_t off = 0;
+  if (!apap_media_offset(plain, (size_t)plain_len, &off)) {
+    ESP_LOGW(TAG, "APAP extension parse failed seq=%lu", (unsigned long)seq);
+    return true;
+  }
+  const size_t aac_len = (size_t)plain_len - off;
+  if (aac_len > APAP_AAC_MAX) {
+    ESP_LOGW(TAG, "APAP AAC unit too large seq=%lu len=%u", (unsigned long)seq,
+             (unsigned)aac_len);
+    return true;
+  }
+  if (off) memmove(plain, plain + off, aac_len);
+
+  const size_t wire_len = 14U + aac_len;
+  const uint32_t w0 = 0x80000000U | (seq & 0x007fffffU);
+  const uint32_t rtp = (uint32_t)sample;
+  const uint32_t words[3] = {w0, rtp, APAP_SSRC_AAC_44100};
+  out[0] = (uint8_t)(wire_len >> 8);
+  out[1] = (uint8_t)wire_len;
+  for (int i = 0; i < 3; i++) {
+    out[2 + 4 * i] = (uint8_t)(words[i] >> 24);
+    out[3 + 4 * i] = (uint8_t)(words[i] >> 16);
+    out[4 + 4 * i] = (uint8_t)(words[i] >> 8);
+    out[5 + 4 * i] = (uint8_t)words[i];
+  }
+  fifo->apap_packages++;
+  if (fifo->apap_packages <= 3U || (fifo->apap_packages % 2000U) == 0U)
+    ESP_LOGI(TAG, "APAP package #%lu seq=%lu mediaTime=%lld/%lu sample=%llu aac=%uB ext=%uB",
+             (unsigned long)fifo->apap_packages, (unsigned long)seq,
+             (long long)media_time, (unsigned long)timescale,
+             (unsigned long long)sample, (unsigned)aac_len, (unsigned)off);
+  return fifo_write_packet(fifo, out, wire_len, epoch);
+}
+
+/* APAP receive loop for one connected client. */
+static void apap_reader_loop(ap2_buffered_fifo_t *fifo, int c, uint32_t epoch) {
+  uint8_t len_bytes[4];
+  size_t len_have = 0;
+  size_t pkg_len = 0, pkg_have = 0;
+  bool skipping = false;
+  uint8_t sink[256];
+  fifo->apap_packages = 0;
+  fifo->apap_auth_failures = 0;
+
+  while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
+    ssize_t n;
+    if (len_have < sizeof(len_bytes)) {
+      n = recv(c, len_bytes + len_have, sizeof(len_bytes) - len_have, 0);
+    } else {
+      size_t want = pkg_len - pkg_have;
+      if (skipping) {
+        if (want > sizeof(sink)) want = sizeof(sink);
+        n = recv(c, sink, want, 0);
+      } else {
+        if (want > FIFO_RECV_CHUNK) want = FIFO_RECV_CHUNK;
+        n = recv(c, fifo->apap_pkg + pkg_have, want, 0);
+      }
+    }
+    if (n <= 0) {
+      if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+        continue;
+      return;
+    }
+    if (len_have < sizeof(len_bytes)) {
+      len_have += (size_t)n;
+      if (len_have < sizeof(len_bytes)) continue;
+      const uint32_t total = rd_be32(len_bytes);
+      if (total <= 4U) {
+        ESP_LOGW(TAG, "invalid APAP package length %lu", (unsigned long)total);
+        return;
+      }
+      pkg_len = total - 4U;
+      pkg_have = 0;
+      skipping = pkg_len > APAP_PACKAGE_MAX;
+      if (skipping)
+        ESP_LOGW(TAG, "APAP package of %u bytes skipped", (unsigned)pkg_len);
+      continue;
+    }
+    pkg_have += (size_t)n;
+    if (pkg_have < pkg_len) continue;
+    len_have = 0;
+    if (!skipping && !apap_convert(fifo, pkg_len, epoch)) return;
+    skipping = false;
+
+    xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+    const bool have_time_to_sleep = fifo->occupancy > FIFO_PACE_THRESHOLD;
+    xSemaphoreGive(fifo->fifo_mutex);
+    if (have_time_to_sleep) {
+      TickType_t ticks = pdMS_TO_TICKS(FIFO_PACE_SLEEP_MS);
+      if (ticks == 0) ticks = 1;
+      vTaskDelay(ticks);
+    }
+  }
+}
+
 static void tcp_reader_task(void *arg) {
   ap2_buffered_fifo_t *fifo = (ap2_buffered_fifo_t *)arg;
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_TCP_READER,
@@ -116,14 +335,16 @@ static void tcp_reader_task(void *arg) {
     fifo->total_read = 0;
     fifo->connected = true;
     fifo->client_sock = c;
-    (void)next_epoch(fifo);
+    const uint32_t conn_epoch = next_epoch(fifo);
     xSemaphoreGive(fifo->fifo_mutex);
 
-    ESP_LOGI(TAG, "buffered TCP connected fifo=%uKiB",
-             (unsigned)(fifo->capacity / 1024U));
+    ESP_LOGI(TAG, "buffered TCP connected fifo=%uKiB%s",
+             (unsigned)(fifo->capacity / 1024U), fifo->apap ? " (APAP)" : "");
     signal_all(fifo);
 
-    while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
+    if (fifo->apap) apap_reader_loop(fifo, c, conn_epoch);
+
+    while (!fifo->apap && __atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
       size_t write_pos = 0;
       size_t request = 0;
       uint32_t write_epoch = 0;
@@ -233,6 +454,9 @@ esp_err_t ap2_buffered_fifo_destroy(ap2_buffered_fifo_t *fifo) {
   if (fifo->fifo_mutex) vSemaphoreDelete(fifo->fifo_mutex);
   if (fifo->not_full) vSemaphoreDelete(fifo->not_full);
   if (fifo->control_wake) vSemaphoreDelete(fifo->control_wake);
+  heap_caps_free(fifo->apap_pkg);
+  heap_caps_free(fifo->apap_out);
+  sodium_memzero(fifo->apap_key, sizeof(fifo->apap_key));
   free(fifo);
   return ESP_OK;
 }
@@ -293,6 +517,31 @@ void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
     fifo->listen_sock = -1;
   }
   fifo->port = 0;
+}
+
+esp_err_t ap2_buffered_fifo_set_apap(ap2_buffered_fifo_t *fifo,
+                                     const uint8_t *key32) {
+  if (!fifo) return ESP_ERR_INVALID_ARG;
+  if (!ap2_buffered_fifo_is_idle(fifo)) return ESP_ERR_INVALID_STATE;
+  if (!key32) {
+    fifo->apap = false;
+    sodium_memzero(fifo->apap_key, sizeof(fifo->apap_key));
+    /* Keep the buffers for the next APAP session. */
+    return ESP_OK;
+  }
+  if (!fifo->apap_pkg)
+    fifo->apap_pkg = heap_caps_malloc(APAP_PACKAGE_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!fifo->apap_out)
+    fifo->apap_out = heap_caps_malloc(14U + APAP_PACKAGE_MAX,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!fifo->apap_pkg || !fifo->apap_out) return ESP_ERR_NO_MEM;
+  memcpy(fifo->apap_key, key32, sizeof(fifo->apap_key));
+  fifo->apap = true;
+  return ESP_OK;
+}
+
+bool ap2_buffered_fifo_is_apap(const ap2_buffered_fifo_t *fifo) {
+  return fifo && fifo->apap;
 }
 
 bool ap2_buffered_fifo_is_idle(ap2_buffered_fifo_t *fifo) {

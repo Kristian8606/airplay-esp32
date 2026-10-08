@@ -219,6 +219,9 @@ bool bplist_find_stream_crypto(const uint8_t *plist, size_t plist_len,
  * @param out_value Output for integer value
  * @return true if found, false otherwise
  */
+/* Lab: key lookup in every dictionary at any depth (int/bool value). */
+bool bplist_find_key_any(const uint8_t *plist, size_t plist_len, const char *key,
+                         int64_t *value);
 bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
                      int64_t *out_value);
 
@@ -231,6 +234,21 @@ bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
  * @param out_value Output for double value
  * @return true if found, false otherwise
  */
+/**
+ * Find a boolean value by key in the top-level dict of a binary plist
+ * @return true if found and the value is a boolean
+ */
+/**
+ * Text form of a binary plist for diagnostics (strings cut at 63 bytes, data
+ * shown as its length): one line, or indented one key per line when pretty.
+ * Returns the text length.
+ */
+size_t bplist_dump(const uint8_t *plist, size_t plist_len, char *out, size_t cap,
+                   bool pretty);
+
+bool bplist_find_bool(const uint8_t *plist, size_t plist_len, const char *key,
+                      bool *out_value);
+
 bool bplist_find_real(const uint8_t *plist, size_t plist_len, const char *key,
                       double *out_value);
 

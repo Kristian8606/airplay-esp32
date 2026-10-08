@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -258,6 +259,18 @@ typedef struct {
   uint16_t seq;
 } ptp_step_log_t;
 
+/* Lab diagnostics: what arrives on the PTP ports and why it is dropped.
+ * Plain counters; a torn read only affects a log line. */
+static struct {
+  uint32_t rx_event, rx_general;
+  uint32_t rx_sync, rx_followup, rx_announce, rx_other;
+  uint32_t rej_expected, rej_peer_ip, rej_mixed, rej_outlier;
+  uint32_t reacquires;
+  int64_t last_reacquire_jump_ns;
+  uint32_t last_ip;
+  uint64_t last_clock;
+} s_ptp_rx;
+
 static int64_t abs_i64(int64_t v) {
   if (v >= 0) return v;
   if (v == INT64_MIN) return INT64_MAX;
@@ -295,8 +308,31 @@ static void update_legacy_offset_locked(int64_t raw_offset_ns,
   const ptp_clock_engine_sample_t r = ptp_clock_engine_add_sample(
       &ptp.legacy_engine, raw_offset_ns, reception_ns);
   if (!r.accepted) {
-    if (r.outlier) AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_OUTLIER);
+    if (r.outlier) {
+      AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_OUTLIER);
+      s_ptp_rx.rej_outlier++;
+    }
     return;
+  }
+  if (r.reacquired) {
+    /* Filter restarted: lock must be earned again. */
+    s_ptp_rx.reacquires++;
+    s_ptp_rx.last_reacquire_jump_ns = r.reacquire_jump_ns;
+    ptp.locked = false;
+    ptp.lock_candidate_start_ms = 0;
+    if (step_ev) {
+      step_ev->emit = true;
+      step_ev->reason = "outlier-reacquire";
+      step_ev->source_clock_id = ptp.legacy_engine.source_clock_id;
+      step_ev->grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+      step_ev->epoch = ptp.legacy_engine.epoch;
+      step_ev->raw_offset_ns = r.raw_offset_ns;
+      step_ev->filtered_offset_ns = r.filtered_offset_ns;
+      step_ev->raw_filter_delta_ns = r.reacquire_jump_ns;
+      step_ev->filtered_step_ns = r.reacquire_jump_ns;
+      step_ev->rx_lag_ns = rx_lag_ns;
+      step_ev->seq = seq;
+    }
   }
 
 
@@ -539,6 +575,7 @@ static bool peer_ipv4_matches_locked(uint32_t source_ip) {
 /* Buffered mode follows one PTP source. Before SETRATEANCHORTIME gives us the
  * expected source, lock onto the first observed source and mark any competing
  * source as mixed rather than letting estimators alternate between clocks. */
+
 static bool legacy_source_admitted_locked(uint64_t source_clock_id,
                                           uint32_t source_ip) {
   if (source_clock_id == 0) return false;
@@ -546,6 +583,7 @@ static bool legacy_source_admitted_locked(uint64_t source_clock_id,
     /* D7/networkTimeTimelineID is authoritative. An incomplete peer list must
      * never block the already-confirmed timing domain. */
     if (source_clock_id == ptp.expected_clock_id) return true;
+    s_ptp_rx.rej_expected++;
     AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
     return false;
   }
@@ -554,6 +592,7 @@ static bool legacy_source_admitted_locked(uint64_t source_clock_id,
    * avoid locking onto unrelated multicast PTP traffic. Fail open when the
    * peer list has no usable IPv4 entries (for example IPv6-only SETPEERSX). */
   if (peer_list_has_ipv4_locked() && !peer_ipv4_matches_locked(source_ip)) {
+    s_ptp_rx.rej_peer_ip++;
     AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
     return false;
   }
@@ -563,6 +602,7 @@ static bool legacy_source_admitted_locked(uint64_t source_clock_id,
     return true;
 
   ptp.legacy_source_mixed = true;
+  s_ptp_rx.rej_mixed++;
   AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
   return false;
 }
@@ -863,6 +903,15 @@ static void process_ptp_message(const uint8_t *data, size_t len,
   if (len < PTP_HEADER_SIZE) return;
   const uint8_t msg_type = data[0] & 0x0F;
   const uint16_t seq = ((uint16_t)data[30] << 8) | data[31];
+  if (is_event_port) s_ptp_rx.rx_event++; else s_ptp_rx.rx_general++;
+  switch (msg_type) {
+    case PTP_MSG_SYNC: s_ptp_rx.rx_sync++; break;
+    case PTP_MSG_FOLLOW_UP: s_ptp_rx.rx_followup++; break;
+    case PTP_MSG_ANNOUNCE: s_ptp_rx.rx_announce++; break;
+    default: s_ptp_rx.rx_other++; break;
+  }
+  s_ptp_rx.last_ip = source_ip;
+  s_ptp_rx.last_clock = parse_ptp_clock_id(data);
 
   bool realtime;
   taskENTER_CRITICAL(&ptp_state_mux);
@@ -1251,6 +1300,40 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
 #endif
 }
 
+
+void ptp_clock_log_rx_stats(const char *why) {
+  const uint32_t ip = s_ptp_rx.last_ip; /* network byte order */
+  uint64_t expected = 0, source = 0;
+  bool mixed = false;
+  size_t peers = 0;
+  uint32_t peer_ip = 0;
+  taskENTER_CRITICAL(&ptp_state_mux);
+  expected = ptp.expected_clock_id;
+  source = ptp.legacy_engine.source_clock_id;
+  mixed = ptp.legacy_source_mixed;
+  peers = ptp.peer_count;
+  for (size_t i = 0; i < ptp.peer_count && !peer_ip; ++i) peer_ip = ptp.peers[i].ipv4_addr;
+  taskEXIT_CRITICAL(&ptp_state_mux);
+  ESP_LOGI(TAG,
+           "PTP rx (%s): event=%" PRIu32 " general=%" PRIu32 " sync=%" PRIu32
+           " followup=%" PRIu32 " announce=%" PRIu32 " other=%" PRIu32
+           " | rejected expected=%" PRIu32 " peerIP=%" PRIu32 " mixed=%" PRIu32
+           " outlier=%" PRIu32 " | reacquired=%" PRIu32 " (last jump %.1f ms)",
+           why ? why : "-", s_ptp_rx.rx_event, s_ptp_rx.rx_general, s_ptp_rx.rx_sync,
+           s_ptp_rx.rx_followup, s_ptp_rx.rx_announce, s_ptp_rx.rx_other,
+           s_ptp_rx.rej_expected, s_ptp_rx.rej_peer_ip, s_ptp_rx.rej_mixed,
+           s_ptp_rx.rej_outlier, s_ptp_rx.reacquires,
+           (double)s_ptp_rx.last_reacquire_jump_ns / 1e6);
+  ESP_LOGI(TAG,
+           "PTP rx (%s): last from %u.%u.%u.%u clock=%016llx | expected=%016llx "
+           "source=%016llx mixed=%d peers=%u peerIP=%u.%u.%u.%u",
+           why ? why : "-", (unsigned)(ip & 0xFF), (unsigned)((ip >> 8) & 0xFF),
+           (unsigned)((ip >> 16) & 0xFF), (unsigned)(ip >> 24),
+           (unsigned long long)s_ptp_rx.last_clock, (unsigned long long)expected,
+           (unsigned long long)source, mixed ? 1 : 0, (unsigned)peers,
+           (unsigned)(peer_ip & 0xFF), (unsigned)((peer_ip >> 8) & 0xFF),
+           (unsigned)((peer_ip >> 16) & 0xFF), (unsigned)(peer_ip >> 24));
+}
 
 void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
   if (!snapshot) return;

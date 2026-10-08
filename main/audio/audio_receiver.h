@@ -59,6 +59,11 @@ void audio_receiver_set_stream_type(audio_stream_type_t type);
 esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
                                       uint16_t tcp_port);
 esp_err_t audio_receiver_start_buffered(uint16_t tcp_port);
+
+/* Lab: Buffered APAP framing for the next buffered session (call before
+ * audio_receiver_start_buffered; the stream key must already be set). */
+void audio_receiver_set_buffered_apap(bool enable);
+bool audio_receiver_buffered_apap_active(void);
 void audio_receiver_stop(void);
 uint16_t audio_receiver_get_buffered_port(void);
 

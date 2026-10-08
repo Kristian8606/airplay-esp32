@@ -8,6 +8,7 @@
 #include "audio_receiver.h"
 #include "amp_control.h"
 #include "ptp_clock.h"
+#include "rtsp_rc.h"
 #include "settings.h"
 #include "freertos/FreeRTOS.h"
 
@@ -43,6 +44,7 @@ rtsp_conn_t *rtsp_conn_create(void) {
   audio_receiver_set_volume_q15(volume_db_to_q15(conn->volume_db));
 
   conn->event_socket = -1;
+  conn->apap_ctrl_sock = -1;
 
   return conn;
 }
@@ -100,13 +102,27 @@ static void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->event_port = 0;
   conn->buffered_port = 0;
 
+  // Remote control channels belong to this connection only.
+  rtsp_rc_stop(conn);
+  conn->mdc = false;
+  conn->apap = false;
+  if (conn->apap_ctrl_sock >= 0) {
+    close(conn->apap_ctrl_sock);
+    conn->apap_ctrl_sock = -1;
+  }
+  conn->apap_ctrl_port = 0;
+
   // Connection teardown ends the lifetime of SETPEERS/SETPEERSX metadata.
   // Stream-level TEARDOWN keeps the RTSP connection alive and therefore does
   // not come through this cleanup path until the session actually closes.
-  ptp_clock_set_peers(NULL, 0);
+  // PTP is global: only the audio owner may reset it (a remote-control or
+  // /info-only connection closing must not disturb the playing session).
+  if (conn->owns_audio) {
+    ptp_clock_set_peers(NULL, 0);
 
-  // Clear PTP clock for fresh sync on next connection
-  ptp_clock_clear();
+    // Clear PTP clock for fresh sync on next connection
+    ptp_clock_clear();
+  }
   conn->ptp_session_fresh = false;
 
   // Reset encryption state

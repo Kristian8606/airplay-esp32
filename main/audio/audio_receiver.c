@@ -1894,9 +1894,13 @@ static void ap2_buffered_processor_task(void *arg) {
       continue; /* new control command or transport epoch: inspect again */
     AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK((uint32_t)packet.len);
 
-    const int dec_len = audio_crypto_decrypt_buffered(
-        &session_encrypt, s.buffered_packet, packet.len,
-        s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
+    /* Buffered APAP: the TCP reader already authenticated and decrypted the
+     * package; a header-only packet is an APAP metadata-only package. */
+    const bool apap_plain = ap2_buffered_fifo_is_apap(s.transport);
+    const int dec_len = (apap_plain && packet.len <= 12U) ? 0 :
+        audio_crypto_decrypt_buffered(
+            apap_plain ? NULL : &session_encrypt, s.buffered_packet, packet.len,
+            s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
     if (dec_len == 0) {
       if ((++empty_blocks & 0x3FU) == 1U)
         ESP_LOGI(TAG, "AAC empty block seq=%lu len=%u (skipped, total %lu)",
@@ -3584,6 +3588,18 @@ void audio_receiver_set_stream_type(audio_stream_type_t t) {
   if (changed) audio_status_notify();
 }
 
+/* Lab: the next buffered session uses APAP framing (see ap2_buffered_fifo). */
+static bool s_buffered_apap_requested;
+
+void audio_receiver_set_buffered_apap(bool enable) {
+  s_buffered_apap_requested = enable;
+}
+
+bool audio_receiver_buffered_apap_active(void) {
+  return ap2_buffered_fifo_is_apap(s.transport) &&
+         __atomic_load_n(&s.rx_running, __ATOMIC_ACQUIRE);
+}
+
 esp_err_t audio_receiver_start_buffered(uint16_t port) {
   timing_snapshot_t fmt_snap;
   snapshot_state(&fmt_snap);
@@ -3612,6 +3628,19 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
    * media are all hard-reset. Live FLUSH commands never clear the byte FIFO. */
   buffered_control_reset();
   ap2_buffered_fifo_clear(s.transport);
+  {
+    audio_encrypt_t key;
+    taskENTER_CRITICAL(&s.state_mux);
+    key = s.encrypt;
+    taskEXIT_CRITICAL(&s.state_mux);
+    const bool apap = s_buffered_apap_requested &&
+                      key.type == AUDIO_ENCRYPT_CHACHA20_POLY1305 && key.key_len == 32;
+    if (s_buffered_apap_requested && !apap)
+      ESP_LOGW(TAG, "APAP requested without a stream key; classic framing used");
+    ESP_RETURN_ON_ERROR(ap2_buffered_fifo_set_apap(s.transport, apap ? key.key : NULL),
+                        TAG, "APAP mode setup failed");
+    memset(&key, 0, sizeof(key));
+  }
   reset_buffered_pcm_store();
 
   uint16_t bound = port;

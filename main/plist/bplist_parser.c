@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "plist.h"
@@ -220,7 +221,9 @@ static bool bplist_scalar_payload(const uint8_t *plist, size_t plist_len,
     return false;
   const uint8_t marker = plist[(size_t)offset];
   const unsigned exponent = marker & 0x0F;
-  if ((marker & 0xF0) != type || exponent > 3) return false;
+  /* Integers may also use the 16-byte form (unsigned values >= 2^63). */
+  const unsigned max_exponent = type == BPLIST_INT ? 4U : 3U;
+  if ((marker & 0xF0) != type || exponent > max_exponent) return false;
   *len = (size_t)1U << exponent;
   return *len <= ctx.end - (size_t)offset - 1;
 }
@@ -230,7 +233,9 @@ static bool bplist_read_int(const uint8_t *plist, size_t plist_len,
   size_t len = 0;
   if (!out || !bplist_scalar_payload(plist, plist_len, offset, BPLIST_INT, &len))
     return false;
-  *out = (int64_t)read_be_int(plist + (size_t)offset + 1, len);
+  /* 16-byte integers: keep the low 64 bits (the value as uint64_t). */
+  const size_t skip = len > 8 ? len - 8 : 0;
+  *out = (int64_t)read_be_int(plist + (size_t)offset + 1 + skip, len - skip);
   return true;
 }
 
@@ -740,6 +745,103 @@ bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
     }
   }
 
+  return false;
+}
+
+/* Lab: look a key up in every dictionary of the plist (any depth). Returns
+ * true when the key exists; *value gets an integer or boolean value (0 for
+ * other value types). The first match in object-table order wins. */
+bool bplist_find_key_any(const uint8_t *plist, size_t plist_len, const char *key,
+                         int64_t *value) {
+  if (!key) return false;
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) return false;
+  uint8_t offset_size = 0, ref_size = 0;
+  uint64_t num_objects = 0, top_object = 0, table = 0;
+  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
+                            &num_objects, &top_object, &table))
+    return false;
+  if (num_objects > 4096) return false;
+  for (uint64_t o = 0; o < num_objects; o++) {
+    const uint64_t off = bplist_get_offset(plist, plist_len, table, offset_size, o);
+    if (off < 8 || off >= plist_len || (plist[off] & 0xF0) != BPLIST_DICT) continue;
+    size_t n = 0, header_len = 0;
+    if (!bplist_parse_count(plist, plist_len, off, &n, &header_len)) continue;
+    const size_t pos = (size_t)off + header_len;
+    if (!bplist_payload_fits(plist, plist_len, pos, n, 2U * ref_size)) continue;
+    const uint8_t *key_refs = plist + pos;
+    const uint8_t *val_refs = key_refs + n * ref_size;
+    for (size_t i = 0; i < n; i++) {
+      const uint64_t k_off = bplist_get_offset(
+          plist, plist_len, table, offset_size, read_be_int(key_refs + i * ref_size, ref_size));
+      char found[64];
+      if (!bplist_read_string(plist, plist_len, k_off, found, sizeof(found)) ||
+          strcmp(found, key) != 0)
+        continue;
+      const uint64_t v_off = bplist_get_offset(
+          plist, plist_len, table, offset_size, read_be_int(val_refs + i * ref_size, ref_size));
+      int64_t v = 0;
+      if (v_off < plist_len) {
+        if (plist[v_off] == 0x09) v = 1;
+        else if (plist[v_off] != 0x08) (void)bplist_read_int(plist, plist_len, v_off, &v);
+      }
+      if (value) *value = v;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool bplist_find_bool(const uint8_t *plist, size_t plist_len, const char *key,
+                      bool *out_value) {
+  if (!key || !out_value) return false;
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {
+    return false;
+  }
+
+  uint8_t offset_size = 0;
+  uint8_t ref_size = 0;
+  uint64_t num_objects = 0;
+  uint64_t top_object = 0;
+  uint64_t offset_table_offset = 0;
+  if (!bplist_parse_trailer(plist, plist_len, &offset_size, &ref_size,
+                            &num_objects, &top_object, &offset_table_offset)) {
+    return false;
+  }
+
+  uint64_t top_offset =
+      bplist_get_offset(plist, plist_len, offset_table_offset, offset_size, top_object);
+  if (top_offset >= plist_len || (plist[top_offset] & 0xF0) != BPLIST_DICT) {
+    return false;
+  }
+
+  size_t dict_size = 0, header_len = 0;
+  if (!bplist_parse_count(plist, plist_len, top_offset, &dict_size,
+                          &header_len)) return false;
+  size_t pos = (size_t)top_offset + header_len;
+  if (!bplist_payload_fits(plist, plist_len, pos, dict_size, 2U * ref_size)) {
+    return false;
+  }
+
+  const uint8_t *key_refs = plist + pos;
+  const uint8_t *val_refs = plist + pos + dict_size * ref_size;
+  for (size_t i = 0; i < dict_size; i++) {
+    uint64_t key_idx = read_be_int(key_refs + i * ref_size, ref_size);
+    uint64_t key_offset =
+        bplist_get_offset(plist, plist_len, offset_table_offset, offset_size, key_idx);
+    char found_key[64];
+    if (!bplist_read_string(plist, plist_len, key_offset, found_key,
+                            sizeof(found_key)) ||
+        strcmp(found_key, key) != 0) {
+      continue;
+    }
+    uint64_t val_idx = read_be_int(val_refs + i * ref_size, ref_size);
+    uint64_t val_offset =
+        bplist_get_offset(plist, plist_len, offset_table_offset, offset_size, val_idx);
+    if (val_offset >= plist_len) return false;
+    if (plist[val_offset] == 0x09) { *out_value = true; return true; }
+    if (plist[val_offset] == 0x08) { *out_value = false; return true; }
+    return false;
+  }
   return false;
 }
 
@@ -1427,4 +1529,160 @@ bool bplist_find_stream_crypto(const uint8_t *plist, size_t plist_len,
   }
 
   return found;
+}
+
+/* ---- compact text dump (diagnostics) ---- */
+
+typedef struct {
+  const uint8_t *p;
+  size_t len;
+  uint8_t offset_size, ref_size;
+  uint64_t table;
+  char *out;
+  size_t cap, o;
+  bool pretty;
+} bp_dump_t;
+
+static void dump_put(bp_dump_t *d, const char *s, size_t n) {
+  if (d->cap == 0 || d->o >= d->cap - 1) return;
+  if (n > d->cap - 1 - d->o) n = d->cap - 1 - d->o;
+  memcpy(d->out + d->o, s, n);
+  d->o += n;
+  d->out[d->o] = '\0';
+}
+static void dump_str(bp_dump_t *d, const char *s) { dump_put(d, s, strlen(s)); }
+static void dump_fmt(bp_dump_t *d, const char *fmt, unsigned long long v, int sign) {
+  char tmp[32];
+  if (sign) snprintf(tmp, sizeof(tmp), fmt, (long long)v);
+  else snprintf(tmp, sizeof(tmp), fmt, v);
+  dump_str(d, tmp);
+}
+
+static void dump_newline(bp_dump_t *d, int depth) {
+  if (!d->pretty) return;
+  dump_str(d, "\n");
+  for (int i = 0; i < depth; i++) dump_str(d, "  ");
+}
+
+static void dump_obj(bp_dump_t *d, uint64_t idx, int depth) {
+  const uint64_t off = bplist_get_offset(d->p, d->len, d->table, d->offset_size, idx);
+  if (off >= d->len) { dump_str(d, "?"); return; }
+  const uint8_t m = d->p[off];
+  size_t count = 0, hl = 0;
+  switch (m & 0xF0) {
+    case 0x00:
+      dump_str(d, m == 0x09 ? "true" : (m == 0x08 ? "false" : "null"));
+      return;
+    case BPLIST_INT: {
+      int64_t v = 0;
+      if (bplist_read_int(d->p, d->len, off, &v)) dump_fmt(d, "%lld", (unsigned long long)v, 1);
+      else dump_str(d, "int?");
+      return;
+    }
+    case BPLIST_REAL: {
+      double r = 0;
+      char tmp[32];
+      if (bplist_read_real(d->p, d->len, off, &r)) {
+        snprintf(tmp, sizeof(tmp), "%g", r);
+        dump_str(d, tmp);
+      } else dump_str(d, "real?");
+      return;
+    }
+    case 0x30:
+      dump_str(d, "<date>");
+      return;
+    case BPLIST_DATA:
+      if (bplist_parse_count(d->p, d->len, off, &count, &hl))
+        dump_fmt(d, "<data %llu>", (unsigned long long)count, 0);
+      return;
+    case BPLIST_UNICODE: {
+      /* UTF-16BE -> UTF-8 (first 48 code units) */
+      if (!bplist_parse_count(d->p, d->len, off, &count, &hl)) {
+        dump_str(d, "\"?\"");
+        return;
+      }
+      const uint8_t *u = d->p + off + hl;
+      char s[200];
+      size_t o = 0;
+      for (size_t i = 0; i < count && i < 48 && o + 4 < sizeof(s); i++) {
+        uint32_t c = ((uint32_t)u[2 * i] << 8) | u[2 * i + 1];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < count) {
+          uint32_t lo = ((uint32_t)u[2 * i + 2] << 8) | u[2 * i + 3];
+          c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+          i++;
+        }
+        if (c < 0x80) {
+          s[o++] = (char)c;
+        } else if (c < 0x800) {
+          s[o++] = (char)(0xC0 | (c >> 6));
+          s[o++] = (char)(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+          s[o++] = (char)(0xE0 | (c >> 12));
+          s[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+          s[o++] = (char)(0x80 | (c & 0x3F));
+        } else {
+          s[o++] = (char)(0xF0 | (c >> 18));
+          s[o++] = (char)(0x80 | ((c >> 12) & 0x3F));
+          s[o++] = (char)(0x80 | ((c >> 6) & 0x3F));
+          s[o++] = (char)(0x80 | (c & 0x3F));
+        }
+      }
+      s[o] = '\0';
+      dump_str(d, "\"");
+      dump_str(d, s);
+      dump_str(d, "\"");
+      return;
+    }
+    case BPLIST_STRING: {
+      char s[64];
+      if (bplist_read_string(d->p, d->len, off, s, sizeof(s))) {
+        dump_str(d, "\"");
+        dump_str(d, s);
+        dump_str(d, "\"");
+      } else dump_str(d, "\"?\"");
+      return;
+    }
+    case BPLIST_ARRAY:
+    case BPLIST_DICT: {
+      const bool dict = (m & 0xF0) == BPLIST_DICT;
+      if (depth > 6 || !bplist_parse_count(d->p, d->len, off, &count, &hl)) {
+        dump_str(d, dict ? "{..}" : "[..]");
+        return;
+      }
+      const uint8_t *refs = d->p + off + hl;
+      dump_str(d, dict ? "{" : "[");
+      for (size_t i = 0; i < count; i++) {
+        if (i) dump_str(d, d->pretty ? "," : ", ");
+        dump_newline(d, depth + 1);
+        if (dict) {
+          dump_obj(d, read_be_int(refs + i * d->ref_size, d->ref_size), depth + 1);
+          dump_str(d, ": ");
+          dump_obj(d, read_be_int(refs + (count + i) * d->ref_size, d->ref_size), depth + 1);
+        } else {
+          dump_obj(d, read_be_int(refs + i * d->ref_size, d->ref_size), depth + 1);
+        }
+      }
+      if (count) dump_newline(d, depth);
+      dump_str(d, dict ? "}" : "]");
+      return;
+    }
+    default:
+      dump_str(d, "?");
+      return;
+  }
+}
+
+size_t bplist_dump(const uint8_t *plist, size_t plist_len, char *out, size_t cap,
+                   bool pretty) {
+  if (!out || cap == 0) return 0;
+  out[0] = '\0';
+  if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) return 0;
+  bp_dump_t d = {.p = plist, .len = plist_len, .out = out, .cap = cap, .o = 0,
+                 .pretty = pretty};
+  uint64_t objects = 0, top = 0;
+  if (!bplist_parse_trailer(plist, plist_len, &d.offset_size, &d.ref_size, &objects,
+                            &top, &d.table))
+    return 0;
+  dump_obj(&d, top, 0);
+  return d.o;
 }

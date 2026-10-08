@@ -7,6 +7,10 @@
 #define PTP_ENGINE_POS_STEADY_DIV    16LL
 #define PTP_ENGINE_NEG_DIV           256LL
 #define PTP_ENGINE_NEG_CLAMP_NS      (-2500000LL)
+/* Restart after this many consecutive outliers spanning at least this long
+ * (AirPlay senders send ~8 Sync/s). */
+#define PTP_ENGINE_REACQUIRE_COUNT   8U
+#define PTP_ENGINE_REACQUIRE_NS      1000000000LL
 
 static uint32_t next_epoch(uint32_t epoch) {
   epoch++;
@@ -22,6 +26,8 @@ static void clear_filter_state(ptp_clock_engine_t *engine) {
   engine->mastership_start_time_ns = 0;
   engine->last_accepted_time_ns = 0;
   engine->accepted_samples = 0;
+  engine->outlier_run = 0;
+  engine->outlier_run_start_ns = 0;
 }
 
 void ptp_clock_engine_init(ptp_clock_engine_t *engine,
@@ -111,13 +117,26 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
     int64_t diff = raw_offset_ns - engine->filtered_offset_ns;
     if (diff < 0) diff = -diff;
     if (diff > engine->outlier_threshold_ns) {
-      result.outlier = true;
-      result.filtered_offset_ns = engine->filtered_offset_ns;
-      result.raw_filter_delta_ns = raw_offset_ns - engine->filtered_offset_ns;
-      result.accepted_samples = engine->accepted_samples;
-      return result;
+      if (engine->outlier_run == 0) engine->outlier_run_start_ns = reception_time_ns;
+      engine->outlier_run++;
+      if (engine->outlier_run >= PTP_ENGINE_REACQUIRE_COUNT &&
+          reception_time_ns - engine->outlier_run_start_ns >= PTP_ENGINE_REACQUIRE_NS) {
+        /* The estimator is the odd one out: start again from this sample. */
+        result.reacquired = true;
+        result.reacquire_jump_ns = raw_offset_ns - engine->filtered_offset_ns;
+        engine->epoch = next_epoch(engine->epoch);
+        clear_filter_state(engine);
+        result.epoch = engine->epoch;
+      } else {
+        result.outlier = true;
+        result.filtered_offset_ns = engine->filtered_offset_ns;
+        result.raw_filter_delta_ns = raw_offset_ns - engine->filtered_offset_ns;
+        result.accepted_samples = engine->accepted_samples;
+        return result;
+      }
     }
   }
+  engine->outlier_run = 0;
 
   const int64_t old_filtered = engine->filtered_offset_ns;
   int64_t smoothed = raw_offset_ns;

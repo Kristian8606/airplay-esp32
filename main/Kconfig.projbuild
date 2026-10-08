@@ -56,6 +56,89 @@ if AIRPLAY_DIAGNOSTICS
 
 endif
 
+menu "HomePod profile (lab)"
+    config AIRPLAY_HP_VERSION
+        bool "HomePod software version (srcvers 1005.12.1, osvers 27.2)"
+        default y
+        help
+            Report the AirPlay source version of a HomePod on HomePod OS 27.2
+            instead of 377.40.00 (mDNS srcvers/vs, GET /info, Server header).
+
+    config AIRPLAY_HP_FEATURES
+        bool "HomePod feature bits (features + fex)"
+        default y
+        help
+            Advertise the exact feature set of a HomePod, including the bits
+            above 63 ("fex"). Off: the previous ESP32 feature set.
+
+    config AIRPLAY_HP_FEATURES_STREAM
+        bool "Include feature bits 58-61"
+        default y
+        depends on AIRPLAY_HP_FEATURES
+        help
+            Bits 58-61 announce remote control, audio stream connection
+            setup, media data control and RFC 2198 redundancy. This receiver
+            does not implement those protocol parts yet: if playback stops
+            starting after enabling the HomePod profile, turn this off first.
+
+    config AIRPLAY_HP_BIT58_HANGDOG
+        bool "Bit 58 SupportsHangdogRemoteControl"
+        default n
+        depends on AIRPLAY_HP_FEATURES_STREAM
+        help
+            A HomePod advertises it. With it the sender first opens a
+            remote-control-only session with a type 130 stream, tears that
+            stream down when audio starts and ends the whole session 60 s
+            later. Off (lab default): test whether APAP + MediaDataControl
+            (bits 59/60) work without that remote control session.
+
+    config AIRPLAY_HP_STATUS_FLAGS
+        bool "HomePod status flags (0x98404)"
+        default y
+        help
+            Status flags of an idle HomePod instead of 0x4.
+
+    config AIRPLAY_HP_VV1
+        bool "vv=1 (as HomePod)"
+        default y
+
+    config AIRPLAY_HP_TXT_EXTRAS
+        bool "HomePod mDNS TXT keys"
+        default y
+        help
+            Same _airplay TXT keys and order as a HomePod: acl, btaddr,
+            deviceid, c, fex, features, flags, gid, igl, gcgl, model,
+            protovers, pi, psi, pk, srcvers, osvers, vv.
+
+    config AIRPLAY_HP_MRP_CLIENT
+        bool "MediaRemote handshake on the remote control stream (type 130)"
+        default y
+        help
+            After answering the sender's DEVICE_INFO, continue as an MRP
+            client: SET_CONNECTION_STATE(Connected) and CLIENT_UPDATES_CONFIG.
+            Experiment for the session that ends 60 s after the sender drops
+            the type 130 stream.
+
+    config AIRPLAY_HP_KEEP_AUDIO_ON_RC_TEARDOWN
+        bool "Keep audio on the first session TEARDOWN after a remote control session"
+        default y
+        help
+            Lab test for the session that ends 60 s after the type 130
+            stream is dropped: answer that session TEARDOWN with 200 but keep
+            the audio stream and the connection, as if it ended only the
+            remote control session sharing the connection.
+
+    config AIRPLAY_HP_INFO
+        bool "HomePod-style GET /info"
+        default y
+        help
+            Answer GET /info with the keys a HomePod returns (binary plist):
+            supportedFormats, keepAliveSendStatsAsBody, volumeControlType,
+            initialVolume, txtAirPlay, featuresEx, psi and others. Only the
+            audio formats this receiver can decode are announced
+            (ALAC 44.1 kHz realtime, AAC-LC 44.1 kHz buffered).
+endmenu
+
 menu "AirPlay Receiver"
     config DEFAULT_AP_SSID
         string "Setup AP SSID"
