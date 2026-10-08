@@ -37,14 +37,12 @@ typedef enum {
   LED_STATE_STANDBY,
   LED_STATE_PAUSED,
   LED_STATE_PLAYING,
-  LED_STATE_ERROR,
 } led_state_t;
 
 static led_strip_handle_t s_strip;
 static TaskHandle_t s_led_task;
 static volatile uint32_t s_requested_state = LED_STATE_STANDBY;
-static volatile bool s_error_active;
-static volatile uint32_t s_brightness = CONFIG_RGB_AUDIO_LED_BRIGHTNESS;
+static const uint32_t s_brightness = CONFIG_RGB_AUDIO_LED_BRIGHTNESS;
 static int64_t s_last_capture_us;
 
 /* Audio -> LED single-latest-frame mailbox. The high-priority playout task
@@ -60,9 +58,7 @@ static inline void led_wake(void) {
 }
 
 static uint8_t scale_bright(uint8_t v) {
-  const uint32_t brightness =
-      __atomic_load_n(&s_brightness, __ATOMIC_ACQUIRE);
-  return (uint8_t)(((uint16_t)v * brightness) / 255U);
+  return (uint8_t)(((uint16_t)v * s_brightness) / 255U);
 }
 
 /* These helpers are called only by led_task after init, making the RMT/strip
@@ -111,10 +107,6 @@ static void render_state(led_state_t state) {
 #else
       rgb_clear();
 #endif
-      break;
-
-    case LED_STATE_ERROR:
-      rgb_refresh_color(scale_bright(0xC0), 0, 0);
       break;
   }
 }
@@ -214,10 +206,8 @@ static void led_task(void *arg) {
   while (1) {
     (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    const bool error = __atomic_load_n(&s_error_active, __ATOMIC_ACQUIRE);
-    led_state_t desired = error
-        ? LED_STATE_ERROR
-        : (led_state_t)__atomic_load_n(&s_requested_state, __ATOMIC_ACQUIRE);
+    const led_state_t desired =
+        (led_state_t)__atomic_load_n(&s_requested_state, __ATOMIC_ACQUIRE);
 
     if (!have_rendered_state || desired != last_state) {
       if (have_rendered_state) {
@@ -225,10 +215,6 @@ static void led_task(void *arg) {
       }
       last_state = desired;
       have_rendered_state = true;
-      render_state(desired);
-    } else if (desired != LED_STATE_PLAYING) {
-      /* Brightness changes while paused/standby/error need a refresh even if
-       * the logical state did not change. */
       render_state(desired);
     }
 
@@ -273,8 +259,7 @@ void led_audio_feed(const audio_out_sample_t *pcm, size_t stereo_frames) {
 #if defined(CONFIG_RGB_AUDIO_LED_PLAYING_VU)
   if (!pcm || stereo_frames == 0 || !s_strip || !s_led_task ||
       __atomic_load_n(&s_requested_state, __ATOMIC_ACQUIRE) !=
-          LED_STATE_PLAYING ||
-      __atomic_load_n(&s_error_active, __ATOMIC_ACQUIRE)) {
+          LED_STATE_PLAYING) {
     return;
   }
 
@@ -334,24 +319,9 @@ void led_init(void) {
   ESP_LOGI(TAG,
            "WS2812 audio LED ready GPIO=%d brightness=%u update=%dHz task=core%d/prio%d",
            CONFIG_RGB_AUDIO_LED_GPIO,
-           (unsigned)__atomic_load_n(&s_brightness, __ATOMIC_RELAXED),
+           (unsigned)s_brightness,
            CONFIG_RGB_AUDIO_LED_UPDATE_HZ, LED_TASK_CORE, LED_TASK_PRIO);
   led_wake();
-}
-
-void led_set_error(bool error) {
-  __atomic_store_n(&s_error_active, error, __ATOMIC_RELEASE);
-  led_wake();
-}
-
-esp_err_t led_set_brightness(uint8_t brightness) {
-  __atomic_store_n(&s_brightness, brightness, __ATOMIC_RELEASE);
-  led_wake();
-  return ESP_OK;
-}
-
-uint8_t led_get_brightness(void) {
-  return (uint8_t)__atomic_load_n(&s_brightness, __ATOMIC_ACQUIRE);
 }
 
 #else  /* CONFIG_ENABLE_RGB_AUDIO_LED */
@@ -361,11 +331,5 @@ void led_audio_feed(const audio_out_sample_t *pcm, size_t stereo_frames) {
   (void)pcm;
   (void)stereo_frames;
 }
-void led_set_error(bool error) { (void)error; }
-esp_err_t led_set_brightness(uint8_t brightness) {
-  (void)brightness;
-  return ESP_ERR_NOT_SUPPORTED;
-}
-uint8_t led_get_brightness(void) { return 0; }
 
 #endif

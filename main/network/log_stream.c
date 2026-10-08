@@ -372,27 +372,3 @@ esp_err_t log_stream_register(httpd_handle_t server) {
   return err;
 }
 
-void log_stream_detach(httpd_handle_t server) {
-  if (!__atomic_load_n(&s_initialized, __ATOMIC_ACQUIRE)) return;
-  /* Stop scheduling first, then drain without holding the mutex. HTTPD
-   * remains alive until this returns and work never waits on this mutex. */
-  xSemaphoreTake(s_server_mutex, portMAX_DELAY);
-  while (s_detaching) {
-    xSemaphoreGive(s_server_mutex);
-    vTaskDelay(1);
-    xSemaphoreTake(s_server_mutex, portMAX_DELAY);
-  }
-  if (s_server != server) {
-    xSemaphoreGive(s_server_mutex);
-    return;
-  }
-  s_detaching = true;
-  s_server = NULL;
-  xSemaphoreGive(s_server_mutex);
-  while (__atomic_load_n(&s_work_pending, __ATOMIC_ACQUIRE)) vTaskDelay(1);
-  xSemaphoreTake(s_server_mutex, portMAX_DELAY);
-  __atomic_store_n(&s_has_viewers, false, __ATOMIC_RELEASE);
-  s_utf8_pending_len = 0;
-  s_detaching = false;
-  xSemaphoreGive(s_server_mutex);
-}

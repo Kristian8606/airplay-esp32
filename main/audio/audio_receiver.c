@@ -40,15 +40,15 @@
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
 #define AP2_STATUS_STACK             6144U
-#define AP2_NETWORK_CORE           1
-#define AP2_DECODE_CORE            1
-#define AP2_BUFFERED_PROCESSOR_CORE 0
-#define AP2_RX_PRIORITY            4  /* raw TCP reader; active RTSP control at prio 17 preempts it */
-#define AP2_DECODE_PRIORITY        4  /* active RTSP control at prio 17 preempts AAC decode */
+#define AP2_AAC_RX_CORE            1  /* buffered TCP reader */
+#define AP2_PLAYOUT_CORE           1  /* I2S playout + ALAC staging */
+#define AP2_BUFFERED_PROCESSOR_CORE 0 /* AAC decrypt/decode/EQ */
+#define AP2_RX_PRIORITY            4  /* raw TCP reader (Core1, below playout and ALAC staging) */
+#define AP2_DECODE_PRIORITY        4  /* AAC processor; RTSP control (prio 17, same core) preempts it */
 #define AP2_NO_TIMING_WAIT_MS      20U /* Shairport: wait ~20 ms without valid timing */
 #define AP2_MAX_DEFERRED_FLUSH      10U /* Shairport MAX_DEFERRED_FLUSH_REQUESTS */
 
-/* v4.1.25: payload format announced in the RTP SSRC, as Shairport Sync reads
+/* Payload format announced in the RTP SSRC, as Shairport Sync reads
  * it (ap2_buffered_audio_processor.c / player.h). We can only play AAC-LC
  * 44100 stereo; the others are skipped with a clear message instead of being
  * fed to the decoder as noise. Unknown SSRC values are consumed without
@@ -106,32 +106,31 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 #define AP2_STATUS_PRIORITY          1
 #define AP2_STATUS_CORE              0
 #define AP2_STATUS_PERIOD_MS      2000U
-/* v4.1.14 buffered timing watchdog: anchor + play but the PTP mapping never
- * qualifies. Normal lock takes < 1 s; give it 5 s, then log why and restart
- * the PTP estimator. At most AP2_TIMING_WD_MAX_RESETS per anchor timeline. */
-/* Buffered start gate (v4.1.16).
- * v4.1.15 started at Shairport's 400 ms mastership without our lock. On the
- * board that produced a -10 ms start error: the nqptp-style filter
- * (ptp_clock_engine.c) still jumps to better samples during its first
- * PTP_ENGINE_STARTUP_NS = 1 s, and our fine correction (APLL servo) is too slow
- * to absorb such a step (Shairport absorbs it by frame stuffing). The PID then
- * wound up to +160 ppm and needed minutes to settle.
- * Now the FIRST mapping of an anchor needs the lock AND >= 1 s mastership, so
- * the filter's startup jumps happen before audio starts. Later anchors (skip,
- * pause, next track) are far past 1 s and start as fast as before.
- * Refreshes while playing: lock + 400 ms, as in v4.1.14. */
+/* Buffered start gate.
+ * Starting at Shairport's 400 ms mastership without our own lock gave a
+ * -10 ms start error: the nqptp-style filter (ptp_clock_engine.c) still jumps
+ * to better samples during its first PTP_ENGINE_STARTUP_NS = 1 s, and our fine
+ * correction (I2S clock servo) is too slow to absorb such a step (Shairport
+ * absorbs it by frame stuffing); the PID then wound up to +160 ppm and needed
+ * minutes to settle. So the FIRST mapping of an anchor needs the lock AND
+ * >= 1 s mastership and the filter's startup jumps happen before audio starts.
+ * Later anchors (skip, pause, next track) are far past 1 s and start at once.
+ * Refreshes while playing: lock + 400 ms. */
 #define AP2_PTP_START_MASTERSHIP_MS 1000U
 #define AP2_PTP_MASTERSHIP_MIN_MS   400U
 #define AP2_PTP_SAMPLE_MAX_AGE_MS  5000U
-/* v4.1.15 hard resync, Shairport "resync_threshold" semantics: if the output
- * is out of sync by more than this for AP2_RESYNC_HOLD_US, stop and re-prime
- * at the exact presentation point (brief silence), keeping the learned I2S
- * clock correction. Shairport uses 50 ms, but it also corrects small errors
- * quickly by frame stuffing; our fine correction is a slow APLL servo
+/* Hard resync, Shairport "resync_threshold" semantics: if the output is out
+ * of sync by more than this for AP2_RESYNC_HOLD_US, stop and re-prime at the
+ * exact presentation point (brief silence), keeping the learned I2S clock
+ * correction. Shairport uses 50 ms, but it also corrects small errors quickly
+ * by frame stuffing; our fine correction is a slow I2S clock servo
  * (<= 160 ppm), so the threshold is lower. */
 #define AP2_RESYNC_THRESHOLD_US      20000
 #define AP2_RESYNC_HOLD_US         1500000LL
 #define AP2_RESYNC_MIN_INTERVAL_US 5000000LL
+/* Buffered timing watchdog: anchor + play but the PTP mapping never
+ * qualifies. Normal lock takes < 1 s; give it 5 s, then log why and restart
+ * the PTP estimator. At most AP2_TIMING_WD_MAX_RESETS per anchor timeline. */
 #define AP2_TIMING_WD_TIMEOUT_MS  5000U
 #define AP2_TIMING_WD_RETRY_MS    6000U
 #define AP2_TIMING_WD_MAX_RESETS     3U
@@ -161,41 +160,41 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
  * P reacts to phase error, I learns the steady crystal/rate bias, D damps
  * motion through zero.  The derivative is low-pass filtered because the PTP
  * timestamp itself has some jitter.  PID is evaluated more often than the
- * physical tune operation so control knowledge can evolve without repeatedly
- * disable/tune/enable cycling I2S. */
+ * physical tune operation so control knowledge can evolve without retuning
+ * the I2S clock every second. */
 #define AP2_PID_KP_PPM_PER_MS          22.0
 #define AP2_PID_KI_PPM_PER_MS_S         0.55
 #define AP2_PID_KD_PPM_PER_MS_PER_S    55.0
 #define AP2_PID_D_ALPHA                  0.20
 #define AP2_PID_I_TERM_LIMIT_PPM       110.0
 
-/* v4.1.17 slow centring inside the +/-1 ms good zone (multiroom accuracy).
- * The PID holds the clock inside the zone, so sync used to park near +/-1 ms
- * and the crystal error was never learned precisely. Every window the
- * centring loop measures the real phase slope and steers the frequency so
+/* Slow centring inside the +/-1 ms good zone (multiroom accuracy).
+ * The PID alone only holds the clock inside the zone, so sync would park near
+ * +/-1 ms and the crystal error would never be learned precisely. Every window
+ * the centring loop measures the real phase slope and steers the frequency so
  * that sync approaches 0 at <= AP2_CENTER_MAX_SLOPE_US_S and then stays flat.
  * 1 ppm of I2S rate change = 1 us/s of sync slope. */
 #define AP2_CENTER_WINDOW_US         15000000LL /* slope measurement window */
 #define AP2_CENTER_QUIET_US               200    /* |sync| below: aim for 0 slope */
-#define AP2_CENTER_TIME_S                20.0   /* approach time constant (v4.1.19: was 60) */
-#define AP2_CENTER_MAX_SLOPE_US_S        40.0   /* max wanted approach speed (v4.1.19: was 10) */
+#define AP2_CENTER_TIME_S                20.0   /* approach time constant */
+#define AP2_CENTER_MAX_SLOPE_US_S        40.0   /* max wanted approach speed */
 #define AP2_CENTER_MAX_STEP_PPM            40    /* max frequency step per window */
-/* v4.1.18 hysteresis: centring mode is entered inside +/-1 ms and is kept
- * through brief excursions. It hands back to the PID only when |sync| stays
- * above 1.5 ms for 3 s, or immediately above 3 ms. The old code dropped out on
- * any momentary D-estimate spike, so a 15 s window never completed. */
+/* Hysteresis: centring mode is entered inside +/-1 ms and is kept through
+ * brief excursions. It hands back to the PID only when |sync| stays above
+ * 1.5 ms for 3 s, or immediately above 3 ms; dropping out on any momentary
+ * D-estimate spike would never let a 15 s window complete. */
 #define AP2_CENTER_EXIT_US               1500
 #define AP2_CENTER_EXIT_HOLD_US       3000000LL
 #define AP2_CENTER_EXIT_HARD_US          3000
-/* v4.1.19: a PTP filter step moves sync by >1 ms between two 1 s samples,
- * while real drift is < 0.1 ms/s. A window that contains such a jump gave a
- * false slope (-83 us/s in the board log). The jump is now subtracted from the
+/* A PTP filter step moves sync by >1 ms between two 1 s samples, while real
+ * drift is < 0.1 ms/s; a window containing such a jump would give a false
+ * slope (-83 us/s seen on the board). The jump is subtracted from the
  * following samples of the window, so the slope stays the true drift and the
  * end-of-window phase still includes the step. */
 #define AP2_CENTER_JUMP_US                400
 /* Fraction of the computed correction applied per window. 0.5 was tried in
- * simulation for v4.1.19 and made phase recovery slower without reducing
- * retunes, so the full step is kept. */
+ * simulation and made phase recovery slower without reducing retunes, so the
+ * full step is kept. */
 #define AP2_CENTER_GAIN                   1.0
 /* Shairport Sync 5.5.2: audio_decoded_buffer_desired_length defaults to
  * 0.75 s; buffered blocks are decoded only inside target + 0.1 s. */
@@ -764,7 +763,7 @@ static bool buffered_ptp_qualified(const ptp_clock_snapshot_t *ps,
          (initial ? AP2_PTP_START_MASTERSHIP_MS : AP2_PTP_MASTERSHIP_MIN_MS);
 }
 
-/* First-audio measurement (v4.1.15): anchor commit time per generation. */
+/* First-audio measurement: anchor commit time per generation. */
 static volatile int64_t s_anchor_commit_us = 0;
 static volatile uint32_t s_anchor_commit_gen = 0;
 
@@ -1020,7 +1019,7 @@ static uint64_t presentation_now_ns(const timing_snapshot_t *snap) {
   return (uint64_t)esp_timer_get_time() * 1000ULL;
 }
 
-/* v4.1.21 output latency after the ESP (DAC/DSP/amp), in microseconds.
+/* Output latency after the ESP (DAC/DSP/amp), in microseconds.
  * Positive = the chain delays the sound, so the ESP must output that much
  * EARLIER. Applied here, the single point every presentation-time calculation
  * (start, cursor, sync measurement, realtime deadlines) goes through; the PTP
@@ -1107,7 +1106,7 @@ static int32_t robust_phase_center_us(const output_sync_state_t *sync) {
 /* Buffered AAC timing watchdog, run from the low-priority status task.
  * Decoding is gated on anchor_local_valid, which needs a LOCKED PTP estimator
  * on the anchor's master for >= 400 ms. If that never happens the stream is
- * silent while the FIFO fills (first session after boot in v4.1.13 logs).
+ * silent while the FIFO fills (seen on the first session after boot).
  * Log the exact failing condition and reset the estimator. */
 static void buffered_timing_watchdog(const timing_snapshot_t *snap) {
   static uint32_t wd_generation = 0;
@@ -1167,7 +1166,7 @@ static void buffered_timing_watchdog(const timing_snapshot_t *snap) {
   wd_last_reset_us = now_us;
 }
 
-/* v4.1.18: the playout task never logs. It posts numbers into these
+/* The playout task never logs. It posts numbers into these
  * single-writer mailboxes (seqlock) and the low-priority audio_status_task
  * formats and prints them. A log line can block on UART/USB for milliseconds;
  * that must never happen on the task that feeds I2S. */
@@ -1225,7 +1224,7 @@ static bool pevt_take(int kind, uint32_t *last_count, int32_t v[5],
   return false; /* writer busy; pick it up on the next cycle */
 }
 
-/* Format and print what the playout task posted (v4.1.18). */
+/* Format and print what the playout task posted. */
 static void status_print_playout_events(void) {
   static uint32_t last[PEVT_COUNT];
   int32_t v[5];
@@ -1952,8 +1951,8 @@ static void ap2_buffered_processor_task(void *arg) {
       packets_played_in_sequence = 0;
     }
 
-    /* No manual yield: RTSP/control runs at priority 17 above both TCP reader and
-     * AAC processor and therefore preempts refill bursts immediately. */
+    /* No manual yield: RTSP control (priority 17) runs on the same core as
+     * this processor (priority 4) and preempts refill bursts immediately. */
   }
 
   if (decoder) aac_decoder_destroy(decoder);
@@ -2429,8 +2428,8 @@ static bool buffered_anchor_moved(const timing_snapshot_t *previous,
   return shift_us > block_us || shift_us < -block_us;
 }
 
-/* ---- wired latency measurement: the I2S side (v4.1.21, v4.1.23) ----
- * v4.1.23: runs like the Wi-Fi scan. The web handler stops RTSP and releases
+/* ---- wired latency measurement: the I2S side ----
+ * Runs like the Wi-Fi scan. The web handler stops RTSP and releases
  * the audio engine (playout task stopped, codec memory freed), so the I2S
  * driver has no other owner and the ADC gets internal DMA memory. The caller's
  * task then plays silence + LATENCY_CAL_BURSTS chirps and records, from the
@@ -2687,7 +2686,7 @@ static void ap2_playout_task(void *arg) {
       cursor_timing = snap;
     }
 
-    /* v4.1.15 hard resync (Shairport resync_threshold semantics). */
+    /* Hard resync (Shairport resync_threshold semantics). */
     if (state == PLAYOUT_RUNNING && s.output_sync.valid &&
         s.output_sync.generation == snap.generation) {
       const int32_t err_us = s.output_sync.us;
@@ -3030,7 +3029,7 @@ static void ap2_playout_task(void *arg) {
      * limits audible artifacts and unnecessary divider changes while keeping
      * the live DMA/tag chronology intact.  +/-1 ms is deliberately treated as GOOD: once there and
      * phase velocity is modest, the PID stops acting and a slow centring loop
-     * (v4.1.17, AP2_CENTER_*) steers towards 0 ms with at most one small step
+     * (AP2_CENTER_*) steers towards 0 ms with at most one small step
      * per 15 s window, based on a least-squares slope of the measured sync.
      */
     const int64_t pid_now_us = esp_timer_get_time();
@@ -3105,7 +3104,7 @@ static void ap2_playout_task(void *arg) {
        * D still remains alive, so a clear passage through the band will be seen
        * on the next calculation rather than being hidden forever. */
       const double sync_slope_ms_s = -pid_d_filtered_ms_s;
-      /* v4.1.18 hysteresis around the centring mode. */
+      /* Hysteresis around the centring mode. */
       if (center_active) {
         if (abs_sync_us > AP2_CENTER_EXIT_HARD_US) {
           center_active = false;
@@ -3122,7 +3121,7 @@ static void ap2_playout_task(void *arg) {
       const bool center_enter = !center_active && in_deadband &&
           sync_slope_ms_s > -0.080 && sync_slope_ms_s < 0.080;
       if (center_active || center_enter) {
-        /* Hold the learned clock, then centre slowly (v4.1.17/18). */
+        /* Hold the learned clock, then centre slowly. */
         bool restart_window = false;
         if (center_enter) {
           next_target = servo_ppm; /* entering the zone: drop pending PID step */
@@ -3210,7 +3209,7 @@ static void ap2_playout_task(void *arg) {
           servo_ppm = next_ppm;
           tune_fail_count = 0;
         } else {
-          /* Previously silent: a failing tune means drift is not corrected. */
+          /* Report it: a failing tune means drift is not corrected. */
           tune_fail_count++;
           pevt_post(PEVT_TUNE_FAIL, next_ppm, (int32_t)te,
                     (int32_t)tune_fail_count, 0, 0, NULL);
@@ -3314,7 +3313,7 @@ esp_err_t audio_receiver_init(void) {
   if (!s.transport) {
     ap2_buffered_fifo_config_t tcfg = {
         .buffer_bytes = AP2_BUFFERED_STORE_REQUEST_BYTES,
-        .task_core = AP2_NETWORK_CORE,
+        .task_core = AP2_AAC_RX_CORE,
         .task_priority = AP2_RX_PRIORITY,
         .task_stack = AP2_RX_STACK,
     };
@@ -3389,17 +3388,17 @@ esp_err_t audio_receiver_init(void) {
   if (!s.playout_task) {
     if (xTaskCreatePinnedToCore(ap2_playout_task, "ap2_playout",
                                 AP2_PLAYOUT_STACK, NULL, AP2_PLAYOUT_PRIORITY,
-                                &s.playout_task, AP2_DECODE_CORE) != pdPASS) {
+                                &s.playout_task, AP2_PLAYOUT_CORE) != pdPASS) {
       return ESP_FAIL;
     }
     AUDIO_DIAG_LIFECYCLE_TASK_STARTED(
-        AUDIO_DIAG_TASK_PLAYOUT, AP2_DECODE_CORE, AP2_PLAYOUT_PRIORITY,
+        AUDIO_DIAG_TASK_PLAYOUT, AP2_PLAYOUT_CORE, AP2_PLAYOUT_PRIORITY,
         AUDIO_PLAYOUT_FRAMES);
   }
   if (!s.realtime_stage_task) {
     if (xTaskCreatePinnedToCore(realtime_stage_task, "alac_stage",
                                 AP2_RT_STAGE_STACK, NULL, AP2_RT_STAGE_PRIORITY,
-                                &s.realtime_stage_task, AP2_DECODE_CORE) != pdPASS) {
+                                &s.realtime_stage_task, AP2_PLAYOUT_CORE) != pdPASS) {
       return ESP_FAIL;
     }
   }
@@ -3715,12 +3714,6 @@ esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
   return ESP_ERR_NOT_SUPPORTED;
 }
 
-esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port) {
-  (void)data_port;
-  (void)control_port;
-  return ESP_ERR_NOT_SUPPORTED;
-}
-
 static bool wait_playout_quiesced(uint32_t request, uint32_t timeout_ms) {
   if (!s.playout_task || !__atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE)) return true;
   const int64_t deadline_us =
@@ -3756,9 +3749,8 @@ void audio_receiver_stop(void) {
   const uint32_t quiesce_request =
       __atomic_add_fetch(&s.playout_quiesce_req, 1U, __ATOMIC_ACQ_REL);
 
-  /* The comment above defines this as a hard boundary, so make that true in
-   * execution too: do not let the next RTSP SETUP overtake the Core1 I2S
-   * flush/reset. The wait is normally only a few milliseconds and is bounded
+  /* This is a hard boundary in execution too: do not let the next RTSP SETUP
+   * overtake the Core1 I2S flush/reset. The wait is normally only a few milliseconds and is bounded
    * so a genuine I2S stall is surfaced rather than hanging the control task. */
   if (!wait_playout_quiesced(quiesce_request, 250U)) {
     ESP_LOGE(TAG,
@@ -3796,22 +3788,12 @@ void audio_receiver_stop(void) {
   s.port = 0;
 }
 
-void audio_receiver_stop_buffered_only(void) { audio_receiver_stop(); }
 uint16_t audio_receiver_get_buffered_port(void) { return s.port; }
 
-size_t audio_receiver_get_buffered_audio_buffer_size(void) {
-  return ap2_buffered_fifo_capacity(s.transport);
-}
-
-uint16_t audio_receiver_get_stream_port(void) { return s.port; }
 void audio_receiver_set_volume_q15(int32_t volume_q15) {
   if (volume_q15 < 0) volume_q15 = 0;
   if (volume_q15 > 32768) volume_q15 = 32768;
   __atomic_store_n(&s_volume_target_q15, volume_q15, __ATOMIC_RELEASE);
-}
-
-int32_t audio_receiver_get_volume_q15(void) {
-  return __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
 }
 
 uint32_t audio_receiver_get_output_mute_mask(void) {
@@ -3838,8 +3820,6 @@ void audio_receiver_seek_flush(void) {
     mark_timeline_discontinuity();
   }
 }
-
-void audio_receiver_flush(void) { audio_receiver_seek_flush(); }
 
 void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
   timing_snapshot_t snap;
@@ -4023,8 +4003,6 @@ void audio_receiver_set_playout_latency_samples(uint32_t v) {
   s.playout_latency_samples = v;
   taskEXIT_CRITICAL(&s.state_mux);
 }
-uint32_t audio_receiver_get_hardware_latency_us(void) { return audio_playout_hardware_latency_us(); }
-
 int32_t audio_receiver_get_output_latency_us(void) {
   return __atomic_load_n(&s_output_latency_us, __ATOMIC_RELAXED);
 }
@@ -4125,19 +4103,6 @@ void audio_receiver_set_playing(bool p) {
     mark_timeline_discontinuity();
   }
   audio_status_notify();
-}
-
-bool audio_receiver_is_playing(void) {
-  bool playing;
-  taskENTER_CRITICAL(&s.state_mux);
-  playing = s.playing;
-  taskEXIT_CRITICAL(&s.state_mux);
-  return playing;
-}
-
-void audio_receiver_reset_timing(void) {
-  mark_timeline_discontinuity();
-  ptp_clock_clear();
 }
 
 void audio_receiver_set_client_control(uint32_t ip, uint16_t port) {

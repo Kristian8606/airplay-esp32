@@ -26,7 +26,3 @@ esp_err_t log_stream_init(void);
  */
 esp_err_t log_stream_register(httpd_handle_t server);
 
-/** Detach before httpd_stop(); drains queued/in-flight HTTPD broadcast work.
- * Call from the server lifecycle owner, outside HTTPD request handlers.
- */
-void log_stream_detach(httpd_handle_t server);

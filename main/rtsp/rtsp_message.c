@@ -8,6 +8,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 
+#include "airplay_identity.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "rtsp_crypto.h"
@@ -24,7 +25,7 @@ const uint8_t *rtsp_find_header_end(const uint8_t *data, size_t len) {
   return NULL;
 }
 
-int rtsp_parse_cseq(const char *request) {
+static int rtsp_parse_cseq(const char *request) {
   const char *cseq = strstr(request, "CSeq:");
   if (cseq) {
     return (int)strtol(cseq + 5, NULL, 10);
@@ -62,8 +63,8 @@ int rtsp_parse_content_length(const char *request) {
   return length;
 }
 
-const uint8_t *rtsp_get_body(const char *request, size_t request_len,
-                             size_t *body_len) {
+static const uint8_t *rtsp_get_body(const char *request, size_t request_len,
+                                    size_t *body_len) {
   const char *body = strstr(request, "\r\n\r\n");
   if (body) {
     body += 4;
@@ -72,44 +73,6 @@ const uint8_t *rtsp_get_body(const char *request, size_t request_len,
   }
   *body_len = 0;
   return NULL;
-}
-
-// Parse Transport header for client ports (AirPlay 1)
-// Format: Transport:
-// RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002
-void rtsp_parse_transport(const char *request, uint16_t *control_port,
-                          uint16_t *timing_port) {
-  if (control_port) {
-    *control_port = 0;
-  }
-  if (timing_port) {
-    *timing_port = 0;
-  }
-
-  // RTSP header names and Transport-header parameter names are
-  // case-insensitive (RFC 2326), so match accordingly.
-  const char *transport = strcasestr(request, "Transport:");
-  if (!transport) {
-    return;
-  }
-
-  // Find end of Transport header line
-  const char *line_end = strstr(transport, "\r\n");
-  if (!line_end) {
-    line_end = transport + strlen(transport);
-  }
-
-  // Parse control_port
-  const char *cp = strcasestr(transport, "control_port=");
-  if (cp && cp < line_end && control_port) {
-    *control_port = (uint16_t)strtoul(cp + 13, NULL, 10);
-  }
-
-  // Parse timing_port
-  const char *tp = strcasestr(transport, "timing_port=");
-  if (tp && tp < line_end && timing_port) {
-    *timing_port = (uint16_t)strtoul(tp + 12, NULL, 10);
-  }
 }
 
 int rtsp_request_parse(const uint8_t *data, size_t len, rtsp_request_t *req) {
@@ -178,7 +141,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
         snprintf(header, sizeof(header),
                  "RTSP/1.0 %d %s\r\n"
                  "CSeq: %d\r\n"
-                 "Server: AirTunes/377.40.00\r\n"
+                 "Server: " AIRPLAY_SERVER_HEADER "\r\n"
                  "%s"
                  "Content-Length: %zu\r\n"
                  "\r\n",
@@ -187,7 +150,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
     header_len = snprintf(header, sizeof(header),
                           "RTSP/1.0 %d %s\r\n"
                           "CSeq: %d\r\n"
-                          "Server: AirTunes/377.40.00\r\n"
+                          "Server: " AIRPLAY_SERVER_HEADER "\r\n"
                           "%s"
                           "\r\n",
                           status_code, status_text, cseq, extra_headers);
@@ -195,7 +158,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
     header_len = snprintf(header, sizeof(header),
                           "RTSP/1.0 %d %s\r\n"
                           "CSeq: %d\r\n"
-                          "Server: AirTunes/377.40.00\r\n"
+                          "Server: " AIRPLAY_SERVER_HEADER "\r\n"
                           "Content-Length: %zu\r\n"
                           "\r\n",
                           status_code, status_text, cseq, body_len);
@@ -203,7 +166,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
     header_len = snprintf(header, sizeof(header),
                           "RTSP/1.0 %d %s\r\n"
                           "CSeq: %d\r\n"
-                          "Server: AirTunes/377.40.00\r\n"
+                          "Server: " AIRPLAY_SERVER_HEADER "\r\n"
                           "\r\n",
                           status_code, status_text, cseq);
   }
@@ -258,7 +221,7 @@ int rtsp_send_http_response(int socket, rtsp_conn_t *conn, int status_code,
                             "HTTP/1.1 %d %s\r\n"
                             "Content-Type: %s\r\n"
                             "Content-Length: %zu\r\n"
-                            "Server: AirTunes/377.40.00\r\n"
+                            "Server: " AIRPLAY_SERVER_HEADER "\r\n"
                             "CSeq: 1\r\n"
                             "\r\n",
                             status_code, status_text, content_type, body_len);

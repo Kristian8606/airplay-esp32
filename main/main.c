@@ -42,8 +42,8 @@ static void print_firmware_banner(void) {
   ESP_LOGI(TAG, "VERSION: %s", app ? app->version : "unknown");
   ESP_LOGI(TAG, "BUILD: %s %s", __DATE__, __TIME__);
   ESP_LOGI(TAG, "IDF: %s", app ? app->idf_ver : "unknown");
-  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/network/PTP + AAC TCP/decode/EQ + ALAC UDP/decrypt/decode");
-  ESP_LOGI(TAG, "CORE PLAN: Core1=high-priority PTP/RTP playout + ALAC ordered staging/EQ");
+  ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/RTSP/PTP + AAC decode/EQ + ALAC UDP/decrypt/decode");
+  ESP_LOGI(TAG, "CORE PLAN: Core1=I2S playout + ALAC ordered staging/EQ + AAC TCP reader");
   ESP_LOGI(TAG, "============================================================");
 }
 
@@ -76,7 +76,7 @@ void app_main(void) {
   }
   log_memory_state("post-wifi");
 
-  /* Temporary diagnostics must exist before PTP/audio init so category-owned
+  /* Optional diagnostics must exist before PTP/audio init so category-owned
    * startup events are captured by the low-priority worker. This is a no-op
    * when diagnostics are disabled or no category is selected. */
   (void)AUDIO_DIAG_INIT();

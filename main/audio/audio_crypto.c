@@ -2,7 +2,6 @@
 
 #include "audio_crypto.h"
 
-#include "aes/esp_aes.h"
 #include "sodium.h"
 
 int audio_crypto_decrypt_rtp(const audio_encrypt_t *encrypt,
@@ -19,43 +18,6 @@ int audio_crypto_decrypt_rtp(const audio_encrypt_t *encrypt,
       return -1;
     }
     memcpy(output, input, input_len);
-    return (int)input_len;
-  }
-
-  if (encrypt->type == AUDIO_ENCRYPT_AES_CBC) {
-    if (input_len > output_capacity) {
-      return -1;
-    }
-
-    uint8_t iv[16];
-    memcpy(iv, encrypt->iv, sizeof(iv));
-
-    size_t num_blocks = input_len / 16;
-    size_t remainder = input_len % 16;
-    size_t encrypted_len = num_blocks * 16;
-
-    if (encrypted_len > 0) {
-      esp_aes_context aes;
-      esp_aes_init(&aes);
-
-      int ret = esp_aes_setkey(&aes, encrypt->key, 128);
-      if (ret != 0) {
-        esp_aes_free(&aes);
-        return -1;
-      }
-
-      ret = esp_aes_crypt_cbc(&aes, ESP_AES_DECRYPT, encrypted_len, iv,
-                                  input, output);
-      esp_aes_free(&aes);
-      if (ret != 0) {
-        return -1;
-      }
-    }
-
-    if (remainder > 0) {
-      memcpy(output + encrypted_len, input + encrypted_len, remainder);
-    }
-
     return (int)input_len;
   }
 

@@ -275,8 +275,8 @@ menu "RGB Audio/VU LED"
         range 5 60
         depends on ENABLE_RGB_AUDIO_LED
         help
-            Limits RMS/bass calculation and WS2812 refresh frequency. The
-            upstream implementation uses approximately 30 Hz.
+            Limits RMS/bass calculation and WS2812 refresh frequency.
+            About 30 Hz gives a smooth VU display.
 
     choice RGB_AUDIO_LED_PLAYING_MODE
         prompt "LED mode while playing"

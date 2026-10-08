@@ -308,7 +308,9 @@ void ap2_buffered_fifo_clear(ap2_buffered_fifo_t *fifo) {
   fifo_discard_all(fifo);
 }
 
-void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo) {
+/* Abort only the current buffered TCP client after fatal framing corruption.
+ * The listening socket remains available for the RTSP session. */
+static void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo) {
   if (!fifo || !fifo->fifo_mutex) return;
 
   int client = -1;

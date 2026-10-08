@@ -7,7 +7,8 @@
 
 /**
  * HAP (HomeKit Accessory Protocol) implementation for AirPlay 2
- * Handles pair-verify for transient pairing
+ * Handles pair-setup (SRP, incl. transient) and pair-verify, plus the
+ * derived control-channel and audio keys
  */
 
 // Key sizes
@@ -119,31 +120,6 @@ esp_err_t hap_pair_verify_m3_raw(hap_session_t *session, const uint8_t *input,
                                  size_t input_len, uint8_t *output,
                                  size_t output_capacity, size_t *output_len);
 
-/**
- * Encrypt data using session keys
- * @param session HAP session (must be established)
- * @param plaintext Input data
- * @param plaintext_len Length of input
- * @param ciphertext Output buffer (must have room for plaintext_len + 16 tag)
- * @param ciphertext_len Actual output length
- * @return ESP_OK on success
- */
-esp_err_t hap_encrypt(hap_session_t *session, const uint8_t *plaintext,
-                      size_t plaintext_len, uint8_t *ciphertext,
-                      size_t *ciphertext_len);
-
-/**
- * Decrypt data using session keys
- * @param session HAP session (must be established)
- * @param ciphertext Input data (includes 16 byte tag)
- * @param ciphertext_len Length of input
- * @param plaintext Output buffer
- * @param plaintext_len Actual output length
- * @return ESP_OK on success, ESP_ERR_INVALID_STATE if auth fails
- */
-esp_err_t hap_decrypt(hap_session_t *session, const uint8_t *ciphertext,
-                      size_t ciphertext_len, uint8_t *plaintext,
-                      size_t *plaintext_len);
 
 /**
  * Derive audio encryption key from pair-verify shared secret

@@ -18,7 +18,6 @@ set(SRC_FILES
     "rtsp/rtsp_handlers.c"
     "rtsp/rtsp_fairplay.c"
     "rtsp/rtsp_crypto.c"
-    "rtsp/rtsp_rsa.c"
     "rtsp/rtsp_events.c"
     "rtsp/rtsp_remote.c"
     "plist/plist_xml.c"
@@ -53,7 +52,7 @@ if(CONFIG_AIRPLAY_DIAG_ACTIVE)
     list(APPEND SRC_FILES "audio/audio_diag.c")
 endif()
 
-# v4.1.21 output latency: the pure analysis is always built (tiny), the ADC
+# Output latency: the pure analysis is always built (tiny), the ADC
 # capture only with the wired measurement option.
 list(APPEND SRC_FILES "audio/latency_cal_dsp.c")
 if(CONFIG_AIRPLAY_LATENCY_CAL)

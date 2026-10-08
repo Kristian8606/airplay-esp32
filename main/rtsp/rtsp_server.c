@@ -62,25 +62,6 @@ typedef struct {
 static client_slot_t clients[2] = {{.socket = -1}, {.socket = -1}}; // Current and old
 static int current_slot = 0;
 
-// Hold the lifetime mutex while accessing a public connection pointer.
-void airplay_set_volume(float volume_db) {
-  if (!lifecycle_mutex) return;
-  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
-  client_slot_t *c = &clients[current_slot];
-  if (c->conn && !c->is_old) rtsp_conn_set_volume(c->conn, volume_db);
-  xSemaphoreGive(lifecycle_mutex);
-}
-
-int32_t airplay_get_volume_q15(void) {
-  if (!lifecycle_mutex) return 16384;
-  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
-  client_slot_t *c = &clients[current_slot];
-  int32_t volume = c->conn && !c->is_old ?
-      rtsp_conn_get_volume_q15(c->conn) : 16384;
-  xSemaphoreGive(lifecycle_mutex);
-  return volume;
-}
-
 static void detach_client_socket(client_slot_t *slot) {
   xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
   int socket = slot->socket;
@@ -183,7 +164,7 @@ static void client_task(void *pvParameters) {
   xSemaphoreGive(lifecycle_mutex);
   AUDIO_DIAG_FLUSH_RTSP_SESSION_RESET(slot->socket);
 
-  // Get client IP address for timing requests
+  // Sender IP: PTP timing peer, event-port filter, realtime retransmits
   struct sockaddr_in peer_addr;
   socklen_t peer_len = sizeof(peer_addr);
   if (getpeername(slot->socket, (struct sockaddr *)&peer_addr, &peer_len) ==
@@ -295,7 +276,7 @@ cleanup:
   free(buffer);
   detach_client_socket(slot);
 
-  // Immediate: stop audio and NTP
+  // Immediate: stop audio and the event channel
   audio_receiver_stop();
   rtsp_stop_event_port_task();
   /* A timeout requests cancellation, but does not release ownership. Keep
@@ -309,7 +290,6 @@ cleanup:
   audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
   audio_receiver_set_encryption(NULL);
 
-  // AirPlay receiver: no AirPlay 1 DACP grace/reconnect path.
   detach_client_conn(slot);
   rtsp_conn_free(conn);
 

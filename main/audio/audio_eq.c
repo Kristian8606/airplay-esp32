@@ -128,7 +128,7 @@ typedef struct {
   audio_eq_output_config_t right;
 } audio_eq_config_v2_t;
 
-esp_err_t audio_eq_load_config(audio_eq_config_t *out) {
+static esp_err_t audio_eq_load_config(audio_eq_config_t *out) {
   if (!out) return ESP_ERR_INVALID_ARG;
   audio_eq_default_config(out);
 
@@ -197,9 +197,10 @@ static bool calc_biquad(audio_eq_filter_type_t type, float frequency_hz,
     return false;
   }
 
-  /* These are the same bilinear-transform equations used by the supplied
-   * Biquad.h. Its Fc was pre-normalised as Hz / SAMPLE_RATE; do it here
-   * explicitly so 44.1/48 kHz streams are both handled correctly. */
+  /* Bilinear-transform biquad equations as in Nigel Redmon's Biquad.h
+   * (EarLevel Engineering). There Fc is pre-normalised as Hz / sample rate;
+   * here it is normalised explicitly with the stream rate, so 44.1 and 48 kHz
+   * are both handled correctly. */
   const double K = tan(M_PI * (double)frequency_hz / (double)sample_rate);
   const double V = pow(10.0, fabs((double)peak_gain_db) / 20.0);
   const double Q = (double)q;
@@ -262,7 +263,7 @@ static bool calc_biquad(audio_eq_filter_type_t type, float frequency_hz,
       break;
 
     case AUDIO_EQ_FILTER_LS:
-      /* Match the supplied Biquad.h: fixed shelf slope (Q is not used). */
+      /* Fixed shelf slope as in that Biquad.h (Q is not used). */
       if (peak_gain_db >= 0.0f) {
         norm = 1.0 / (1.0 + sqrt(2.0) * K + K * K);
         b0 = (1.0 + sqrt(2.0 * V) * K + V * K * K) * norm;
@@ -281,7 +282,7 @@ static bool calc_biquad(audio_eq_filter_type_t type, float frequency_hz,
       break;
 
     case AUDIO_EQ_FILTER_HS:
-      /* Match the supplied Biquad.h: fixed shelf slope (Q is not used). */
+      /* Fixed shelf slope as in that Biquad.h (Q is not used). */
       if (peak_gain_db >= 0.0f) {
         norm = 1.0 / (1.0 + sqrt(2.0) * K + K * K);
         b0 = (V + sqrt(2.0 * V) * K + K * K) * norm;
@@ -453,8 +454,8 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
        * old delay lines are stale: start from silence. */
       reset_state_unlocked();
     } else {
-      /* Live tweak while audio is playing. Zeroing the delay lines here used
-       * to inject a step into the signal (an audible click on every slider
+      /* Live tweak while audio is playing. Zeroing the delay lines here would
+       * inject a step into the signal (an audible click on every slider
        * move). A biquad in transposed direct form II tolerates coefficient
        * changes, so retain a state only when its configured slot and type
        * still occupy the same active position. Enabling/disabling an earlier

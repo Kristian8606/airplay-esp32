@@ -35,16 +35,13 @@ static bool s_wifi_initialized = false;
 static bool s_sta_connected = false;
 static bool s_have_selected_network = false;
 static esp_timer_handle_t s_retry_timer = NULL;
-/* v4.1.20: channel of the BSSID chosen at boot (0 = unknown). */
+/* Channel of the BSSID chosen at boot (0 = unknown). */
 static uint8_t s_sta_locked_channel = 0;
 static uint32_t s_backoff_retries = 0;
 #define WIFI_FULL_SCAN_EVERY 4
 
 // Saved AP config from init, used to re-enable AP without duplication
 static wifi_config_t s_ap_config;
-/* DHCP option 114 points clients directly at the setup portal. The DHCP
- * server keeps this pointer, so the URI must live for the lifetime of AP. */
-static char s_captive_portal_uri[32];
 
 static bool wifi_select_best_saved_network(void);
 static void scan_and_connect_task(void *arg);
@@ -52,15 +49,11 @@ static esp_err_t wifi_collect_scan_results(bool show_hidden,
                                            wifi_ap_record_t **ap_list,
                                            uint16_t *ap_count);
 
-/* v4.1.20: DHCP option 114 is OFF by default. RFC 8910/8908 define it as the
- * URI of a Captive Portal *API* that MUST be HTTPS and return
- * application/captive+json. We advertised the plain HTML page over HTTP,
- * which clients can treat as a broken API. iOS/Android captive detection works
- * reliably through the classic probe (captive.apple.com/hotspot-detect.html,
- * answered by our wildcard DNS + HTTP 302), so rely on that alone. */
-#ifndef WIFI_DHCP_OPTION_114
-#define WIFI_DHCP_OPTION_114 0
-#endif
+/* No DHCP option 114: RFC 8910/8908 define it as the URI of a Captive Portal
+ * *API* that MUST be HTTPS and return application/captive+json, so the plain
+ * HTML setup page must not be advertised there. iOS/Android captive detection
+ * works through the classic probe (captive.apple.com/hotspot-detect.html,
+ * answered by our wildcard DNS + HTTP 302). */
 
 /* Captive DNS must run whenever the setup AP is on (not only after a 30 s
  * boot timeout), and stop when the AP is switched off. */
@@ -72,37 +65,6 @@ static void captive_dns_start(void) {
     return;
   }
   (void)dns_server_start(ip_info.ip.addr); /* idempotent */
-}
-
-static void configure_ap_captive_portal(void) {
-  if (!s_ap_netif) return;
-#if !WIFI_DHCP_OPTION_114
-  return;
-#endif
-
-  esp_netif_ip_info_t ip_info = {0};
-  esp_err_t err = esp_netif_get_ip_info(s_ap_netif, &ip_info);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to get setup AP IP: %s", esp_err_to_name(err));
-    return;
-  }
-
-  snprintf(s_captive_portal_uri, sizeof(s_captive_portal_uri),
-           "http://" IPSTR "/", IP2STR(&ip_info.ip));
-
-  /* Configure before Wi-Fi/AP start while DHCPS is stopped. This is the
-   * standards-based captive portal advertisement (DHCP option 114); the
-   * existing wildcard DNS redirect remains as a compatibility fallback. */
-  err = esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
-                               ESP_NETIF_CAPTIVEPORTAL_URI,
-                               s_captive_portal_uri,
-                               strlen(s_captive_portal_uri));
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to set DHCP captive portal URI: %s",
-             esp_err_to_name(err));
-  } else {
-    ESP_LOGI(TAG, "DHCP captive portal URI: %s", s_captive_portal_uri);
-  }
 }
 
 static void sanitize_hostname(const char *name, char *out, size_t out_len) {
@@ -183,13 +145,12 @@ static void enable_ap_mode(void) {
     if (!s_ap_netif) {
       s_ap_netif = esp_netif_create_default_wifi_ap();
     }
-    configure_ap_captive_portal();
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     esp_wifi_set_config(WIFI_IF_AP, &s_ap_config);
   }
-  /* v4.1.20: the AP may also come back at runtime (after the router was
-   * lost); the captive DNS was stopped at GOT_IP and never restarted, so
-   * phones joining the setup AP got no DNS answers and no setup page. */
+  /* The AP may also come back at runtime (after the router was lost). The
+   * captive DNS was stopped at GOT_IP, so restart it here or phones joining
+   * the setup AP get no DNS answers and no setup page. */
   captive_dns_start();
 }
 
@@ -224,7 +185,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     s_retry_num++;
     if (s_retry_num < AP_REENABLE_THRESHOLD) {
       // Reconnect only to the BSSID selected at boot. A new strongest-AP scan
-      // happens only after reboot, matching the upstream behavior we want.
+      // happens only after reboot (intentionally no roaming).
       ESP_LOGI(TAG, "Retrying same AP (%d/%d)...", s_retry_num,
                AP_REENABLE_THRESHOLD);
       esp_wifi_connect();
@@ -399,10 +360,10 @@ static bool wifi_select_best_saved_network(void) {
           sizeof(sta_cfg.sta.password));
   memcpy(sta_cfg.sta.bssid, ap_list[best_ap].bssid, sizeof(sta_cfg.sta.bssid));
   sta_cfg.sta.bssid_set = true;
-  /* v4.1.20: lock the channel too. With channel=0 every (re)connect attempt
-   * scanned all 13 channels; in AP+STA mode the single radio then left the
-   * setup AP's channel on every retry (every 5-30 s while the router is
-   * missing), so a phone on the setup AP kept losing the page. A full scan is
+  /* Lock the channel too. With channel=0 every (re)connect attempt scans all
+   * 13 channels; in AP+STA mode the single radio then leaves the setup AP's
+   * channel on every retry (every 5-30 s while the router is missing), so a
+   * phone on the setup AP keeps losing the page. A full scan is
    * still done every WIFI_FULL_SCAN_EVERY backoff retries (router moved). */
   sta_cfg.sta.channel = ap_list[best_ap].primary;
   s_sta_locked_channel = ap_list[best_ap].primary;
@@ -480,7 +441,6 @@ void wifi_init_apsta(const char *ap_ssid, const char *ap_password) {
   if (!s_ap_netif) {
     s_ap_netif = esp_netif_create_default_wifi_ap();
   }
-  configure_ap_captive_portal();
 
   // Configure AP and save for later re-enable. STA credentials are selected
   // only after the boot scan has compared all saved networks.
@@ -509,9 +469,8 @@ void wifi_init_apsta(const char *ap_ssid, const char *ap_password) {
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &s_ap_config));
   ESP_ERROR_CHECK(esp_wifi_start());
-  /* v4.1.20: answer DNS from the first second the setup AP exists. main.c
-   * used to start it only after a failed/30 s STA wait. It is stopped again
-   * at GOT_IP together with the AP. */
+  /* Answer DNS from the first second the setup AP exists, not only after a
+   * failed 30 s STA wait. It is stopped again at GOT_IP together with the AP. */
   captive_dns_start();
 
   ESP_LOGI(TAG, "AP+STA mode started: AP SSID=%s, saved networks=%u",
@@ -578,18 +537,3 @@ esp_err_t wifi_scan(wifi_ap_record_t **ap_list, uint16_t *ap_count) {
   return err;
 }
 
-void wifi_stop(void) {
-  if (s_wifi_initialized) {
-    esp_timer_stop(s_retry_timer);
-    esp_wifi_stop();
-    esp_wifi_deinit();
-    s_wifi_initialized = false;
-    s_sta_connected = false;
-      s_have_selected_network = false;
-    s_retry_num = 0;
-    if (s_wifi_event_group) {
-      xEventGroupClearBits(s_wifi_event_group,
-                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    }
-  }
-}

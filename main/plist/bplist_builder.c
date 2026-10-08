@@ -1,6 +1,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "airplay_identity.h"
 #include "audio_receiver.h"
 #include "plist.h"
 
@@ -447,8 +448,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_id,
                                   const char *device_name,
                                   const uint8_t *public_key,
-                                  size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version) {
+                                  size_t public_key_len, uint64_t features) {
   if (!out || !device_id || !device_name || !public_key ||
       public_key_len == 0 || capacity < 512) {
     return 0;
@@ -493,7 +493,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 5: model
-  if (!bplist_write_ascii_string(out, capacity, &pos, "AudioAccessory6,1")) {
+  if (!bplist_write_ascii_string(out, capacity, &pos, AIRPLAY_MODEL)) {
     return 0;
   }
   ADD_OFFSET(); // 6: "protovers"
@@ -501,7 +501,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 7: protocol version string
-  if (!bplist_write_ascii_string(out, capacity, &pos, "1.1")) {
+  if (!bplist_write_ascii_string(out, capacity, &pos, AIRPLAY_PROTOVERS)) {
     return 0;
   }
   ADD_OFFSET(); // 8: "srcvers"
@@ -509,7 +509,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 9: source version string
-  if (!bplist_write_ascii_string(out, capacity, &pos, "377.40.00")) {
+  if (!bplist_write_ascii_string(out, capacity, &pos, AIRPLAY_SOURCE_VERSION)) {
     return 0;
   }
   ADD_OFFSET(); // 10: "vv"
@@ -517,7 +517,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 11: vv value
-  if (!bplist_write_int(out, capacity, &pos, (uint64_t)protocol_version)) {
+  if (!bplist_write_int(out, capacity, &pos, AIRPLAY_PROTOCOL_VERSION)) {
     return 0;
   }
   ADD_OFFSET(); // 12: "statusFlags"
@@ -525,7 +525,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 13: statusFlags value
-  if (!bplist_write_int(out, capacity, &pos, 4)) {
+  if (!bplist_write_int(out, capacity, &pos, AIRPLAY_STATUS_FLAGS)) {
     return 0;
   }
   ADD_OFFSET(); // 14: "pk"
@@ -541,8 +541,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 17: pairing identifier
-  if (!bplist_write_ascii_string(out, capacity, &pos,
-                                 "00000000-0000-0000-0000-000000000000")) {
+  if (!bplist_write_ascii_string(out, capacity, &pos, AIRPLAY_PAIRING_ID)) {
     return 0;
   }
   ADD_OFFSET(); // 18: "name"

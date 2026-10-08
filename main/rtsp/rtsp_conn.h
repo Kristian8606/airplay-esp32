@@ -24,9 +24,8 @@ struct rtsp_conn {
   /* One serialized client task owns read/write crypto scratch. */
   uint8_t *crypto_scratch;
 
-  // Volume control: Q15 fixed-point (0-32768)
-  // 32768 = 0 dB (unity), 0 = mute
-  volatile int32_t volume_q15;
+  // AirPlay volume in dB (0 = max, -144 = mute); the Q15 gain lives in
+  // audio_receiver (audio_receiver_set_volume_q15).
   float volume_db;
 
   // Audio streaming state
@@ -35,8 +34,8 @@ struct rtsp_conn {
   // Shairport AP2 TEARDOWN semantics: a valid plist without a streams item
   // requests the RTSP connection itself to close after the 200 response.
   bool close_after_response;
-  // v4.1.14: set once the first stream SETUP of this RTSP connection has
-  // started PTP from a clean estimator (later stream SETUPs keep it).
+  // Set once the first stream SETUP of this RTSP connection has started PTP
+  // from a clean estimator (later stream SETUPs keep it).
   bool ptp_session_fresh;
   bool amp_session_active;
   int64_t pause_started_us;
@@ -47,34 +46,14 @@ struct rtsp_conn {
   uint32_t setup_latency;
   int64_t stream_type;    // 96=UDP realtime, 103=TCP buffered
   uint16_t data_port;     // UDP port for audio data (type 96)
-  uint16_t control_port;  // UDP port for control (retransmit requests)
-  uint16_t timing_port;   // UDP port for timing (our local port)
+  uint16_t control_port;  // UDP port for control (retransmit requests, type 96)
   uint16_t event_port;    // TCP port for server->client events
   uint16_t buffered_port; // TCP port for buffered audio (type 103)
-  int data_socket;
-  int control_socket;
-  int event_socket; // TCP listener for event port
+  int event_socket;       // TCP listener for event port (until handed over)
 
-  // Client address for AirPlay 1 timing requests
-  uint32_t client_ip;           // Client IP (network byte order)
-  uint16_t client_timing_port;  // Client's timing port (for sending requests)
-  uint16_t client_control_port; // Client's control port
-
-  // Codec info from ANNOUNCE/SETUP
-  char codec[32];
-  int sample_rate;
-  int channels;
-  int bits_per_sample;
-
-  // DACP identifiers for sending commands back to the client
-  char dacp_id[32];       // DACP-ID header (hex string)
-  char active_remote[32]; // Active-Remote header (token string)
-
-  // AirPlay protocol version detected from request shape:
-  //   0 = unknown (handshake not complete)
-  //   1 = classic RAOP (Apple-Challenge / rsaaeskey / Transport: header)
-  //   2 = AirPlay 2 (HAP / bplist streams)
-  uint8_t protocol_version;
+  uint32_t client_ip;           // Sender IP (network byte order): PTP peer,
+                                // event-port filter, realtime retransmits
+  uint16_t client_control_port; // Sender's realtime control port
 };
 
 /**
@@ -88,17 +67,6 @@ rtsp_conn_t *rtsp_conn_create(void);
  */
 void rtsp_conn_free(rtsp_conn_t *conn);
 
-/**
- * Reset stream-related state (called on stream teardown)
- * Keeps session alive but clears audio stream state
- */
-void rtsp_conn_reset_stream(rtsp_conn_t *conn);
-
-/**
- * Full cleanup when connection closes
- * Stops audio, closes sockets, clears PTP
- */
-void rtsp_conn_cleanup(rtsp_conn_t *conn);
 
 /**
  * Set volume in dB (converts to Q15 internally)
@@ -107,12 +75,6 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn);
  */
 void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db);
 
-/**
- * Get volume as Q15 scale factor
- * @param conn Connection state
- * @return Q15 fixed-point multiplier (0 = mute, 32768 = unity)
- */
-int32_t rtsp_conn_get_volume_q15(rtsp_conn_t *conn);
 
 /* Event volume acknowledgments can race sender SET_PARAMETER. These APIs
  * serialize scalar gain state; the conditional update preserves newer input. */

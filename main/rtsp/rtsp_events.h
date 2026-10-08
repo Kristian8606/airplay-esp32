@@ -60,11 +60,6 @@ typedef void (*rtsp_event_callback_t)(rtsp_event_t event,
  */
 int rtsp_events_register(rtsp_event_callback_t callback, void *user_data);
 
-/**
- * Unregister a previously registered listener.
- * @param callback The callback to remove
- */
-void rtsp_events_unregister(rtsp_event_callback_t callback);
 
 /**
  * Emit an event to all registered listeners.
@@ -74,10 +69,3 @@ void rtsp_events_unregister(rtsp_event_callback_t callback);
  */
 void rtsp_events_emit(rtsp_event_t event, const rtsp_event_data_t *data);
 
-/**
- * Format seconds as mm:ss string.
- * @param seconds Time in seconds
- * @param out Output buffer (at least 8 bytes for "999:59\0")
- * @param out_size Size of output buffer
- */
-void rtsp_format_time_mmss(uint32_t seconds, char *out, size_t out_size);

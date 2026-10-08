@@ -1,6 +1,6 @@
 #pragma once
 /*
- * Wired output-latency measurement (ADC loopback), v4.1.21.
+ * Wired output-latency measurement (ADC loopback).
  *
  * The ESP plays a short known chirp through I2S and records what comes back
  * from the DAC/DSP line output on one ADC1 pin. Emission times come from the
@@ -47,9 +47,6 @@ void latency_cal_analyze(const uint16_t *samples, uint32_t n,
                          uint32_t cb_n, const int64_t *emit_us, int n_emit,
                          latency_cal_result_t *res);
 
-/* ---- ESP capture part (only with CONFIG_AIRPLAY_LATENCY_CAL) ---- */
-bool latency_cal_available(void);
-int latency_cal_gpio(void);
 esp_err_t latency_cal_capture_start(void);
 /* Stops the capture and analyses it against the emission times. */
 void latency_cal_capture_finish(const int64_t *emit_us, int n_emit,

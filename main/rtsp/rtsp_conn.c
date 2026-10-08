@@ -13,6 +13,8 @@
 
 static portMUX_TYPE volume_lock = portMUX_INITIALIZER_UNLOCKED;
 
+static void rtsp_conn_cleanup(rtsp_conn_t *conn);
+
 
 static int32_t volume_db_to_q15(float volume_db){
     if (volume_db <= -30.0f)
@@ -38,11 +40,8 @@ rtsp_conn_t *rtsp_conn_create(void) {
   } else {
     conn->volume_db = -15.0f;
   }
-  conn->volume_q15 = volume_db_to_q15(conn->volume_db);
-  audio_receiver_set_volume_q15(conn->volume_q15);
+  audio_receiver_set_volume_q15(volume_db_to_q15(conn->volume_db));
 
-  conn->data_socket = -1;
-  conn->control_socket = -1;
   conn->event_socket = -1;
 
   return conn;
@@ -77,20 +76,8 @@ void rtsp_conn_free(rtsp_conn_t *conn) {
   free(conn);
 }
 
-void rtsp_conn_reset_stream(rtsp_conn_t *conn) {
-  if (!conn) {
-    return;
-  }
-
-  // Reset stream state but keep session alive
-  conn->stream_active = false;
-  conn->stream_paused = true; // Paused, not fully torn down
-
-  // Keep ports allocated for quick resume
-  // Don't clear: data_port, control_port, timing_port, event_port
-}
-
-void rtsp_conn_cleanup(rtsp_conn_t *conn) {
+/* Full cleanup when the connection closes: closes sockets, clears PTP. */
+static void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   if (!conn) {
     return;
   }
@@ -100,14 +87,6 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   // to avoid killing a new session's audio during client replacement.
 
   // Close sockets
-  if (conn->data_socket >= 0) {
-    close(conn->data_socket);
-    conn->data_socket = -1;
-  }
-  if (conn->control_socket >= 0) {
-    close(conn->control_socket);
-    conn->control_socket = -1;
-  }
   if (conn->event_socket >= 0) {
     close(conn->event_socket);
     conn->event_socket = -1;
@@ -118,7 +97,6 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->stream_paused = false;
   conn->data_port = 0;
   conn->control_port = 0;
-  conn->timing_port = 0;
   conn->event_port = 0;
   conn->buffered_port = 0;
 
@@ -147,7 +125,6 @@ static bool conn_update_volume(rtsp_conn_t *conn, float volume_db,
     return false;
   }
   conn->volume_db = volume_db;
-  conn->volume_q15 = gain;
   audio_receiver_set_volume_q15(gain); /* Atomic target; existing output ramp. */
   /* This setter only updates the cached float; NVS is written at disconnect. */
   settings_set_volume(volume_db);
@@ -172,10 +149,3 @@ float rtsp_conn_get_volume_db(rtsp_conn_t *conn) {
   return volume;
 }
 
-int32_t rtsp_conn_get_volume_q15(rtsp_conn_t *conn) {
-  if (!conn) return 32768;
-  portENTER_CRITICAL(&volume_lock);
-  int32_t gain = conn->volume_q15;
-  portEXIT_CRITICAL(&volume_lock);
-  return gain;
-}

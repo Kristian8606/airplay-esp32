@@ -12,6 +12,3 @@
 void led_init(void);
 /* Final I2S samples (16- or 32-bit slots); the VU uses the top 16 bits. */
 void led_audio_feed(const audio_out_sample_t *pcm, size_t stereo_frames);
-void led_set_error(bool error);
-esp_err_t led_set_brightness(uint8_t brightness);
-uint8_t led_get_brightness(void);

@@ -472,14 +472,6 @@ esp_err_t rtsp_start_event_port_task(int listener, rtsp_conn_t *conn) {
   return ret == pdPASS ? ESP_OK : ESP_FAIL;
 }
 
-int rtsp_event_port_listen_socket(void) {
-  if (!event_socket_mutex) return -1;
-  xSemaphoreTake(event_socket_mutex, portMAX_DELAY);
-  int fd = event_listen_socket;
-  xSemaphoreGive(event_socket_mutex);
-  return fd;
-}
-
 void rtsp_stop_event_port_task(void) {
   if (!event_socket_mutex) return;
   xSemaphoreTake(event_socket_mutex, portMAX_DELAY);

@@ -44,10 +44,6 @@ esp_err_t wifi_get_ip_str(char *ip_str, size_t len);
  */
 esp_err_t wifi_scan(wifi_ap_record_t **ap_list, uint16_t *ap_count);
 
-/**
- * Disconnect and stop WiFi
- */
-void wifi_stop(void);
 
 /**
  * Set the DHCP hostname from the given device name.

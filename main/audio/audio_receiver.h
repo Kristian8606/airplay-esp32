@@ -26,7 +26,6 @@ typedef struct {
 
 typedef enum {
   AUDIO_ENCRYPT_NONE = 0,
-  AUDIO_ENCRYPT_AES_CBC,
   AUDIO_ENCRYPT_CHACHA20_POLY1305
 } audio_encrypt_type_t;
 
@@ -57,26 +56,19 @@ void audio_receiver_set_format(const audio_format_t *format);
 void audio_receiver_set_encryption(const audio_encrypt_t *encrypt);
 void audio_receiver_set_stream_type(audio_stream_type_t type);
 
-esp_err_t audio_receiver_start(uint16_t data_port, uint16_t control_port);
 esp_err_t audio_receiver_start_stream(uint16_t data_port, uint16_t control_port,
                                       uint16_t tcp_port);
 esp_err_t audio_receiver_start_buffered(uint16_t tcp_port);
 void audio_receiver_stop(void);
-void audio_receiver_stop_buffered_only(void);
-uint16_t audio_receiver_get_stream_port(void);
 uint16_t audio_receiver_get_buffered_port(void);
-size_t audio_receiver_get_buffered_audio_buffer_size(void);
 
 /* Software output volume. Q15: 0=mute, 32768=0 dB/full scale. */
 void audio_receiver_set_volume_q15(int32_t volume_q15);
-int32_t audio_receiver_get_volume_q15(void);
 /* Physical outputs: channel 0 = left, 1 = right. Applied after the PCM ring,
  * independently of EQ/source mode and RTSP volume. Runtime only, no NVS. */
 uint32_t audio_receiver_get_output_mute_mask(void);
 esp_err_t audio_receiver_set_output_muted(uint32_t channel, bool muted);
 
-/* Buffered no-boundary FLUSH: invalidate PCM and wait for a fresh anchor. */
-void audio_receiver_flush(void);
 void audio_receiver_seek_flush(void);
 /* AP2 realtime FLUSH with RTP-Info: discard audio older than the sender's
  * RTP boundary while preserving the validated D7/SETRATE RTP<->PTP map. */
@@ -90,8 +82,6 @@ esp_err_t audio_receiver_set_deferred_flush_range(uint32_t from_seq, uint32_t fr
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts);
 void audio_receiver_pause(void);
 void audio_receiver_set_playing(bool playing);
-bool audio_receiver_is_playing(void);
-void audio_receiver_reset_timing(void);
 
 void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
                                     uint32_t rtp_time);
@@ -123,11 +113,11 @@ bool audio_receiver_set_realtime_anchor_local(
 void audio_receiver_set_client_control(uint32_t client_ip,
                                        uint16_t client_control_port);
 
-/* RTSP compatibility: buffered AP2 uses zero extra playout latency here. */
+/* Realtime (type 96): sender latencyMin in samples, added to the anchor.
+ * Buffered (type 103) plays at the anchor itself and uses 0. */
 void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
-uint32_t audio_receiver_get_hardware_latency_us(void);
 
-/* v4.1.21 output latency after the ESP (DAC/DSP), microseconds. Positive =
+/* Output latency after the ESP (DAC/DSP), microseconds. Positive =
  * the chain delays the sound, so the ESP plays that much earlier. Applied
  * live; persist=true also stores it in NVS. Range -100000..150000. */
 #include "latency_cal.h"

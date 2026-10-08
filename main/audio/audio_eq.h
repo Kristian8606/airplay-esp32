@@ -61,10 +61,6 @@ typedef struct {
 /* Load the saved configuration and initialise the runtime DSP state. */
 esp_err_t audio_eq_init(void);
 
-/* Persistent and live configuration are deliberately separate. Save writes
- * NVS only; Apply changes the running DSP without moving EQ from the decoder
- * side of the PCM ring and without restarting the device. */
-esp_err_t audio_eq_load_config(audio_eq_config_t *out);
 esp_err_t audio_eq_save_config(const audio_eq_config_t *config);
 esp_err_t audio_eq_apply_config(const audio_eq_config_t *config);
 esp_err_t audio_eq_get_active_config(audio_eq_config_t *out);

@@ -47,10 +47,6 @@ void plist_dict_int(plist_t *p, const char *key, int64_t value);
  */
 void plist_dict_uint(plist_t *p, const char *key, uint64_t value);
 
-/**
- * Add boolean to dictionary
- */
-void plist_dict_bool(plist_t *p, const char *key, bool value);
 
 /**
  * Add base64 data to dictionary
@@ -58,11 +54,6 @@ void plist_dict_bool(plist_t *p, const char *key, bool value);
 void plist_dict_data(plist_t *p, const char *key, const uint8_t *data,
                      size_t len);
 
-/**
- * Add data as hex string (for pk field)
- */
-void plist_dict_data_hex(plist_t *p, const char *key, const uint8_t *data,
-                         size_t len);
 
 /**
  * End dictionary
@@ -74,20 +65,12 @@ void plist_dict_end(plist_t *p);
  */
 void plist_dict_array_begin(plist_t *p, const char *key);
 
-/**
- * Start an array (standalone)
- */
-void plist_array_begin(plist_t *p);
 
 /**
  * End array
  */
 void plist_array_end(plist_t *p);
 
-/**
- * Add integer to array
- */
-void plist_array_int(plist_t *p, int64_t value);
 
 /**
  * End plist document
@@ -134,18 +117,6 @@ bool bplist_get_peer_list(const uint8_t *plist, size_t plist_len,
                           bool extended, bplist_peer_info_t *out,
                           size_t out_capacity, size_t *out_count);
 
-/**
- * Find a data value by key in a binary plist
- * @param plist Binary plist data
- * @param plist_len Length of plist
- * @param key Key to search for (e.g., "ekey", "eiv")
- * @param out_data Output buffer for data value
- * @param out_capacity Capacity of output buffer
- * @param out_len Actual length of data found
- * @return true if found, false otherwise
- */
-bool bplist_find_data(const uint8_t *plist, size_t plist_len, const char *key,
-                      uint8_t *out_data, size_t out_capacity, size_t *out_len);
 
 /**
  * Find a data value by key anywhere in a binary plist
@@ -186,7 +157,7 @@ bool bplist_get_stream_info(const uint8_t *plist, size_t plist_len,
                             size_t index, int64_t *type, size_t *ekey_len,
                             size_t *eiv_len, size_t *shk_len);
 
-// Stream key debug info
+// Key/value summary of one stream dict entry
 typedef struct {
   char key[64];
   uint8_t value_type; // See BPLIST_VALUE_*
@@ -203,7 +174,8 @@ typedef struct {
 #define BPLIST_VALUE_DICT    6
 
 /**
- * Get key/value info for a stream dict (debug helper)
+ * Get key/value info for a stream dict (SETUP reads ct/sr/spf/controlPort/
+ * latencyMin from it)
  * @param plist Binary plist data
  * @param plist_len Length of plist
  * @param index Stream index
@@ -280,7 +252,7 @@ bool bplist_find_string(const uint8_t *plist, size_t plist_len, const char *key,
 
 /**
  * Build initial SETUP response bplist (no streams array)
- * Returns eventPort and timingPort.
+ * Returns eventPort and timingPort (0: PTP timing, no NTP port).
  * @param out Output buffer
  * @param capacity Buffer capacity
  * @param event_port Event port to include in response
@@ -328,15 +300,13 @@ size_t bplist_build_feedback_response(uint8_t *out, size_t capacity,
  * @param public_key HAP Ed25519 public key
  * @param public_key_len Public key length
  * @param features AirPlay feature bitmask
- * @param protocol_version AirPlay protocol version value ("vv")
  * @return Length of generated bplist, or 0 on error
  */
 size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_id,
                                   const char *device_name,
                                   const uint8_t *public_key,
-                                  size_t public_key_len, uint64_t features,
-                                  int64_t protocol_version);
+                                  size_t public_key_len, uint64_t features);
 
 /* Receiver-to-sender command on the AirPlay 2 audio event connection. */
 size_t bplist_build_media_remote_command(uint8_t *out, size_t capacity,

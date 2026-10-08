@@ -59,17 +59,16 @@ bool audio_playout_wait_completion(audio_playout_completion_t *out,
                                     uint32_t timeout_ticks);
 
 bool audio_playout_is_enabled(void);
-uint32_t audio_playout_hardware_latency_us(void);
 
-/* Fine tune the active TX master clock. The ESP-IDF 5.5 API requires READY,
- * so this helper performs the same disable -> tune -> enable sequence used by
- * Espressif's dynamic I2S tuning example. Call only from the playout task
- * between writes. target_ppm is relative to the nominal MCLK measured at init. */
+/* Fine tune the RUNNING TX master clock (channel enabled). The IDF header
+ * documents i2s_channel_tune_rate() for the READY state, but its
+ * implementation only rewrites the MCLK fractional divider without a state
+ * check, so it is used live: no disable/enable, DMA and the tag-to-EOF
+ * chronology keep running. Call only from the playout task between writes.
+ * target_ppm is relative to the nominal MCLK measured at init (+/-160 ppm). */
 esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
                                  audio_playout_tune_info_t *out);
 /* Reset the physical MCLK correction to nominal while preserving the current
  * enabled/disabled channel state. Intended for a hard audio-session boundary,
  * not for normal track/anchor changes inside one session. */
 esp_err_t audio_playout_reset_tune(void);
-int32_t audio_playout_get_tune_ppm(void);
-uint32_t audio_playout_get_nominal_mclk_hz(void);

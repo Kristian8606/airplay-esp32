@@ -13,43 +13,10 @@
  * Inspired by shairport-sync's method_handlers pattern
  */
 
-// Key bits:
-//   Bit 38: SupportsCoreUtilsPairingAndEncryption
-//   Bit 46: SupportsHKPairingAndAccessControl
-//   Bit 48: SupportsTransientPairing
-#ifdef CONFIG_AIRPLAY_FORCE_V1
-// AirPlay v1: strip pairing/encryption bits so iOS uses classic RAOP
-#define AIRPLAY_FEATURES_HI 0x0
-#define AIRPLAY_FEATURES_LO 0x5C4A00
-#else
-#define AIRPLAY_FEATURES_HI 0x1C340
-#define AIRPLAY_FEATURES_LO 0x405C4A00
-#endif
+#include "airplay_identity.h"
 
 // Include for audio_format_t and the shared buffered transport capacity.
 #include "audio_receiver.h"
-
-// Advertise exactly the amount of raw type-103 audio we can stage.
-
-/**
- * Codec registry entry
- */
-typedef struct {
-  const char *name; // Codec name: "ALAC", "AAC", "OPUS"
-  int64_t type_id;  // bplist "ct" value (2=ALAC, 4=AAC, 8=AAC-ELD)
-} rtsp_codec_t;
-
-/**
- * Configure audio format from codec type ID
- * Looks up codec in registry and calls its configure function.
- * @param type_id Codec type from bplist "ct" field
- * @param fmt Audio format struct to configure
- * @param sample_rate Sample rate from bplist
- * @param samples_per_frame Samples per frame from bplist
- * @return true if codec found and configured, false otherwise
- */
-bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
-                          int64_t sample_rate, int64_t samples_per_frame);
 
 /**
  * Handler function type
@@ -77,12 +44,6 @@ typedef struct {
 int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
                   size_t raw_len);
 
-/**
- * Get device ID string (MAC address format)
- * @param device_id Output buffer (at least 18 bytes)
- * @param len Buffer size
- */
-void rtsp_get_device_id(char *device_id, size_t len);
 
 // Event port task management
 // Successful start transfers listening descriptor ownership to the task.
@@ -90,4 +51,3 @@ void rtsp_get_device_id(char *device_id, size_t len);
 esp_err_t rtsp_start_event_port_task(int listen_socket, rtsp_conn_t *conn);
 void rtsp_stop_event_port_task(void);
 bool rtsp_event_port_is_idle(void);
-int rtsp_event_port_listen_socket(void);

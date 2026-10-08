@@ -17,12 +17,6 @@
  */
 esp_err_t ptp_clock_init(void);
 
-/**
- * Request PTP stop and wait up to one second for owner socket cleanup.
- * If the task has not acknowledged stop, resources remain owned by it and
- * initialization remains blocked until it finishes.
- */
-void ptp_clock_stop(void);
 
 /**
  * Clear PTP clock synchronization state.
@@ -54,18 +48,6 @@ typedef struct {
  */
 void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count);
 
-/**
- * Get current PTP time in nanoseconds.
- * Returns local time adjusted by PTP offset.
- * @return PTP time in nanoseconds since epoch
- */
-uint64_t ptp_clock_get_time_ns(void);
-
-/**
- * Get current offset from local clock to PTP time in nanoseconds.
- * PTP_time = local_time + offset
- */
-int64_t ptp_clock_get_offset_ns(void);
 
 typedef struct {
   bool realtime_mode;
@@ -82,7 +64,7 @@ typedef struct {
   uint32_t mastership_age_ms;
   uint32_t sample_count;
   uint32_t sample_age_ms; /* UINT32_MAX when no accepted timing sample exists. */
-  /* Diagnostics (v4.1.14): why a buffered anchor may never become usable. */
+  /* Diagnostics: why a buffered anchor may never become usable. */
   bool source_mixed;          /* packets from a second source were rejected */
   uint64_t expected_clock_id; /* D7/timeline hint, 0 = none */
   uint32_t peer_count;        /* SETPEERS entries currently tracked */
@@ -126,14 +108,6 @@ void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip);
  */
 void ptp_clock_note_realtime_d7(uint64_t clock_id);
 
-/**
- * Convert a remote timestamp from the current READY realtime grandmaster into
- * ESP monotonic time. Returns false while a new GM is still acquiring or when
- * the D7 clock_id does not match the current grandmaster.
- */
-bool ptp_clock_realtime_time_to_local(uint64_t clock_id,
-                                      uint64_t remote_ptp_ns,
-                                      uint64_t *local_ns);
 
 typedef struct {
   bool realtime_mode;
@@ -191,7 +165,3 @@ void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot);
  */
 void ptp_clock_set_master_clock_id(uint64_t clock_id);
 
-/**
- * Read the current expected master clock_id (0 if none / filter cleared).
- */
-uint64_t ptp_clock_get_master_clock_id(void);

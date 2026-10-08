@@ -622,7 +622,7 @@ static bool bplist_find_data_recursive(const uint8_t *plist, size_t plist_len,
   return false;
 }
 
-bool bplist_find_data(const uint8_t *plist, size_t plist_len, const char *key,
+static bool bplist_find_data(const uint8_t *plist, size_t plist_len, const char *key,
                       uint8_t *out_data, size_t out_capacity, size_t *out_len) {
   if (!key || !out_data || !out_len) return false;
   if (!plist || plist_len < 40 || memcmp(plist, "bplist00", 8) != 0) {

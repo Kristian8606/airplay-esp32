@@ -1,5 +1,4 @@
 #include "dns_server.h"
-#include "spiram_task.h"
 
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -233,9 +232,9 @@ esp_err_t dns_server_start(uint32_t redirect_ip) {
 
   s_dns_socket = sock;
   atomic_store_explicit(&s_dns_task_live, true, memory_order_release);
-  if (task_create_pinned_spiram(dns_server_task, "dns_server", 4096,
-                                (void *)(intptr_t)sock, 5,
-                                &s_dns_task, 0, NULL) != pdPASS) {
+  if (xTaskCreatePinnedToCore(dns_server_task, "dns_server", 4096,
+                              (void *)(intptr_t)sock, 5,
+                              &s_dns_task, 0) != pdPASS) {
     ESP_LOGE(TAG, "Failed to create DNS server task");
     close(sock);
     s_dns_socket = -1;

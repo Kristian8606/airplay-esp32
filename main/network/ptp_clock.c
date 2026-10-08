@@ -15,7 +15,6 @@
 #include "audio_diag.h"
 #include "ptp_clock.h"
 #include "ptp_clock_engine.h"
-#include "spiram_task.h"
 
 static const char *TAG = "ptp_clock";
 
@@ -94,7 +93,6 @@ static const char *TAG = "ptp_clock";
 static struct {
   bool running;
   TaskHandle_t task_handle;
-  spiram_task_mem_t task_mem;
   int event_socket;
   int general_socket;
 
@@ -1068,9 +1066,9 @@ esp_err_t ptp_clock_init(void) {
 
   __atomic_store_n(&ptp.running, true, __ATOMIC_RELEASE);
   TaskHandle_t task_handle = NULL;
-  BaseType_t ret = task_create_pinned_spiram(ptp_task, "ptp_clock", 4096, NULL,
-                                             PTP_TASK_PRIORITY_LEGACY,
-                                             &task_handle, 0, &ptp.task_mem);
+  BaseType_t ret = xTaskCreatePinnedToCore(ptp_task, "ptp_clock", 4096, NULL,
+                                           PTP_TASK_PRIORITY_LEGACY,
+                                           &task_handle, 0);
   if (ret != pdPASS) {
     __atomic_store_n(&ptp.running, false, __ATOMIC_RELEASE);
     ESP_LOGE(TAG, "Failed to create PTP task");
@@ -1087,23 +1085,6 @@ failed:
   ptp.event_socket = ptp.general_socket = -1;
   xSemaphoreGive(lifecycle);
   return ESP_FAIL;
-}
-
-void ptp_clock_stop(void) {
-  SemaphoreHandle_t lifecycle = ptp_lifecycle_lock();
-  __atomic_store_n(&ptp.running, false, __ATOMIC_RELEASE);
-  /* Keep owner-only close. The existing one-second select/receive timeouts
-   * bound exit; timeout is never permission to reset a still-live task. */
-  for (int i = 0; i < 20 &&
-       __atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE) != NULL; i++) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  if (__atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE) != NULL) {
-    ESP_LOGW(TAG, "PTP task did not exit in time; restart remains blocked");
-  } else {
-    task_free_spiram(&ptp.task_mem);
-  }
-  xSemaphoreGive(lifecycle);
 }
 
 /* Estimator reset without the lock; caller holds ptp_state_mux. */
@@ -1193,13 +1174,13 @@ void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count) {
     }
   }
   if (changed) {
-    /* v4.1.14: a session is starting (empty -> non-empty peer list). Before
-     * this point the task admitted ANY PTP source it heard on the network
-     * (boot, other AirPlay/HomeKit devices) and latched onto the first one.
-     * That latch was never undone, so the real sender's packets were rejected
-     * as a "mixed" source until the next full TEARDOWN: the first session
-     * after boot could stay silent forever. Drop the pre-session estimator so
-     * only the advertised peers can seed it. Mid-session peer changes (group
+    /* A session is starting (empty -> non-empty peer list). Before this
+     * point the task admits ANY PTP source it hears on the network (boot,
+     * other AirPlay/HomeKit devices) and latches onto the first one. Without
+     * this reset the real sender's packets would be rejected as a "mixed"
+     * source until the next full TEARDOWN, and the first session after boot
+     * could stay silent. Drop the pre-session estimator so only the
+     * advertised peers can seed it. Mid-session peer changes (group
      * edits) keep the estimator and its handover logic. */
     if (ptp.peer_count == 0 && normalized_count > 0 && !ptp.realtime_mode &&
         (ptp.legacy_engine.source_clock_id != 0 || ptp.legacy_source_mixed)) {
@@ -1268,24 +1249,6 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
            (unsigned long)pause_duration_ms,
            realtime ? "realtime" : "buffered");
 #endif
-}
-
-
-uint64_t ptp_clock_get_time_ns(void) {
-  const int64_t local_ns = get_local_time_ns();
-  int64_t offset_ns;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  offset_ns = ptp.filtered_offset_ns;
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  return (uint64_t)(local_ns + offset_ns);
-}
-
-int64_t ptp_clock_get_offset_ns(void) {
-  int64_t offset_ns;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  offset_ns = ptp.filtered_offset_ns;
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  return offset_ns;
 }
 
 
@@ -1424,15 +1387,6 @@ void ptp_clock_note_realtime_d7(uint64_t clock_id) {
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
-bool ptp_clock_realtime_time_to_local(uint64_t clock_id,
-                                      uint64_t remote_ptp_ns,
-                                      uint64_t *local_ns) {
-  ptp_realtime_snapshot_t snapshot;
-  ptp_clock_get_realtime_snapshot(&snapshot);
-  return ptp_clock_realtime_snapshot_to_local(
-      &snapshot, clock_id, remote_ptp_ns, local_ns);
-}
-
 void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
   if (!snapshot) return;
   memset(snapshot, 0, sizeof(*snapshot));
@@ -1542,11 +1496,3 @@ void ptp_clock_set_master_clock_id(uint64_t clock_id) {
   }
 }
 
-uint64_t ptp_clock_get_master_clock_id(void) {
-  uint64_t clock_id;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  clock_id = ptp.realtime_mode ? ptp.grandmaster_clock_id
-                               : ptp.expected_clock_id;
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  return clock_id;
-}

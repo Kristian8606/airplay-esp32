@@ -177,43 +177,6 @@ esp_err_t settings_get_wifi_network(size_t index,
   return e;
 }
 
-static esp_err_t get_latest_wifi_network(settings_wifi_network_t *network) {
-  if (!network) return ESP_ERR_INVALID_ARG;
-  nvs_handle_t h;
-  esp_err_t e = nvs_open(NS, NVS_READONLY, &h);
-  if (e != ESP_OK) return e;
-
-  wifi_store_t store;
-  e = load_store_or_legacy(h, &store);
-  if (e == ESP_OK) {
-    if (store.count == 0 || store.latest_index >= store.count) {
-      e = ESP_ERR_NOT_FOUND;
-    } else {
-      *network = store.network[store.latest_index];
-    }
-  }
-  nvs_close(h);
-  return e;
-}
-
-esp_err_t settings_get_wifi_ssid(char *ssid, size_t len) {
-  if (!ssid || len == 0) return ESP_ERR_INVALID_ARG;
-  settings_wifi_network_t network;
-  esp_err_t e = get_latest_wifi_network(&network);
-  if (e != ESP_OK) return e;
-  strlcpy(ssid, network.ssid, len);
-  return ESP_OK;
-}
-
-esp_err_t settings_get_wifi_password(char *password, size_t len) {
-  if (!password || len == 0) return ESP_ERR_INVALID_ARG;
-  settings_wifi_network_t network;
-  esp_err_t e = get_latest_wifi_network(&network);
-  if (e != ESP_OK) return e;
-  strlcpy(password, network.password, len);
-  return ESP_OK;
-}
-
 esp_err_t settings_set_wifi_credentials(const char *ssid,
                                         const char *password) {
   if (!ssid || ssid[0] == '\0' || strlen(ssid) >= SETTINGS_WIFI_SSID_LEN ||

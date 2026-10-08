@@ -41,28 +41,11 @@ int rtsp_request_parse(const uint8_t *data, size_t len, rtsp_request_t *req);
 const uint8_t *rtsp_find_header_end(const uint8_t *data, size_t len);
 
 /**
- * Parse CSeq header from request
- * @param request Request string
- * @return CSeq value, or 1 if not found
- */
-int rtsp_parse_cseq(const char *request);
-
-/**
  * Parse Content-Length header from request
  * @param request Request string
- * @return Content length, or 0 if not found
+ * @return Content length, 0 if absent, -1 if malformed or duplicated
  */
 int rtsp_parse_content_length(const char *request);
-
-/**
- * Get body pointer from request
- * @param request Request string
- * @param request_len Total request length
- * @param body_len Output: body length
- * @return Pointer to body, or NULL if none
- */
-const uint8_t *rtsp_get_body(const char *request, size_t request_len,
-                             size_t *body_len);
 
 /**
  * Send RTSP response (handles encryption automatically)
@@ -87,7 +70,7 @@ int rtsp_send_response(int socket, rtsp_conn_t *conn, int status_code,
 int rtsp_send_ok(int socket, rtsp_conn_t *conn, int cseq);
 
 /**
- * Send HTTP response (for GET /info before RTSP mode)
+ * Send HTTP response (plain HTTP GET /info)
  * @param socket Client socket
  * @param conn Connection state
  * @param status_code HTTP status code
@@ -100,12 +83,3 @@ int rtsp_send_ok(int socket, rtsp_conn_t *conn, int cseq);
 int rtsp_send_http_response(int socket, rtsp_conn_t *conn, int status_code,
                             const char *status_text, const char *content_type,
                             const char *body, size_t body_len);
-
-/**
- * Parse Transport header for client ports (AirPlay 1)
- * @param request Request string
- * @param control_port Output: client's control port (or 0)
- * @param timing_port Output: client's timing port (or 0)
- */
-void rtsp_parse_transport(const char *request, uint16_t *control_port,
-                          uint16_t *timing_port);

@@ -47,10 +47,6 @@ bool ap2_buffered_fifo_is_idle(ap2_buffered_fifo_t *fifo);
  * stopped/idle; live FLUSHBUFFERED never rewinds or purges this byte FIFO. */
 void ap2_buffered_fifo_clear(ap2_buffered_fifo_t *fifo);
 
-/* Abort only the current buffered TCP client after fatal framing corruption.
- * The listening socket remains available for the RTSP session. */
-void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo);
-
 size_t ap2_buffered_fifo_capacity(const ap2_buffered_fifo_t *fifo);
 /* Revalidate an already-consumed packet before publishing decoded PCM. */
 bool ap2_buffered_fifo_epoch_is_current(const ap2_buffered_fifo_t *fifo,

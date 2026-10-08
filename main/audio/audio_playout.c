@@ -232,9 +232,9 @@ static esp_err_t audio_playout_init_current_core(void) {
              esp_err_to_name(err), s_nominal_mclk_hz);
   }
 
-  /* Keep the channel READY/disabled. Preload both DMA descriptors before
-   * the exact PTP start edge, then enables the channel. This removes the
-   * zero-descriptor ambiguity that made earlier EOF counting unreliable. */
+  /* Keep the channel READY/disabled. Both DMA descriptors are preloaded before
+   * the exact PTP start edge, then the channel is enabled. This removes the
+   * zero-descriptor ambiguity that would make EOF counting unreliable. */
   AUDIO_DIAG_PLAYOUT_I2S(
       s_nominal_mclk_hz, (uint32_t)I2S_DMA_DESC_NUM,
       (uint32_t)I2S_DMA_FRAME_NUM,
@@ -483,14 +483,6 @@ esp_err_t audio_playout_reset_tune(void) {
   return err;
 }
 
-int32_t audio_playout_get_tune_ppm(void) {
-  return s_tune_ppm;
-}
-
-uint32_t audio_playout_get_nominal_mclk_hz(void) {
-  return s_nominal_mclk_hz;
-}
-
 esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
                                  audio_playout_tune_info_t *out) {
   if (!s_tx || !s_enabled || s_nominal_mclk_hz == 0U) {
@@ -524,9 +516,9 @@ esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
   };
   i2s_tuning_info_t info = {0};
 
-  /* i2s_channel_tune_rate() is the IDF runtime fine-tuning API. Keep
-   * the active DMA ring running so clock correction cannot reset TX/GDMA
-   * state or disturb the application tag-to-EOF chronology. */
+  /* Tune while running (see audio_playout.h): the DMA ring keeps going, so
+   * clock correction cannot reset TX/GDMA state or disturb the application
+   * tag-to-EOF chronology. */
   esp_err_t err = i2s_channel_tune_rate(s_tx, &cfg, &info);
   if (err == ESP_OK) {
     s_tune_ppm = target_ppm;
@@ -540,7 +532,3 @@ esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
   return err;
 }
 
-uint32_t audio_playout_hardware_latency_us(void) {
-  return (uint32_t)(((uint64_t)I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM *
-                     1000000ULL) / I2S_RATE_HZ);
-}
