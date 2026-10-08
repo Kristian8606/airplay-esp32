@@ -304,6 +304,9 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 static void handle_setpeers(int socket, rtsp_conn_t *conn,
                             const rtsp_request_t *req, const uint8_t *raw,
                             size_t raw_len);
+static void handle_loudnessnormalization(int socket, rtsp_conn_t *conn,
+                                         const rtsp_request_t *req,
+                                         const uint8_t *raw, size_t raw_len);
 
 // Dispatch table
 static const rtsp_method_handler_t method_handlers[] = {
@@ -322,6 +325,7 @@ static const rtsp_method_handler_t method_handlers[] = {
     {"SETRATEANCHORTIME", handle_setrateanchortime},
     {"SETPEERS", handle_setpeers},
     {"SETPEERSX", handle_setpeers},
+    {"LOUDNESSNORMALIZATION", handle_loudnessnormalization},
     {NULL, NULL}};
 
 // Parse a named header value from raw RTSP request data (case-insensitive).
@@ -1796,6 +1800,17 @@ static void handle_get_parameter(int socket, rtsp_conn_t *conn,
     }
   }
 
+  rtsp_send_ok(socket, conn, req->cseq);
+}
+
+/* LOUDNESSNORMALIZATION: newer iOS/tvOS senders send this during SETUP with
+ * a bplist { loudnessNormalizationEnabled: <bool> }. Accept it with 200 OK
+ * like a real speaker instead of 501; the setting is not applied. */
+static void handle_loudnessnormalization(int socket, rtsp_conn_t *conn,
+                                         const rtsp_request_t *req,
+                                         const uint8_t *raw, size_t raw_len) {
+  (void)raw;
+  (void)raw_len;
   rtsp_send_ok(socket, conn, req->cseq);
 }
 
