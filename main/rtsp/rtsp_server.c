@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -22,6 +23,8 @@
 #include "rtsp_handlers.h"
 #include "rtsp_message.h"
 
+#include "airplay_identity.h"
+#include "mdns_airplay.h"
 #include "ptp_clock.h"
 #include "rtsp_events.h"
 
@@ -50,17 +53,27 @@ static _Atomic(SemaphoreHandle_t) lifecycle_mutex;
 // reconnect/start-stop paths cannot reuse static task memory before FreeRTOS
 // idle finishes deletion.
 
-// Client slot for tracking connections
+// Client slot for tracking connections. Several RTSP connections may be
+// open at once (a sender's audio connection next to its remote-control-only
+// connection, /info probes, a new sender pairing). Only one of them owns the
+// global audio / PTP / event state: the one that did the last audio SETUP
+// (see rtsp_server_claim_audio()).
+#define MAX_CLIENTS 4
+
 typedef struct {
   rtsp_conn_t *conn;
   _Atomic bool live;
   int socket;
   _Atomic bool should_stop;
   _Atomic bool is_old; // Marked as old client being killed
+  _Atomic bool audio_owner;
+  /* Body bytes of an oversized request still to be dropped (owned by the
+   * client task). */
+  size_t discard_left;
 } client_slot_t;
 
-static client_slot_t clients[2] = {{.socket = -1}, {.socket = -1}}; // Current and old
-static int current_slot = 0;
+static client_slot_t clients[MAX_CLIENTS] = {
+    {.socket = -1}, {.socket = -1}, {.socket = -1}, {.socket = -1}};
 
 static void detach_client_socket(client_slot_t *slot) {
   xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
@@ -99,10 +112,34 @@ static uint8_t *grow_buffer(uint8_t *old_buf, size_t old_size, size_t new_size,
   return new_buf;
 }
 
+/* First request line ("POST /command RTSP/1.0") for log messages. */
+static void request_line(const uint8_t *buffer, size_t len, char *out, size_t cap) {
+  size_t n = 0;
+  while (n < len && n + 1 < cap && buffer[n] != '\r' && buffer[n] != '\n') {
+    out[n] = (buffer[n] >= 0x20 && buffer[n] < 0x7f) ? (char)buffer[n] : '?';
+    n++;
+  }
+  out[n] = '\0';
+}
+
+static int request_cseq(const char *header) {
+  const char *c = strcasestr(header, "\r\nCSeq:");
+  return c ? atoi(c + 7) : -1;
+}
+
 // Process buffered RTSP requests
 static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
                                 size_t *buf_len) {
   while (*buf_len > 0 && !slot->should_stop) {
+    if (slot->discard_left > 0) {
+      /* Drop the body of an oversized request that was already answered. */
+      size_t n = *buf_len < slot->discard_left ? *buf_len : slot->discard_left;
+      if (*buf_len > n) memmove(buffer, buffer + n, *buf_len - n);
+      *buf_len -= n;
+      slot->discard_left -= n;
+      if (slot->discard_left == 0) ESP_LOGI(TAG, "Oversized request body skipped");
+      continue;
+    }
     const uint8_t *header_end = rtsp_find_header_end(buffer, *buf_len);
     if (!header_end) {
       break;
@@ -114,10 +151,31 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     buffer[header_len] = '\0';
     int content_len = rtsp_parse_content_length((const char *)buffer);
     buffer[header_len] = header_saved;
-    if (content_len < 0 || header_len > RTSP_BUFFER_LARGE ||
-        (size_t)content_len > RTSP_BUFFER_LARGE - header_len) {
+    if (content_len < 0 || header_len > RTSP_BUFFER_LARGE) {
+      char line[96];
+      request_line(buffer, *buf_len, line, sizeof(line));
+      ESP_LOGW(TAG, "Malformed request header (Content-Length %d, header %u B): "
+               "closing connection | %s", content_len, (unsigned)header_len, line);
       slot->conn->close_after_response = true;
       return; /* Never reinterpret an invalid body as a new request. */
+    }
+    if ((size_t)content_len > RTSP_BUFFER_LARGE - header_len) {
+      /* Too large to buffer (e.g. now-playing info with big artwork). Answer
+       * it without reading the body and drop the body bytes as they arrive;
+       * closing the connection here ends the sender's whole session. */
+      char line[96];
+      request_line(buffer, *buf_len, line, sizeof(line));
+      buffer[header_len] = '\0';
+      const int cseq = request_cseq((const char *)buffer);
+      buffer[header_len] = header_saved;
+      ESP_LOGW(TAG, "RTSP <- %s cseq=%d body=%d B is over the %u KiB limit: "
+               "answered 200 OK, body skipped", line, cseq, content_len,
+               (unsigned)(RTSP_BUFFER_LARGE / 1024U));
+      rtsp_send_ok(slot->socket, slot->conn, cseq);
+      slot->discard_left = (size_t)content_len;
+      if (*buf_len > header_len) memmove(buffer, buffer + header_len, *buf_len - header_len);
+      *buf_len -= header_len;
+      continue;
     }
     size_t total_len = header_len + (size_t)content_len;
     if (*buf_len < total_len) break;
@@ -193,6 +251,10 @@ static void client_task(void *pvParameters) {
 
   size_t buf_len = 0;
   uint8_t *decrypted = NULL; /* Lazy bounded encrypted-frame staging. */
+  slot->discard_left = 0;
+  /* Why the loop ended, for the disconnect log line. */
+  const char *why = "stop requested";
+  int why_errno = 0;
 
   // Socket timeout for stop signal responsiveness
   struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
@@ -214,19 +276,23 @@ static void client_task(void *pvParameters) {
           decrypted = heap_caps_malloc(RTSP_ENCRYPTED_BLOCK_MAX,
               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
           if (!decrypted) decrypted = malloc(RTSP_ENCRYPTED_BLOCK_MAX);
-          if (!decrypted) goto cleanup;
+          if (!decrypted) { why = "out of memory"; goto cleanup; }
         }
         int block_len = rtsp_crypto_read_block(
             slot->socket, conn, decrypted, RTSP_ENCRYPTED_BLOCK_MAX);
-        if (block_len <= 0) goto cleanup;
+        if (block_len <= 0) {
+          why_errno = errno;
+          why = slot->should_stop ? "stop requested" : "sender closed or read failed";
+          goto cleanup;
+        }
         size_t offset = 0;
         while (offset < (size_t)block_len) {
           if (buf_len == buf_capacity) {
-            if (buf_capacity == RTSP_BUFFER_LARGE) goto cleanup;
+            if (buf_capacity == RTSP_BUFFER_LARGE) { why = "receive buffer full"; goto cleanup; }
             size_t new_cap = buf_capacity * 2;
             if (new_cap > RTSP_BUFFER_LARGE) new_cap = RTSP_BUFFER_LARGE;
             uint8_t *new_buf = grow_buffer(buffer, buf_capacity, new_cap, buf_len);
-            if (!new_buf) goto cleanup;
+            if (!new_buf) { why = "out of memory"; goto cleanup; }
             buffer = new_buf;
             buf_capacity = new_cap;
           }
@@ -236,7 +302,7 @@ static void client_task(void *pvParameters) {
           buf_len += chunk;
           offset += chunk;
           process_rtsp_buffer(slot, buffer, &buf_len);
-          if (conn->close_after_response) goto cleanup;
+          if (conn->close_after_response) { why = "closed after response"; goto cleanup; }
         }
       }
       goto cleanup;
@@ -244,11 +310,12 @@ static void client_task(void *pvParameters) {
 
     // Plain-text mode
     if (buf_len == buf_capacity) {
-      if (buf_capacity == RTSP_BUFFER_LARGE) break;
+      if (buf_capacity == RTSP_BUFFER_LARGE) { why = "receive buffer full"; break; }
       size_t new_cap = buf_capacity * 2;
       if (new_cap > RTSP_BUFFER_LARGE) new_cap = RTSP_BUFFER_LARGE;
       uint8_t *new_buf = grow_buffer(buffer, buf_capacity, new_cap, buf_len);
       if (!new_buf) {
+        why = "out of memory";
         break;
       }
       buffer = new_buf;
@@ -261,40 +328,59 @@ static void client_task(void *pvParameters) {
       if (recv_len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         continue;
       }
+      why_errno = recv_len < 0 ? errno : 0;
+      why = recv_len == 0 ? "sender closed" : "read failed";
       break;
     }
     buf_len += (size_t)recv_len;
     process_rtsp_buffer(slot, buffer, &buf_len);
     if (conn->close_after_response) {
+      why = "closed after response";
       goto cleanup;
     }
   }
 
 cleanup:
-  ESP_LOGI(TAG, "Client slot %d disconnected", slot_idx);
+  {
+    char err[16] = "";
+    if (why_errno) snprintf(err, sizeof(err), " (errno %d)", why_errno);
+    ESP_LOGI(TAG, "Client slot %d disconnected%s: %s%s (stack headroom %u of %u B)",
+             slot_idx,
+             conn->owns_audio ? "" : (conn->rc_only ? " (remote control)" : " (no audio)"),
+             why, err, (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)CLIENT_STACK_SIZE);
+  }
   free(decrypted);
   free(buffer);
   detach_client_socket(slot);
 
-  // Immediate: stop audio and the event channel
-  audio_receiver_stop();
-  rtsp_stop_event_port_task();
-  /* A timeout requests cancellation, but does not release ownership. Keep
-   * this slot live until every producer and event socket actually exits. */
-  while (!audio_receiver_is_idle() || !rtsp_event_port_is_idle()) {
-    /* A late static DATA-task suspension must be reaped by another stop. */
-    if (!audio_receiver_is_idle()) audio_receiver_stop();
-    if (!rtsp_event_port_is_idle()) rtsp_stop_event_port_task();
-    vTaskDelay(1);
+  if (conn->owns_audio) {
+    // Immediate: stop audio and the event channel
+    audio_receiver_stop();
+    rtsp_stop_event_port_task();
+    /* A timeout requests cancellation, but does not release ownership. Keep
+     * this slot live until every producer and event socket actually exits. */
+    while (!audio_receiver_is_idle() || !rtsp_event_port_is_idle()) {
+      /* A late static DATA-task suspension must be reaped by another stop. */
+      if (!audio_receiver_is_idle()) audio_receiver_stop();
+      if (!rtsp_event_port_is_idle()) rtsp_stop_event_port_task();
+      vTaskDelay(1);
+    }
+    audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
+    audio_receiver_set_encryption(NULL);
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+    /* Audio stopped with the connection: the receiver session is no longer
+     * active (status flag bit 17). */
+    if (airplay_set_session_active(false)) mdns_airplay_update_flags();
+#endif
   }
-  audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
-  audio_receiver_set_encryption(NULL);
 
   detach_client_conn(slot);
   rtsp_conn_free(conn);
 
   slot->should_stop = false;
   slot->is_old = false;
+  slot->audio_owner = false;
   slot->live = false;
 
   vTaskDelete(NULL);
@@ -391,51 +477,35 @@ static void server_task(void *pvParameters) {
     }
 
     if (!server_running) { close(new_socket); break; }
-    ESP_LOGI(TAG, "New client connected");
 
-    // Find slot for new client (alternate between 0 and 1)
-    int new_slot = 1 - current_slot;
-
-    // A spare slot should normally already be free.  If a stale task is still
-    // finishing there, do not reuse its slot until cleanup is complete.
-    if (clients[new_slot].live) {
-      signal_client_stop(new_slot);
-      if (!wait_client_stopped(new_slot, pdMS_TO_TICKS(3000))) {
-        ESP_LOGE(TAG, "Slot %d task did not exit in time", new_slot);
-        close(new_socket);
-        continue;
-      }
-    }
-
-    // Serialize RTSP ownership.  client_task cleanup performs global
-    // audio_receiver_stop() and rtsp_conn_free() -> ptp_clock_clear().
-    // The replacement must not start until those operations are complete.
-    if (clients[current_slot].live) {
-      signal_client_stop(current_slot);
-      ESP_LOGI(TAG,
-               "Waiting for old client slot %d cleanup before replacement",
-               current_slot);
-      if (!wait_client_stopped(current_slot, pdMS_TO_TICKS(3000))) {
-        ESP_LOGE(TAG,
-                 "Old client slot %d did not release audio ownership in time",
-                 current_slot);
-        close(new_socket);
-        continue;
-      }
-      ESP_LOGI(TAG, "Old client cleanup complete; starting replacement");
-    }
-
-    // Setup new slot only after the previous owner has completed all global
-    // audio/PTP cleanup.
+    // A new connection no longer replaces the current one here: the audio
+    // owner changes only when a connection does an audio SETUP
+    // (rtsp_server_claim_audio). /info probes and remote-control-only
+    // connections run alongside the playing session.
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     if (!server_running) {
       xSemaphoreGive(lifecycle_mutex);
       close(new_socket);
       break;
     }
+    int new_slot = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+      if (!clients[i].live) {
+        new_slot = i;
+        break;
+      }
+    }
+    if (new_slot < 0) {
+      xSemaphoreGive(lifecycle_mutex);
+      ESP_LOGW(TAG, "New client rejected: all %d slots busy", MAX_CLIENTS);
+      close(new_socket);
+      continue;
+    }
+    ESP_LOGI(TAG, "New client connected (slot %d)", new_slot);
     clients[new_slot].socket = new_socket;
     clients[new_slot].should_stop = false;
     clients[new_slot].is_old = false;
+    clients[new_slot].audio_owner = false;
     clients[new_slot].live = true;
     BaseType_t task_ret = xTaskCreatePinnedToCore(
         client_task, "rtsp_client", CLIENT_STACK_SIZE,
@@ -443,8 +513,6 @@ static void server_task(void *pvParameters) {
     if (task_ret != pdPASS) {
       clients[new_slot].socket = -1;
       clients[new_slot].live = false;
-    } else {
-      current_slot = new_slot;
     }
     xSemaphoreGive(lifecycle_mutex);
     if (task_ret != pdPASS) {
@@ -453,7 +521,7 @@ static void server_task(void *pvParameters) {
     }
   }
 
-  for (int i = 0; i < 2; i++) signal_client_stop(i);
+  for (int i = 0; i < MAX_CLIENTS; i++) signal_client_stop(i);
 
 server_close:
   xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
@@ -467,8 +535,40 @@ server_exit:
 }
 
 bool rtsp_server_is_idle(void) {
-  return !server_task_live && !clients[0].live && !clients[1].live &&
-         rtsp_event_port_is_idle();
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (clients[i].live) return false;
+  }
+  return !server_task_live && rtsp_event_port_is_idle();
+}
+
+esp_err_t rtsp_server_claim_audio(rtsp_conn_t *conn) {
+  if (!conn) return ESP_ERR_INVALID_ARG;
+  if (conn->owns_audio) return ESP_OK;
+  int self = -1;
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (clients[i].conn == conn) self = i;
+  }
+  xSemaphoreGive(lifecycle_mutex);
+
+  // Serialize audio ownership: client_task cleanup of the previous owner
+  // performs global audio_receiver_stop() and rtsp_conn_free() ->
+  // ptp_clock_clear(). This connection must not touch that state before the
+  // previous owner has finished.
+  for (int i = 0; i < MAX_CLIENTS; i++) {
+    if (i == self || !clients[i].live || !clients[i].audio_owner) continue;
+    ESP_LOGI(TAG, "Slot %d takes over audio; stopping previous owner slot %d",
+             self, i);
+    signal_client_stop(i);
+    if (!wait_client_stopped(i, pdMS_TO_TICKS(3000))) {
+      ESP_LOGE(TAG, "Previous owner slot %d did not release audio in time", i);
+      return ESP_ERR_TIMEOUT;
+    }
+  }
+  conn->owns_audio = true;
+  if (self >= 0) clients[self].audio_owner = true;
+  rtsp_conn_load_volume(conn);
+  return ESP_OK;
 }
 
 esp_err_t rtsp_server_start(void) {
@@ -504,19 +604,20 @@ void rtsp_server_stop(void) {
   server_running = false;
   if (server_socket >= 0) shutdown(server_socket, SHUT_RDWR);
   xSemaphoreGive(lifecycle_mutex);
-  for (int i = 0; i < 2; ++i) signal_client_stop(i);
+  for (int i = 0; i < MAX_CLIENTS; ++i) signal_client_stop(i);
   TickType_t start = xTaskGetTickCount();
   while (server_task_live &&
          (TickType_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(2000))
     vTaskDelay(1);
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < MAX_CLIENTS; ++i) {
     if (!wait_client_stopped(i, pdMS_TO_TICKS(3000)))
       ESP_LOGW(TAG, "RTSP client slot %d still stopping", i);
   }
   if (!rtsp_server_is_idle())
     ESP_LOGW(TAG,
-             "RTSP owners still stopping: listener=%d client0=%d client1=%d event=%d; "
+             "RTSP owners still stopping: listener=%d clients=%d%d%d%d event=%d; "
              "restart/resource release forbidden",
              (int)atomic_load(&server_task_live), (int)atomic_load(&clients[0].live),
-             (int)atomic_load(&clients[1].live), !rtsp_event_port_is_idle());
+             (int)atomic_load(&clients[1].live), (int)atomic_load(&clients[2].live),
+             (int)atomic_load(&clients[3].live), !rtsp_event_port_is_idle());
 }

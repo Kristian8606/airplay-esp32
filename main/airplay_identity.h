@@ -2,19 +2,42 @@
 
 #include <stddef.h>
 
+/* The model below depends on menuconfig: CONFIG_ values must be visible here
+ * whatever the including file included before. */
+#include "sdkconfig.h"
+
 /* How this receiver presents itself to AirPlay 2 senders. Used by mDNS
  * (_airplay/_raop TXT records), GET /info and the RTSP "Server" header, so
  * all of them always agree. */
 
-/* AudioAccessory6,1 = HomePod (2nd generation). */
+/* AudioAccessory6,1 = HomePod (2nd generation). The Home app does not offer
+ * a "HomePod" for adding as an AirPlay accessory (HomePods are set up by
+ * proximity), so the HomeKit build presents a third-party speaker model. */
+#if defined(CONFIG_AIRPLAY_HOMEKIT) && defined(CONFIG_AIRPLAY_HOMEKIT_MODEL)
+#define AIRPLAY_MODEL          CONFIG_AIRPLAY_HOMEKIT_MODEL
+#else
 #define AIRPLAY_MODEL          "AudioAccessory6,1"
+#endif
 #define AIRPLAY_SOURCE_VERSION "377.40.00"
 #define AIRPLAY_SERVER_HEADER  "AirTunes/" AIRPLAY_SOURCE_VERSION
 #define AIRPLAY_PROTOVERS      "1.1"
 /* "vv" / protocol version: AirPlay 2 only. */
 #define AIRPLAY_PROTOCOL_VERSION 2
-/* statusFlags / "flags" / "sf": 0x4 = audio receiver. */
+/* statusFlags / "flags" / "sf": 0x4 = audio receiver. Bit 10 (0x400) is
+ * added while the receiver is in a HomeKit home (an admin controller is
+ * paired), as an AirPort Express in a home advertises 0x404. Use
+ * airplay_status_flags() for the current value. */
 #define AIRPLAY_STATUS_FLAGS   0x4
+#define AIRPLAY_STATUS_HOMEKIT 0x400
+/* Bit 17 (0x20000), "receiver session is active": set while audio plays,
+ * so the Home app can show the accessory as active (as the open-source
+ * AirPlay 2 receiver does around its audio session). */
+#define AIRPLAY_STATUS_SESSION_ACTIVE 0x20000
+#include <stdbool.h>
+#include <stdint.h>
+uint32_t airplay_status_flags(void);
+/* Returns true when the flags changed (caller re-publishes them). */
+bool airplay_set_session_active(bool active);
 
 /* Feature bits advertised in mDNS "features"/"ft" and GET /info.
  * Key bits:
@@ -29,3 +52,9 @@
  * reboots and unique per device. */
 #define AIRPLAY_PAIRING_ID_LEN 37 /* 36 chars + NUL */
 void airplay_get_pairing_id(char *out, size_t len);
+
+/* Serial number (Wi-Fi MAC in hex, 12 chars) and firmware revision (the
+ * project version without the leading "v", e.g. "4.2.5"), as the Home app
+ * shows them. */
+void airplay_get_serial_number(char *out, size_t len);
+void airplay_get_firmware_revision(char *out, size_t len);

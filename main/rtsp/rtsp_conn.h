@@ -51,6 +51,16 @@ struct rtsp_conn {
   uint16_t buffered_port; // TCP port for buffered audio (type 103)
   int event_socket;       // TCP listener for event port (until handed over)
 
+  /* Remote-control-only connection (session SETUP with isRemoteControlOnly,
+   * e.g. the Home hub managing HomeKit pairings): never owns audio, PTP or
+   * the audio event channel. */
+  bool rc_only;
+  /* This connection did an audio SETUP and is the single owner of the global
+   * audio / PTP / event-channel state. Only the owner resets them on close. */
+  bool owns_audio;
+  int rc_event_socket;    // event port listener of a remote-control session
+  uint16_t rc_event_port;
+
   uint32_t client_ip;           // Sender IP (network byte order): PTP peer,
                                 // event-port filter, realtime retransmits
   uint16_t client_control_port; // Sender's realtime control port
@@ -61,6 +71,10 @@ struct rtsp_conn {
  * @return Allocated connection state, or NULL on failure
  */
 rtsp_conn_t *rtsp_conn_create(void);
+
+/* Load the saved volume into the connection and apply it to the output
+ * (called when the connection becomes the audio owner). */
+void rtsp_conn_load_volume(rtsp_conn_t *conn);
 
 /**
  * Free connection state and associated resources

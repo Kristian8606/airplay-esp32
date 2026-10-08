@@ -10,3 +10,6 @@
  * With all required TXT records for iOS to recognize the device
  */
 void mdns_airplay_init(void);
+
+/* Re-publish the status flags (TXT flags / sf) after they changed. */
+void mdns_airplay_update_flags(void);

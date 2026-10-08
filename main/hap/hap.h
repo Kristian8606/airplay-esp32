@@ -54,6 +54,19 @@ typedef struct {
 
   // SRP session for pair-setup
   struct srp_session *srp;
+
+  // HomeKit controller of this connection: set by a full pair-setup (M5) or
+  // by pair-verify of a stored controller. Empty for transient pairing and
+  // for controllers this receiver does not know.
+  char controller_id[64];
+  uint8_t controller_id_len;
+  uint8_t controller_perm;
+  bool controller_verified;
+
+  // pair-verify attempts on this connection and the accessory identifier
+  // presented in the last M2 (see hap_pair_verify_m1).
+  uint8_t pv_attempts;
+  bool pv_id_is_pi;
 } hap_session_t;
 
 /**

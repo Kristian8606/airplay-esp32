@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
@@ -22,6 +23,7 @@
 #include "audio_diag.h"
 #include "amp_control.h"
 #include "hap.h"
+#include "hap_pairings.h"
 #include "ptp_clock.h"
 #include "plist.h"
 #include "rtsp_fairplay.h"
@@ -30,6 +32,7 @@
 #include "tlv8.h"
 
 #include "rtsp_events.h"
+#include "rtsp_server.h"
 
 static const char *TAG = "rtsp_handlers";
 
@@ -383,6 +386,16 @@ static bool request_uses_rtsp(const rtsp_request_t *req) {
   return req && strncasecmp(req->protocol, "RTSP/", 5) == 0;
 }
 
+static bool audio_owner_method(const char *method) {
+  static const char *const methods[] = {
+      "SET_PARAMETER", "PAUSE", "FLUSH", "FLUSHBUFFERED",
+      "SETRATEANCHORTIME", "SETPEERS", "SETPEERSX", NULL};
+  for (int i = 0; methods[i]; i++) {
+    if (strcasecmp(method, methods[i]) == 0) return true;
+  }
+  return false;
+}
+
 int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
                   size_t raw_len) {
   rtsp_request_t req;
@@ -392,6 +405,37 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
   }
 
   AUDIO_DIAG_FLUSH_RTSP_BEGIN(socket, req.method);
+
+  /* One line per request. The session URL (rtsp://<ip>/<session>) is left
+   * out; frequent requests that log their own content (SET_PARAMETER volume,
+   * progress, metadata) and the /feedback keepalive only at debug. */
+  {
+    const bool session_url = strncmp(req.path, "rtsp://", 7) == 0;
+    const char *path = session_url ? "" : req.path;
+    const bool quiet = strstr(req.path, "/feedback") ||
+                       strcasecmp(req.method, "SET_PARAMETER") == 0 ||
+                       strcasecmp(req.method, "GET_PARAMETER") == 0;
+    char extra[24] = "";
+    if (req.body_len) snprintf(extra, sizeof(extra), " (%u B)", (unsigned)req.body_len);
+    if (quiet) {
+      ESP_LOGD(TAG, "RTSP <- %s %s cseq=%d%s", req.method, path, req.cseq, extra);
+    } else {
+      ESP_LOGI(TAG, "RTSP <- %s%s%s cseq=%d%s%s", req.method, path[0] ? " " : "", path,
+               req.cseq, extra, conn->encrypted_mode ? "" : " [not encrypted]");
+    }
+  }
+
+  /* Requests that change the global audio / PTP state are only taken from
+   * the connection that owns audio. A remote-control or management
+   * connection (e.g. the Home hub) gets 200 OK and the playing session is
+   * left alone. */
+  if (!conn->owns_audio && audio_owner_method(req.method)) {
+    ESP_LOGI(TAG, "%s ignored: not the audio session%s", req.method,
+             conn->rc_only ? " (remote control connection)" : "");
+    rtsp_send_ok(socket, conn, req.cseq);
+    AUDIO_DIAG_FLUSH_RTSP_END(socket, req.method);
+    return 0;
+  }
 
   // Find handler in dispatch table
   for (const rtsp_method_handler_t *h = method_handlers; h->method; h++) {
@@ -491,10 +535,20 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     plist_dict_string(&p, "protovers", AIRPLAY_PROTOVERS);
     plist_dict_string(&p, "srcvers", AIRPLAY_SOURCE_VERSION);
     plist_dict_int(&p, "vv", AIRPLAY_PROTOCOL_VERSION);
-    plist_dict_int(&p, "statusFlags", AIRPLAY_STATUS_FLAGS);
+    plist_dict_int(&p, "statusFlags", (int64_t)airplay_status_flags());
     plist_dict_data(&p, "pk", pk, 32);
     plist_dict_string(&p, "pi", pairing_id);
     plist_dict_string(&p, "name", device_name);
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+    {
+      char serial[13], firmware[32];
+      airplay_get_serial_number(serial, sizeof(serial));
+      airplay_get_firmware_revision(firmware, sizeof(firmware));
+      plist_dict_string(&p, "manufacturer", CONFIG_AIRPLAY_HOMEKIT_MANUFACTURER);
+      plist_dict_string(&p, "serialNumber", serial);
+      plist_dict_string(&p, "firmwareRevision", firmware);
+    }
+#endif
 
     // Audio formats array
     plist_dict_array_begin(&p, "audioFormats");
@@ -542,6 +596,191 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
                               "Not Found", 9);
     }
   }
+}
+
+/* A binary plist body, one key per log line (requests we are still
+ * learning about). */
+static void log_body_plist(const char *what, const uint8_t *b, size_t n) {
+  const size_t cap = 4096;
+  char *text = malloc(cap);
+  if (!text) return;
+  if (bplist_dump(b, n, text, cap, true) > 0) {
+    ESP_LOGI(TAG, "    %s:", what);
+    char *line = text;
+    while (line && *line) {
+      char *nl = strchr(line, '\n');
+      if (nl) *nl = '\0';
+      ESP_LOGI(TAG, "      %s", line);
+      line = nl ? nl + 1 : NULL;
+    }
+  }
+  free(text);
+}
+
+/* First bytes of a body in hex, for requests we do not understand yet. */
+static void log_body_hex(const char *what, const uint8_t *b, size_t n) {
+  char hex[2 * 48 + 1];
+  const size_t k = n < 48 ? n : 48;
+  for (size_t i = 0; i < k; i++) snprintf(hex + 2 * i, 3, "%02x", b[i]);
+  hex[2 * k] = '\0';
+  ESP_LOGI(TAG, "    %s %u B: %s%s", what, (unsigned)n, hex, n > 48 ? "..." : "");
+}
+
+/* HomeKit pairings management (HAP methods 3 add, 4 remove, 5 list) on
+ * /pair-add, /pair-remove, /pair-list (or /pairings with a method TLV).
+ * Only a verified admin controller may use them, with one exception: the
+ * Home app adds an AirPlay speaker over a transient pairing (code 3939) and
+ * then sends /pair-add with the home's controller. While the receiver has no
+ * pairing at all, that first /pair-add makes its controller the owner
+ * (admin), and this connection acts as that admin from then on. */
+static void handle_pairings(int socket, rtsp_conn_t *conn, const rtsp_request_t *req) {
+  enum { M_ADD = 3, M_REMOVE = 4, M_LIST = 5 };
+  static const uint8_t TLV_PERMISSIONS = 0x0B;
+  const uint8_t *body = req->body;
+  const size_t body_len = req->body_len;
+  size_t len = 0;
+  const uint8_t *m = body ? tlv8_find(body, body_len, TLV_TYPE_METHOD, &len) : NULL;
+  int method = (m && len == 1) ? m[0] : -1;
+  if (method < 0) {
+    if (strstr(req->path, "/pair-add")) method = M_ADD;
+    else if (strstr(req->path, "/pair-remove")) method = M_REMOVE;
+    else if (strstr(req->path, "/pair-list")) method = M_LIST;
+  }
+  hap_session_t *s = conn->hap_session;
+  const bool admin = s && s->controller_verified && (s->controller_perm & HAP_PERM_ADMIN);
+  bool first_owner = !admin && method == M_ADD && s && conn->encrypted_mode &&
+                     hap_pairings_count() == 0;
+  /* The Home app retries a failed add the same way (transient + /pair-add).
+   * If it re-adds a stored admin with the very same long-term key, accept it
+   * as that owner again instead of refusing until the flash is erased. */
+  if (!admin && !first_owner && method == M_ADD && s && conn->encrypted_mode && body) {
+    size_t il = 0, kl = 0;
+    const uint8_t *i = tlv8_find(body, body_len, TLV_TYPE_IDENTIFIER, &il);
+    const uint8_t *k = tlv8_find(body, body_len, TLV_TYPE_PUBLIC_KEY, &kl);
+    uint8_t stored[32], perm = 0;
+    if (i && k && kl == 32 && il <= HAP_PAIRING_ID_MAX &&
+        hap_pairings_find(i, il, stored, &perm) && (perm & HAP_PERM_ADMIN) &&
+        memcmp(stored, k, 32) == 0) {
+      first_owner = true;
+      ESP_LOGW(TAG, "HomeKit: owner %.*s adds itself again (Home app retry)", (int)il,
+               (const char *)i);
+    }
+  }
+  ESP_LOGI(TAG, "HomeKit %s (method %d) from %s%.*s", req->path, method,
+           admin ? "admin " : (s && s->controller_verified ? "user " : "unverified controller"),
+           s ? (int)s->controller_id_len : 0, s ? s->controller_id : "");
+  if (body && body_len) {
+    size_t il = 0, pl = 0;
+    const uint8_t *i = tlv8_find(body, body_len, TLV_TYPE_IDENTIFIER, &il);
+    const uint8_t *p = tlv8_find(body, body_len, TLV_PERMISSIONS, &pl);
+    if (i && il)
+      ESP_LOGI(TAG, "    identifier %.*s permissions %d", (int)(il > 64 ? 64 : il),
+               (const char *)i, (p && pl == 1) ? p[0] : -1);
+  }
+
+  uint8_t *out = malloc(1024);
+  if (!out) {
+    rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
+    return;
+  }
+  tlv8_encoder_t enc;
+  tlv8_encoder_init(&enc, out, 1024);
+  size_t out_len = 0;
+
+#ifndef CONFIG_AIRPLAY_HOMEKIT
+  const bool enabled = false;
+#else
+  const bool enabled = true;
+#endif
+  if (!enabled || (!admin && !first_owner)) {
+    ESP_LOGW(TAG, "HomeKit %s refused: %s", req->path,
+             enabled ? "not an admin controller" : "HomeKit disabled in menuconfig");
+    tlv8_encode_byte(&enc, TLV_TYPE_STATE, 2);
+    tlv8_encode_byte(&enc, TLV_TYPE_ERROR, TLV_ERROR_AUTHENTICATION);
+    out_len = tlv8_encoder_size(&enc);
+  } else if (method == M_LIST) {
+    out_len = hap_pairings_list_tlv(out, 1024);
+    hap_pairings_log("pair-list");
+  } else if (method == M_ADD || method == M_REMOVE) {
+    size_t id_len = 0, key_len = 0, perm_len = 0;
+    const uint8_t *id = tlv8_find(body, body_len, TLV_TYPE_IDENTIFIER, &id_len);
+    const uint8_t *key = tlv8_find(body, body_len, TLV_TYPE_PUBLIC_KEY, &key_len);
+    const uint8_t *perm = tlv8_find(body, body_len, TLV_PERMISSIONS, &perm_len);
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    if (id && id_len > 0 && id_len <= HAP_PAIRING_ID_MAX) {
+      uint8_t p = (perm && perm_len == 1) ? perm[0] : 0;
+      if (first_owner) p |= HAP_PERM_ADMIN; /* the first pairing is the owner */
+      if (method == M_ADD && key && key_len == 32)
+        err = hap_pairings_add(id, id_len, key, p);
+      else if (method == M_REMOVE)
+        err = hap_pairings_remove(id, id_len);
+      if (err == ESP_OK && first_owner) {
+        memcpy(s->controller_id, id, id_len);
+        s->controller_id_len = (uint8_t)id_len;
+        s->controller_perm = HAP_PERM_ADMIN;
+        s->controller_verified = true;
+        ESP_LOGI(TAG, "HomeKit: %.*s is the owner (admin), added over a %s session",
+                 (int)id_len, (const char *)id,
+                 s->pair_setup_transient ? "transient" : "verified");
+      }
+    }
+    if (method == M_REMOVE && err == ESP_ERR_NOT_FOUND) err = ESP_OK; /* idempotent */
+    tlv8_encode_byte(&enc, TLV_TYPE_STATE, 2);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "HomeKit %s failed: %s", method == M_ADD ? "pair-add" : "pair-remove",
+               esp_err_to_name(err));
+      tlv8_encode_byte(&enc, TLV_TYPE_ERROR,
+                       err == ESP_ERR_NO_MEM ? TLV_ERROR_MAX_PEERS : TLV_ERROR_UNKNOWN);
+    }
+    out_len = tlv8_encoder_size(&enc);
+    hap_pairings_log(method == M_ADD ? "pair-add" : "pair-remove");
+  } else {
+    ESP_LOGW(TAG, "HomeKit %s: unknown method %d", req->path, method);
+    if (body && body_len) log_body_hex("pairings body", body, body_len);
+    tlv8_encode_byte(&enc, TLV_TYPE_STATE, 2);
+    tlv8_encode_byte(&enc, TLV_TYPE_ERROR, TLV_ERROR_UNKNOWN);
+    out_len = tlv8_encoder_size(&enc);
+  }
+  rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                     "Content-Type: application/octet-stream\r\n", (const char *)out,
+                     out_len);
+  free(out);
+}
+
+/* POST /configure (HomeKit): the Home app tells the speaker how access is
+ * controlled. The reply carries the accessory's pairing identifier ("pi")
+ * and long-term public key; adding over transient pairing gives the Home app
+ * no other way to learn them, and without them the add fails. */
+static void handle_configure(int socket, rtsp_conn_t *conn, const rtsp_request_t *req) {
+  const uint8_t *body = req->body;
+  const size_t body_len = req->body_len;
+  if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)
+    log_body_plist("configure", body, body_len);
+  int64_t acl = 0, hkac = 1;
+  char name[65] = "", pw[65] = "";
+  (void)bplist_find_any_int(body, body_len, "Access_Control_Level", &acl);
+  (void)bplist_find_any_int(body, body_len, "Enable_HK_Access_Control", &hkac);
+  const bool got_name = bplist_find_any_string(body, body_len, "Device_Name", name, sizeof(name));
+  (void)bplist_find_any_string(body, body_len, "Password", pw, sizeof(pw));
+  if (!got_name) settings_get_device_name(name, sizeof(name));
+  else ESP_LOGW(TAG, "configure: Home asks for the name \"%s\" (not applied yet)", name);
+  ESP_LOGI(TAG, "configure: access control level %lld (0 everyone, 1 home members, 2 admins), "
+           "HomeKit access control %s, password %s", (long long)acl, hkac ? "on" : "off",
+           pw[0] ? "set" : "none");
+
+  char pi[AIRPLAY_PAIRING_ID_LEN];
+  airplay_get_pairing_id(pi, sizeof(pi));
+  uint8_t out[384];
+  size_t n = bplist_build_configure_response(out, sizeof(out), pi, hkac != 0,
+                                             hap_get_public_key(), name, acl, pw);
+  if (!n) {
+    ESP_LOGE(TAG, "configure: reply build failed");
+    rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
+    return;
+  }
+  log_body_plist("configure reply", out, n);
+  rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                     "Content-Type: application/x-apple-binary-plist\r\n", (const char *)out, n);
 }
 
 static void handle_post(int socket, rtsp_conn_t *conn,
@@ -639,6 +878,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
 
     size_t response_len = 0;
     esp_err_t err = ESP_FAIL;
+    bool start_encryption = false;
 
     if (body && body_len > 0) {
       size_t state_len;
@@ -652,12 +892,10 @@ static void handle_post(int socket, rtsp_conn_t *conn,
         } else if (state[0] == 0x03) {
           err = hap_pair_verify_m3(conn->hap_session, body, body_len, response,
                                    1024, &response_len);
-          // TLV8 pair-verify M3 establishes RTSP channel encryption
-          if (err == ESP_OK &&
-              conn->hap_session->pair_verify_state == PAIR_VERIFY_STATE_M4) {
-            conn->encrypted_mode = true;
-            ESP_LOGI(TAG, "RTSP encryption enabled (TLV8 pair-verify)");
-          }
+          // TLV8 pair-verify M3 establishes RTSP channel encryption, starting
+          // with the request after M4: M4 itself goes out in plain text.
+          start_encryption = err == ESP_OK &&
+              conn->hap_session->pair_verify_state == PAIR_VERIFY_STATE_M4;
         }
       } else {
         // Raw format - used for audio encryption keys, not RTSP encryption
@@ -679,6 +917,10 @@ static void handle_post(int socket, rtsp_conn_t *conn,
       rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                          "Content-Type: application/octet-stream\r\n",
                          (const char *)response, response_len);
+      if (start_encryption) {
+        conn->encrypted_mode = true;
+        ESP_LOGI(TAG, "RTSP encryption enabled (TLV8 pair-verify)");
+      }
     } else {
       ESP_LOGE(TAG, "Pair-verify failed, err=%d", err);
       rtsp_send_response(socket, conn, 200, "OK", req->cseq,
@@ -748,9 +990,63 @@ static void handle_post(int socket, rtsp_conn_t *conn,
       rtsp_send_ok(socket, conn, req->cseq);
     }
 
+  } else if (strstr(req->path, "/configure")) {
+    handle_configure(socket, conn, req);
+
+  } else if (strstr(req->path, "/audioMode")) {
+    /* Sent before each stream start ({"audioMode": "default"}); nothing to do. */
+    char mode[32] = "?";
+    (void)bplist_find_any_string(body, body_len, "audioMode", mode, sizeof(mode));
+    ESP_LOGI(TAG, "audioMode: %s", mode);
+    rtsp_send_ok(socket, conn, req->cseq);
+
+  } else if (strstr(req->path, "/pair-add") || strstr(req->path, "/pair-remove") ||
+             strstr(req->path, "/pair-list") || strstr(req->path, "/pairings")) {
+    handle_pairings(socket, conn, req);
+
   } else {
+    ESP_LOGW(TAG, "Unhandled POST %s (%u bytes), answered 200 OK", req->path,
+             (unsigned)body_len);
+    if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)
+      log_body_plist("POST body", body, body_len);
+    else if (body && body_len)
+      log_body_hex("POST body", body, body_len);
     rtsp_send_ok(socket, conn, req->cseq);
   }
+}
+
+/* SETUP on a remote-control-only connection. The session SETUP gets an
+ * event port of its own (a listener owned by this connection, not the audio
+ * event channel); streams are not offered on such a connection. */
+static void handle_setup_remote_control(int socket, rtsp_conn_t *conn,
+                                        const rtsp_request_t *req,
+                                        bool has_streams) {
+  if (has_streams) {
+    ESP_LOGW(TAG, "SETUP: stream on a remote-control-only connection refused");
+    rtsp_send_response(socket, conn, 455, "Method Not Valid In This State",
+                       req->cseq, NULL, NULL, 0);
+    return;
+  }
+  if (conn->rc_event_socket < 0) {
+    conn->rc_event_socket = rtsp_create_event_socket(&conn->rc_event_port);
+    if (conn->rc_event_socket < 0) {
+      conn->rc_event_port = 0;
+      rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
+      return;
+    }
+  }
+  uint8_t reply[128];
+  const size_t reply_len =
+      bplist_build_initial_setup(reply, sizeof(reply), conn->rc_event_port);
+  if (!reply_len) {
+    rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
+    return;
+  }
+  ESP_LOGI(TAG, "SETUP: remote control session (audio untouched), event port %u",
+           conn->rc_event_port);
+  rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                     "Content-Type: application/x-apple-binary-plist\r\n",
+                     (const char *)reply, reply_len);
 }
 
 static void handle_setup(int socket, rtsp_conn_t *conn,
@@ -787,6 +1083,29 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   ESP_LOGI(TAG, "SETUP: has_streams=%d, stream_count=%zu", request_has_streams,
            stream_count);
+  if (!request_has_streams && body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)
+    log_body_plist("SETUP body", body, body_len);
+
+  /* A session SETUP with isRemoteControlOnly (the Home hub managing HomeKit
+   * pairings, a remote control) never touches the global audio / PTP /
+   * event state: it must not stop a session that is playing. Every session
+   * SETUP decides again, so a connection can still become an audio session
+   * with a later normal session SETUP. */
+  if (!request_has_streams) {
+    int64_t rc_flag = 0;
+    conn->rc_only = bplist_find_any_int(body, body_len, "isRemoteControlOnly", &rc_flag) &&
+                    rc_flag != 0;
+  }
+  if (conn->rc_only) {
+    handle_setup_remote_control(socket, conn, req, request_has_streams);
+    return;
+  }
+  /* Audio session: stop the previous audio owner (another sender) first. */
+  if (rtsp_server_claim_audio(conn) != ESP_OK) {
+    rtsp_send_response(socket, conn, 503, "Service Unavailable", req->cseq,
+                       NULL, NULL, 0);
+    return;
+  }
 
   if (request_has_streams) {
 
@@ -1380,6 +1699,7 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
             return;
           }
           rtsp_conn_set_volume(conn, volume);
+          ESP_LOGI(TAG, "Volume %.1f dB%s", volume, volume <= -144.0f ? " (mute)" : "");
         }
       }
       // Progress may also arrive in the text/parameters body
@@ -1671,6 +1991,18 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   }
   ESP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
            stream_count);
+  if (!conn->owns_audio) {
+    /* Remote-control / management connection: nothing of the audio session
+     * (this or another connection's) is touched. */
+    if (!has_streams) {
+      rtsp_send_response(socket, conn, 200, "OK", req->cseq,
+                         "Connection: close\r\n", NULL, 0);
+      conn->close_after_response = true;
+      return;
+    }
+    rtsp_send_ok(socket, conn, req->cseq);
+    return;
+  }
   // Stream-level teardown is a pause: close the play gate immediately and
   // emit PAUSED (LED state) before the slower receiver/decoder teardown below
   // (audio_receiver_stop can block ~1 s waiting for the listener task).
@@ -1885,16 +2217,31 @@ static void handle_setpeers(int socket, rtsp_conn_t *conn,
     return;
   }
 
-  bplist_peer_info_t parsed[PTP_CLOCK_MAX_PEERS] = {0};
+  /* The peer tables (~4.6 KB) live on the heap, not on the RTSP client task
+   * stack: SETPEERS runs at the deepest point of the request path (dispatch +
+   * encrypted response send) and overflowed the 8 KB stack. */
+  struct setpeers_work {
+    bplist_peer_info_t parsed[PTP_CLOCK_MAX_PEERS];
+    ptp_clock_peer_t tracked[PTP_CLOCK_MAX_PEERS];
+  } *work = heap_caps_calloc(1, sizeof(*work), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!work) work = calloc(1, sizeof(*work));
+  if (!work) {
+    ESP_LOGE(TAG, "%s: out of memory, peer list kept", req->method);
+    rtsp_send_ok(socket, conn, req->cseq);
+    return;
+  }
+  bplist_peer_info_t *parsed = work->parsed;
+  ptp_clock_peer_t *tracked = work->tracked;
+
   size_t advertised_count = 0;
   if (!bplist_get_peer_list(body, body_len, extended, parsed,
                             PTP_CLOCK_MAX_PEERS, &advertised_count)) {
     ESP_LOGW(TAG, "%s: invalid peer-list bplist", req->method);
+    free(work);
     rtsp_send_ok(socket, conn, req->cseq);
     return;
   }
 
-  ptp_clock_peer_t tracked[PTP_CLOCK_MAX_PEERS] = {0};
   size_t tracked_count = 0;
   size_t ipv4_count = 0;
   size_t ipv6_count = 0;
@@ -1970,6 +2317,7 @@ static void handle_setpeers(int socket, rtsp_conn_t *conn,
            ipv6_count, clock_count,
            advertised_count > PTP_CLOCK_MAX_PEERS ? " truncated" : "",
            invalid_addr_count ? " invalid-address" : "");
+  free(work);
 
   /* Do NOT reset audio timing here. Buffered AAC keeps its existing RTP<->PTP
    * map; realtime ALAC keeps its RTP<->ESP-local anchor. A new admitted PTP

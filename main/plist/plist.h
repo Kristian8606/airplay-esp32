@@ -223,6 +223,29 @@ bool bplist_find_int(const uint8_t *plist, size_t plist_len, const char *key,
                      int64_t *out_value);
 
 /**
+ * Text form of a binary plist for logs (strings cut at 63 bytes, data shown
+ * as its length); pretty = one key per line, indented. Returns the length.
+ */
+size_t bplist_dump(const uint8_t *plist, size_t plist_len, char *out, size_t cap,
+                   bool pretty);
+
+/* Value of key in any dictionary of the plist (int/bool, or string). */
+bool bplist_find_any_int(const uint8_t *plist, size_t plist_len, const char *key,
+                         int64_t *value);
+bool bplist_find_any_string(const uint8_t *plist, size_t plist_len, const char *key,
+                            char *out, size_t cap);
+
+/**
+ * Reply to POST /configure (HomeKit): the accessory's pairing identifier and
+ * long-term public key, which the Home app does not get any other way when
+ * it adds the speaker over transient pairing, plus the settings it applied.
+ */
+size_t bplist_build_configure_response(uint8_t *out, size_t capacity,
+                                       const char *identifier, bool hk_access_control,
+                                       const uint8_t public_key[32], const char *device_name,
+                                       int64_t access_control_level, const char *password);
+
+/**
  * Find a real/float value by key in a binary plist
  * Handles both real and integer values (converting int to double)
  * @param plist Binary plist data

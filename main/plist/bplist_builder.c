@@ -455,7 +455,11 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
   }
 
   size_t pos = 0;
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  size_t offsets[45]; /* + manufacturer, serialNumber, firmwareRevision */
+#else
   size_t offsets[39];
+#endif
   size_t obj = 0;
 
 #define ADD_OFFSET()                                   \
@@ -525,7 +529,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 13: statusFlags value
-  if (!bplist_write_int(out, capacity, &pos, AIRPLAY_STATUS_FLAGS)) {
+  if (!bplist_write_int(out, capacity, &pos, (int64_t)airplay_status_flags())) {
     return 0;
   }
   ADD_OFFSET(); // 14: "pk"
@@ -646,12 +650,38 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
   }
   ADD_OFFSET(); // 38: top-level info dict
   {
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+    /* Accessory details the Home app shows (objects 39..44 below). */
+    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 39, 41, 43};
+    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 40, 42, 44};
+#else
     const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28};
     const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 12)) {
+#endif
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, sizeof(keys))) {
       return 0;
     }
   }
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  {
+    char serial[13], firmware[32];
+    airplay_get_serial_number(serial, sizeof(serial));
+    airplay_get_firmware_revision(firmware, sizeof(firmware));
+    ADD_OFFSET(); // 39
+    if (!bplist_write_ascii_string(out, capacity, &pos, "manufacturer")) return 0;
+    ADD_OFFSET(); // 40
+    if (!bplist_write_ascii_string(out, capacity, &pos, CONFIG_AIRPLAY_HOMEKIT_MANUFACTURER))
+      return 0;
+    ADD_OFFSET(); // 41
+    if (!bplist_write_ascii_string(out, capacity, &pos, "serialNumber")) return 0;
+    ADD_OFFSET(); // 42
+    if (!bplist_write_ascii_string(out, capacity, &pos, serial)) return 0;
+    ADD_OFFSET(); // 43
+    if (!bplist_write_ascii_string(out, capacity, &pos, "firmwareRevision")) return 0;
+    ADD_OFFSET(); // 44
+    if (!bplist_write_ascii_string(out, capacity, &pos, firmware)) return 0;
+  }
+#endif
 
 #undef ADD_OFFSET
 
@@ -709,5 +739,76 @@ size_t bplist_build_media_remote_volume(uint8_t *out, size_t capacity,
   const uint8_t keys[] = {0, 1, 2, 3}, values[] = {4, 5, 6, 7};
   if (!bplist_write_dict(out, capacity, &pos, keys, values, 4) ||
       !bplist_finish(out, capacity, &pos, offsets, 9, 8)) return 0;
+  return pos;
+}
+
+/* A string object: ASCII as is, anything else as UTF-16BE (BMP only). */
+static bool bplist_write_text(uint8_t *out, size_t capacity, size_t *pos,
+                              const char *value) {
+  bool ascii = true;
+  for (const char *c = value; *c; c++)
+    if ((uint8_t)*c >= 0x80) ascii = false;
+  if (ascii) return bplist_write_ascii_string(out, capacity, pos, value);
+  uint16_t u16[128];
+  size_t n = 0;
+  const uint8_t *s = (const uint8_t *)value;
+  while (*s && n < 128) {
+    uint32_t cp;
+    if (s[0] < 0x80) { cp = s[0]; s += 1; }
+    else if ((s[0] & 0xE0) == 0xC0 && s[1]) { cp = ((s[0] & 0x1FU) << 6) | (s[1] & 0x3FU); s += 2; }
+    else if ((s[0] & 0xF0) == 0xE0 && s[1] && s[2]) {
+      cp = ((s[0] & 0x0FU) << 12) | ((s[1] & 0x3FU) << 6) | (s[2] & 0x3FU); s += 3;
+    } else { cp = '?'; s += 1; while ((*s & 0xC0) == 0x80) s++; }
+    u16[n++] = (uint16_t)cp;
+  }
+  if (!bplist_write_length(out, capacity, pos, 0x60, n) ||
+      !bplist_has_room(*pos, 2 * n, capacity))
+    return false;
+  for (size_t i = 0; i < n; i++) {
+    out[(*pos)++] = (uint8_t)(u16[i] >> 8);
+    out[(*pos)++] = (uint8_t)u16[i];
+  }
+  return true;
+}
+
+size_t bplist_build_configure_response(uint8_t *out, size_t capacity,
+                                       const char *identifier, bool hk_access_control,
+                                       const uint8_t public_key[32], const char *device_name,
+                                       int64_t access_control_level, const char *password) {
+  if (!out || !identifier || !public_key || !device_name || capacity < 256) return 0;
+  const bool with_pw = password && password[0];
+  size_t pos = 0;
+  size_t offsets[13];
+  size_t obj = 0;
+  memcpy(out, "bplist00", 8);
+  pos = 8;
+#define ADD() offsets[obj++] = pos
+  ADD(); if (!bplist_write_ascii_string(out, capacity, &pos, "Identifier")) return 0;
+  ADD(); if (!bplist_write_text(out, capacity, &pos, identifier)) return 0;
+  ADD(); if (!bplist_write_ascii_string(out, capacity, &pos, "Enable_HK_Access_Control")) return 0;
+  ADD(); if (!bplist_has_room(pos, 1, capacity)) return 0;
+  out[pos++] = hk_access_control ? 0x09 : 0x08;
+  ADD(); if (!bplist_write_ascii_string(out, capacity, &pos, "PublicKey")) return 0;
+  ADD(); if (!bplist_write_data(out, capacity, &pos, public_key, 32)) return 0;
+  ADD(); if (!bplist_write_ascii_string(out, capacity, &pos, "Device_Name")) return 0;
+  ADD(); if (!bplist_write_text(out, capacity, &pos, device_name)) return 0;
+  ADD(); if (!bplist_write_ascii_string(out, capacity, &pos, "Access_Control_Level")) return 0;
+  ADD(); if (!bplist_write_int(out, capacity, &pos,
+                               (uint64_t)(access_control_level < 0 ? 0 : access_control_level)))
+    return 0;
+  if (with_pw) {
+    ADD(); if (!bplist_write_ascii_string(out, capacity, &pos, "Password")) return 0;
+    ADD(); if (!bplist_write_text(out, capacity, &pos, password)) return 0;
+  }
+  const size_t top = obj;
+  ADD();
+  {
+    const uint8_t keys[] = {0, 2, 4, 6, 8, 10};
+    const uint8_t values[] = {1, 3, 5, 7, 9, 11};
+    const size_t n = with_pw ? 6 : 5;
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, n)) return 0;
+  }
+#undef ADD
+  if (!bplist_finish(out, capacity, &pos, offsets, obj, top)) return 0;
   return pos;
 }

@@ -7,6 +7,7 @@
 #include "nvs_flash.h"
 #include "sodium.h"
 
+#include "hap_pairings.h"
 #include "srp.h"
 
 static const char *TAG = "hap";
@@ -65,6 +66,12 @@ esp_err_t hap_init(void) {
   }
 
   nvs_close(nvs);
+
+  err = hap_pairings_init();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "HomeKit pairing store: %s", esp_err_to_name(err));
+    return err;
+  }
 
   g_initialized = true;
   return ESP_OK;

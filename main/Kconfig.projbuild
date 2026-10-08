@@ -79,6 +79,40 @@ menu "AirPlay Receiver"
         bool "Advertise artwork support"
         default n
 
+    config AIRPLAY_HOMEKIT
+        bool "HomeKit: allow adding the speaker to a home"
+        default y
+        help
+            Complete the full (non-transient) pair-setup the Home app uses to
+            add an AirPlay speaker, store the home's controllers
+            (/pair-add, /pair-remove, /pair-list) and advertise status flag
+            bit 10 (0x400) while paired, like an AirPort Express in a home.
+            AirPlay without a home keeps working as before.
+
+    config AIRPLAY_HOMEKIT_MODEL
+        string "Model presented to senders and the Home app"
+        default "AirPlaySpeaker1,1"
+        depends on AIRPLAY_HOMEKIT
+        help
+            mDNS model / am and GET /info model. The Home app only offers
+            third-party AirPlay speakers for adding; a HomePod model
+            (AudioAccessory6,1) is not listed under Add Accessory.
+
+    config AIRPLAY_HOMEKIT_MANUFACTURER
+        string "Manufacturer (TXT manufacturer, shown in the Home app)"
+        default "Espressif"
+        depends on AIRPLAY_HOMEKIT
+
+    config AIRPLAY_HOMEKIT_SETUP_CODE
+        string "HomeKit pair-setup code"
+        default "3939"
+        depends on AIRPLAY_HOMEKIT
+        help
+            SRP password of the full pair-setup. The Home app adds AirPlay
+            speakers without asking for a code; 3939 is the fixed AirPlay
+            code (also used for transient pairing). If the add fails with
+            "pair-setup M3: wrong code" in the log, try 0000.
+
     menu "Hardware playback buttons"
         config AIRPLAY_HARDWARE_BUTTONS
             bool "Enable GPIO playback buttons (PSRAM task)"

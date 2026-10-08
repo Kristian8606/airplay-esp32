@@ -1,6 +1,8 @@
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "mdns.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -16,8 +18,9 @@ static const char *TAG = "mdns_airplay";
 #define STR(x) STR_(x)
 
 // Model, versions, flags and feature bits come from airplay_identity.h
-// (shared with GET /info).
-#define AIRPLAY_FLAGS STR(AIRPLAY_STATUS_FLAGS)
+// (shared with GET /info). Status flags change when the receiver joins or
+// leaves a HomeKit home (mdns_airplay_update_flags).
+static char s_flags_str[16];
 
 // Metadata types advertised in the "md" txt record:
 //   0 = text (track title/artist/album), 1 = artwork (cover art images),
@@ -40,6 +43,14 @@ void mdns_airplay_init(void) {
   char device_name[65];
   char hostname[WIFI_HOSTNAME_MAX_LEN + 1];
   char pairing_id[AIRPLAY_PAIRING_ID_LEN];
+
+  snprintf(s_flags_str, sizeof(s_flags_str), "0x%" PRIX32, airplay_status_flags());
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  char serial[16];
+  char fw_version[32];
+  airplay_get_serial_number(serial, sizeof(serial));
+  airplay_get_firmware_revision(fw_version, sizeof(fw_version));
+#endif
 
   // Get device name from settings. The service instance names may contain
   // spaces/UTF-8; the host name must be a plain DNS label (same as DHCP).
@@ -87,13 +98,20 @@ void mdns_airplay_init(void) {
   mdns_txt_item_t airplay_txt[] = {
       {"deviceid", device_id},
       {"features", features_str},
-      {"flags", AIRPLAY_FLAGS},
+      {"flags", s_flags_str},
       {"model", AIRPLAY_MODEL},
       {"pk", pk_str},
       {"pi", pairing_id},
       {"srcvers", AIRPLAY_SOURCE_VERSION},
       {"vv", STR(AIRPLAY_PROTOCOL_VERSION)},
       {"acl", "0"},
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+      /* Accessory details the Home app shows, as an AirPort Express has. */
+      {"manufacturer", CONFIG_AIRPLAY_HOMEKIT_MANUFACTURER},
+      {"serialNumber", serial},
+      {"fv", fw_version},
+      {"protovers", AIRPLAY_PROTOVERS},
+#endif
   };
 
   err = mdns_service_add(device_name, "_airplay", "_tcp", 7000, airplay_txt,
@@ -118,7 +136,7 @@ void mdns_airplay_init(void) {
       {"ft", features_str},           // Features (same as airplay)
       {"md", AIRPLAY_METADATA_TYPES}, // Metadata types
       {"pk", pk_str},                 // Public key
-      {"sf", AIRPLAY_FLAGS},          // Status flags
+      {"sf", s_flags_str},            // Status flags
       {"tp", "UDP"},                  // Transport protocol
       {"vn", "65537"},                // Version number
       {"vs", AIRPLAY_SOURCE_VERSION},
@@ -132,4 +150,15 @@ void mdns_airplay_init(void) {
     ESP_LOGE(TAG, "Failed to add _raop._tcp service: %s",
              esp_err_to_name(err_raop));
   }
+}
+
+void mdns_airplay_update_flags(void) {
+  char flags[16];
+  snprintf(flags, sizeof(flags), "0x%" PRIX32, airplay_status_flags());
+  if (strcmp(flags, s_flags_str) == 0) return;
+  snprintf(s_flags_str, sizeof(s_flags_str), "%s", flags);
+  esp_err_t a = mdns_service_txt_item_set("_airplay", "_tcp", "flags", s_flags_str);
+  esp_err_t r = mdns_service_txt_item_set("_raop", "_tcp", "sf", s_flags_str);
+  ESP_LOGI(TAG, "Status flags now %s (TXT update: airplay %s, raop %s)", s_flags_str,
+           esp_err_to_name(a), esp_err_to_name(r));
 }

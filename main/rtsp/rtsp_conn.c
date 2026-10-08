@@ -12,6 +12,8 @@
 #include "freertos/FreeRTOS.h"
 
 static portMUX_TYPE volume_lock = portMUX_INITIALIZER_UNLOCKED;
+/* Volume of the audio owner, shown to other connections (GET_PARAMETER). */
+static float s_owner_volume_db = -15.0f;
 
 static void rtsp_conn_cleanup(rtsp_conn_t *conn);
 
@@ -33,6 +35,19 @@ rtsp_conn_t *rtsp_conn_create(void) {
     return NULL;
   }
 
+  /* The saved volume is loaded and applied when this connection becomes the
+   * audio owner (rtsp_conn_load_volume): a remote-control or /info-only
+   * connection must not reset the volume of a session that is playing. */
+  conn->volume_db = s_owner_volume_db;
+
+  conn->event_socket = -1;
+  conn->rc_event_socket = -1;
+
+  return conn;
+}
+
+void rtsp_conn_load_volume(rtsp_conn_t *conn) {
+  if (!conn) return;
   // Load saved AirPlay volume or use a conservative default.
   float saved_volume;
   if (settings_get_volume(&saved_volume) == ESP_OK) {
@@ -40,11 +55,8 @@ rtsp_conn_t *rtsp_conn_create(void) {
   } else {
     conn->volume_db = -15.0f;
   }
+  s_owner_volume_db = conn->volume_db;
   audio_receiver_set_volume_q15(volume_db_to_q15(conn->volume_db));
-
-  conn->event_socket = -1;
-
-  return conn;
 }
 
 void rtsp_conn_free(rtsp_conn_t *conn) {
@@ -60,8 +72,8 @@ void rtsp_conn_free(rtsp_conn_t *conn) {
     amp_control_session_disconnected();
   }
 
-  // Persist volume at disconnect
-  settings_persist_volume();
+  // Persist volume at disconnect (only the audio owner changes it)
+  if (conn->owns_audio) settings_persist_volume();
 
   // Cleanup any resources
   rtsp_conn_cleanup(conn);
@@ -91,6 +103,11 @@ static void rtsp_conn_cleanup(rtsp_conn_t *conn) {
     close(conn->event_socket);
     conn->event_socket = -1;
   }
+  if (conn->rc_event_socket >= 0) {
+    close(conn->rc_event_socket);
+    conn->rc_event_socket = -1;
+  }
+  conn->rc_event_port = 0;
 
   // Reset stream state
   conn->stream_active = false;
@@ -103,10 +120,14 @@ static void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   // Connection teardown ends the lifetime of SETPEERS/SETPEERSX metadata.
   // Stream-level TEARDOWN keeps the RTSP connection alive and therefore does
   // not come through this cleanup path until the session actually closes.
-  ptp_clock_set_peers(NULL, 0);
+  // PTP is global: only the audio owner may reset it (a remote-control or
+  // /info-only connection closing must not disturb the playing session).
+  if (conn->owns_audio) {
+    ptp_clock_set_peers(NULL, 0);
 
-  // Clear PTP clock for fresh sync on next connection
-  ptp_clock_clear();
+    // Clear PTP clock for fresh sync on next connection
+    ptp_clock_clear();
+  }
   conn->ptp_session_fresh = false;
 
   // Reset encryption state
@@ -125,6 +146,7 @@ static bool conn_update_volume(rtsp_conn_t *conn, float volume_db,
     return false;
   }
   conn->volume_db = volume_db;
+  if (conn->owns_audio) s_owner_volume_db = volume_db;
   audio_receiver_set_volume_q15(gain); /* Atomic target; existing output ramp. */
   /* This setter only updates the cached float; NVS is written at disconnect. */
   settings_set_volume(volume_db);

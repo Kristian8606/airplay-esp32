@@ -1,7 +1,9 @@
 #include <string.h>
 
+#include "airplay_identity.h"
 #include "hap.h"
 #include "hap_internal.h"
+#include "hap_pairings.h"
 #include "tlv8.h"
 
 #include "esp_log.h"
@@ -38,12 +40,27 @@ esp_err_t hap_pair_verify_m1(hap_session_t *session, const uint8_t *input,
     return ESP_FAIL;
   }
 
-  uint8_t mac[6];
-  esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  char device_id[18];
-  snprintf(device_id, sizeof(device_id), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  size_t device_id_len = 17;
+  /* Accessory pairing identifier. A controller that knows this receiver
+   * from a home (added over transient pairing + /pair-add, so it never got
+   * an M6) only has the TXT/info "pi" and "pk" to go by; the device ID (MAC)
+   * was used so far. Until it is known which one the controller expects,
+   * present "pi" first and the device ID when the controller starts over
+   * with a new M1 on the same connection (it rejected the previous M2). */
+  char device_id[AIRPLAY_PAIRING_ID_LEN];
+  session->pv_id_is_pi = (session->pv_attempts % 2U) == 0U;
+  if (session->pv_id_is_pi) {
+    airplay_get_pairing_id(device_id, sizeof(device_id));
+  } else {
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(device_id, sizeof(device_id), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],
+             mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+  const size_t device_id_len = strlen(device_id);
+  session->pv_attempts++;
+  ESP_LOGI(TAG, "pair-verify M1 #%u: presenting accessory id %s (%s)%s",
+           (unsigned)session->pv_attempts, device_id, session->pv_id_is_pi ? "pi" : "device ID",
+           session->pv_attempts > 1 ? " - controller did not accept the previous M2" : "");
 
   uint8_t accessory_info[128];
   size_t accessory_info_len = 0;
@@ -128,6 +145,48 @@ esp_err_t hap_pair_verify_m3(hap_session_t *session, const uint8_t *input,
     tlv8_encode_byte(&enc, TLV_TYPE_ERROR, TLV_ERROR_AUTHENTICATION);
     *output_len = tlv8_encoder_size(&enc);
     return ESP_ERR_INVALID_STATE;
+  }
+
+  /* A controller this receiver is paired with (HomeKit) must prove it owns
+   * the stored long-term key: signature over iOSDevicePublicKey || pairing
+   * ID || AccessoryPublicKey. Other controllers keep the open AirPlay access
+   * (acl=0) they had before. */
+  size_t id_len = 0, sig_len = 0;
+  const uint8_t *id = tlv8_find(decrypted, (size_t)decrypted_len, TLV_TYPE_IDENTIFIER, &id_len);
+  const uint8_t *sig =
+      tlv8_find(decrypted, (size_t)decrypted_len, TLV_TYPE_SIGNATURE, &sig_len);
+  uint8_t ltpk[32];
+  uint8_t perm = 0;
+  session->controller_verified = false;
+  session->controller_id_len = 0;
+  if (id && id_len > 0 && id_len <= HAP_PAIRING_ID_MAX &&
+      hap_pairings_find(id, id_len, ltpk, &perm)) {
+    uint8_t info[32 + HAP_PAIRING_ID_MAX + 32];
+    memcpy(info, session->client_public_key, 32);
+    memcpy(info + 32, id, id_len);
+    memcpy(info + 32 + id_len, session->session_public_key, 32);
+    if (!sig || sig_len != crypto_sign_BYTES ||
+        crypto_sign_verify_detached(sig, info, 32 + id_len + 32, ltpk) != 0) {
+      ESP_LOGE(TAG, "pair-verify: paired controller %.*s failed its signature check",
+               (int)id_len, (const char *)id);
+      tlv8_encoder_t enc;
+      tlv8_encoder_init(&enc, output, output_capacity);
+      tlv8_encode_byte(&enc, TLV_TYPE_STATE, PAIR_VERIFY_STATE_M4);
+      tlv8_encode_byte(&enc, TLV_TYPE_ERROR, TLV_ERROR_AUTHENTICATION);
+      *output_len = tlv8_encoder_size(&enc);
+      return ESP_ERR_INVALID_STATE;
+    }
+    memcpy(session->controller_id, id, id_len);
+    session->controller_id_len = (uint8_t)id_len;
+    session->controller_perm = perm;
+    session->controller_verified = true;
+    ESP_LOGI(TAG, "pair-verify: HomeKit controller %.*s (%s), accepted our %s",
+             (int)id_len, (const char *)id, (perm & HAP_PERM_ADMIN) ? "admin" : "user",
+             session->pv_id_is_pi ? "pi" : "device ID");
+  } else if (id && id_len > 0) {
+    ESP_LOGI(TAG, "pair-verify: controller %.*s is not paired (open access)",
+             (int)(id_len > HAP_PAIRING_ID_MAX ? HAP_PAIRING_ID_MAX : id_len),
+             (const char *)id);
   }
 
   hap_hkdf_sha512((uint8_t *)"Control-Salt", 12, session->shared_secret,
