@@ -269,7 +269,7 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
   led_wake();
 }
 
-void led_audio_feed(const int16_t *pcm, size_t stereo_frames) {
+void led_audio_feed(const audio_out_sample_t *pcm, size_t stereo_frames) {
 #if defined(CONFIG_RGB_AUDIO_LED_PLAYING_VU)
   if (!pcm || stereo_frames == 0 || !s_strip || !s_led_task ||
       __atomic_load_n(&s_requested_state, __ATOMIC_ACQUIRE) !=
@@ -286,7 +286,8 @@ void led_audio_feed(const int16_t *pcm, size_t stereo_frames) {
   uint32_t seq = __atomic_load_n(&s_pcm_seq, __ATOMIC_RELAXED);
   if (seq & 1U) ++seq;
   __atomic_store_n(&s_pcm_seq, seq + 1U, __ATOMIC_RELEASE);
-  memcpy(s_pcm_mailbox, pcm, stereo_frames * 2U * sizeof(int16_t));
+  for (size_t i = 0; i < stereo_frames * 2U; ++i)
+    s_pcm_mailbox[i] = audio_out_to_pcm16(pcm[i]);
   __atomic_store_n(&s_pcm_frames, (uint32_t)stereo_frames, __ATOMIC_RELAXED);
   __atomic_store_n(&s_pcm_seq, seq + 2U, __ATOMIC_RELEASE);
   led_wake();
@@ -356,7 +357,7 @@ uint8_t led_get_brightness(void) {
 #else  /* CONFIG_ENABLE_RGB_AUDIO_LED */
 
 void led_init(void) {}
-void led_audio_feed(const int16_t *pcm, size_t stereo_frames) {
+void led_audio_feed(const audio_out_sample_t *pcm, size_t stereo_frames) {
   (void)pcm;
   (void)stereo_frames;
 }

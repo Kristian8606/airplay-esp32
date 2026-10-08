@@ -23,6 +23,15 @@
 #define TX_TAG_Q_CAP      8U
 #define TX_DONE_Q_CAP     8U
 
+/* Slot width follows menuconfig "I2S output slot width" (audio_out_sample.h).
+ * MCLK stays 256 x fs in both modes; 32-bit slots only double BCLK. */
+#if AUDIO_OUT_SLOT_BITS == 32
+#define I2S_SLOT_DATA_WIDTH I2S_DATA_BIT_WIDTH_32BIT
+#else
+#define I2S_SLOT_DATA_WIDTH I2S_DATA_BIT_WIDTH_16BIT
+#endif
+#define I2S_FRAME_BYTES ((size_t)2U * sizeof(audio_out_sample_t))
+
 /* Allocate the I2S/GDMA channel from Core1 so its external interrupt is
  * serviced on the same core as the playout task, away from Core0 network/PTP
  * traffic. This helper task exists only during boot-time initialisation. */
@@ -176,7 +185,7 @@ static esp_err_t audio_playout_init_current_core(void) {
 
   i2s_std_config_t cfg = {
       .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_RATE_HZ),
-      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_SLOT_DATA_WIDTH,
                                                       I2S_SLOT_MODE_STEREO),
       .gpio_cfg = {
           .mclk = CONFIG_I2S_SCK_IO,
@@ -236,6 +245,10 @@ static esp_err_t audio_playout_init_current_core(void) {
 #endif
   );
   s_tx = tx; /* Publish only a fully initialised channel. */
+  ESP_LOGI(TAG, "I2S TX %u-bit slots (%s), %u Hz, MCLK=%" PRIu32 " Hz",
+           (unsigned)AUDIO_OUT_SLOT_BITS,
+           AUDIO_OUT_SLOT_BITS == 32 ? "24-bit audio" : "16-bit audio",
+           (unsigned)I2S_RATE_HZ, s_nominal_mclk_hz);
   return ESP_OK;
 
 fail:
@@ -335,13 +348,14 @@ esp_err_t audio_playout_flush(void) {
   return ESP_OK;
 }
 
-esp_err_t audio_playout_preload_tagged(const int16_t *stereo, uint32_t frames,
+esp_err_t audio_playout_preload_tagged(const audio_out_sample_t *stereo,
+                                       uint32_t frames,
                                        uint32_t rtp, uint32_t generation) {
   if (!s_tx || !stereo || frames == 0U || s_enabled) {
     return ESP_ERR_INVALID_STATE;
   }
   size_t loaded = 0;
-  const size_t bytes = (size_t)frames * 2U * sizeof(int16_t);
+  const size_t bytes = (size_t)frames * I2S_FRAME_BYTES;
   esp_err_t err = i2s_channel_preload_data(s_tx, stereo, bytes, &loaded);
   if (loaded > 0U) s_preload_pending = true;
   if (err != ESP_OK || loaded != bytes) {
@@ -368,7 +382,8 @@ esp_err_t audio_playout_enable(void) {
   return err;
 }
 
-esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
+esp_err_t audio_playout_write_tagged(const audio_out_sample_t *stereo,
+                                     uint32_t frames,
                                      uint32_t rtp, uint32_t generation) {
   if (!s_tx || !s_enabled || !stereo || frames == 0U || audio_playout_has_fault()) {
     return ESP_ERR_INVALID_STATE;
@@ -382,7 +397,7 @@ esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
   }
 
   size_t written = 0;
-  const size_t bytes = (size_t)frames * 2U * sizeof(int16_t);
+  const size_t bytes = (size_t)frames * I2S_FRAME_BYTES;
   esp_err_t err = i2s_channel_write(s_tx, stereo, bytes, &written,
                                     portMAX_DELAY);
 

@@ -2252,7 +2252,7 @@ static void process_i2s_completions(const timing_snapshot_t *snap) {
 }
 
 
-
+#if AUDIO_OUT_SLOT_BITS == 16
 /* Volume scaling is the LAST requantisation to 16 bit, so it is where TPDF
  * dither belongs. The Q15 product carries 15 fractional bits; adding +-1 LSB
  * triangular noise before rounding decorrelates the rounding error from the
@@ -2330,6 +2330,64 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
   current_q15[0] = target[0];
   current_q15[1] = target[1];
 }
+
+/* 16-bit slots: volume works in place, the PCM block is the I2S block. */
+static void output_stage(int16_t *pcm, audio_out_sample_t *out,
+                         uint32_t frames, int32_t current_q15[2]) {
+  (void)out;
+  apply_output_volume(pcm, frames, current_q15);
+}
+
+#else /* AUDIO_OUT_SLOT_BITS == 32 */
+
+/* 32-bit slots, 24-bit audio. Same volume target, mute mask and one-block
+ * fade as the 16-bit path, but the result is written to a separate 32-bit
+ * block without rounding back to 16 bits (audio_out_scale_q15). There is no
+ * dither: the 24-bit rounding error is ~-144 dBFS. Unity gain is exactly
+ * x << 16 and zero stays zero. Only the playout task calls this. */
+static void apply_output_volume_s32(const int16_t *pcm, int32_t *out,
+                                    uint32_t frames, int32_t current_q15[2]) {
+  if (!pcm || !out || !current_q15 || frames == 0U) return;
+  int32_t volume = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
+  if (volume < 0) volume = 0;
+  if (volume > 32768) volume = 32768;
+  const uint32_t muted = audio_receiver_get_output_mute_mask();
+  const int32_t target[2] = {
+      (muted & 1U) ? 0 : volume, (muted & 2U) ? 0 : volume};
+  const int32_t start[2] = {current_q15[0], current_q15[1]};
+  if (start[0] == target[0] && start[1] == target[1]) {
+    if (target[0] == 32768 && target[1] == 32768) {
+      audio_out_from_pcm16_block(pcm, out, (size_t)frames * 2U);
+      return;
+    }
+    if (target[0] == 0 && target[1] == 0) {
+      memset(out, 0, (size_t)frames * 2U * sizeof(*out));
+      return;
+    }
+    for (uint32_t i = 0; i < frames * 2U; ++i)
+      out[i] = audio_out_scale_q15(pcm[i], target[i & 1U]);
+    return;
+  }
+  /* Fade each changed output over one DMA block, like volume changes. */
+  const int64_t dg[2] = {
+      (int64_t)target[0] - start[0], (int64_t)target[1] - start[1]};
+  for (uint32_t f = 0; f < frames; ++f) {
+    for (uint32_t ch = 0; ch < 2U; ++ch) {
+      const uint32_t i = f * 2U + ch;
+      const int32_t gain = start[ch] +
+          (int32_t)((dg[ch] * (int64_t)(f + 1U)) / (int64_t)frames);
+      out[i] = audio_out_scale_q15(pcm[i], gain);
+    }
+  }
+  current_q15[0] = target[0];
+  current_q15[1] = target[1];
+}
+
+static void output_stage(int16_t *pcm, audio_out_sample_t *out,
+                         uint32_t frames, int32_t current_q15[2]) {
+  apply_output_volume_s32(pcm, out, frames, current_q15);
+}
+#endif /* AUDIO_OUT_SLOT_BITS */
 
 
 /* I2S lifecycle is single-owner on the playout task.  A failed flush must
@@ -2413,8 +2471,9 @@ static void cal_take_completion(const audio_playout_completion_t *d) {
 }
 
 static esp_err_t playout_run_latency_calibration(void) {
-  static int16_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
+  static audio_out_sample_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
   static int16_t burst[AUDIO_PLAYOUT_FRAMES * 2U];
+  static audio_out_sample_t burst_out[AUDIO_PLAYOUT_FRAMES * 2U];
   memset(silence, 0, sizeof(silence));
   s_cal.n_emit = 0;
   for (int k = 0; k < LATENCY_CAL_BURSTS; ++k) s_cal.emit_us[k] = 0;
@@ -2438,8 +2497,11 @@ static esp_err_t playout_run_latency_calibration(void) {
         if (muted & 1U) burst[f * 2U] = 0;
         if (muted & 2U) burst[f * 2U + 1U] = 0;
       }
+      /* Same chirp level in both slot widths (unity gain, bit-exact). */
+      audio_out_from_pcm16_block(burst, burst_out,
+                                 (size_t)AUDIO_PLAYOUT_FRAMES * 2U);
     }
-    const int16_t *blk = is_burst ? burst : silence;
+    const audio_out_sample_t *blk = is_burst ? burst_out : silence;
     if (audio_playout_write_tagged(blk, AUDIO_PLAYOUT_FRAMES, idx,
                                    CAL_GENERATION) != ESP_OK ||
         audio_playout_has_fault()) {
@@ -2472,6 +2534,25 @@ static void ap2_playout_task(void *arg) {
     vTaskDelete(NULL);
     return;
   }
+  /* `block` holds 16-bit PCM from the ring; `out_block` is what goes to I2S.
+   * With 16-bit slots they are the same buffer (volume works in place). */
+#if AUDIO_OUT_SLOT_BITS == 32
+  audio_out_sample_t *out_block = heap_caps_malloc(
+      AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!out_block) {
+    out_block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
+  }
+  if (!out_block) {
+    ESP_LOGE(TAG, "playout output block allocation failed");
+    free(block);
+    s.playout_task = NULL;
+    vTaskDelete(NULL);
+    return;
+  }
+#else
+  audio_out_sample_t *out_block = block;
+#endif
 
   typedef enum {
     PLAYOUT_STOPPED = 0,
@@ -2683,7 +2764,7 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      static int16_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
+      static audio_out_sample_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
       memset(silence, 0, sizeof(silence));
 
       /* The silence tags use generation 0 on purpose: their EOFs are only a
@@ -2821,8 +2902,8 @@ static void ap2_playout_task(void *arg) {
         vTaskDelay(1);
         continue;
       }
-      apply_output_volume(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
-      if (audio_playout_write_tagged(block, AUDIO_PLAYOUT_FRAMES,
+      output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+      if (audio_playout_write_tagged(out_block, AUDIO_PLAYOUT_FRAMES,
                                      real_start_rtp,
                                      snap.generation) != ESP_OK) {
         (void)playout_flush_checked("prime-write-fail");
@@ -2932,10 +3013,10 @@ static void ap2_playout_task(void *arg) {
     if (!have_pcm) {
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
     }
-    apply_output_volume(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+    output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
 
     const esp_err_t write_err = audio_playout_write_tagged(
-        block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
+        out_block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
     process_i2s_completions(&snap);
 
     /* PID clock servo.
@@ -3150,6 +3231,9 @@ static void ap2_playout_task(void *arg) {
   }
 
   (void)playout_flush_checked("task-exit");
+#if AUDIO_OUT_SLOT_BITS == 32
+  free(out_block);
+#endif
   free(block);
   s.playout_task = NULL;
   vTaskDelete(NULL);

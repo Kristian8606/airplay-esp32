@@ -184,6 +184,29 @@ menu "I2S Playout"
         int "I2S DATA OUT GPIO"
         default 12
 
+    choice AIRPLAY_I2S_SLOT_WIDTH
+        prompt "I2S output slot width"
+        default AIRPLAY_I2S_SLOT_32
+        help
+            Width of each I2S slot sent to the DAC. Decoders, EQ and the PCM
+            buffer stay 16-bit; only the final volume stage changes.
+
+        config AIRPLAY_I2S_SLOT_32
+            bool "32-bit slots, 24-bit audio (64 BCLK/frame)"
+            help
+                Volume is applied without rounding back to 16 bits, so lower
+                volume keeps full detail and adds no dither noise. The audio
+                is 24-bit, left-justified in a 32-bit slot (low 8 bits zero).
+                MCLK and LRCK are unchanged; BCLK doubles to 64 x fs.
+                The DAC must accept 64 BCLK per frame (PCM5102A does).
+
+        config AIRPLAY_I2S_SLOT_16
+            bool "16-bit slots (32 BCLK/frame, previous behaviour)"
+            help
+                Volume is rounded to 16 bits with TPDF dither. Use only if
+                the DAC does not accept 32-bit slots.
+    endchoice
+
     config AIRPLAY_OUTPUT_LATENCY_US
         int "Default output latency after the ESP (microseconds)"
         default 0

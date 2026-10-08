@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "audio_out_sample.h"
 
 /* I2S playout backend: two 256-frame DMA descriptors. Every application audio
  * block is tagged with its RTP/generation before it reaches DMA. The TX EOF
@@ -33,7 +34,8 @@ esp_err_t audio_playout_flush(void);
 /* Preload is valid only while the TX channel is disabled/READY. It is used for
  * the first two blocks of an epoch so the channel starts with known audio in
  * both DMA descriptors instead of clocking zero-filled descriptors first. */
-esp_err_t audio_playout_preload_tagged(const int16_t *stereo, uint32_t frames,
+esp_err_t audio_playout_preload_tagged(const audio_out_sample_t *stereo,
+                                       uint32_t frames,
                                        uint32_t rtp, uint32_t generation);
 
 /* Enable after the first two blocks have been preloaded and the PTP start edge
@@ -42,7 +44,8 @@ esp_err_t audio_playout_enable(void);
 
 /* Normal steady-state write. The RTP tag is paired FIFO-wise with the TX EOF
  * callback for the descriptor that physically finished sending. */
-esp_err_t audio_playout_write_tagged(const int16_t *stereo, uint32_t frames,
+esp_err_t audio_playout_write_tagged(const audio_out_sample_t *stereo,
+                                     uint32_t frames,
                                      uint32_t rtp, uint32_t generation);
 
 /* Drain one completed tagged DMA block. done_local_us comes from
