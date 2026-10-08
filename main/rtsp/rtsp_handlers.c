@@ -447,29 +447,41 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     uint64_t features =
         ((uint64_t)AIRPLAY_FEATURES_HI << 32) | AIRPLAY_FEATURES_LO;
 
+    /* The reply buffers are only needed while answering: allocate them per
+     * request and free them right after sending. */
     if (request_uses_rtsp(req)) {
-      static uint8_t body[1024];
+      const size_t body_cap = 1024;
+      uint8_t *body = malloc(body_cap);
       size_t body_len =
-          bplist_build_info_response(body, sizeof(body), device_id, device_name,
-                                     pk, 32, features);
+          body ? bplist_build_info_response(body, body_cap, device_id,
+                                            device_name, pk, 32, features)
+               : 0;
       if (body_len == 0) {
         ESP_LOGE(TAG, "Failed to build binary /info response");
         rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
                            NULL, 0);
+        free(body);
         return;
       }
       rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                          "Content-Type: application/x-apple-binary-plist\r\n",
                          (const char *)body, body_len);
+      free(body);
       return;
     }
 
-    static char body[4096];
+    const size_t body_cap = 4096;
+    char *body = malloc(body_cap);
+    if (!body) {
+      rtsp_send_http_response(socket, conn, 500, "Internal Error",
+                              "text/plain", "Out of memory", 13);
+      return;
+    }
     plist_t p;
     char pairing_id[AIRPLAY_PAIRING_ID_LEN];
     airplay_get_pairing_id(pairing_id, sizeof(pairing_id));
 
-    plist_init(&p, body, sizeof(body));
+    plist_init(&p, body, body_cap);
     plist_begin(&p);
     plist_dict_begin(&p);
 
@@ -519,6 +531,7 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
 
     rtsp_send_http_response(socket, conn, 200, "OK", "text/x-apple-plist+xml",
                             body, body_len);
+    free(body);
   } else {
     ESP_LOGW(TAG, "Unknown GET path: %s", req->path);
     if (request_uses_rtsp(req)) {

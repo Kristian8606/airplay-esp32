@@ -2428,6 +2428,10 @@ static bool buffered_anchor_moved(const timing_snapshot_t *previous,
   return shift_us > block_us || shift_us < -block_us;
 }
 
+/* One block of digital silence, shared read-only by the start-up phase probe
+ * and the latency measurement (zero-initialised, never written). */
+static audio_out_sample_t s_silence_block[AUDIO_PLAYOUT_FRAMES * 2U];
+
 /* ---- wired latency measurement: the I2S side ----
  * Runs like the Wi-Fi scan. The web handler stops RTSP and releases
  * the audio engine (playout task stopped, codec memory freed), so the I2S
@@ -2469,11 +2473,9 @@ static void cal_take_completion(const audio_playout_completion_t *d) {
   s_cal.n_emit++;
 }
 
-static esp_err_t playout_run_latency_calibration(void) {
-  static audio_out_sample_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
-  static int16_t burst[AUDIO_PLAYOUT_FRAMES * 2U];
-  static audio_out_sample_t burst_out[AUDIO_PLAYOUT_FRAMES * 2U];
-  memset(silence, 0, sizeof(silence));
+static esp_err_t playout_run_latency_calibration_blocks(
+    int16_t *burst, audio_out_sample_t *burst_out) {
+  const audio_out_sample_t *silence = s_silence_block;
   s_cal.n_emit = 0;
   for (int k = 0; k < LATENCY_CAL_BURSTS; ++k) s_cal.emit_us[k] = 0;
 
@@ -2515,6 +2517,21 @@ static esp_err_t playout_run_latency_calibration(void) {
   }
   (void)playout_flush_checked("latency-cal-end");
   return s_cal.n_emit == LATENCY_CAL_BURSTS ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+/* The chirp buffers are only needed while a measurement runs: take them for
+ * the measurement and give them back afterwards. */
+static esp_err_t playout_run_latency_calibration(void) {
+  int16_t *burst = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
+  audio_out_sample_t *burst_out =
+      malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
+  esp_err_t err = ESP_ERR_NO_MEM;
+  if (burst && burst_out) {
+    err = playout_run_latency_calibration_blocks(burst, burst_out);
+  }
+  free(burst_out);
+  free(burst);
+  return err;
 }
 
 #endif /* CONFIG_AIRPLAY_LATENCY_CAL */
@@ -2763,8 +2780,7 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      static audio_out_sample_t silence[AUDIO_PLAYOUT_FRAMES * 2U];
-      memset(silence, 0, sizeof(silence));
+      const audio_out_sample_t *silence = s_silence_block;
 
       /* The silence tags use generation 0 on purpose: their EOFs are only a
        * phase probe and must not become the generation's public SYNC START.
@@ -4075,7 +4091,9 @@ esp_err_t audio_receiver_measure_output_latency(latency_cal_result_t *res,
     } else {
       latency_cal_result_t dummy;
       latency_cal_capture_finish(s_cal.emit_us, 0, &dummy);
-      res->error = "I2S test playback failed";
+      res->error = play == ESP_ERR_NO_MEM
+                       ? "not enough memory for the test signal"
+                       : "I2S test playback failed";
       err = play;
     }
   }
