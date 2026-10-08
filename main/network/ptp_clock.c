@@ -298,6 +298,25 @@ static void update_legacy_offset_locked(int64_t raw_offset_ns,
     if (r.outlier) AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_OUTLIER);
     return;
   }
+  if (r.reacquired) {
+    /* The sender's clock stepped: the filter restarted, lock must be earned
+     * again. */
+    ptp.locked = false;
+    ptp.lock_candidate_start_ms = 0;
+    if (step_ev) {
+      step_ev->emit = true;
+      step_ev->reason = "outlier-reacquire";
+      step_ev->source_clock_id = ptp.legacy_engine.source_clock_id;
+      step_ev->grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
+      step_ev->epoch = ptp.legacy_engine.epoch;
+      step_ev->raw_offset_ns = r.raw_offset_ns;
+      step_ev->filtered_offset_ns = r.filtered_offset_ns;
+      step_ev->raw_filter_delta_ns = r.reacquire_jump_ns;
+      step_ev->filtered_step_ns = r.reacquire_jump_ns;
+      step_ev->rx_lag_ns = rx_lag_ns;
+      step_ev->seq = seq;
+    }
+  }
 
 
   ptp.filtered_offset_ns = r.filtered_offset_ns;

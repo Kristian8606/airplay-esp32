@@ -25,6 +25,8 @@ typedef struct {
 typedef struct {
   bool accepted;
   bool outlier;
+  bool reacquired; /* outlier run too long: filter restarted on this sample */
+  int64_t reacquire_jump_ns; /* new raw offset minus the abandoned filter */
   int64_t raw_offset_ns;
   int64_t filtered_offset_ns;
   int64_t filtered_step_ns;
@@ -48,6 +50,13 @@ typedef struct {
   uint32_t accepted_samples;
 
   int64_t outlier_threshold_ns;
+  /* Consecutive rejected samples. A filter seeded from one bad sample (or a
+   * real step of the sender's clock) would otherwise reject everything
+   * forever; a long enough run restarts the estimator. */
+  uint32_t outlier_run;
+  int64_t outlier_run_start_ns;
+  int64_t outlier_run_level_ns; /* raw offset level of the current run */
+  uint32_t outlier_agree;       /* consecutive outliers at that level */
 } ptp_clock_engine_t;
 
 void ptp_clock_engine_init(ptp_clock_engine_t *engine,
