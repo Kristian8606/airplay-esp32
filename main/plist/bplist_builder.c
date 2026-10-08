@@ -541,7 +541,9 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     return 0;
   }
   ADD_OFFSET(); // 17: pairing identifier
-  if (!bplist_write_ascii_string(out, capacity, &pos, AIRPLAY_PAIRING_ID)) {
+  char pairing_id[AIRPLAY_PAIRING_ID_LEN];
+  airplay_get_pairing_id(pairing_id, sizeof(pairing_id));
+  if (!bplist_write_ascii_string(out, capacity, &pos, pairing_id)) {
     return 0;
   }
   ADD_OFFSET(); // 18: "name"

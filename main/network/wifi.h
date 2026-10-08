@@ -45,9 +45,20 @@ esp_err_t wifi_get_ip_str(char *ip_str, size_t len);
 esp_err_t wifi_scan(wifi_ap_record_t **ap_list, uint16_t *ap_count);
 
 
+// lwIP DHCP hostnames are limited to 31 characters plus the trailing NUL.
+#define WIFI_HOSTNAME_MAX_LEN 31
+
 /**
- * Set the DHCP hostname from the given device name.
- * Sanitizes to a valid DNS label (lowercase, hyphens for spaces/symbols).
- * Takes effect on the next DHCP transaction.
+ * Turn a device name into a valid DNS label: ASCII letters and digits are
+ * kept (case unchanged), every other run of characters becomes one '-',
+ * leading/trailing '-' are dropped. Falls back to "esp32-airplay-xxxxxx"
+ * (last 3 MAC bytes) when nothing is left. Used for both the DHCP and the
+ * mDNS hostname.
+ */
+void wifi_sanitize_hostname(const char *name, char *out, size_t out_len);
+
+/**
+ * Set the DHCP hostname from the given device name (see
+ * wifi_sanitize_hostname). Takes effect on the next DHCP transaction.
  */
 void wifi_set_hostname(const char *device_name);

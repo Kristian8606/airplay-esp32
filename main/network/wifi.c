@@ -25,8 +25,6 @@ static EventGroupHandle_t s_wifi_event_group;
 
 // Re-enable AP after this many consecutive failures
 #define AP_REENABLE_THRESHOLD 5
-// lwIP DHCP hostnames are limited to 31 characters plus the trailing NUL.
-#define DHCP_HOSTNAME_MAX_LEN 31
 
 static int s_retry_num = 0;
 static esp_netif_t *s_sta_netif = NULL;
@@ -67,7 +65,13 @@ static void captive_dns_start(void) {
   (void)dns_server_start(ip_info.ip.addr); /* idempotent */
 }
 
-static void sanitize_hostname(const char *name, char *out, size_t out_len) {
+void wifi_sanitize_hostname(const char *name, char *out, size_t out_len) {
+  if (!out || out_len == 0) {
+    return;
+  }
+  if (!name) {
+    name = "";
+  }
   size_t j = 0;
   for (size_t i = 0; name[i] && j < out_len - 1; i++) {
     char c = name[i];
@@ -82,7 +86,12 @@ static void sanitize_hostname(const char *name, char *out, size_t out_len) {
     j--;
   }
   if (j == 0) {
-    strlcpy(out, "esp32-airplay", out_len);
+    /* Nothing usable (e.g. an all-Cyrillic name): add the MAC tail so two
+     * such devices on one network still get different host names. */
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(out, out_len, "esp32-airplay-%02x%02x%02x", mac[3], mac[4],
+             mac[5]);
     return;
   }
   out[j] = '\0';
@@ -92,8 +101,8 @@ void wifi_set_hostname(const char *device_name) {
   if (!s_sta_netif || !device_name) {
     return;
   }
-  char hostname[DHCP_HOSTNAME_MAX_LEN + 1];
-  sanitize_hostname(device_name, hostname, sizeof(hostname));
+  char hostname[WIFI_HOSTNAME_MAX_LEN + 1];
+  wifi_sanitize_hostname(device_name, hostname, sizeof(hostname));
   esp_err_t err = esp_netif_set_hostname(s_sta_netif, hostname);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to set hostname '%s': %s", hostname,

@@ -5,15 +5,18 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
-# ESP32-S3 N8R8 uses quad flash + octal PSRAM.
-CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
-CONFIG_ESPTOOLPY_FLASHMODE="dio"
+# ESP32-S3 N8R8 uses quad flash + octal PSRAM. QIO reads code from flash
+# over 4 data lines (DIO uses 2), so instruction-cache misses refill faster.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHMODE="qio"
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
 CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
 CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y
+# Data cache stays at the 32 KB default: 64 KB would take 32 KB of internal
+# RAM, and only ~60 KiB is free after audio init.
 
 # AirPlay RX/burst-priority WiFi/LwIP profile (Espressif performance-oriented).
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=24

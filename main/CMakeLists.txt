@@ -1,5 +1,6 @@
 set(SRC_FILES
     "main.c"
+    "airplay_identity.c"
     "amp_control.c"
     "settings.c"
     "led.c"

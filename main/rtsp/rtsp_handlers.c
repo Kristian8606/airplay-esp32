@@ -466,6 +466,8 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
 
     static char body[4096];
     plist_t p;
+    char pairing_id[AIRPLAY_PAIRING_ID_LEN];
+    airplay_get_pairing_id(pairing_id, sizeof(pairing_id));
 
     plist_init(&p, body, sizeof(body));
     plist_begin(&p);
@@ -479,7 +481,7 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     plist_dict_int(&p, "vv", AIRPLAY_PROTOCOL_VERSION);
     plist_dict_int(&p, "statusFlags", AIRPLAY_STATUS_FLAGS);
     plist_dict_data(&p, "pk", pk, 32);
-    plist_dict_string(&p, "pi", AIRPLAY_PAIRING_ID);
+    plist_dict_string(&p, "pi", pairing_id);
     plist_dict_string(&p, "name", device_name);
 
     // Audio formats array
