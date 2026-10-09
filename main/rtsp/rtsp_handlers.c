@@ -33,6 +33,7 @@
 
 #include "rtsp_events.h"
 #include "rtsp_server.h"
+#include "bplist_writer.h"
 #include "mdns_airplay.h"
 
 static const char *TAG = "rtsp_handlers";
@@ -476,6 +477,70 @@ static void handle_options(int socket, rtsp_conn_t *conn,
                      0);
 }
 
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+/* GET /info laid out as an AirPort Express answers it (same key names and
+ * value types; plus the keys earlier senders of this firmware use). */
+static size_t build_info_airport_style(uint8_t *out, size_t cap, const char *device_id,
+                                       const char *device_name, const uint8_t *pk,
+                                       uint64_t features) {
+  bpw_t *w = heap_caps_malloc(sizeof(*w), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!w) w = malloc(sizeof(*w));
+  if (!w) return 0;
+  char pi[AIRPLAY_PAIRING_ID_LEN], serial[13], firmware[32];
+  airplay_get_pairing_id(pi, sizeof(pi));
+  airplay_get_serial_number(serial, sizeof(serial));
+  airplay_get_firmware_revision(firmware, sizeof(firmware));
+  static const int64_t stream_types[] = {AUDIO_STREAM_REALTIME, AUDIO_STREAM_BUFFERED};
+
+  bpw_init(w);
+  bpw_dict_begin(w);
+  bpw_key(w, "audioFormats");
+  bpw_array_begin(w);
+  bpw_dict_begin(w);
+  bpw_kv_int(w, "audioInputFormats", 0x1000000);
+  bpw_kv_int(w, "audioOutputFormats", 0x1000000);
+  bpw_kv_int(w, "type", AUDIO_STREAM_REALTIME);
+  bpw_end(w);
+  bpw_end(w);
+  bpw_key(w, "audioLatencies");
+  bpw_array_begin(w);
+  for (size_t i = 0; i < sizeof(stream_types) / sizeof(stream_types[0]); i++) {
+    bpw_dict_begin(w);
+    bpw_kv_string(w, "audioType", "default");
+    bpw_kv_int(w, "inputLatencyMicros", 0);
+    bpw_kv_int(w, "outputLatencyMicros", 0);
+    bpw_kv_int(w, "type", stream_types[i]);
+    bpw_end(w);
+  }
+  bpw_end(w);
+  bpw_kv_string(w, "build", firmware);
+  bpw_kv_string(w, "deviceID", device_id);
+  bpw_kv_string(w, "deviceid", device_id);
+  bpw_kv_uint(w, "features", features);
+  bpw_kv_string(w, "firmwareBuildDate", __DATE__);
+  bpw_kv_string(w, "firmwareRevision", firmware);
+  bpw_kv_bool(w, "keepAliveLowPower", true);
+  bpw_kv_bool(w, "keepAliveSendStatsAsBody", true);
+  bpw_kv_string(w, "manufacturer", CONFIG_AIRPLAY_HOMEKIT_MANUFACTURER);
+  bpw_kv_string(w, "model", AIRPLAY_MODEL);
+  bpw_kv_string(w, "name", device_name);
+  bpw_kv_string(w, "pi", pi);
+  bpw_kv_data(w, "pk", pk, 32);
+  bpw_kv_string(w, "protocolVersion", AIRPLAY_PROTOVERS);
+  bpw_kv_string(w, "protovers", AIRPLAY_PROTOVERS);
+  bpw_kv_string(w, "sdk", "AirPlay;2.0.2");
+  bpw_kv_string(w, "serialNumber", serial);
+  bpw_kv_string(w, "sourceVersion", AIRPLAY_SOURCE_VERSION);
+  bpw_kv_string(w, "srcvers", AIRPLAY_SOURCE_VERSION);
+  bpw_kv_uint(w, "statusFlags", airplay_status_flags());
+  bpw_kv_int(w, "vv", AIRPLAY_PROTOCOL_VERSION);
+  bpw_end(w);
+  const size_t n = bpw_finish(w, out, cap);
+  free(w);
+  return n;
+}
+#endif
+
 static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
                        const uint8_t *raw, size_t raw_len) {
   (void)raw;
@@ -495,12 +560,19 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     /* The reply buffers are only needed while answering: allocate them per
      * request and free them right after sending. */
     if (request_uses_rtsp(req)) {
-      const size_t body_cap = 1024;
+      const size_t body_cap = 1536;
       uint8_t *body = malloc(body_cap);
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+      size_t body_len =
+          body ? build_info_airport_style(body, body_cap, device_id, device_name, pk,
+                                          features)
+               : 0;
+#else
       size_t body_len =
           body ? bplist_build_info_response(body, body_cap, device_id,
                                             device_name, pk, 32, features)
                : 0;
+#endif
       if (body_len == 0) {
         ESP_LOGE(TAG, "Failed to build binary /info response");
         rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,

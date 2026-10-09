@@ -18,7 +18,12 @@
 #else
 #define AIRPLAY_MODEL          "AudioAccessory6,1"
 #endif
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+/* As an AirPort Express (and shairport-sync) report it. */
+#define AIRPLAY_SOURCE_VERSION "366.0"
+#else
 #define AIRPLAY_SOURCE_VERSION "377.40.00"
+#endif
 #define AIRPLAY_SERVER_HEADER  "AirTunes/" AIRPLAY_SOURCE_VERSION
 #define AIRPLAY_PROTOVERS      "1.1"
 /* "vv" / protocol version: AirPlay 2 only. */
@@ -48,7 +53,14 @@ bool airplay_set_session_active(bool active);
  *   Bit 46: SupportsHKPairingAndAccessControl
  *   Bit 48: SupportsTransientPairing */
 #define AIRPLAY_FEATURES_HI 0x1C340
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+/* + bit 16 (progress metadata), as an AirPort Express advertises. Its MFi
+ * bit 26 is not copied: senders then demand MFi authentication
+ * (/auth-setup), which needs Apple's authentication chip. */
+#define AIRPLAY_FEATURES_LO 0x405D4A00
+#else
 #define AIRPLAY_FEATURES_LO 0x405C4A00
+#endif
 
 /* Pairing identity UUID ("pi" in mDNS and GET /info), lowercase
  * 8-4-4-4-12 form. Derived from the Wi-Fi MAC, so it is stable across
