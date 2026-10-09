@@ -40,12 +40,11 @@ esp_err_t hap_pair_verify_m1(hap_session_t *session, const uint8_t *input,
     return ESP_FAIL;
   }
 
-  /* Accessory pairing identifier. A controller that knows this receiver
-   * from a home (added over transient pairing + /pair-add, so it never got
-   * an M6) only has the TXT/info "pi" and "pk" to go by; the device ID (MAC)
-   * was used so far. Until it is known which one the controller expects,
-   * present "pi" first and the device ID when the controller starts over
-   * with a new M1 on the same connection (it rejected the previous M2). */
+  /* Accessory pairing identifier: "pi" (TXT and /info), which HomeKit
+   * controllers expect - a home learns this receiver over transient pairing
+   * + /pair-add and never gets an M6. If a controller rejects that M2 and
+   * starts over on the same connection, the next M1 presents the device ID
+   * (MAC) this receiver used before HomeKit support, as a fallback. */
   char device_id[AIRPLAY_PAIRING_ID_LEN];
   session->pv_id_is_pi = (session->pv_attempts % 2U) == 0U;
   if (session->pv_id_is_pi) {
@@ -58,9 +57,13 @@ esp_err_t hap_pair_verify_m1(hap_session_t *session, const uint8_t *input,
   }
   const size_t device_id_len = strlen(device_id);
   session->pv_attempts++;
-  ESP_LOGI(TAG, "pair-verify M1 #%u: presenting accessory id %s (%s)%s",
-           (unsigned)session->pv_attempts, device_id, session->pv_id_is_pi ? "pi" : "device ID",
-           session->pv_attempts > 1 ? " - controller did not accept the previous M2" : "");
+  if (session->pv_attempts > 1) {
+    ESP_LOGW(TAG, "pair-verify M1 #%u: controller did not accept the previous M2, "
+             "presenting %s %s", (unsigned)session->pv_attempts,
+             session->pv_id_is_pi ? "pi" : "device ID", device_id);
+  } else {
+    ESP_LOGD(TAG, "pair-verify M1: presenting pi %s", device_id);
+  }
 
   uint8_t accessory_info[128];
   size_t accessory_info_len = 0;

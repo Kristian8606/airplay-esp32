@@ -40,7 +40,7 @@
  * describe the speaker with canRelayCommunicationChannel. Bit 17 is not
  * used: it shows up as "isAirPlayReceiverSessionActive", which an AirPort
  * playing in a group does not report. */
-#define AIRPLAY_STATUS_SESSION_ACTIVE 0x800
+#define AIRPLAY_STATUS_RELAY 0x800
 #include <stdbool.h>
 #include <stdint.h>
 uint32_t airplay_status_flags(void);

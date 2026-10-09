@@ -306,6 +306,6 @@ esp_err_t hap_pair_setup_m5(hap_session_t *session, const uint8_t *input,
   session->decrypt_nonce = 0;
   ESP_LOGI(TAG, "pair-setup M6: paired with HomeKit controller %.*s (admin)",
            (int)id_len, (const char *)id);
-  hap_pairings_log("after pair-setup");
+  hap_pairings_log("after pair-setup", true);
   return ESP_OK;
 }

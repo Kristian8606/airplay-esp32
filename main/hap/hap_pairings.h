@@ -41,8 +41,9 @@ esp_err_t hap_pairings_remove(const uint8_t *id, size_t id_len);
  * key, permissions), separated by TLV separators. Returns the length. */
 size_t hap_pairings_list_tlv(uint8_t *out, size_t cap);
 
-/* Log the table (one line per controller). */
-void hap_pairings_log(const char *why);
+/* Log the number of controllers; with detail, one line per controller
+ * (otherwise those lines at debug level). */
+void hap_pairings_log(const char *why, bool detail);
 
 /* Called (from the caller's task) whenever the admin presence changes. */
 typedef void (*hap_pairings_changed_cb)(bool has_admin);

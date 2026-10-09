@@ -677,19 +677,24 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
   }
 }
 
-/* A binary plist body, one key per log line (requests we are still
- * learning about). */
-static void log_body_plist(const char *what, const uint8_t *b, size_t n) {
+/* A binary plist body, one key per log line. debug_only: only when this
+ * tag logs at debug level (bodies of requests that repeat in every session,
+ * such as the Home hub's SETUP and /configure). */
+static void log_body_plist(const char *what, const uint8_t *b, size_t n, bool debug_only) {
+  if (debug_only && esp_log_level_get(TAG) < ESP_LOG_DEBUG) return;
   const size_t cap = 4096;
-  char *text = malloc(cap);
+  char *text = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!text) text = malloc(cap);
   if (!text) return;
   if (bplist_dump(b, n, text, cap, true) > 0) {
-    ESP_LOGI(TAG, "    %s:", what);
+    if (debug_only) ESP_LOGD(TAG, "    %s:", what);
+    else ESP_LOGI(TAG, "    %s:", what);
     char *line = text;
     while (line && *line) {
       char *nl = strchr(line, '\n');
       if (nl) *nl = '\0';
-      ESP_LOGI(TAG, "      %s", line);
+      if (debug_only) ESP_LOGD(TAG, "      %s", line);
+      else ESP_LOGI(TAG, "      %s", line);
       line = nl ? nl + 1 : NULL;
     }
   }
@@ -779,7 +784,7 @@ static void handle_pairings(int socket, rtsp_conn_t *conn, const rtsp_request_t 
     out_len = tlv8_encoder_size(&enc);
   } else if (method == M_LIST) {
     out_len = hap_pairings_list_tlv(out, 1024);
-    hap_pairings_log("pair-list");
+    hap_pairings_log("pair-list", false);
   } else if (method == M_ADD || method == M_REMOVE) {
     size_t id_len = 0, key_len = 0, perm_len = 0;
     const uint8_t *id = tlv8_find(body, body_len, TLV_TYPE_IDENTIFIER, &id_len);
@@ -812,7 +817,7 @@ static void handle_pairings(int socket, rtsp_conn_t *conn, const rtsp_request_t 
                        err == ESP_ERR_NO_MEM ? TLV_ERROR_MAX_PEERS : TLV_ERROR_UNKNOWN);
     }
     out_len = tlv8_encoder_size(&enc);
-    hap_pairings_log(method == M_ADD ? "pair-add" : "pair-remove");
+    hap_pairings_log(method == M_ADD ? "pair-add" : "pair-remove", false);
   } else {
     ESP_LOGW(TAG, "HomeKit %s: unknown method %d", req->path, method);
     if (body && body_len) log_body_hex("pairings body", body, body_len);
@@ -834,15 +839,15 @@ static void handle_configure(int socket, rtsp_conn_t *conn, const rtsp_request_t
   const uint8_t *body = req->body;
   const size_t body_len = req->body_len;
   if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)
-    log_body_plist("configure", body, body_len);
+    log_body_plist("configure", body, body_len, true);
   int64_t acl = 0, hkac = 1;
   char name[65] = "", pw[65] = "";
   (void)bplist_find_any_int(body, body_len, "Access_Control_Level", &acl);
   (void)bplist_find_any_int(body, body_len, "Enable_HK_Access_Control", &hkac);
   const bool got_name = bplist_find_any_string(body, body_len, "Device_Name", name, sizeof(name));
   (void)bplist_find_any_string(body, body_len, "Password", pw, sizeof(pw));
+  /* A Device_Name in the request is echoed back; otherwise our own name. */
   if (!got_name) settings_get_device_name(name, sizeof(name));
-  else ESP_LOGW(TAG, "configure: Home asks for the name \"%s\" (not applied yet)", name);
   ESP_LOGI(TAG, "configure: access control level %lld (0 everyone, 1 home members, 2 admins), "
            "HomeKit access control %s, password %s", (long long)acl, hkac ? "on" : "off",
            pw[0] ? "set" : "none");
@@ -857,7 +862,7 @@ static void handle_configure(int socket, rtsp_conn_t *conn, const rtsp_request_t
     rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
     return;
   }
-  log_body_plist("configure reply", out, n);
+  log_body_plist("configure reply", out, n, true);
   rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                      "Content-Type: application/x-apple-binary-plist\r\n", (const char *)out, n);
 }
@@ -1087,7 +1092,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
     ESP_LOGW(TAG, "Unhandled POST %s (%u bytes), answered 200 OK", req->path,
              (unsigned)body_len);
     if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)
-      log_body_plist("POST body", body, body_len);
+      log_body_plist("POST body", body, body_len, false);
     else if (body && body_len)
       log_body_hex("POST body", body, body_len);
     rtsp_send_ok(socket, conn, req->cseq);
@@ -1162,8 +1167,14 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   ESP_LOGI(TAG, "SETUP: has_streams=%d, stream_count=%zu", request_has_streams,
            stream_count);
-  if (!request_has_streams && body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)
-    log_body_plist("SETUP body", body, body_len);
+  if (!request_has_streams) {
+    /* One line per session SETUP; the whole body at debug level. */
+    char sender[48] = "?", model[32] = "?";
+    (void)bplist_find_any_string(body, body_len, "name", sender, sizeof(sender));
+    (void)bplist_find_any_string(body, body_len, "model", model, sizeof(model));
+    ESP_LOGI(TAG, "SETUP: session from \"%s\" (%s)", sender, model);
+    log_body_plist("SETUP body", body, body_len, true);
+  }
 
   /* A session SETUP with isRemoteControlOnly (the Home hub managing HomeKit
    * pairings, a remote control) never touches the global audio / PTP /

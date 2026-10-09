@@ -78,7 +78,7 @@ esp_err_t hap_pairings_init(void) {
   }
   for (int i = 0; i < HAP_PAIRINGS_MAX; i++)
     if (s_pairs[i].id_len > HAP_PAIRING_ID_MAX) s_pairs[i].used = 0;
-  hap_pairings_log("loaded");
+  hap_pairings_log("loaded", true);
   return ESP_OK;
 }
 
@@ -120,9 +120,14 @@ esp_err_t hap_pairings_add(const uint8_t *id, size_t id_len, const uint8_t ltpk[
   esp_err_t err = ESP_OK;
   int i = find_locked(id, id_len);
   const bool existed = i >= 0;
+  bool unchanged = false;
   if (i >= 0) {
     if (memcmp(s_pairs[i].ltpk, ltpk, 32) != 0) {
       err = ESP_ERR_INVALID_STATE; /* HAP: same id, other key -> error */
+    } else if (s_pairs[i].perm == perm) {
+      /* The Home hub re-adds the same controllers in every management
+       * session: nothing to store (spares the flash). */
+      unchanged = true;
     } else {
       s_pairs[i].perm = perm; /* permission update */
     }
@@ -140,12 +145,16 @@ esp_err_t hap_pairings_add(const uint8_t *id, size_t id_len, const uint8_t ltpk[
       memcpy(s_pairs[i].ltpk, ltpk, 32);
     }
   }
-  if (err == ESP_OK) err = save_locked();
+  if (err == ESP_OK && !unchanged) err = save_locked();
   const bool after = has_admin_locked();
   xSemaphoreGive(s_lock);
-  if (err == ESP_OK) {
+  if (err == ESP_OK && unchanged) {
+    ESP_LOGD(TAG, "Controller %.*s already paired (%s)", (int)id_len, (const char *)id,
+             (perm & HAP_PERM_ADMIN) ? "admin" : "user");
+  } else if (err == ESP_OK) {
     ESP_LOGI(TAG, "Controller %.*s %s (%s)", (int)id_len, (const char *)id,
-             existed ? "updated" : "stored", (perm & HAP_PERM_ADMIN) ? "admin" : "user");
+             existed ? "permission changed" : "stored",
+             (perm & HAP_PERM_ADMIN) ? "admin" : "user");
   }
   notify(before, after);
   return err;
@@ -194,7 +203,7 @@ size_t hap_pairings_list_tlv(uint8_t *out, size_t cap) {
   return tlv8_encoder_size(&enc);
 }
 
-void hap_pairings_log(const char *why) {
+void hap_pairings_log(const char *why, bool detail) {
   if (!s_pairs) return;
   xSemaphoreTake(s_lock, portMAX_DELAY);
   int n = 0;
@@ -203,9 +212,15 @@ void hap_pairings_log(const char *why) {
            n == 1 ? "" : "s");
   for (int i = 0; i < HAP_PAIRINGS_MAX; i++) {
     if (!s_pairs[i].used) continue;
-    ESP_LOGI(TAG, "    %.*s  %s  ltpk %02x%02x%02x%02x...", (int)s_pairs[i].id_len,
-             s_pairs[i].id, (s_pairs[i].perm & HAP_PERM_ADMIN) ? "admin" : "user ",
-             s_pairs[i].ltpk[0], s_pairs[i].ltpk[1], s_pairs[i].ltpk[2], s_pairs[i].ltpk[3]);
+    if (detail) {
+      ESP_LOGI(TAG, "    %.*s  %s  ltpk %02x%02x%02x%02x...", (int)s_pairs[i].id_len,
+               s_pairs[i].id, (s_pairs[i].perm & HAP_PERM_ADMIN) ? "admin" : "user ",
+               s_pairs[i].ltpk[0], s_pairs[i].ltpk[1], s_pairs[i].ltpk[2], s_pairs[i].ltpk[3]);
+    } else {
+      ESP_LOGD(TAG, "    %.*s  %s  ltpk %02x%02x%02x%02x...", (int)s_pairs[i].id_len,
+               s_pairs[i].id, (s_pairs[i].perm & HAP_PERM_ADMIN) ? "admin" : "user ",
+               s_pairs[i].ltpk[0], s_pairs[i].ltpk[1], s_pairs[i].ltpk[2], s_pairs[i].ltpk[3]);
+    }
   }
   xSemaphoreGive(s_lock);
 }
