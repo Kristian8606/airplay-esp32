@@ -38,20 +38,6 @@ static void log_memory_state(const char *where) {
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
            (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) / 1024U));
 }
-#ifdef CONFIG_AIRPLAY_HOMEKIT
-/* Status flag bit 17 follows playback (Home shows the accessory active). */
-static void on_playback_event(rtsp_event_t event, const rtsp_event_data_t *data,
-                              void *user_data) {
-  (void)data;
-  (void)user_data;
-  bool active;
-  if (event == RTSP_EVENT_PLAYING) active = true;
-  else if (event == RTSP_EVENT_PAUSED || event == RTSP_EVENT_DISCONNECTED) active = false;
-  else return;
-  if (airplay_set_session_active(active)) mdns_airplay_update_flags();
-}
-#endif
-
 static void on_homekit_changed(bool has_admin) {
   ESP_LOGI(TAG, "HomeKit: %s a home", has_admin ? "added to" : "removed from");
   mdns_airplay_update_flags();
@@ -117,12 +103,9 @@ void app_main(void) {
     ESP_ERROR_CHECK(audio_receiver_init());
     log_memory_state("post-audio-init");
     mdns_airplay_init();
-    /* Joining or leaving a HomeKit home, and playback, change the status
-     * flags. */
+    /* Joining or leaving a HomeKit home changes the status flags (the audio
+     * session flag is set and cleared by the RTSP server). */
     hap_pairings_set_changed_cb(on_homekit_changed);
-#ifdef CONFIG_AIRPLAY_HOMEKIT
-    rtsp_events_register(on_playback_event, NULL);
-#endif
     ESP_ERROR_CHECK(rtsp_server_start());
     esp_err_t buttons_err = playback_buttons_init();
     if (buttons_err != ESP_OK) {

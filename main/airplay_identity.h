@@ -29,10 +29,13 @@
  * airplay_status_flags() for the current value. */
 #define AIRPLAY_STATUS_FLAGS   0x4
 #define AIRPLAY_STATUS_HOMEKIT 0x400
-/* Bit 17 (0x20000), "receiver session is active": set while audio plays,
- * so the Home app can show the accessory as active (as the open-source
- * AirPlay 2 receiver does around its audio session). */
-#define AIRPLAY_STATUS_SESSION_ACTIVE 0x20000
+/* Bit 11 (0x800), DeviceSupportsRelay: set while a sender holds an audio
+ * session, cleared when it ends (shairport-sync does the same around its
+ * play lock; an AirPort Express in a group advertises 0xc04). Senders then
+ * describe the speaker with canRelayCommunicationChannel. Bit 17 is not
+ * used: it shows up as "isAirPlayReceiverSessionActive", which an AirPort
+ * playing in a group does not report. */
+#define AIRPLAY_STATUS_SESSION_ACTIVE 0x800
 #include <stdbool.h>
 #include <stdint.h>
 uint32_t airplay_status_flags(void);

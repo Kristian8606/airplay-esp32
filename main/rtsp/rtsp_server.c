@@ -369,8 +369,8 @@ cleanup:
     audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
     audio_receiver_set_encryption(NULL);
 #ifdef CONFIG_AIRPLAY_HOMEKIT
-    /* Audio stopped with the connection: the receiver session is no longer
-     * active (status flag bit 17). */
+    /* Audio stopped with the connection: the sender's session is over
+     * (status flag DeviceSupportsRelay cleared). */
     if (airplay_set_session_active(false)) mdns_airplay_update_flags();
 #endif
     mdns_airplay_set_group(NULL, false); /* no session: own group again */
@@ -568,6 +568,10 @@ esp_err_t rtsp_server_claim_audio(rtsp_conn_t *conn) {
   }
   conn->owns_audio = true;
   if (self >= 0) clients[self].audio_owner = true;
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  /* A sender holds the audio session: status flag DeviceSupportsRelay. */
+  if (airplay_set_session_active(true)) mdns_airplay_update_flags();
+#endif
   rtsp_conn_load_volume(conn);
   return ESP_OK;
 }
