@@ -31,8 +31,8 @@ bool airplay_set_session_active(bool active) {
 
 uint32_t airplay_status_flags(void) {
   uint32_t f = AIRPLAY_STATUS_FLAGS;
-  if (s_session_active) f |= AIRPLAY_STATUS_RELAY;
 #ifdef CONFIG_AIRPLAY_HOMEKIT
+  if (s_session_active) f |= AIRPLAY_STATUS_RELAY;
   if (hap_pairings_has_admin()) f |= AIRPLAY_STATUS_HOMEKIT;
 #endif
   return f;

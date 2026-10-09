@@ -32,13 +32,56 @@ void plist_dict_begin(plist_t *p) {
   plist_append(p, "<dict>\n");
 }
 
-void plist_dict_string(plist_t *p, const char *key, const char *value) {
-  size_t remaining = p->capacity - p->size;
-  int len = snprintf(p->buffer + p->size, remaining,
-                     "<key>%s</key>\n<string>%s</string>\n", key, value);
-  if (len > 0 && (size_t)len < remaining) {
-    p->size += (size_t)len;
+/* Length of s with the XML special characters escaped. */
+static size_t xml_escaped_len(const char *s) {
+  size_t n = 0;
+  for (; *s; s++) {
+    switch (*s) {
+      case '&': n += 5; break;  /* &amp; */
+      case '<':
+      case '>': n += 4; break;  /* &lt; &gt; */
+      case '"': n += 6; break;  /* &quot; */
+      default: n += 1; break;
+    }
   }
+  return n;
+}
+
+/* Append s escaped; the caller has checked that it fits. */
+static void xml_append_escaped(plist_t *p, const char *s) {
+  for (; *s; s++) {
+    const char *rep = NULL;
+    switch (*s) {
+      case '&': rep = "&amp;"; break;
+      case '<': rep = "&lt;"; break;
+      case '>': rep = "&gt;"; break;
+      case '"': rep = "&quot;"; break;
+      default: break;
+    }
+    if (rep) {
+      const size_t k = strlen(rep);
+      memcpy(p->buffer + p->size, rep, k);
+      p->size += k;
+    } else {
+      p->buffer[p->size++] = *s;
+    }
+  }
+  p->buffer[p->size] = '\0';
+}
+
+void plist_dict_string(plist_t *p, const char *key, const char *value) {
+  /* Whole entry or nothing, as before; key and value are escaped (a device
+   * name such as "Kitchen & Living Room" must not break the XML). */
+  static const char k_open[] = "<key>", k_close[] = "</key>\n<string>",
+                    s_close[] = "</string>\n";
+  const size_t need = (sizeof(k_open) - 1) + xml_escaped_len(key) + (sizeof(k_close) - 1) +
+                      xml_escaped_len(value) + (sizeof(s_close) - 1);
+  if (p->size + need >= p->capacity) return;
+  plist_append(p, k_open);
+  xml_append_escaped(p, key);
+  plist_append(p, k_close);
+  xml_append_escaped(p, value);
+  plist_append(p, s_close);
 }
 
 void plist_dict_int(plist_t *p, const char *key, int64_t value) {

@@ -1106,7 +1106,10 @@ static void handle_setup_remote_control(int socket, rtsp_conn_t *conn,
                                         const rtsp_request_t *req,
                                         bool has_streams) {
   if (has_streams) {
-    ESP_LOGW(TAG, "SETUP: stream on a remote-control-only connection refused");
+    /* Expected while status bit 11 (relay) is advertised: senders keep asking
+     * for the type 130 remote-control channel. Refusing is harmless, so keep
+     * it out of the normal log. */
+    ESP_LOGD(TAG, "SETUP: stream on a remote-control-only connection refused");
     rtsp_send_response(socket, conn, 455, "Method Not Valid In This State",
                        req->cseq, NULL, NULL, 0);
     return;
@@ -1799,7 +1802,7 @@ static void handle_set_parameter(int socket, rtsp_conn_t *conn,
             return;
           }
           rtsp_conn_set_volume(conn, volume);
-          ESP_LOGI(TAG, "Volume %.1f dB%s", volume, volume <= -144.0f ? " (mute)" : "");
+          ESP_LOGD(TAG, "Volume %.1f dB%s", volume, volume <= -144.0f ? " (mute)" : "");
         }
       }
       // Progress may also arrive in the text/parameters body

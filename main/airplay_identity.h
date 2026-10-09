@@ -39,7 +39,10 @@
  * play lock; an AirPort Express in a group advertises 0xc04). Senders then
  * describe the speaker with canRelayCommunicationChannel. Bit 17 is not
  * used: it shows up as "isAirPlayReceiverSessionActive", which an AirPort
- * playing in a group does not report. */
+ * playing in a group does not report.
+ * Required: without it the Apple TV shows no artwork or controls for this
+ * speaker in a group. Its side effect is that senders also ask for the
+ * type 130 remote-control stream, which is refused (logged at debug). */
 #define AIRPLAY_STATUS_RELAY 0x800
 #include <stdbool.h>
 #include <stdint.h>

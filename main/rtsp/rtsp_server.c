@@ -48,6 +48,9 @@ static int server_socket = -1;
 static _Atomic bool server_task_live;
 static _Atomic bool server_running;
 static _Atomic(SemaphoreHandle_t) lifecycle_mutex;
+/* Held for a whole rtsp_server_claim_audio(): two senders starting at the
+ * same time take over the audio one after the other, never both at once. */
+static _Atomic(SemaphoreHandle_t) claim_mutex;
 
 // RTSP tasks are restartable. Use dynamic TCB allocation so
 // reconnect/start-stop paths cannot reuse static task memory before FreeRTOS
@@ -374,6 +377,8 @@ cleanup:
     if (airplay_set_session_active(false)) mdns_airplay_update_flags();
 #endif
     mdns_airplay_set_group(NULL, false); /* no session: own group again */
+    /* The sender's session is over: status LED back to standby. */
+    rtsp_events_emit(RTSP_EVENT_DISCONNECTED, NULL);
   }
 
   detach_client_conn(slot);
@@ -545,6 +550,12 @@ bool rtsp_server_is_idle(void) {
 esp_err_t rtsp_server_claim_audio(rtsp_conn_t *conn) {
   if (!conn) return ESP_ERR_INVALID_ARG;
   if (conn->owns_audio) return ESP_OK;
+  SemaphoreHandle_t claim = claim_mutex;
+  if (!claim || xSemaphoreTake(claim, pdMS_TO_TICKS(5000)) != pdTRUE) {
+    ESP_LOGE(TAG, "Audio take-over still in progress for another sender");
+    return ESP_ERR_TIMEOUT;
+  }
+  esp_err_t err = ESP_OK;
   int self = -1;
   xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
   for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -563,17 +574,21 @@ esp_err_t rtsp_server_claim_audio(rtsp_conn_t *conn) {
     signal_client_stop(i);
     if (!wait_client_stopped(i, pdMS_TO_TICKS(3000))) {
       ESP_LOGE(TAG, "Previous owner slot %d did not release audio in time", i);
-      return ESP_ERR_TIMEOUT;
+      err = ESP_ERR_TIMEOUT;
+      break;
     }
   }
-  conn->owns_audio = true;
-  if (self >= 0) clients[self].audio_owner = true;
+  if (err == ESP_OK) {
+    conn->owns_audio = true;
+    if (self >= 0) clients[self].audio_owner = true;
 #ifdef CONFIG_AIRPLAY_HOMEKIT
-  /* A sender holds the audio session: status flag DeviceSupportsRelay. */
-  if (airplay_set_session_active(true)) mdns_airplay_update_flags();
+    /* A sender holds the audio session: status flag DeviceSupportsRelay. */
+    if (airplay_set_session_active(true)) mdns_airplay_update_flags();
 #endif
-  rtsp_conn_load_volume(conn);
-  return ESP_OK;
+    rtsp_conn_load_volume(conn);
+  }
+  xSemaphoreGive(claim);
+  return err;
 }
 
 esp_err_t rtsp_server_start(void) {
@@ -582,6 +597,13 @@ esp_err_t rtsp_server_start(void) {
     if (!created) return ESP_ERR_NO_MEM;
     SemaphoreHandle_t expected = NULL;
     if (!atomic_compare_exchange_strong(&lifecycle_mutex, &expected, created))
+      vSemaphoreDelete(created);
+  }
+  if (!claim_mutex) {
+    SemaphoreHandle_t created = xSemaphoreCreateMutex();
+    if (!created) return ESP_ERR_NO_MEM;
+    SemaphoreHandle_t expected = NULL;
+    if (!atomic_compare_exchange_strong(&claim_mutex, &expected, created))
       vSemaphoreDelete(created);
   }
   if (!lifecycle_mutex) return ESP_ERR_NO_MEM;
