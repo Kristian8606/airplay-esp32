@@ -22,6 +22,13 @@ static const char *TAG = "mdns_airplay";
 // leaves a HomeKit home (mdns_airplay_update_flags).
 static char s_flags_str[16];
 
+/* AirPlay group the receiver currently plays in (TXT gid / gcgl). A sender
+ * puts its groupUUID in the session SETUP; senders and the Home app use it to
+ * see which group (and whose now-playing info) this speaker belongs to.
+ * Without a session, gid is our own pairing identifier (as shairport-sync). */
+static char s_gid[48];
+static char s_gcgl[2] = "0";
+
 // Metadata types advertised in the "md" txt record:
 //   0 = text (track title/artist/album), 1 = artwork (cover art images),
 //   2 = progress.
@@ -57,6 +64,7 @@ void mdns_airplay_init(void) {
   settings_get_device_name(device_name, sizeof(device_name));
   wifi_sanitize_hostname(device_name, hostname, sizeof(hostname));
   airplay_get_pairing_id(pairing_id, sizeof(pairing_id));
+  snprintf(s_gid, sizeof(s_gid), "%s", pairing_id);
 
   // Get MAC address
   wifi_get_mac_str(mac_str, sizeof(mac_str));
@@ -105,6 +113,11 @@ void mdns_airplay_init(void) {
       {"srcvers", AIRPLAY_SOURCE_VERSION},
       {"vv", STR(AIRPLAY_PROTOCOL_VERSION)},
       {"acl", "0"},
+      {"gid", s_gid},
+      {"igl", "0"},
+      {"isGroupLeader", "0"}, /* AirPort Express spelling of igl */
+      {"gcgl", s_gcgl},
+      {"rsf", "0x0"},
 #ifdef CONFIG_AIRPLAY_HOMEKIT
       /* Accessory details the Home app shows, as an AirPort Express has. */
       {"manufacturer", CONFIG_AIRPLAY_HOMEKIT_MANUFACTURER},
@@ -161,4 +174,22 @@ void mdns_airplay_update_flags(void) {
   esp_err_t r = mdns_service_txt_item_set("_raop", "_tcp", "sf", s_flags_str);
   ESP_LOGI(TAG, "Status flags now %s (TXT update: airplay %s, raop %s)", s_flags_str,
            esp_err_to_name(a), esp_err_to_name(r));
+}
+
+void mdns_airplay_set_group(const char *gid, bool contains_leader) {
+  char want[sizeof(s_gid)];
+  if (gid && gid[0]) {
+    snprintf(want, sizeof(want), "%s", gid);
+  } else {
+    airplay_get_pairing_id(want, sizeof(want));
+  }
+  const char *gcgl = contains_leader ? "1" : "0";
+  if (strcmp(want, s_gid) == 0 && strcmp(gcgl, s_gcgl) == 0) return;
+  snprintf(s_gid, sizeof(s_gid), "%s", want);
+  snprintf(s_gcgl, sizeof(s_gcgl), "%s", gcgl);
+  esp_err_t a = mdns_service_txt_item_set("_airplay", "_tcp", "gid", s_gid);
+  esp_err_t b = mdns_service_txt_item_set("_airplay", "_tcp", "gcgl", s_gcgl);
+  ESP_LOGI(TAG, "AirPlay group now %s%s (TXT update: %s, %s)", s_gid,
+           (gid && gid[0]) ? (contains_leader ? ", group has a leader" : "") : " (own, no session)",
+           esp_err_to_name(a), esp_err_to_name(b));
 }

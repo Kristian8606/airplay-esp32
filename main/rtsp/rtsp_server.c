@@ -373,6 +373,7 @@ cleanup:
      * active (status flag bit 17). */
     if (airplay_set_session_active(false)) mdns_airplay_update_flags();
 #endif
+    mdns_airplay_set_group(NULL, false); /* no session: own group again */
   }
 
   detach_client_conn(slot);

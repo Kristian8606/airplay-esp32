@@ -456,7 +456,8 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
 
   size_t pos = 0;
 #ifdef CONFIG_AIRPLAY_HOMEKIT
-  size_t offsets[45]; /* + manufacturer, serialNumber, firmwareRevision */
+  size_t offsets[48]; /* + manufacturer, serialNumber, firmwareRevision,
+                       * Apple key names deviceID/protocolVersion/sourceVersion */
 #else
   size_t offsets[39];
 #endif
@@ -652,8 +653,10 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
   {
 #ifdef CONFIG_AIRPLAY_HOMEKIT
     /* Accessory details the Home app shows (objects 39..44 below). */
-    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 39, 41, 43};
-    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 40, 42, 44};
+    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 39, 41, 43,
+                            45, 46, 47};
+    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 40, 42, 44,
+                              1, 7, 9};
 #else
     const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28};
     const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37};
@@ -680,6 +683,14 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     if (!bplist_write_ascii_string(out, capacity, &pos, "firmwareRevision")) return 0;
     ADD_OFFSET(); // 44
     if (!bplist_write_ascii_string(out, capacity, &pos, firmware)) return 0;
+    /* The key names Apple receivers (AirPort Express, shairport-sync) use in
+     * /info; the lower-case TXT names above stay for existing senders. */
+    ADD_OFFSET(); // 45 -> device id (1)
+    if (!bplist_write_ascii_string(out, capacity, &pos, "deviceID")) return 0;
+    ADD_OFFSET(); // 46 -> protocol version (7)
+    if (!bplist_write_ascii_string(out, capacity, &pos, "protocolVersion")) return 0;
+    ADD_OFFSET(); // 47 -> source version (9)
+    if (!bplist_write_ascii_string(out, capacity, &pos, "sourceVersion")) return 0;
   }
 #endif
 

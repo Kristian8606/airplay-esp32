@@ -33,6 +33,7 @@
 
 #include "rtsp_events.h"
 #include "rtsp_server.h"
+#include "mdns_airplay.h"
 
 static const char *TAG = "rtsp_handlers";
 
@@ -534,6 +535,12 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     plist_dict_string(&p, "model", AIRPLAY_MODEL);
     plist_dict_string(&p, "protovers", AIRPLAY_PROTOVERS);
     plist_dict_string(&p, "srcvers", AIRPLAY_SOURCE_VERSION);
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+    /* Apple key names (AirPort Express, shairport-sync), next to the above. */
+    plist_dict_string(&p, "deviceID", device_id);
+    plist_dict_string(&p, "protocolVersion", AIRPLAY_PROTOVERS);
+    plist_dict_string(&p, "sourceVersion", AIRPLAY_SOURCE_VERSION);
+#endif
     plist_dict_int(&p, "vv", AIRPLAY_PROTOCOL_VERSION);
     plist_dict_int(&p, "statusFlags", (int64_t)airplay_status_flags());
     plist_dict_data(&p, "pk", pk, 32);
@@ -1105,6 +1112,16 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     rtsp_send_response(socket, conn, 503, "Service Unavailable", req->cseq,
                        NULL, NULL, 0);
     return;
+  }
+  if (!request_has_streams) {
+    /* Advertise the sender's group (TXT gid/gcgl), as AirPlay 2 speakers do:
+     * iOS and the Home app use it to tie this speaker to the group's
+     * now-playing info (artwork, controls). */
+    char group[48] = "";
+    int64_t leader = 0;
+    (void)bplist_find_any_string(body, body_len, "groupUUID", group, sizeof(group));
+    (void)bplist_find_any_int(body, body_len, "groupContainsGroupLeader", &leader);
+    if (group[0]) mdns_airplay_set_group(group, leader != 0);
   }
 
   if (request_has_streams) {
