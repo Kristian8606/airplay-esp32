@@ -1256,6 +1256,54 @@ static void status_print_playout_events(void) {
              esp_err_to_name((esp_err_t)v[0]), (unsigned long)(missed + 1U));
 }
 
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+/* PLAYOUT diagnostics (menuconfig): what reaches the DAC, per status period.
+ * Written by the playout task, read and cleared by the status line. */
+static struct {
+  uint32_t max_gap_us;     /* longest time between two running DMA writes */
+  uint32_t max_work_us;    /* longest PCM read + output stage of one block */
+  uint32_t conceal_blocks; /* blocks with holes filled by silence */
+  uint32_t conceal_frames; /* frames of that silence */
+  uint32_t silent_blocks;  /* whole block missing: played as silence */
+  uint32_t write_fails;    /* running write failed: flush and re-prime */
+} s_pd;
+#define PD_MAX(field, v)                                                    \
+  do {                                                                      \
+    const uint32_t pd_v = (uint32_t)(v);                                    \
+    if (pd_v > __atomic_load_n(&s_pd.field, __ATOMIC_RELAXED))              \
+      __atomic_store_n(&s_pd.field, pd_v, __ATOMIC_RELAXED);                \
+  } while (0)
+#define PD_ADD(field, v) __atomic_fetch_add(&s_pd.field, (uint32_t)(v), __ATOMIC_RELAXED)
+
+static void status_print_playout_diag(void) {
+  uint32_t underruns = 0, tag_faults = 0;
+  audio_playout_diag_take(&underruns, &tag_faults);
+  const uint32_t gap = __atomic_exchange_n(&s_pd.max_gap_us, 0U, __ATOMIC_RELAXED);
+  const uint32_t work = __atomic_exchange_n(&s_pd.max_work_us, 0U, __ATOMIC_RELAXED);
+  const uint32_t cb = __atomic_exchange_n(&s_pd.conceal_blocks, 0U, __ATOMIC_RELAXED);
+  const uint32_t cf = __atomic_exchange_n(&s_pd.conceal_frames, 0U, __ATOMIC_RELAXED);
+  const uint32_t sb = __atomic_exchange_n(&s_pd.silent_blocks, 0U, __ATOMIC_RELAXED);
+  const uint32_t wf = __atomic_exchange_n(&s_pd.write_fails, 0U, __ATOMIC_RELAXED);
+  /* One block is 5805 us: a gap above two blocks (11610 us) means the DMA
+   * queue ran dry before this write. */
+  const bool bad = underruns || tag_faults || cb || sb || wf || gap > 11000U;
+  if (bad) {
+    ESP_LOGW(STATUS_TAG,
+             "PLAYOUT | gap max %lu us | work max %lu us | underrun %lu | "
+             "tag fault %lu | holes %lu blk/%lu fr | silent %lu blk | rewrite %lu",
+             (unsigned long)gap, (unsigned long)work, (unsigned long)underruns,
+             (unsigned long)tag_faults, (unsigned long)cb, (unsigned long)cf,
+             (unsigned long)sb, (unsigned long)wf);
+  } else {
+    ESP_LOGI(STATUS_TAG, "PLAYOUT | gap max %lu us | work max %lu us | clean",
+             (unsigned long)gap, (unsigned long)work);
+  }
+}
+#else
+#define PD_MAX(field, v) do {} while (0)
+#define PD_ADD(field, v) do {} while (0)
+#endif
+
 static void audio_status_task(void *arg) {
   (void)arg;
   bool stack_headroom_warned = false;
@@ -1278,6 +1326,9 @@ static void audio_status_task(void *arg) {
          snap.stream_type != AUDIO_STREAM_REALTIME)) continue;
     const audio_stream_type_t task_stream = snap.stream_type;
     buffered_timing_watchdog(&snap);
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+    status_print_playout_diag();
+#endif
 
     const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
     uint32_t wanted = 0;
@@ -2401,6 +2452,10 @@ static void output_stage(int16_t *pcm, audio_out_sample_t *out,
  * pending so the next playout iteration retries before any new PRIME work is
  * allowed to touch the channel. */
 static bool playout_flush_checked(const char *reason) {
+  /* The output stops here (track change, seek, pause, re-prime). Whatever
+   * plays next must not continue the loudness filters' memory of the audio
+   * before the stop: that would start with a step, i.e. a pop. */
+  audio_loudness_reset();
   const esp_err_t err = audio_playout_flush();
   if (err == ESP_OK) {
     return true;
@@ -2592,6 +2647,9 @@ static void ap2_playout_task(void *arg) {
       (initial_mute & 1U) ? 0 : initial_volume,
       (initial_mute & 2U) ? 0 : initial_volume};
   playout_state_t state = PLAYOUT_STOPPED;
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+  int64_t pd_last_write_us = 0;
+#endif
   int32_t servo_ppm = 0;
   int32_t servo_target_ppm = 0;
   int64_t pid_last_calc_us = 0;
@@ -2961,6 +3019,9 @@ static void ap2_playout_task(void *arg) {
       cursor_rtp = real_start_rtp + AUDIO_PLAYOUT_FRAMES;
       cursor_timing = commit_snap;
       state = PLAYOUT_RUNNING;
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+      pd_last_write_us = 0;
+#endif
       if (snap.stream_type == AUDIO_STREAM_BUFFERED &&
           start_logged_gen != snap.generation &&
           s_anchor_commit_gen == snap.generation && s_anchor_commit_us != 0) {
@@ -2979,6 +3040,9 @@ static void ap2_playout_task(void *arg) {
      * descriptors are paced by their EOF interrupts. No guessed current+1
      * subtraction is used for sync any more; the ISR completion tags are the
      * source of truth. */
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+    const int64_t pd_work_start_us = esp_timer_get_time();
+#endif
     bool have_pcm = pcm_rtp_ring_read_256(
         s.pcm_ring, cursor_rtp, snap.pcm_generation, block);
     if (!have_pcm && snap.stream_type == AUDIO_STREAM_BUFFERED) {
@@ -3025,19 +3089,48 @@ static void ap2_playout_task(void *arg) {
                                      diag_transition);
       if (diag_conceal_ok) have_pcm = true;
 #else
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+      uint32_t pd_missing = 0U;
+      if (pcm_rtp_ring_read_256_conceal(
+              s.pcm_ring, cursor_rtp, snap.pcm_generation, block, &pd_missing)) {
+        have_pcm = true;
+        PD_ADD(conceal_blocks, 1U);
+        PD_ADD(conceal_frames, pd_missing);
+      }
+#else
       if (pcm_rtp_ring_read_256_conceal(
               s.pcm_ring, cursor_rtp, snap.pcm_generation, block, NULL)) {
         have_pcm = true;
       }
 #endif
+#endif
     }
     if (!have_pcm) {
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
+      PD_ADD(silent_blocks, 1U);
     }
     output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+    PD_MAX(max_work_us, esp_timer_get_time() - pd_work_start_us);
+#endif
 
     const esp_err_t write_err = audio_playout_write_tagged(
         out_block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+    {
+      /* Time between consecutive running writes. Cleared when RUNNING
+       * starts, so the first write after a (re)start is not a gap. */
+      const int64_t pd_now = esp_timer_get_time();
+      if (write_err == ESP_OK) {
+        if (pd_last_write_us != 0)
+          PD_MAX(max_gap_us, pd_now - pd_last_write_us);
+        pd_last_write_us = pd_now;
+      } else {
+        pd_last_write_us = 0;
+        PD_ADD(write_fails, 1U);
+      }
+    }
+#endif
     process_i2s_completions(&snap);
 
     /* PID clock servo.

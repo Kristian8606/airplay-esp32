@@ -15,10 +15,16 @@ static volatile uint32_t s_cfg;
 
 #define CFG_ENABLED 0x80000000U
 
-/* Attenuation followed per 256-frame block (5.8 ms): at most this many dB
- * per block, so a volume jump turns into a short glide instead of a step
- * in the filter gain. 0.5 dB per block = 86 dB/s. */
+/* Volume turned down (more correction): the boost glides up by at most this
+ * many dB of attenuation per 256-frame block (5.8 ms), 86 dB/s, so it never
+ * steps. Volume turned up (less correction): the boost follows at once, in
+ * the same block as the volume ramp. Lagging there would leave a large bass
+ * boost on a suddenly loud signal and clip it. */
 #define ATT_STEP_DB 0.5f
+/* Blocks at unity gain before the filters leave the path, so the transient
+ * of the last coefficient change has died away (8 blocks = 46 ms, many time
+ * constants of a 130 Hz shelf) and the switch to bit-exact is seamless. */
+#define UNITY_BLOCKS_BEFORE_BYPASS 8U
 
 typedef struct {
   float b0, b1, b2, a1, a2; /* normalised by a0 */
@@ -34,6 +40,7 @@ static float s_coeff_att_db = -1.0f;
 static lb_coeff_t s_low, s_high;
 static lb_state_t s_state[2][2]; /* [channel][low, high] */
 static bool s_running;           /* filters in the path (state live) */
+static uint32_t s_unity_blocks;  /* consecutive blocks at unity gain */
 
 static uint32_t pack_cfg(bool enabled, int32_t reference_db) {
   return (enabled ? CFG_ENABLED : 0U) | ((uint32_t)reference_db & 0xffU);
@@ -124,6 +131,16 @@ static void shelf(lb_coeff_t *c, bool high, float f0, float slope, float gain_db
   c->a2 = a2 * inv;
 }
 
+/* After digital silence the filter memory decays toward denormal floats,
+ * which some FPUs handle slowly. Clear values far below the 24-bit LSB
+ * (2^-23 of full scale ~ 1e-7) once per block. */
+static void flush_tiny_state(void) {
+  float *v = &s_state[0][0].x1;
+  for (size_t i = 0; i < sizeof(s_state) / sizeof(float); ++i) {
+    if (fabsf(v[i]) < 1e-20f) v[i] = 0.0f;
+  }
+}
+
 static inline float biquad(float x, const lb_coeff_t *c, lb_state_t *s) {
   const float y = c->b0 * x + c->b1 * s->x1 + c->b2 * s->x2 - c->a1 * s->y1 -
                   c->a2 * s->y2;
@@ -139,18 +156,23 @@ static inline float biquad(float x, const lb_coeff_t *c, lb_state_t *s) {
 static bool loudness_prepare(int32_t gain_q15) {
   const uint32_t cfg = __atomic_load_n(&s_cfg, __ATOMIC_ACQUIRE);
   const float target = target_att_db(cfg, gain_q15);
-  if (target == 0.0f && s_att_db == 0.0f) {
-    if (s_running) {
-      /* The filters have glided back to unity: leave the path. */
+  if (!s_running && target == 0.0f) return false;
+  if (target > s_att_db + ATT_STEP_DB) s_att_db += ATT_STEP_DB;
+  else s_att_db = target; /* down, or within one step: at once */
+
+  if (s_att_db == 0.0f) {
+    /* Unity gain: keep filtering a few blocks so the last change settles,
+     * then leave the path (bit-exact from there on). */
+    if (++s_unity_blocks > UNITY_BLOCKS_BEFORE_BYPASS) {
       memset(s_state, 0, sizeof(s_state));
       s_running = false;
       s_coeff_att_db = -1.0f;
+      s_unity_blocks = 0;
+      return false;
     }
-    return false;
+  } else {
+    s_unity_blocks = 0;
   }
-  if (target > s_att_db + ATT_STEP_DB) s_att_db += ATT_STEP_DB;
-  else if (target < s_att_db - ATT_STEP_DB) s_att_db -= ATT_STEP_DB;
-  else s_att_db = target;
 
   if (s_att_db != s_coeff_att_db) {
     shelf(&s_low, false, AUDIO_LOUDNESS_LOW_HZ, AUDIO_LOUDNESS_LOW_SLOPE,
@@ -161,6 +183,10 @@ static bool loudness_prepare(int32_t gain_q15) {
   }
   s_running = true;
   return true;
+}
+
+void audio_loudness_reset(void) {
+  memset(s_state, 0, sizeof(s_state));
 }
 
 void audio_loudness_process_s32(int32_t *out, uint32_t frames, int32_t gain_q15) {
@@ -176,6 +202,7 @@ void audio_loudness_process_s32(int32_t *out, uint32_t frames, int32_t gain_q15)
     else if (y < -2147483648.0f) y = -2147483648.0f;
     out[i] = (int32_t)(((int32_t)y + 128) & ~255);
   }
+  flush_tiny_state();
 }
 
 void audio_loudness_process_s16(int16_t *pcm, uint32_t frames, int32_t gain_q15) {
@@ -189,4 +216,5 @@ void audio_loudness_process_s16(int16_t *pcm, uint32_t frames, int32_t gain_q15)
     else if (y < -32768.0f) y = -32768.0f;
     pcm[i] = (int16_t)y;
   }
+  flush_tiny_state();
 }

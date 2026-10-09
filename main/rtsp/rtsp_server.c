@@ -14,6 +14,7 @@
 #include "audio_diag.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -478,6 +479,22 @@ static void server_task(void *pvParameters) {
       if (!server_running) break;
       if (accept_error == EINTR || accept_error == EAGAIN ||
           accept_error == EWOULDBLOCK || accept_error == ETIMEDOUT) continue;
+      if (accept_error == ENFILE || accept_error == EMFILE ||
+          accept_error == ENOMEM || accept_error == ENOBUFS ||
+          accept_error == ECONNABORTED) {
+        /* Out of sockets or memory for a moment (the web UI or a burst of
+         * hub connections). Not a reason to stop AirPlay and the music that
+         * is playing: wait for a socket to be freed and accept again. */
+        static int64_t last_warn_us;
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - last_warn_us > 10000000LL) {
+          ESP_LOGW(TAG, "accept: no socket available (errno %d); retrying",
+                   accept_error);
+          last_warn_us = now_us;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
       ESP_LOGE(TAG, "Failed to accept: %d", accept_error);
       break;
     }

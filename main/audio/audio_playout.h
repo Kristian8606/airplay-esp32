@@ -54,6 +54,10 @@ bool audio_playout_poll_completion(audio_playout_completion_t *out);
 
 /* Sticky until a successful flush. Never use completions after a FIFO fault. */
 bool audio_playout_has_fault(void);
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+/* Counts since the last call: DMA underruns, EOF tag faults. */
+void audio_playout_diag_take(uint32_t *underruns, uint32_t *tag_faults);
+#endif
 /* Single playout owner only; timeout is in FreeRTOS ticks. */
 bool audio_playout_wait_completion(audio_playout_completion_t *out,
                                     uint32_t timeout_ticks);
