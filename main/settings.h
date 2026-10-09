@@ -31,3 +31,7 @@ esp_err_t settings_get_output_latency_us(int32_t *us);
 esp_err_t settings_set_output_latency_us(int32_t us);
 /* Forget the saved value (back to the Kconfig default). */
 esp_err_t settings_clear_output_latency(void);
+/* Loudness compensation: on/off and reference offset in dB (off, 0 when
+ * nothing was saved). */
+esp_err_t settings_get_loudness(bool *enabled, int32_t *reference_db);
+esp_err_t settings_set_loudness(bool enabled, int32_t reference_db);

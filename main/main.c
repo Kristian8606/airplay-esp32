@@ -2,6 +2,7 @@
 #include "audio_diag.h"
 #include "amp_control.h"
 #include "audio_eq.h"
+#include "audio_loudness.h"
 #include "dns_server.h"
 #include "hap.h"
 #include "hap_pairings.h"
@@ -66,6 +67,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(e);
   ESP_ERROR_CHECK(settings_init());
   ESP_ERROR_CHECK(audio_eq_init());
+  (void)audio_loudness_init();
   ESP_ERROR_CHECK(log_stream_init());
 
   const bool provisioning_only = !settings_has_wifi_credentials();

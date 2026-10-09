@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "audio_receiver.h"
 #include "audio_eq.h"
+#include "audio_loudness.h"
 #include "ota.h"
 #include "wifi.h"
 #include "settings.h"
@@ -20,6 +21,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -378,6 +380,62 @@ static esp_err_t latency_post_handler(httpd_req_t *req) {
                                             : esp_err_to_name(e));
   add_latency_state(r);
   if (j) cJSON_Delete(j);
+  send_json_obj(req, r);
+  return ESP_OK;
+}
+/* Loudness compensation: settings plus the live state (the page polls it
+ * while open and draws the curve from the filter parameters given here). */
+static void add_loudness_state(cJSON *r) {
+  audio_loudness_status_t st;
+  audio_loudness_get_status(&st);
+  cJSON_AddBoolToObject(r, "enabled", st.enabled);
+  cJSON_AddNumberToObject(r, "reference_db", st.reference_db);
+  cJSON_AddNumberToObject(r, "reference_max_db", AUDIO_LOUDNESS_REF_MAX_DB);
+  if (st.output_silent) cJSON_AddNullToObject(r, "output_db");
+  else cJSON_AddNumberToObject(r, "output_db", roundf(st.output_db * 10.0f) / 10.0f);
+  cJSON_AddNumberToObject(r, "correction_db", roundf(st.correction_db * 100.0f) / 100.0f);
+  cJSON_AddNumberToObject(r, "sample_rate", AUDIO_LOUDNESS_SAMPLE_RATE);
+  cJSON *lo = cJSON_AddObjectToObject(r, "low");
+  if (lo) {
+    cJSON_AddNumberToObject(lo, "hz", AUDIO_LOUDNESS_LOW_HZ);
+    cJSON_AddNumberToObject(lo, "slope", AUDIO_LOUDNESS_LOW_SLOPE);
+    cJSON_AddNumberToObject(lo, "db_per_db", AUDIO_LOUDNESS_LOW_DB_PER_DB);
+  }
+  cJSON *hi = cJSON_AddObjectToObject(r, "high");
+  if (hi) {
+    cJSON_AddNumberToObject(hi, "hz", AUDIO_LOUDNESS_HIGH_HZ);
+    cJSON_AddNumberToObject(hi, "slope", AUDIO_LOUDNESS_HIGH_SLOPE);
+    cJSON_AddNumberToObject(hi, "db_per_db", AUDIO_LOUDNESS_HIGH_DB_PER_DB);
+  }
+}
+static esp_err_t loudness_get_handler(httpd_req_t *req) {
+  cJSON *r = cJSON_CreateObject();
+  cJSON_AddBoolToObject(r, "success", true);
+  add_loudness_state(r);
+  send_json_obj(req, r);
+  return ESP_OK;
+}
+static esp_err_t loudness_post_handler(httpd_req_t *req) {
+  char b[96];
+  if (recv_json(req, b, sizeof(b)) != ESP_OK) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+    return ESP_FAIL;
+  }
+  cJSON *j = cJSON_Parse(b);
+  cJSON *en = j ? cJSON_GetObjectItem(j, "enabled") : NULL;
+  cJSON *ref = j ? cJSON_GetObjectItem(j, "reference_db") : NULL;
+  esp_err_t e = ESP_ERR_INVALID_ARG;
+  if (cJSON_IsBool(en) && cJSON_IsNumber(ref)) {
+    e = audio_loudness_set(cJSON_IsTrue(en), (int32_t)lround(ref->valuedouble), true);
+  }
+  if (j) cJSON_Delete(j);
+  cJSON *r = cJSON_CreateObject();
+  cJSON_AddBoolToObject(r, "success", e == ESP_OK);
+  if (e != ESP_OK)
+    cJSON_AddStringToObject(r, "error", e == ESP_ERR_INVALID_ARG
+                                            ? "reference out of range (0..20 dB)"
+                                            : esp_err_to_name(e));
+  add_loudness_state(r);
   send_json_obj(req, r);
   return ESP_OK;
 }
@@ -741,7 +799,7 @@ static esp_err_t speed_upload(httpd_req_t *req){
 
 esp_err_t web_server_start(uint16_t port){ if(s_server)return ESP_OK; httpd_config_t c=HTTPD_DEFAULT_CONFIG();c.server_port=port;c.max_uri_handlers=30;c.stack_size=8192;c.lru_purge_enable=true;c.task_priority=HTTP_SERVER_TASK_PRIORITY;esp_err_t e=httpd_start(&s_server,&c);if(e!=ESP_OK)return e;
 #define REG(U,M,H) do{httpd_uri_t x={.uri=U,.method=M,.handler=H};ESP_ERROR_CHECK(httpd_register_uri_handler(s_server,&x));}while(0)
-  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/audio/mute",HTTP_POST,output_mute_post_handler);REG("/api/audio/remote",HTTP_GET,remote_get_handler);REG("/api/audio/remote",HTTP_POST,remote_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);REG("/api/audio/latency",HTTP_GET,latency_get_handler);REG("/api/audio/latency",HTTP_POST,latency_post_handler);REG("/api/audio/latency/measure",HTTP_POST,latency_measure_handler);
+  REG("/",HTTP_GET,root_handler);REG("/favicon.ico",HTTP_GET,favicon_handler);REG("/logs",HTTP_GET,logs_handler);REG("/speedtest",HTTP_GET,speedtest_handler);REG("/eq",HTTP_GET,eq_page_handler);REG("/api/eq",HTTP_GET,eq_get_handler);REG("/api/eq",HTTP_POST,eq_post_handler);REG("/api/audio/mute",HTTP_POST,output_mute_post_handler);REG("/api/audio/remote",HTTP_GET,remote_get_handler);REG("/api/audio/remote",HTTP_POST,remote_post_handler);REG("/api/wifi/scan",HTTP_GET,wifi_scan_handler);REG("/api/wifi/config",HTTP_POST,wifi_config_handler);REG("/api/device/name",HTTP_POST,device_name_handler);REG("/api/ota/update",HTTP_POST,ota_handler);REG("/api/system/info",HTTP_GET,system_info_handler);REG("/api/system/restart",HTTP_POST,restart_handler);REG("/api/speedtest/ping",HTTP_GET,speed_ping);REG("/api/speedtest/download",HTTP_GET,speed_download);REG("/api/speedtest/upload",HTTP_POST,speed_upload);REG("/hotspot-detect.html",HTTP_GET,captive_redirect);REG("/library/test/success.html",HTTP_GET,captive_redirect);REG("/generate_204",HTTP_GET,captive_redirect);REG("/connecttest.txt",HTTP_GET,captive_redirect);REG("/api/audio/latency",HTTP_GET,latency_get_handler);REG("/api/audio/latency",HTTP_POST,latency_post_handler);REG("/api/audio/latency/measure",HTTP_POST,latency_measure_handler);REG("/api/audio/loudness",HTTP_GET,loudness_get_handler);REG("/api/audio/loudness",HTTP_POST,loudness_post_handler);
   ESP_ERROR_CHECK(httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_404_handler));
 #undef REG
   e=log_stream_register(s_server);if(e!=ESP_OK)ESP_LOGW(TAG,"log stream register failed: %s",esp_err_to_name(e));ESP_LOGI(TAG,"Web UI started on port %u",port);return ESP_OK; }

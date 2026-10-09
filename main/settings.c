@@ -297,6 +297,29 @@ esp_err_t settings_clear_output_latency(void) {
   nvs_close(h);
   return e;
 }
+esp_err_t settings_get_loudness(bool *enabled, int32_t *reference_db) {
+  if (!enabled || !reference_db) return ESP_ERR_INVALID_ARG;
+  *enabled = false;
+  *reference_db = 0;
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;
+  uint8_t en = 0;
+  int32_t ref = 0;
+  if (nvs_get_u8(h, "loud_en", &en) == ESP_OK) *enabled = en != 0;
+  if (nvs_get_i32(h, "loud_ref", &ref) == ESP_OK) *reference_db = ref;
+  nvs_close(h);
+  return ESP_OK;
+}
+esp_err_t settings_set_loudness(bool enabled, int32_t reference_db) {
+  nvs_handle_t h;
+  esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
+  if (e != ESP_OK) return e;
+  e = nvs_set_u8(h, "loud_en", enabled ? 1U : 0U);
+  if (e == ESP_OK) e = nvs_set_i32(h, "loud_ref", reference_db);
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  return e;
+}
 esp_err_t settings_persist_volume(void) {
   nvs_handle_t h;
   esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);

@@ -12,6 +12,7 @@
 
 #include "aac_decoder.h"
 #include "audio_eq.h"
+#include "audio_loudness.h"
 #include "audio_crypto.h"
 #include "audio_diag.h"
 #include "ap2_buffered_fifo.h"
@@ -2335,6 +2336,8 @@ static void output_stage(int16_t *pcm, audio_out_sample_t *out,
                          uint32_t frames, int32_t current_q15[2]) {
   (void)out;
   apply_output_volume(pcm, frames, current_q15);
+  audio_loudness_process_s16(pcm, frames, current_q15[0] > current_q15[1]
+                                              ? current_q15[0] : current_q15[1]);
 }
 
 #else /* AUDIO_OUT_SLOT_BITS == 32 */
@@ -2385,6 +2388,9 @@ static void apply_output_volume_s32(const int16_t *pcm, int32_t *out,
 static void output_stage(int16_t *pcm, audio_out_sample_t *out,
                          uint32_t frames, int32_t current_q15[2]) {
   apply_output_volume_s32(pcm, out, frames, current_q15);
+  /* Loudness follows the volume just applied (current_q15 = its target). */
+  audio_loudness_process_s32(out, frames, current_q15[0] > current_q15[1]
+                                              ? current_q15[0] : current_q15[1]);
 }
 #endif /* AUDIO_OUT_SLOT_BITS */
 
@@ -3810,6 +3816,10 @@ void audio_receiver_set_volume_q15(int32_t volume_q15) {
   if (volume_q15 < 0) volume_q15 = 0;
   if (volume_q15 > 32768) volume_q15 = 32768;
   __atomic_store_n(&s_volume_target_q15, volume_q15, __ATOMIC_RELEASE);
+}
+
+int32_t audio_receiver_get_volume_q15(void) {
+  return __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
 }
 
 uint32_t audio_receiver_get_output_mute_mask(void) {
