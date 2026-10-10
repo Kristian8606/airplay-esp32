@@ -43,6 +43,10 @@ CONFIG_MBEDTLS_THREADING_PTHREAD=y
 # up to 4 connections, event listeners/connections, buffered audio TCP, 2 PTP,
 # web server (listener, control, up to 4 clients). 16 ran out (errno 23).
 CONFIG_LWIP_MAX_SOCKETS=24
+# Network processing (tcpip task, priority 18) stays on core 0 with Wi-Fi,
+# RTSP and the AAC decoder. Core 1 is left to the audio output: a TCP burst
+# (track change, buffer refill) no longer delays the I2S writes there.
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
 CONFIG_LWIP_SO_RCVBUF=y
 # Realtime streaming TCP/LwIP sizing.
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
