@@ -12,6 +12,7 @@
 
 #include "aac_decoder.h"
 #include "audio_eq.h"
+#include "audio_loudness.h"
 #include "audio_crypto.h"
 #include "audio_diag.h"
 #include "ap2_buffered_fifo.h"
@@ -1704,6 +1705,9 @@ static void ap2_buffered_processor_task(void *arg) {
       packets_played_in_sequence = 0;
       expected_timestamp = 0;
       audio_eq_reset_state();
+      /* New connection: stop I2S before the old PCM is invalidated. */
+      __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
+      media_control_wake();
       xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
       xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
       (void)reset_buffered_pcm_store();
@@ -2335,6 +2339,8 @@ static void output_stage(int16_t *pcm, audio_out_sample_t *out,
                          uint32_t frames, int32_t current_q15[2]) {
   (void)out;
   apply_output_volume(pcm, frames, current_q15);
+  audio_loudness_process_s16(pcm, frames, current_q15[0] > current_q15[1]
+                                              ? current_q15[0] : current_q15[1]);
 }
 
 #else /* AUDIO_OUT_SLOT_BITS == 32 */
@@ -2385,6 +2391,9 @@ static void apply_output_volume_s32(const int16_t *pcm, int32_t *out,
 static void output_stage(int16_t *pcm, audio_out_sample_t *out,
                          uint32_t frames, int32_t current_q15[2]) {
   apply_output_volume_s32(pcm, out, frames, current_q15);
+  /* Loudness follows the volume just applied (current_q15 = its target). */
+  audio_loudness_process_s32(out, frames, current_q15[0] > current_q15[1]
+                                              ? current_q15[0] : current_q15[1]);
 }
 #endif /* AUDIO_OUT_SLOT_BITS */
 
@@ -2397,6 +2406,9 @@ static void output_stage(int16_t *pcm, audio_out_sample_t *out,
 static bool playout_flush_checked(const char *reason) {
   const esp_err_t err = audio_playout_flush();
   if (err == ESP_OK) {
+    /* I2S is stopped. Only now forget the loudness filters' memory of the
+     * audio before the stop, so whatever plays next starts from silence. */
+    audio_loudness_reset();
     return true;
   }
   __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
@@ -2691,6 +2703,10 @@ static void ap2_playout_task(void *arg) {
     }
 
     if (!timeline_ok) {
+      /* Playback stopped (pause, FLUSH, track change, lost clock): stop I2S
+       * now, so the DAC mutes on the clock halt, instead of letting the
+       * queued DMA run out into silence with the clocks still running. */
+      if (audio_playout_is_enabled()) (void)playout_flush_checked("stop");
       state = PLAYOUT_STOPPED;
       (void)xSemaphoreTake(s.playout_wake, 1);
       continue;
@@ -3026,6 +3042,13 @@ static void ap2_playout_task(void *arg) {
 #endif
     }
     if (!have_pcm) {
+      /* A stop (FLUSH, track change) may have cleared the PCM just now. Do
+       * not send that gap as silence while I2S still runs: stop I2S first
+       * (top of the loop). A real underrun while playing has no stop
+       * request and is still played as silence. */
+      if (__atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
+          __atomic_load_n(&s.playout_servo_reset_requested, __ATOMIC_ACQUIRE))
+        continue;
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
     }
     output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
@@ -3812,6 +3835,10 @@ void audio_receiver_set_volume_q15(int32_t volume_q15) {
   __atomic_store_n(&s_volume_target_q15, volume_q15, __ATOMIC_RELEASE);
 }
 
+int32_t audio_receiver_get_volume_q15(void) {
+  return __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
+}
+
 uint32_t audio_receiver_get_output_mute_mask(void) {
   return __atomic_load_n(&s_output_mute_mask, __ATOMIC_ACQUIRE);
 }
@@ -3983,6 +4010,9 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
   s.playing = false;
   taskEXIT_CRITICAL(&s.state_mux);
   status_invalidate_sync();
+  /* Stop I2S first: request the stop before the PCM is invalidated, so the
+   * playout task sees it before it can find the emptied store. */
+  __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
   /* Must happen here, not on a sampled playing->stopped transition. Rapid
    * FLUSH/anchor/resume can otherwise bypass the consumer's old PCM reset. */
   (void)reset_buffered_pcm_store();

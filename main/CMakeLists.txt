@@ -7,6 +7,7 @@ set(SRC_FILES
     "audio/audio_receiver.c"
     "audio/ap2_buffered_fifo.c"
     "audio/audio_eq.c"
+    "audio/audio_loudness.c"
     "audio/aac_decoder.c"
     "audio/alac_decoder.c"
     "audio/realtime_receiver.c"
