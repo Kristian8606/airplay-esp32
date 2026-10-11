@@ -82,9 +82,24 @@ static bool IRAM_ATTR wake_completion_waiter(void) {
   return woken == pdTRUE;
 }
 
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+/* PLAYOUT diagnostics: DMA ran out of queued audio (underrun), and EOF tag
+ * bookkeeping faults. Read and cleared by the audio status line. */
+static DRAM_ATTR uint32_t s_diag_underruns;
+static DRAM_ATTR uint32_t s_diag_tag_faults;
+#define DIAG_ISR_COUNT(v) __atomic_fetch_add(&(v), 1U, __ATOMIC_RELAXED)
+void audio_playout_diag_take(uint32_t *underruns, uint32_t *tag_faults) {
+  if (underruns) *underruns = __atomic_exchange_n(&s_diag_underruns, 0U, __ATOMIC_RELAXED);
+  if (tag_faults) *tag_faults = __atomic_exchange_n(&s_diag_tag_faults, 0U, __ATOMIC_RELAXED);
+}
+#else
+#define DIAG_ISR_COUNT(v) do {} while (0)
+#endif
+
 static bool IRAM_ATTR on_send_q_ovf(i2s_chan_handle_t handle,
                                     i2s_event_data_t *event, void *user_ctx) {
   (void)handle; (void)event; (void)user_ctx;
+  DIAG_ISR_COUNT(s_diag_underruns);
   __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
   return wake_completion_waiter();
 }
@@ -152,6 +167,7 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
 
   tx_tag_t tag;
   if (!tag_pop_isr(&tag)) {
+    DIAG_ISR_COUNT(s_diag_tag_faults);
     __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
     return wake_completion_waiter();
   }
@@ -159,8 +175,10 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
   /* esp_timer_get_time() is lock-free and documented for ISR use. Timestamp
    * the DMA EOF itself; conversion to PTP is done later in task context. */
   const int64_t done_local_us = esp_timer_get_time();
-  if (!done_push_isr(&tag, done_local_us))
+  if (!done_push_isr(&tag, done_local_us)) {
+    DIAG_ISR_COUNT(s_diag_tag_faults);
     __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
+  }
   return wake_completion_waiter();
 }
 

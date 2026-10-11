@@ -34,6 +34,13 @@ if AIRPLAY_DIAGNOSTICS
     config AIRPLAY_DIAG_PLAYOUT
         bool "PLAYOUT - scheduler, I2S, DMA and late/early diagnostics"
         default n
+        help
+            Adds a "PLAYOUT |" line to the 2-second audio status: longest
+            gap between DMA writes and longest block processing time, DMA
+            underruns, holes filled with silence, silent blocks and
+            re-primes. The line is a warning when any of them happened.
+            Use it to tell clicks from the ESP (counted here) from clicks
+            on the I2S wiring (nothing counted).
 
     config AIRPLAY_DIAG_LIFECYCLE
         bool "LIFECYCLE - task/session/generation/race diagnostics"
