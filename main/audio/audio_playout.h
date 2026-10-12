@@ -64,15 +64,28 @@ bool audio_playout_wait_completion(audio_playout_completion_t *out,
 
 bool audio_playout_is_enabled(void);
 
-/* Fine tune the RUNNING TX master clock (channel enabled). The IDF header
- * documents i2s_channel_tune_rate() for the READY state, but its
- * implementation only rewrites the MCLK fractional divider without a state
- * check, so it is used live: no disable/enable, DMA and the tag-to-EOF
- * chronology keep running. Call only from the playout task between writes.
- * target_ppm is relative to the nominal MCLK measured at init (+/-160 ppm). */
+/* Fine tune the TX master clock of a running channel: disable -> tune ->
+ * enable (the IDF allows i2s_channel_tune_rate() only in the READY state).
+ * Call only from the playout task between writes. target_ppm is relative to
+ * the nominal MCLK measured at init (+/-160 ppm). */
 esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
                                  audio_playout_tune_info_t *out);
+
+/* Same, but reloads the two DMA descriptors in play order before enable():
+ * `playing` is the block the DMA was sending, `next` the block queued after
+ * it (the last one written). Call right after a write returned, so only a
+ * few frames of `playing` are repeated. halt_us = how long TX was stopped. */
+esp_err_t audio_playout_tune_ppm_in_order(int32_t target_ppm,
+                                          const audio_out_sample_t *playing,
+                                          const audio_out_sample_t *next,
+                                          uint32_t frames,
+                                          audio_playout_tune_info_t *out,
+                                          uint32_t *halt_us);
 /* Reset the physical MCLK correction to nominal while preserving the current
  * enabled/disabled channel state. Intended for a hard audio-session boundary,
  * not for normal track/anchor changes inside one session. */
 esp_err_t audio_playout_reset_tune(void);
+
+/* True when retunes rewrite only the fractional MCLK divider register while
+ * I2S keeps running (the normal case; checked at init). */
+bool audio_playout_tune_is_live(void);

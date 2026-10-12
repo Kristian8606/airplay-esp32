@@ -178,6 +178,19 @@ menu "Amplifier Power Control"
 endmenu
 
 menu "I2S Playout"
+    config AIRPLAY_LOG_AUDIO_EVENTS
+        bool "Log every audible audio event (I2S stop/start, silence, mutes)"
+        default y
+        help
+            Prints one "AUDIO EVT" line, with its time since boot, for each
+            event that can be heard as a click, pop or gap: the I2S clocks
+            stopping (with the reason) and starting again, a whole DMA block
+            played as silence, a hole in a block filled with silence, an AAC
+            block muted or lost, an ALAC block played as silence, and every
+            I2S clock retune. The playout task only posts numbers; the
+            low-priority status task prints them. Events are rare, so the
+            cost is negligible. Turn off once the click source is found.
+
     config I2S_SCK_IO
         int "I2S MCLK GPIO"
         default 8

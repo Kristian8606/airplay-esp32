@@ -17,6 +17,17 @@
 
 #define TAG "audio_playout"
 
+/* Live clock tuning: within +/-160 ppm the integer part of the
+ * MCLK divider never changes, so a retune only rewrites the fractional part
+ * (x, y, z, yn1) in ONE 32-bit register store. No disable/enable, no DMA
+ * reset, no intermediate divider 2: the I2S clocks and the samples keep
+ * running. */
+#include "hal/i2s_ll.h"
+#define LIVE_SCLK_HZ 160000000U /* PLL_F160M, tx_clk_sel == 2 */
+static uint32_t s_live_div_int; /* 0: not available, fall back to
+                                 * disable -> i2s_channel_tune_rate -> enable */
+static void live_tune_init(void);
+
 #define I2S_DMA_DESC_NUM  2U
 #define I2S_DMA_FRAME_NUM AUDIO_PLAYOUT_FRAMES
 #define I2S_RATE_HZ       44100U
@@ -250,6 +261,8 @@ static esp_err_t audio_playout_init_current_core(void) {
              esp_err_to_name(err), s_nominal_mclk_hz);
   }
 
+  live_tune_init();
+
   /* Keep the channel READY/disabled. Both DMA descriptors are preloaded before
    * the exact PTP start edge, then the channel is enabled. This removes the
    * zero-descriptor ambiguity that would make EOF counting unreliable. */
@@ -467,12 +480,87 @@ bool audio_playout_is_enabled(void) {
 }
 
 
+static void live_tune_init(void) {
+  i2s_dev_t *hw = I2S_LL_GET_HW(I2S_NUM_0);
+  s_live_div_int = 0;
+  const uint32_t sel = hw->tx_clkm_conf.tx_clk_sel;
+  const uint32_t n = hw->tx_clkm_conf.tx_clkm_div_num;
+  if (sel != 2U || s_nominal_mclk_hz == 0U) {
+    ESP_LOGW(TAG, "live I2S tuning off: clock source %u, using disable/tune/enable",
+             (unsigned)sel);
+    return;
+  }
+  /* The whole +/-200 ppm range must keep the same integer divider. */
+  const uint64_t lo = (uint64_t)s_nominal_mclk_hz * (1000000U - 200U);
+  const uint64_t hi = (uint64_t)s_nominal_mclk_hz * (1000000U + 200U);
+  const uint64_t sclk_u = (uint64_t)LIVE_SCLK_HZ * 1000000ULL;
+  if (sclk_u / lo != n || sclk_u / hi != n) {
+    ESP_LOGW(TAG, "live I2S tuning off: divider %u not constant over +/-200 ppm",
+             (unsigned)n);
+    return;
+  }
+  s_live_div_int = n;
+  ESP_LOGI(TAG, "I2S clock tuning: LIVE, one register write, I2S never stops"
+                " (MCLK = 160 MHz / %u.xxx)", (unsigned)n);
+}
+
+/* Set the TX MCLK to nominal * (1 + ppm / 1e6) by rewriting only the
+ * fractional divider register. Integer math, best b/a with a < 512. */
+static esp_err_t live_tune_write(int32_t ppm, uint32_t *mclk_hz_out) {
+  if (s_live_div_int == 0U) return ESP_ERR_INVALID_STATE;
+  /* M = target MCLK in micro-Hz; LIVE_SCLK_HZ * 1e6 = n * M + r. */
+  const uint64_t M = (uint64_t)s_nominal_mclk_hz * (uint64_t)(1000000 + ppm);
+  const uint64_t sclk_u = (uint64_t)LIVE_SCLK_HZ * 1000000ULL;
+  const uint64_t n = sclk_u / M;
+  if (n != s_live_div_int) return ESP_ERR_INVALID_ARG;
+  const uint64_t r = sclk_u - n * M; /* fraction = r / M */
+  uint64_t best_a = 1, best_b = 0, best_e = r; /* error of b/a = |r*a - b*M| / a */
+  for (uint64_t a = 2; a < I2S_LL_CLK_FRAC_DIV_AB_MAX; ++a) {
+    const uint64_t b = (r * a + M / 2U) / M;
+    if (b == 0U || b >= a) continue;
+    const uint64_t ra = r * a, bm = b * M;
+    const uint64_t e = ra > bm ? ra - bm : bm - ra;
+    if (e * best_a < best_e * a) {
+      best_e = e;
+      best_a = a;
+      best_b = b;
+    }
+  }
+  uint32_t x = 0, y = 0, z = 0, yn1 = 0;
+  if (best_b) {
+    yn1 = best_b * 2U > best_a;
+    z = (uint32_t)(yn1 ? best_a - best_b : best_b);
+    x = (uint32_t)(best_a / z) - 1U;
+    y = (uint32_t)(best_a % z);
+  }
+  i2s_dev_t *hw = I2S_LL_GET_HW(I2S_NUM_0);
+  uint32_t v = hw->tx_clkm_div_conf.val & 0xF0000000U; /* keep reserved bits */
+  v |= (z & 0x1FFU) | ((y & 0x1FFU) << 9) | ((x & 0x1FFU) << 18) |
+       ((yn1 & 1U) << 27);
+  hw->tx_clkm_div_conf.val = v; /* the single store: x, y, z, yn1 together */
+  if (mclk_hz_out) {
+    /* MCLK = sclk / (n + b/a) = sclk * a / (n*a + b) */
+    *mclk_hz_out = (uint32_t)(((uint64_t)LIVE_SCLK_HZ * best_a + (n * best_a + best_b) / 2U) /
+                              (n * best_a + best_b));
+  }
+  return ESP_OK;
+}
+
+bool audio_playout_tune_is_live(void) {
+  return s_live_div_int != 0U;
+}
+
 esp_err_t audio_playout_reset_tune(void) {
   if (!s_tx || s_nominal_mclk_hz == 0U) {
     return ESP_ERR_INVALID_STATE;
   }
   if (s_tune_ppm == 0) {
     return ESP_OK;
+  }
+  if (s_live_div_int) {
+    const esp_err_t le = live_tune_write(0, NULL);
+    if (le == ESP_OK) s_tune_ppm = 0;
+    return le;
   }
 
   /* ADDSUB is relative to the current MCLK. Query the actual clock first and
@@ -501,9 +589,15 @@ esp_err_t audio_playout_reset_tune(void) {
   return err;
 }
 
-esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
-                                 audio_playout_tune_info_t *out) {
-  if (!s_tx || !s_enabled || s_nominal_mclk_hz == 0U) {
+static esp_err_t tune_ppm_impl(int32_t target_ppm,
+                               const audio_out_sample_t *playing,
+                               const audio_out_sample_t *next,
+                               uint32_t frames,
+                               audio_playout_tune_info_t *out,
+                               uint32_t *halt_us) {
+  if (halt_us) *halt_us = 0;
+  if (!s_tx || s_nominal_mclk_hz == 0U ||
+      (!audio_playout_tune_is_live() && !s_enabled)) {
     return ESP_ERR_INVALID_STATE;
   }
   if (target_ppm > 160) target_ppm = 160;
@@ -517,6 +611,25 @@ esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
                                    (int32_t)s_nominal_mclk_hz;
     }
     return ESP_OK;
+  }
+
+  if (s_live_div_int) {
+    /* Live: one register store, nothing stops, the DMA is not touched, so
+     * playing/next are not needed. halt_us = time spent here. */
+    (void)playing; (void)next; (void)frames;
+    const int64_t lt0 = esp_timer_get_time();
+    uint32_t mclk_hz = 0;
+    const esp_err_t le = live_tune_write(target_ppm, &mclk_hz);
+    if (halt_us) *halt_us = (uint32_t)(esp_timer_get_time() - lt0);
+    if (le == ESP_OK) {
+      s_tune_ppm = target_ppm;
+      if (out) {
+        out->requested_ppm = target_ppm;
+        out->curr_mclk_hz = mclk_hz;
+        out->actual_delta_mclk_hz = (int32_t)mclk_hz - (int32_t)s_nominal_mclk_hz;
+      }
+    }
+    return le;
   }
 
   /* ADDSUB is relative to the CURRENT clock, so apply only the requested
@@ -534,13 +647,42 @@ esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
   };
   i2s_tuning_info_t info = {0};
 
-  /* Tune while running (see audio_playout.h): the DMA ring keeps going, so
-   * clock correction cannot reset TX/GDMA state or disturb the application
-   * tag-to-EOF chronology. */
-  esp_err_t err = i2s_channel_tune_rate(s_tx, &cfg, &info);
+  /* The IDF allows rate tuning only on a READY channel: disable, tune,
+   * enable, as in Espressif's dynamic-tuning example and as this project did
+   * until 2026-09-14 (commit 1cf3509 switched to tuning the running channel, whose
+   * divider sequence sends a burst of fast clocks to the DAC: a click).
+   * Called only between application writes on the playout task. */
+  const int64_t t0 = esp_timer_get_time();
+  esp_err_t err = i2s_channel_disable(s_tx);
+  if (err != ESP_OK) return err;
+  s_enabled = false;
+  err = i2s_channel_tune_rate(s_tx, &cfg, &info);
   if (err == ESP_OK) {
     s_tune_ppm = target_ppm;
   }
+  /* enable() always restarts the DMA at descriptor 0. Without a reload the
+   * two descriptors replay whatever they hold, and when the newer block sits
+   * in descriptor 0 the playing block and the next one come out swapped
+   * (heard as a click on about every second retune). Reload them in play
+   * order: the block that was playing, then the one queued after it. Their
+   * tags are already in the tag FIFO in this order. */
+  bool reloaded = false;
+  if (playing && next && frames) {
+    const size_t bytes = (size_t)frames * I2S_FRAME_BYTES;
+    size_t l1 = 0, l2 = 0;
+    const esp_err_t p1 = i2s_channel_preload_data(s_tx, playing, bytes, &l1);
+    const esp_err_t p2 = i2s_channel_preload_data(s_tx, next, bytes, &l2);
+    reloaded = p1 == ESP_OK && p2 == ESP_OK && l1 == bytes && l2 == bytes;
+  }
+  esp_err_t en_err = i2s_channel_enable(s_tx);
+  if (en_err == ESP_OK) s_enabled = true;
+  s_preload_pending = false;
+  if (err == ESP_OK && en_err != ESP_OK) err = en_err;
+  if (playing && next && frames && !reloaded) {
+    /* DMA order unknown: let the playout task flush and re-prime. */
+    __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
+  }
+  if (halt_us) *halt_us = (uint32_t)(esp_timer_get_time() - t0);
 
   if (out) {
     out->requested_ppm = s_tune_ppm;
@@ -550,3 +692,16 @@ esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
   return err;
 }
 
+esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
+                                 audio_playout_tune_info_t *out) {
+  return tune_ppm_impl(target_ppm, NULL, NULL, 0U, out, NULL);
+}
+
+esp_err_t audio_playout_tune_ppm_in_order(int32_t target_ppm,
+                                          const audio_out_sample_t *playing,
+                                          const audio_out_sample_t *next,
+                                          uint32_t frames,
+                                          audio_playout_tune_info_t *out,
+                                          uint32_t *halt_us) {
+  return tune_ppm_impl(target_ppm, playing, next, frames, out, halt_us);
+}

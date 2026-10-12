@@ -1304,11 +1304,14 @@ static void status_print_playout_diag(void) {
 #define PD_ADD(field, v) do {} while (0)
 #endif
 
+static void status_print_audio_events(void);
+
 static void audio_status_task(void *arg) {
   (void)arg;
   bool stack_headroom_warned = false;
   uint32_t last_rt_pressure[4] = {0};
   while (__atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE)) {
+    status_print_audio_events();
     status_print_playout_events();
     timing_snapshot_t snap;
     snapshot_state(&snap);
@@ -1486,6 +1489,161 @@ static void audio_status_task(void *arg) {
 static void audio_status_notify(void) {
   if (s.status_wake) xSemaphoreGive(s.status_wake);
 }
+
+/* ---- AUDIO EVT: every event that can be heard as a click, pop or gap ----
+ * Producers (playout, AAC processor, ALAC staging) only copy a few numbers
+ * into this small ring under a spinlock and wake the status task, which
+ * prints them. Nothing here blocks or logs on the I2S feeding path. */
+typedef enum {
+  AEVT_I2S_STOP = 0,  /* str = reason, a = generation */
+  AEVT_PLAY_START,    /* a = generation, b = first RTP, c = stream type */
+  AEVT_SILENCE_BEGIN, /* a = RTP: whole 256-frame blocks played as zeros */
+  AEVT_SILENCE_END,   /* a = RTP, b = silent blocks */
+  AEVT_CONCEAL,       /* a = RTP, b = missing frames in a 256-frame block */
+  AEVT_TUNE,          /* a = old ppm, b = new ppm */
+  AEVT_AAC_MUTE,      /* a = seq, b = RTP, c = RTP gap (0: first of sequence) */
+  AEVT_AAC_LOST,      /* str = why, a = seq */
+  AEVT_ALAC_SILENCE,  /* a = RTP, b = frames (recovery window ran out) */
+  AEVT_I2S_IDLE,      /* str = reason: I2S keeps running and plays zeros */
+} aevt_kind_t;
+
+#if defined(CONFIG_AIRPLAY_LOG_AUDIO_EVENTS) && CONFIG_AIRPLAY_LOG_AUDIO_EVENTS
+typedef struct {
+  int64_t t_us;
+  const char *str;
+  int32_t a, b, c, d;
+  uint8_t kind;
+} aevt_t;
+
+#define AEVT_CAP 32U
+static aevt_t s_aevt[AEVT_CAP];
+static uint32_t s_aevt_head;
+static uint32_t s_aevt_tail;
+static uint32_t s_aevt_dropped;
+static portMUX_TYPE s_aevt_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void aevt_post(aevt_kind_t kind, const char *str, int32_t a, int32_t b,
+                      int32_t c, int32_t d) {
+  const int64_t now_us = esp_timer_get_time();
+  taskENTER_CRITICAL(&s_aevt_mux);
+  const uint32_t next = (s_aevt_head + 1U) % AEVT_CAP;
+  if (next == s_aevt_tail) {
+    s_aevt_dropped++;
+  } else {
+    aevt_t *e = &s_aevt[s_aevt_head];
+    e->t_us = now_us;
+    e->str = str;
+    e->a = a;
+    e->b = b;
+    e->c = c;
+    e->d = d;
+    e->kind = (uint8_t)kind;
+    s_aevt_head = next;
+  }
+  taskEXIT_CRITICAL(&s_aevt_mux);
+  audio_status_notify();
+}
+
+static void status_print_audio_events(void) {
+  static int64_t last_stop_us = 0;
+  static int64_t last_idle_us = 0;
+  for (;;) {
+    aevt_t e = {0};
+    uint32_t dropped = 0;
+    bool have = false;
+    taskENTER_CRITICAL(&s_aevt_mux);
+    if (s_aevt_tail != s_aevt_head) {
+      e = s_aevt[s_aevt_tail];
+      s_aevt_tail = (s_aevt_tail + 1U) % AEVT_CAP;
+      have = true;
+    }
+    dropped = s_aevt_dropped;
+    s_aevt_dropped = 0;
+    taskEXIT_CRITICAL(&s_aevt_mux);
+    if (dropped)
+      ESP_LOGW(TAG, "AUDIO EVT: %lu events lost (ring full)",
+               (unsigned long)dropped);
+    if (!have) return;
+
+    const unsigned long ms = (unsigned long)(e.t_us / 1000LL);
+    switch ((aevt_kind_t)e.kind) {
+      case AEVT_I2S_STOP:
+        last_stop_us = e.t_us;
+        ESP_LOGW(TAG, "AUDIO EVT %lu ms: I2S STOP (clocks halted) reason=%s gen=%ld",
+                 ms, e.str ? e.str : "?", (long)e.a);
+        break;
+      case AEVT_PLAY_START:
+        if (e.d)
+          ESP_LOGW(TAG, "AUDIO EVT %lu ms: PLAY START gen=%ld rtp=%lu %s"
+                        " (I2S kept running, %ld ms of zeros before)",
+                   ms, (long)e.a, (unsigned long)(uint32_t)e.b,
+                   e.c == AUDIO_STREAM_REALTIME ? "ALAC" : "AAC",
+                   last_idle_us ? (long)((e.t_us - last_idle_us) / 1000LL) : -1L);
+        else
+          ESP_LOGW(TAG, "AUDIO EVT %lu ms: I2S PLAY START gen=%ld rtp=%lu %s"
+                        " (%ld ms after last I2S stop)",
+                   ms, (long)e.a, (unsigned long)(uint32_t)e.b,
+                   e.c == AUDIO_STREAM_REALTIME ? "ALAC" : "AAC",
+                   last_stop_us ? (long)((e.t_us - last_stop_us) / 1000LL) : -1L);
+        break;
+      case AEVT_I2S_IDLE:
+        last_idle_us = e.t_us;
+        ESP_LOGW(TAG, "AUDIO EVT %lu ms: I2S KEEPS RUNNING, playing zeros (%s) gen=%ld",
+                 ms, e.str ? e.str : "?", (long)e.a);
+        break;
+      case AEVT_SILENCE_BEGIN:
+        ESP_LOGW(TAG, "AUDIO EVT %lu ms: SILENCE begins while running, no PCM at rtp=%lu",
+                 ms, (unsigned long)(uint32_t)e.a);
+        break;
+      case AEVT_SILENCE_END:
+        ESP_LOGW(TAG, "AUDIO EVT %lu ms: SILENCE ends at rtp=%lu after %ld blocks (%.1f ms)",
+                 ms, (unsigned long)(uint32_t)e.a, (long)e.b,
+                 (double)e.b * (double)AUDIO_PLAYOUT_FRAMES * 1000.0 / 44100.0);
+        break;
+      case AEVT_CONCEAL:
+        ESP_LOGW(TAG, "AUDIO EVT %lu ms: HOLE in block rtp=%lu, %ld frames played as silence",
+                 ms, (unsigned long)(uint32_t)e.a, (long)e.b);
+        break;
+      case AEVT_TUNE:
+        if (audio_playout_tune_is_live())
+          ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
+                        " (step %+ld, LIVE: one register write in %ld us,"
+                        " I2S not stopped)",
+                   ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
+        else
+          ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
+                        " (step %+ld, TX stopped %ld us, DMA reloaded in order)",
+                   ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
+        break;
+      case AEVT_AAC_MUTE:
+        if (e.c == 0)
+          ESP_LOGI(TAG, "AUDIO EVT %lu ms: AAC first block of a play sequence muted"
+                        " seq=%lu rtp=%lu (will be heard in %ld ms)",
+                   ms, (unsigned long)(uint32_t)e.a, (unsigned long)(uint32_t)e.b,
+                   (long)e.d);
+        else
+          ESP_LOGW(TAG, "AUDIO EVT %lu ms: AAC block MUTED after RTP gap %+ld seq=%lu rtp=%lu"
+                        " (will be heard in %ld ms)",
+                   ms, (long)e.c, (unsigned long)(uint32_t)e.a,
+                   (unsigned long)(uint32_t)e.b, (long)e.d);
+        break;
+      case AEVT_AAC_LOST:
+        ESP_LOGW(TAG, "AUDIO EVT %lu ms: AAC block LOST (%s) seq=%lu",
+                 ms, e.str ? e.str : "?", (unsigned long)(uint32_t)e.a);
+        break;
+      case AEVT_ALAC_SILENCE:
+        ESP_LOGW(TAG, "AUDIO EVT %lu ms: ALAC block missing, %ld frames of silence rtp=%lu"
+                      " (will be heard in %ld ms)",
+                 ms, (long)e.b, (unsigned long)(uint32_t)e.a, (long)e.d);
+        break;
+    }
+  }
+}
+#else
+#define aevt_post(kind, str, a, b, c, d) \
+  do { (void)(kind); (void)(str); (void)(a); (void)(b); (void)(c); (void)(d); } while (0)
+static void status_print_audio_events(void) {}
+#endif
 
 static bool rtp_to_presentation_ns(const timing_snapshot_t *snap, uint32_t rtp,
                                     uint64_t *out_time_ns) {
@@ -1960,6 +2118,7 @@ static void ap2_buffered_processor_task(void *arg) {
       continue;
     }
     if (dec_len < 0) {
+      aevt_post(AEVT_AAC_LOST, "decrypt-error", (int32_t)packet.seq, 0, 0, 0);
       if ((++decrypt_failures & 0x3FU) == 1U)
         ESP_LOGW(TAG, "AAC decrypt/auth failed seq=%lu rtp=%lu len=%u (%lu total)",
                  (unsigned long)packet.seq, (unsigned long)packet.rtp,
@@ -1975,6 +2134,7 @@ static void ap2_buffered_processor_task(void *arg) {
       /* Shairport keeps the FFmpeg decoder chain after a bad AAC packet. The
        * missing timestamp is enough to mute the first packet that decodes
        * successfully afterwards. */
+      aevt_post(AEVT_AAC_LOST, "decode-error", (int32_t)packet.seq, 0, 0, 0);
       if ((++decode_failures & 0x3FU) == 1U)
         ESP_LOGW(TAG, "AAC decode failed at seq=%lu (%lu total); decoder kept",
                  (unsigned long)packet.seq, (unsigned long)decode_failures);
@@ -1985,6 +2145,15 @@ static void ap2_buffered_processor_task(void *arg) {
      * EQ, matching Shairport's intent: the decoder sees the real first block,
      * while the downstream audio chain receives silence for its duration. */
     if (mute) {
+      {
+        uint32_t now_rtp = 0;
+        const int sr_ev = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+        const int32_t lead_ms = wanted_rtp_now(&snap, &now_rtp)
+            ? (int32_t)(((int64_t)rtp_delta(packet.rtp, now_rtp) * 1000LL) / sr_ev)
+            : -1;
+        aevt_post(AEVT_AAC_MUTE, NULL, (int32_t)packet.seq, (int32_t)packet.rtp,
+                  timestamp_difference, lead_ms);
+      }
       memset(s.decode_pcm, 0,
              (size_t)frames * (size_t)info.channels * sizeof(int16_t));
     }
@@ -2145,6 +2314,7 @@ static void realtime_stage_task(void *arg) {
                                     xPortGetCoreID(), AP2_RT_STAGE_PRIORITY, 0U);
 
   uint32_t local_generation = 0;
+  bool alac_in_silence = false; /* log only the first of a silent run */
   __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
 
   while (__atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE)) {
@@ -2208,6 +2378,12 @@ static void realtime_stage_task(void *arg) {
        * with one silent ALAC-sized PCM block. A later RTX is too late to
        * rewrite filter history and is discarded by realtime_pcm_sink(). */
       memset(pcm, 0, (size_t)frames * 2U * sizeof(int16_t));
+      if (!alac_in_silence)
+        aevt_post(AEVT_ALAC_SILENCE, NULL, (int32_t)cursor, (int32_t)frames,
+                  0, have_deadline ? (int32_t)(time_to_play_us / 1000LL) : -1);
+      alac_in_silence = true;
+    } else {
+      alac_in_silence = false;
     }
 
     if (local_generation != snap.generation) {
@@ -2455,8 +2631,13 @@ static void output_stage(int16_t *pcm, audio_out_sample_t *out,
  * pending so the next playout iteration retries before any new PRIME work is
  * allowed to touch the channel. */
 static bool playout_flush_checked(const char *reason) {
+  const bool was_running = audio_playout_is_enabled();
   const esp_err_t err = audio_playout_flush();
   if (err == ESP_OK) {
+    if (was_running) {
+      aevt_post(AEVT_I2S_STOP, reason ? reason : "unknown",
+                (int32_t)__atomic_load_n(&s.generation, __ATOMIC_RELAXED), 0, 0, 0);
+    }
     /* I2S is stopped. Only now forget the loudness filters' memory of the
      * audio before the stop, so whatever plays next starts from silence. */
     audio_loudness_reset();
@@ -2599,39 +2780,80 @@ static esp_err_t playout_run_latency_calibration(void) {
 
 #endif /* CONFIG_AIRPLAY_LATENCY_CAL */
 
+/* The last two blocks handed to the DMA, oldest first. A clock retune
+ * reloads them in this order (audio_playout_tune_ppm_in_order). */
+typedef struct {
+  const audio_out_sample_t *prev;
+  const audio_out_sample_t *last;
+} playout_hist_t;
+
+static esp_err_t playout_write(playout_hist_t *h, const audio_out_sample_t *blk,
+                               uint32_t frames, uint32_t rtp,
+                               uint32_t generation) {
+  const esp_err_t e = audio_playout_write_tagged(blk, frames, rtp, generation);
+  if (e == ESP_OK) {
+    h->prev = h->last;
+    h->last = blk;
+  } else {
+    h->prev = h->last = NULL;
+  }
+  return e;
+}
+
 static void ap2_playout_task(void *arg) {
   (void)arg;
-  int16_t *block = heap_caps_malloc(
-      AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t),
-      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!block) {
-    block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
+  /* Two of each block buffer, used in turn: the output block written last
+   * and the one before it stay intact while the next one is built, so a
+   * clock retune can reload both into the DMA in play order. */
+  int16_t *block_buf[2] = {NULL, NULL};
+  for (int i = 0; i < 2; ++i) {
+    block_buf[i] = heap_caps_malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t),
+                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!block_buf[i]) block_buf[i] = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
   }
-  if (!block) {
+  if (!block_buf[0] || !block_buf[1]) {
     ESP_LOGE(TAG, "playout block allocation failed");
+    free(block_buf[0]);
+    free(block_buf[1]);
     s.playout_task = NULL;
     vTaskDelete(NULL);
     return;
   }
+  int16_t *block = block_buf[0];
   /* `block` holds 16-bit PCM from the ring; `out_block` is what goes to I2S.
    * With 16-bit slots they are the same buffer (volume works in place). */
 #if AUDIO_OUT_SLOT_BITS == 32
-  audio_out_sample_t *out_block = heap_caps_malloc(
-      AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
-      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!out_block) {
-    out_block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
+  audio_out_sample_t *out_buf[2] = {NULL, NULL};
+  for (int i = 0; i < 2; ++i) {
+    out_buf[i] = heap_caps_malloc(
+        AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!out_buf[i])
+      out_buf[i] = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
   }
-  if (!out_block) {
+  if (!out_buf[0] || !out_buf[1]) {
     ESP_LOGE(TAG, "playout output block allocation failed");
-    free(block);
+    free(out_buf[0]);
+    free(out_buf[1]);
+    free(block_buf[0]);
+    free(block_buf[1]);
     s.playout_task = NULL;
     vTaskDelete(NULL);
     return;
   }
 #else
-  audio_out_sample_t *out_block = block;
+  audio_out_sample_t *out_buf[2] = {block_buf[0], block_buf[1]};
 #endif
+  audio_out_sample_t *out_block = out_buf[0];
+  unsigned buf_index = 0;
+  playout_hist_t hist = {NULL, NULL};
+  /* Use the other buffer pair for the next block (after writing out_block). */
+#define PLAYOUT_NEXT_BUFFERS()            \
+  do {                                    \
+    buf_index ^= 1U;                      \
+    block = block_buf[buf_index];         \
+    out_block = out_buf[buf_index];       \
+  } while (0)
 
   typedef enum {
     PLAYOUT_STOPPED = 0,
@@ -2649,6 +2871,17 @@ static void ap2_playout_task(void *arg) {
       (initial_mute & 1U) ? 0 : initial_volume,
       (initial_mute & 2U) ? 0 : initial_volume};
   playout_state_t state = PLAYOUT_STOPPED;
+  uint32_t zero_blocks = 0; /* consecutive whole blocks played as zeros */
+  /* Why the next PRIMING flush happens, for the AUDIO EVT log. */
+  const char *restart_reason = "prime-start";
+  /* Pause, FLUSH and track changes keep the I2S clocks running and play
+   * zeros; a new start is then aligned on the running DMA ("warm" prime).
+   * I2S is disabled only at hard boundaries (session/codec, DMA fault). */
+  bool warm_prime = false;
+  bool retune_pending = false;
+  int32_t retune_ppm = 0;
+  bool idle_zeros = false;   /* currently feeding zeros while not RUNNING */
+  uint32_t warm_probe_seq = 0;
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
   int64_t pd_last_write_us = 0;
 #endif
@@ -2705,6 +2938,7 @@ static void ap2_playout_task(void *arg) {
 
       servo_ppm = 0;
       servo_target_ppm = 0;
+      idle_zeros = false;
       servo_generation = 0;
       center_active = false;
       pid_integral_ms_s = 0.0;
@@ -2719,11 +2953,22 @@ static void ap2_playout_task(void *arg) {
       state = PLAYOUT_STOPPED;
     }
 
-    if (__atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL) ||
-        audio_playout_has_fault()) {
-      if (!playout_flush_checked("control")) {
-        vTaskDelay(1);
-        continue;
+    const bool flush_requested =
+        __atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL);
+    const bool dma_fault = audio_playout_has_fault();
+    if (flush_requested || dma_fault) {
+      if (dma_fault || !audio_playout_is_enabled()) {
+        if (!playout_flush_checked(dma_fault ? "dma-underrun-or-tag-fault"
+                                             : "flush-request")) {
+          vTaskDelay(1);
+          continue;
+        }
+        idle_zeros = false;
+      } else if (!idle_zeros) {
+        /* Track change / seek / FLUSH: keep the clocks, play zeros. */
+        aevt_post(AEVT_I2S_IDLE, "FLUSH request (track change/seek)",
+                  (int32_t)__atomic_load_n(&s.generation, __ATOMIC_RELAXED), 0, 0, 0);
+        idle_zeros = true;
       }
       s.output_sync.valid = false;
       status_invalidate_sync();
@@ -2736,6 +2981,16 @@ static void ap2_playout_task(void *arg) {
      * hand-off point before a new codec stream is started. */
     const uint32_t quiesce_req =
         __atomic_load_n(&s.playout_quiesce_req, __ATOMIC_ACQUIRE);
+    if (quiesce_req != __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_RELAXED) &&
+        state != PLAYOUT_RUNNING && audio_playout_is_enabled()) {
+      /* New codec stream / session: the hand-off needs a stopped channel. */
+      if (!playout_flush_checked("session/codec boundary")) {
+        vTaskDelay(1);
+        continue;
+      }
+      state = PLAYOUT_STOPPED;
+      idle_zeros = false;
+    }
     if (quiesce_req !=
             __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_RELAXED) &&
         state == PLAYOUT_STOPPED &&
@@ -2757,10 +3012,28 @@ static void ap2_playout_task(void *arg) {
     }
 
     if (!timeline_ok) {
-      /* Playback stopped (pause, FLUSH, track change, lost clock): stop I2S
-       * now, so the DAC mutes on the clock halt, instead of letting the
-       * queued DMA run out into silence with the clocks still running. */
-      if (audio_playout_is_enabled()) (void)playout_flush_checked("stop");
+      /* Pause, FLUSH, track change, lost clock: keep the I2S clocks running
+       * and play zeros (the blocking DMA write paces this loop), like a
+       * constant-clock DSP. Only a clock change or a hard boundary stops I2S. */
+      if (audio_playout_is_enabled()) {
+        if (!idle_zeros) {
+          const char *why = !snap.playing ? "not playing (pause/FLUSH/track change)"
+              : !snap.anchor_valid ? "no anchor"
+              : snap.timeline_reset_pending ? "timeline reset pending"
+              : !timing_clock_ready(&snap) ? "PTP/clock map not ready"
+              : "RTP position not computable";
+          aevt_post(AEVT_I2S_IDLE, why, (int32_t)snap.generation, 0, 0, 0);
+          idle_zeros = true;
+        }
+        state = PLAYOUT_STOPPED;
+        if (playout_write(&hist, s_silence_block, AUDIO_PLAYOUT_FRAMES,
+                                       0U, 0U) != ESP_OK) {
+          (void)playout_flush_checked("zeros-write-fail");
+          idle_zeros = false;
+          vTaskDelay(1);
+        }
+        continue;
+      }
       state = PLAYOUT_STOPPED;
       (void)xSemaphoreTake(s.playout_wake, 1);
       continue;
@@ -2769,7 +3042,10 @@ static void ap2_playout_task(void *arg) {
     if (state == PLAYOUT_RUNNING && snap.stream_type == AUDIO_STREAM_BUFFERED &&
         cursor_generation == snap.generation &&
         cursor_timing.media_revision != snap.media_revision) {
-      if (buffered_anchor_moved(&cursor_timing, &snap)) state = PLAYOUT_STOPPED;
+      if (buffered_anchor_moved(&cursor_timing, &snap)) {
+        state = PLAYOUT_STOPPED;
+        restart_reason = "re-prime: sender anchor moved";
+      }
       cursor_timing = snap;
     }
 
@@ -2792,6 +3068,7 @@ static void ap2_playout_task(void *arg) {
           resync_last_us = now_us;
           resync_over_since_us = 0;
           state = PLAYOUT_STOPPED; /* re-prime below; servo_ppm is kept */
+          restart_reason = "re-prime: hard resync";
         }
       } else {
         resync_over_since_us = 0;
@@ -2801,6 +3078,11 @@ static void ap2_playout_task(void *arg) {
     }
 
     if (cursor_generation != snap.generation || state == PLAYOUT_STOPPED) {
+      if (state == PLAYOUT_RUNNING)
+        restart_reason = "re-prime: new generation while playing";
+      const char *flush_reason = restart_reason;
+      restart_reason = "prime-start";
+      retune_pending = false;
       cursor_generation = snap.generation;
       servo_generation = snap.generation;
       pid_last_calc_us = esp_timer_get_time();
@@ -2816,11 +3098,157 @@ static void ap2_playout_task(void *arg) {
       s.output_sync.valid = false;
       status_invalidate_sync();
       state = PLAYOUT_PRIMING;
-      if (!playout_flush_checked("prime-start")) {
+      warm_prime = audio_playout_is_enabled();
+      if (warm_prime) {
+        /* Keep the clocks: the running DMA plays zeros until the aligned
+         * first block. */
+        if (!idle_zeros) {
+          aevt_post(AEVT_I2S_IDLE, flush_reason, (int32_t)snap.generation, 0, 0, 0);
+          idle_zeros = true;
+        }
+      } else {
+        if (!playout_flush_checked(flush_reason)) {
+          state = PLAYOUT_STOPPED;
+          vTaskDelay(1);
+          continue;
+        }
+        idle_zeros = false;
+      }
+    }
+
+    if (state == PLAYOUT_PRIMING && warm_prime) {
+      /* WARM PRIME: I2S is running (zeros). Same alignment as the cold
+       * prime, on the live DMA: queue a silent probe P and one more silent
+       * block S; P's EOF timestamp is the exact start of S, so the block
+       * written right after it starts one block later. */
+      const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+      uint32_t guard_frames = AP2_START_PRIME_GUARD_BLOCKS * AUDIO_PLAYOUT_FRAMES;
+      if (snap.stream_type == AUDIO_STREAM_REALTIME)
+        guard_frames += (uint32_t)(((uint64_t)sr * AP2_REALTIME_PRIME_MS) / 1000ULL);
+      const audio_out_sample_t *silence = s_silence_block;
+      if (!pcm_rtp_ring_has_range(s.pcm_ring,
+                                  desired_rtp + 2U * AUDIO_PLAYOUT_FRAMES,
+                                  guard_frames, snap.pcm_generation)) {
+        /* Not enough PCM yet: one more block of zeros (paces the loop). */
+        if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+          (void)playout_flush_checked("warm-zeros-write-fail");
+          idle_zeros = false;
+          state = PLAYOUT_STOPPED;
+          vTaskDelay(1);
+        }
+        continue;
+      }
+
+      /* Probe tags: generation 0, RTP field = private counter (never a
+       * generation's sync observation). */
+      const uint32_t probe_id = 0x80000000U | (++warm_probe_seq & 0x7FFFFFFFU);
+      if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, probe_id, 0U) != ESP_OK ||
+          playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+        (void)playout_flush_checked("warm-probe-write-fail");
+        idle_zeros = false;
         state = PLAYOUT_STOPPED;
         vTaskDelay(1);
         continue;
       }
+      const int64_t align_deadline = esp_timer_get_time() + AP2_START_ALIGN_TIMEOUT_US;
+      audio_playout_completion_t probe_done;
+      bool have_probe = false;
+      while (esp_timer_get_time() < align_deadline) {
+        if (audio_playout_wait_completion(&probe_done, 1U)) {
+          if (probe_done.generation == 0U && probe_done.rtp == probe_id) {
+            have_probe = true;
+            break;
+          }
+        } else if (audio_playout_has_fault()) {
+          break;
+        }
+      }
+      if (!have_probe) {
+        (void)playout_flush_checked("warm-probe-timeout");
+        idle_zeros = false;
+        state = PLAYOUT_STOPPED;
+        vTaskDelay(1);
+        continue;
+      }
+
+      /* One DMA slot is free now and S is playing: the next write starts at
+       * probe EOF + one block (at the current hardware clock). */
+      int64_t rate_scale_ppm = 1000000LL + (int64_t)servo_ppm;
+      if (rate_scale_ppm < 900000LL) rate_scale_ppm = 900000LL;
+      const uint64_t block_den = (uint64_t)sr * (uint64_t)rate_scale_ppm;
+      const uint64_t block_ns =
+          ((uint64_t)AUDIO_PLAYOUT_FRAMES * 1000000000ULL * 1000000ULL +
+           block_den / 2ULL) / block_den;
+      const uint64_t boundary_ns =
+          (uint64_t)completion_presentation_ns(&snap, &probe_done) + block_ns;
+      const uint64_t half_sample_ns = 500000000ULL / (uint64_t)sr;
+
+      timing_snapshot_t align_snap;
+      snapshot_state(&align_snap);
+      uint32_t real_start_rtp = 0;
+      const bool still_valid =
+          align_snap.playing && align_snap.anchor_valid &&
+          !align_snap.timeline_reset_pending &&
+          align_snap.generation == snap.generation &&
+          (snap.stream_type != AUDIO_STREAM_BUFFERED ||
+           align_snap.media_revision == snap.media_revision) &&
+          !__atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) &&
+          timing_clock_ready(&align_snap) &&
+          (snap.stream_type != AUDIO_STREAM_REALTIME ||
+           (align_snap.anchor_clock_id == snap.anchor_clock_id &&
+            align_snap.anchor_ptp_ns == snap.anchor_ptp_ns &&
+            align_snap.anchor_rtp == snap.anchor_rtp));
+      const bool have_real =
+          still_valid &&
+          wanted_rtp_at_presentation_ns(&snap, boundary_ns + half_sample_ns,
+                                        &real_start_rtp) &&
+          pcm_rtp_ring_read_256(s.pcm_ring, real_start_rtp,
+                                snap.pcm_generation, block);
+      if (!have_real) {
+        /* Keep the free slot fed and try again on the next pass. */
+        if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+          (void)playout_flush_checked("warm-zeros-write-fail");
+          idle_zeros = false;
+          state = PLAYOUT_STOPPED;
+          vTaskDelay(1);
+        }
+        continue;
+      }
+
+      output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+      if (playout_write(&hist, out_block, AUDIO_PLAYOUT_FRAMES,
+                                     real_start_rtp, snap.generation) != ESP_OK) {
+        PLAYOUT_NEXT_BUFFERS();
+        (void)playout_flush_checked("warm-write-fail");
+        idle_zeros = false;
+        state = PLAYOUT_STOPPED;
+        vTaskDelay(1);
+        continue;
+      }
+      PLAYOUT_NEXT_BUFFERS();
+      cursor_rtp = real_start_rtp + AUDIO_PLAYOUT_FRAMES;
+      cursor_timing = align_snap;
+      state = PLAYOUT_RUNNING;
+      warm_prime = false;
+      idle_zeros = false;
+      zero_blocks = 0;
+      aevt_post(AEVT_PLAY_START, NULL, (int32_t)snap.generation,
+                (int32_t)real_start_rtp, (int32_t)snap.stream_type, 1);
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+      pd_last_write_us = 0;
+#endif
+      if (snap.stream_type == AUDIO_STREAM_BUFFERED &&
+          start_logged_gen != snap.generation &&
+          s_anchor_commit_gen == snap.generation && s_anchor_commit_us != 0) {
+        start_logged_gen = snap.generation;
+        ptp_clock_snapshot_t ps = {0};
+        ptp_clock_get_snapshot(&ps);
+        pevt_post(PEVT_START, (int32_t)snap.generation,
+                  (int32_t)((esp_timer_get_time() - s_anchor_commit_us) / 1000LL),
+                  ps.locked ? 1 : 0, (int32_t)ps.mastership_age_ms,
+                  (int32_t)ps.sample_count, NULL);
+      }
+      continue;
     }
 
     if (state == PLAYOUT_PRIMING) {
@@ -2864,6 +3292,7 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
+      hist.prev = hist.last = silence;
       if (audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
                                        silence_rtp, 0U) != ESP_OK ||
           audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
@@ -2988,9 +3417,10 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
       output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
-      if (audio_playout_write_tagged(out_block, AUDIO_PLAYOUT_FRAMES,
-                                     real_start_rtp,
-                                     snap.generation) != ESP_OK) {
+      const esp_err_t first_err = playout_write(&hist, out_block, AUDIO_PLAYOUT_FRAMES,
+                                                real_start_rtp, snap.generation);
+      PLAYOUT_NEXT_BUFFERS();
+      if (first_err != ESP_OK) {
         (void)playout_flush_checked("prime-write-fail");
         state = PLAYOUT_STOPPED;
         vTaskDelay(1);
@@ -3025,6 +3455,10 @@ static void ap2_playout_task(void *arg) {
       cursor_rtp = real_start_rtp + AUDIO_PLAYOUT_FRAMES;
       cursor_timing = commit_snap;
       state = PLAYOUT_RUNNING;
+      idle_zeros = false;
+      zero_blocks = 0;
+      aevt_post(AEVT_PLAY_START, NULL, (int32_t)snap.generation,
+                (int32_t)real_start_rtp, (int32_t)snap.stream_type, 0);
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
       pd_last_write_us = 0;
 #endif
@@ -3093,7 +3527,12 @@ static void ap2_playout_task(void *arg) {
                                      diag_missing_frames,
                                      diag_contiguous_before_gap,
                                      diag_transition);
-      if (diag_conceal_ok) have_pcm = true;
+      if (diag_conceal_ok) {
+        have_pcm = true;
+        if (diag_missing_frames)
+          aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp,
+                    (int32_t)diag_missing_frames, 0, 0);
+      }
 #else
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
       uint32_t pd_missing = 0U;
@@ -3102,11 +3541,18 @@ static void ap2_playout_task(void *arg) {
         have_pcm = true;
         PD_ADD(conceal_blocks, 1U);
         PD_ADD(conceal_frames, pd_missing);
+        if (pd_missing)
+          aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp,
+                    (int32_t)pd_missing, 0, 0);
       }
 #else
+      uint32_t missing = 0U;
       if (pcm_rtp_ring_read_256_conceal(
-              s.pcm_ring, cursor_rtp, snap.pcm_generation, block, NULL)) {
+              s.pcm_ring, cursor_rtp, snap.pcm_generation, block, &missing)) {
         have_pcm = true;
+        if (missing)
+          aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp,
+                    (int32_t)missing, 0, 0);
       }
 #endif
 #endif
@@ -3121,14 +3567,42 @@ static void ap2_playout_task(void *arg) {
         continue;
       memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
       PD_ADD(silent_blocks, 1U);
+      if (zero_blocks++ == 0U)
+        aevt_post(AEVT_SILENCE_BEGIN, NULL, (int32_t)cursor_rtp, 0, 0, 0);
+    } else if (zero_blocks != 0U) {
+      aevt_post(AEVT_SILENCE_END, NULL, (int32_t)cursor_rtp,
+                (int32_t)zero_blocks, 0, 0);
+      zero_blocks = 0;
     }
     output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
     PD_MAX(max_work_us, esp_timer_get_time() - pd_work_start_us);
 #endif
 
-    const esp_err_t write_err = audio_playout_write_tagged(
+    const esp_err_t write_err = playout_write(&hist,
         out_block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
+    PLAYOUT_NEXT_BUFFERS();
+    /* A clock retune decided by the servo runs here, right after the write
+     * returned: the DMA has just started hist.prev and hist.last is queued
+     * behind it, so the in-order reload repeats only a few frames. */
+    if (write_err == ESP_OK && retune_pending) {
+      retune_pending = false;
+      audio_playout_tune_info_t ti = {0};
+      uint32_t halt_us = 0;
+      const esp_err_t te = (hist.prev && hist.last)
+          ? audio_playout_tune_ppm_in_order(retune_ppm, hist.prev, hist.last,
+                                            AUDIO_PLAYOUT_FRAMES, &ti, &halt_us)
+          : audio_playout_tune_ppm(retune_ppm, &ti);
+      if (te == ESP_OK) {
+        aevt_post(AEVT_TUNE, NULL, servo_ppm, retune_ppm, (int32_t)halt_us, 0);
+        servo_ppm = retune_ppm;
+        tune_fail_count = 0;
+      } else {
+        tune_fail_count++;
+        pevt_post(PEVT_TUNE_FAIL, retune_ppm, (int32_t)te,
+                  (int32_t)tune_fail_count, 0, 0, NULL);
+      }
+    }
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
     {
       /* Time between consecutive running writes. Cleared when RUNNING
@@ -3319,6 +3793,7 @@ static void ap2_playout_task(void *arg) {
                           servo_ppm, snap.generation);
     }
 
+
     if (write_err == ESP_OK && s.output_sync.valid &&
         s.output_sync.generation == snap.generation &&
         servo_generation == snap.generation &&
@@ -3330,18 +3805,11 @@ static void ap2_playout_task(void *arg) {
         if (delta < -AP2_PID_MAX_JUMP_PPM) delta = -AP2_PID_MAX_JUMP_PPM;
         const int32_t next_ppm = servo_ppm + delta;
 
-        audio_playout_tune_info_t ti = {0};
-        esp_err_t te = audio_playout_tune_ppm(next_ppm, &ti);
+        /* disable -> tune -> in-order reload -> enable, right after the
+         * next DMA write (see above). */
         pid_last_tune_us = pid_now_us;
-        if (te == ESP_OK) {
-          servo_ppm = next_ppm;
-          tune_fail_count = 0;
-        } else {
-          /* Report it: a failing tune means drift is not corrected. */
-          tune_fail_count++;
-          pevt_post(PEVT_TUNE_FAIL, next_ppm, (int32_t)te,
-                    (int32_t)tune_fail_count, 0, 0, NULL);
-        }
+        retune_pending = true;
+        retune_ppm = next_ppm;
       }
     }
 
@@ -3358,10 +3826,13 @@ static void ap2_playout_task(void *arg) {
   }
 
   (void)playout_flush_checked("task-exit");
+#undef PLAYOUT_NEXT_BUFFERS
 #if AUDIO_OUT_SLOT_BITS == 32
-  free(out_block);
+  free(out_buf[0]);
+  free(out_buf[1]);
 #endif
-  free(block);
+  free(block_buf[0]);
+  free(block_buf[1]);
   s.playout_task = NULL;
   vTaskDelete(NULL);
 }
