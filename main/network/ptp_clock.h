@@ -25,30 +25,6 @@ esp_err_t ptp_clock_init(void);
  */
 void ptp_clock_clear(void);
 
-#define PTP_CLOCK_MAX_PEERS 16
-
-typedef struct {
-  /* IPv4 address in network byte order. Zero means no usable IPv4 address was
-   * advertised for this peer (for example an IPv6-only SETPEERSX entry). */
-  uint32_t ipv4_addr;
-  /* Optional SETPEERSX ClockID. It is tracked for identity/diagnostics but is
-   * not trusted as a hard admission key because observed senders disagree on
-   * whether it names the PTP source port identity or the selected GM. */
-  uint64_t clock_id;
-} ptp_clock_peer_t;
-
-/**
- * Atomically replace the AirPlay-advertised PTP peer set.
- *
- * This never resets the active estimator and never changes audio timing. The
- * peer list is used to reject unrelated IPv4 PTP sources while the buffered
- * path does not yet have an authoritative D7/networkTimeTimelineID clock id,
- * and to broaden the realtime timing-peer admission to explicitly advertised
- * group peers. Passing NULL/0 clears the tracked list.
- */
-void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count);
-
-
 typedef struct {
   bool realtime_mode;
   bool valid;
@@ -65,9 +41,8 @@ typedef struct {
   uint32_t sample_count;
   uint32_t sample_age_ms; /* UINT32_MAX when no accepted timing sample exists. */
   /* Diagnostics: why a buffered anchor may never become usable. */
-  bool source_mixed;          /* packets from a second source were rejected */
+  bool source_mixed;          /* source identity changed within selected peer */
   uint64_t expected_clock_id; /* D7/timeline hint, 0 = none */
-  uint32_t peer_count;        /* SETPEERS entries currently tracked */
 } ptp_clock_snapshot_t;
 
 /* Coherent status/diagnostic snapshot for either buffered or realtime mode. */
@@ -90,16 +65,11 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot);
 void ptp_clock_notify_resume(uint32_t pause_duration_ms);
 
 /**
- * Enable the AirPlay 2 realtime NQPTP-style estimator path.
- *
- * In realtime mode the PTP source is selected by the RTSP client's IPv4
- * address and Announce supplies the actual grandmasterIdentity. Realtime PTP
- * only estimates remote-GM -> ESP-local conversion; audio continuity is owned
- * by the ALAC RTP<->local anchor, not by a synthetic/virtual PTP timeline.
- *
- * Buffered AAC leaves this mode disabled and keeps the existing PTP behaviour.
+ * Stream SETUP equivalent of Shairport/NQPTP T <RTSP client IP>, then B.
+ * Starts one fresh timing record and selects that IP for both AAC and ALAC.
+ * SETPEERS/SETPEERSX and media anchors never reset this record.
  */
-void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip);
+void ptp_clock_start_timing(bool realtime, uint32_t timing_peer_ip);
 
 /**
  * Record the clockIdentity carried by the latest realtime D7 anchor. This is
@@ -149,19 +119,6 @@ static inline bool ptp_clock_realtime_snapshot_to_local(
 
 void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot);
 
-/**
- * Restrict the PTP clock to a single master identified by its 8-byte
- * clockIdentity (the value carried in the AirPlay 2 0xD7 anchor packet at
- * offset +20, and in the PTP common-header sourcePortIdentity field at
- * bytes 20-27).
- *
- * Pass 0 to clear the filter (accept any master — the default at startup).
- *
- * In buffered/legacy mode this retains the original behaviour: changing the
- * expected clock resets samples and filters PTP by sourcePortIdentity.
- * In AirPlay 2 realtime mode it is only an anchor-clock hint; PTP source
- * selection comes from the RTSP client IP and Announce determines the actual
- * grandmaster, matching the Shairport/NQPTP model.
- */
+/* Media-anchor hint for diagnostics only. Source selection belongs to
+ * ptp_clock_start_timing(); changing this hint never resets the estimator. */
 void ptp_clock_set_master_clock_id(uint64_t clock_id);
-

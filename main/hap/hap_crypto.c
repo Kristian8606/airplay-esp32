@@ -5,6 +5,7 @@
 
 #include "esp_log.h"
 #include "sodium.h"
+#include "airplay_log.h"
 
 static const char *TAG = "hap_crypto";
 
@@ -61,7 +62,7 @@ esp_err_t hap_derive_audio_key(hap_session_t *session, uint8_t *audio_key,
   }
 
   if (!session->session_established) {
-    ESP_LOGW(TAG, "Cannot derive audio key before session established");
+    AP_LOGW(TAG, "Cannot derive audio key before session established");
     return ESP_ERR_INVALID_STATE;
   }
 

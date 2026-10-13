@@ -6,6 +6,7 @@
 #include "audio_receiver.h"
 #include "esp_log.h"
 #include "settings.h"
+#include "airplay_log.h"
 
 static const char *TAG = "loudness";
 
@@ -67,7 +68,7 @@ esp_err_t audio_loudness_set(bool enabled, int32_t reference_db, bool save) {
   const uint32_t cfg = pack_cfg(enabled, reference_db);
   const uint32_t old = __atomic_exchange_n(&s_cfg, cfg, __ATOMIC_ACQ_REL);
   if (old != cfg) {
-    ESP_LOGI(TAG, "Loudness %s, reference -%ld dB", enabled ? "on" : "off",
+    AP_LOGI(TAG, "Loudness %s, reference -%ld dB", enabled ? "on" : "off",
              (long)reference_db);
   }
   if (!save) return ESP_OK;

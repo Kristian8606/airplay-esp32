@@ -34,9 +34,6 @@ struct rtsp_conn {
   // Shairport AP2 TEARDOWN semantics: a valid plist without a streams item
   // requests the RTSP connection itself to close after the 200 response.
   bool close_after_response;
-  // Set once the first stream SETUP of this RTSP connection has started PTP
-  // from a clean estimator (later stream SETUPs keep it).
-  bool ptp_session_fresh;
   bool amp_session_active;
   int64_t pause_started_us;
   /* Last committed AP2 setup; only the RTSP owner changes this snapshot. */
@@ -50,6 +47,15 @@ struct rtsp_conn {
   uint16_t event_port;    // TCP port for server->client events
   uint16_t buffered_port; // TCP port for buffered audio (type 103)
   int event_socket;       // TCP listener for event port (until handed over)
+
+  /* Shairport play lock (principal_conn): only the owner may touch the
+   * global audio/PTP/event state. A connection that merely probes the device
+   * never becomes the owner, so it cannot interrupt a running session. It
+   * takes the lock over (and so ends the old session) only at the stream
+   * SETUP, i.e. when it really wants to play. */
+  bool owns_session;
+  /* Phase-1 encryption applied after taking the play lock. */
+  bool pending_encryption;
 
   uint32_t client_ip;           // Sender IP (network byte order): PTP peer,
                                 // event-port filter, realtime retransmits
@@ -66,6 +72,12 @@ rtsp_conn_t *rtsp_conn_create(void);
  * Free connection state and associated resources
  */
 void rtsp_conn_free(rtsp_conn_t *conn);
+
+/* Play lock. rtsp_session_acquire(conn, false) takes the lock only if nobody
+ * has it; with break_in=true it ends the owning connection first (Shairport
+ * get_play_lock(conn, 1)). Returns true if conn owns the session afterwards. */
+bool rtsp_session_acquire(rtsp_conn_t *conn, bool break_in);
+void rtsp_session_release(rtsp_conn_t *conn);
 
 
 /**

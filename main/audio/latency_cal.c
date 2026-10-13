@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+#include "airplay_log.h"
 
 static const char *TAG = "latency_cal";
 
@@ -184,7 +185,7 @@ esp_err_t latency_cal_capture_start(void) {
     cap_free();
     return ESP_ERR_NO_MEM;
   }
-  ESP_LOGI(TAG, "loopback capture started on GPIO%d (%u Hz)",
+  AP_LOGI(TAG, "loopback capture started on GPIO%d (%u Hz)",
            CONFIG_AIRPLAY_LATENCY_CAL_GPIO, (unsigned)LATENCY_CAL_ADC_RATE_HZ);
   return ESP_OK;
 }
@@ -206,7 +207,7 @@ void latency_cal_capture_finish(const int64_t *emit_us, int n_emit,
     latency_cal_analyze(s_cap.samples, s_cap.n, s_cap.cb_count, s_cap.cb_t,
                         s_cap.cb_n, emit_us, n_emit, res);
   }
-  ESP_LOGI(TAG, "capture: %lu samples, %lu frames -> %s",
+  AP_LOGI(TAG, "capture: %lu samples, %lu frames -> %s",
            (unsigned long)s_cap.n, (unsigned long)s_cap.cb_n,
            res->ok ? "ok" : (res->error ? res->error : "failed"));
   if (!s_cap.reader) cap_free();

@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "airplay_log.h"
 
 static const char *TAG = "web_server";
 static httpd_handle_t s_server = NULL;
@@ -35,7 +36,7 @@ static httpd_handle_t s_server = NULL;
 #define HTTP_BODY_IDLE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 
 static void log_wifi_scan_memory(const char *where) {
-  ESP_LOGI(TAG,
+  AP_LOGI(TAG,
            "WiFi scan MEM %s internal=%uKiB largest=%uKiB psram=%uKiB largest=%uKiB",
            where,
            (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) /
@@ -57,7 +58,7 @@ static esp_err_t restore_airplay_after_wifi_scan(void) {
       last_err = rtsp_server_start();
       if (last_err == ESP_OK) {
         if (attempt > 1) {
-          ESP_LOGI(TAG, "WiFi scan: AirPlay restore succeeded on retry");
+          AP_LOGI(TAG, "WiFi scan: AirPlay restore succeeded on retry");
         }
         return ESP_OK;
       }
@@ -151,7 +152,7 @@ static esp_err_t airplay_still_stopping(httpd_req_t *req) {
   if (rtsp_server_is_idle()) {
     const esp_err_t err = rtsp_server_start();
     if (err == ESP_OK) {
-      ESP_LOGI(TAG, "AirPlay restored after delayed maintenance stop");
+      AP_LOGI(TAG, "AirPlay restored after delayed maintenance stop");
       return ESP_FAIL;
     }
     ESP_LOGE(TAG, "AirPlay restart after delayed stop failed: %s",
@@ -175,7 +176,7 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
    * scan. On first boot the audio engine was never created, so the scan starts
    * with essentially the full PSRAM headroom already available. */
   if (restore_airplay) {
-    ESP_LOGI(TAG, "WiFi scan: pausing AirPlay and releasing audio memory");
+    AP_LOGI(TAG, "WiFi scan: pausing AirPlay and releasing audio memory");
     rtsp_server_stop();
     if (!rtsp_server_is_idle()) {
       return airplay_still_stopping(req);
@@ -219,7 +220,7 @@ static esp_err_t wifi_scan_handler(httpd_req_t *req) {
       reboot_after_wifi_scan_restore_failure();
       return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "WiFi scan: AirPlay ready again");
+    AP_LOGI(TAG, "WiFi scan: AirPlay ready again");
     log_wifi_scan_memory("after-audio-restore");
   }
 
@@ -456,7 +457,7 @@ static esp_err_t latency_measure_handler(httpd_req_t *req) {
    * memory, measure, restore AirPlay. */
   const bool restore_airplay = audio_receiver_is_initialized();
   if (restore_airplay) {
-    ESP_LOGI(TAG, "Latency test: pausing AirPlay and releasing audio memory");
+    AP_LOGI(TAG, "Latency test: pausing AirPlay and releasing audio memory");
     rtsp_server_stop();
     if (!rtsp_server_is_idle()) {
       return airplay_still_stopping(req);
@@ -485,7 +486,7 @@ static esp_err_t latency_measure_handler(httpd_req_t *req) {
       reboot_after_wifi_scan_restore_failure();
       return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "Latency test: AirPlay ready again");
+    AP_LOGI(TAG, "Latency test: AirPlay ready again");
   }
   cJSON *r = cJSON_CreateObject();
   cJSON_AddBoolToObject(r, "success", e == ESP_OK && res.ok);
@@ -758,7 +759,7 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
     return err;
   }
 
-  ESP_LOGI(TAG, "EQ %s%s", do_apply ? "applied" : "",
+  AP_LOGI(TAG, "EQ %s%s", do_apply ? "applied" : "",
            do_save ? (do_apply ? " + saved" : "saved") : "");
   httpd_resp_set_type(req, "application/json");
   char response[96];
@@ -768,7 +769,7 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
   return httpd_resp_sendstr(req, response);
 }
 
-static esp_err_t ota_handler(httpd_req_t *req){ if(!admin_ok(req)) return ESP_OK; if(req->content_len==0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"No firmware uploaded");return ESP_FAIL;} ESP_LOGI(TAG,"Stopping RTSP for OTA"); rtsp_server_stop(); if(!rtsp_server_is_idle()) return airplay_still_stopping(req); esp_err_t e=ota_start_from_http(req); if(e!=ESP_OK){ ESP_LOGE(TAG,"OTA failed (%s); restarting RTSP",esp_err_to_name(e)); esp_err_t re=rtsp_server_start(); if(re!=ESP_OK){ESP_LOGE(TAG,"RTSP restart after OTA failure failed: %s",esp_err_to_name(re));} httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,esp_err_to_name(e));return e;} httpd_resp_sendstr(req,"Firmware update complete, rebooting now!\n"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK; }
+static esp_err_t ota_handler(httpd_req_t *req){ if(!admin_ok(req)) return ESP_OK; if(req->content_len==0){httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"No firmware uploaded");return ESP_FAIL;} AP_LOGI(TAG,"Stopping RTSP for OTA"); rtsp_server_stop(); if(!rtsp_server_is_idle()) return airplay_still_stopping(req); esp_err_t e=ota_start_from_http(req); if(e!=ESP_OK){ ESP_LOGE(TAG,"OTA failed (%s); restarting RTSP",esp_err_to_name(e)); esp_err_t re=rtsp_server_start(); if(re!=ESP_OK){ESP_LOGE(TAG,"RTSP restart after OTA failure failed: %s",esp_err_to_name(re));} httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,esp_err_to_name(e));return e;} httpd_resp_sendstr(req,"Firmware update complete, rebooting now!\n"); vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); return ESP_OK; }
 static const char *reset_reason_str(esp_reset_reason_t r){switch(r){case ESP_RST_POWERON:return"poweron";case ESP_RST_EXT:return"external";case ESP_RST_SW:return"software";case ESP_RST_PANIC:return"panic";case ESP_RST_INT_WDT:return"int_wdt";case ESP_RST_TASK_WDT:return"task_wdt";case ESP_RST_WDT:return"other_wdt";case ESP_RST_DEEPSLEEP:return"deepsleep";case ESP_RST_BROWNOUT:return"brownout";case ESP_RST_SDIO:return"sdio";default:return"unknown";}}
 static esp_err_t system_info_handler(httpd_req_t *req){
   cJSON *root=cJSON_CreateObject(),*i=cJSON_CreateObject(); char ip[16]={0},mac[18]={0},name[65]={0}; bool connected=wifi_is_connected(); wifi_get_ip_str(ip,sizeof(ip)); wifi_get_mac_str(mac,sizeof(mac)); settings_get_device_name(name,sizeof(name)); cJSON_AddStringToObject(i,"ip",ip);cJSON_AddStringToObject(i,"mac",mac);cJSON_AddStringToObject(i,"device_name",name);cJSON_AddBoolToObject(i,"wifi_connected",connected);cJSON_AddNumberToObject(i,"free_heap",esp_get_free_heap_size());

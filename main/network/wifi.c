@@ -15,6 +15,7 @@
 #include "wifi.h"
 #include "settings.h"
 #include "dns_server.h"
+#include "airplay_log.h"
 
 static const char *TAG = "wifi";
 
@@ -125,7 +126,7 @@ static void retry_timer_callback(void *arg) {
     const bool full_scan = s_sta_locked_channel != 0 &&
         (++s_backoff_retries % WIFI_FULL_SCAN_EVERY) == 0;
     sta_set_channel(full_scan ? 0 : s_sta_locked_channel);
-    ESP_LOGI(TAG, "Retry timer fired, reconnecting same AP (attempt %d%s)...",
+    AP_LOGI(TAG, "Retry timer fired, reconnecting same AP (attempt %d%s)...",
              s_retry_num + 1, full_scan ? ", full channel scan" : "");
     esp_wifi_connect();
   }
@@ -142,7 +143,7 @@ static void schedule_retry(void) {
       delay_s = 30;
     }
   }
-  ESP_LOGI(TAG, "Scheduling same-AP retry in %d seconds", delay_s);
+  AP_LOGI(TAG, "Scheduling same-AP retry in %d seconds", delay_s);
   esp_timer_stop(s_retry_timer);
   esp_timer_start_once(s_retry_timer, (uint64_t)delay_s * 1000000);
 }
@@ -150,7 +151,7 @@ static void schedule_retry(void) {
 static void enable_ap_mode(void) {
   wifi_mode_t mode;
   if (esp_wifi_get_mode(&mode) == ESP_OK && mode != WIFI_MODE_APSTA) {
-    ESP_LOGI(TAG, "Re-enabling AP mode for configuration access");
+    AP_LOGI(TAG, "Re-enabling AP mode for configuration access");
     if (!s_ap_netif) {
       s_ap_netif = esp_netif_create_default_wifi_ap();
     }
@@ -195,7 +196,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     if (s_retry_num < AP_REENABLE_THRESHOLD) {
       // Reconnect only to the BSSID selected at boot. A new strongest-AP scan
       // happens only after reboot (intentionally no roaming).
-      ESP_LOGI(TAG, "Retrying same AP (%d/%d)...", s_retry_num,
+      AP_LOGI(TAG, "Retrying same AP (%d/%d)...", s_retry_num,
                AP_REENABLE_THRESHOLD);
       esp_wifi_connect();
     } else {
@@ -225,11 +226,11 @@ static void event_handler(void *arg, esp_event_base_t event_base,
     // Disable AP mode when STA connects
     wifi_mode_t mode;
     if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_APSTA) {
-      ESP_LOGI(TAG, "STA connected, disabling AP mode");
+      AP_LOGI(TAG, "STA connected, disabling AP mode");
       esp_wifi_set_mode(WIFI_MODE_STA);
     }
   } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
-    ESP_LOGI(TAG, "AP started");
+    AP_LOGI(TAG, "AP started");
   }
 }
 

@@ -22,7 +22,7 @@
  *   Bit 46: SupportsHKPairingAndAccessControl
  *   Bit 48: SupportsTransientPairing */
 #define AIRPLAY_FEATURES_HI 0x1C340
-#define AIRPLAY_FEATURES_LO 0x405C4A00
+#define AIRPLAY_FEATURES_LO 0x401C4A00 /* bit 22 off, as Shairport Sync */
 
 /* Pairing identity UUID ("pi" in mDNS and GET /info), lowercase
  * 8-4-4-4-12 form. Derived from the Wi-Fi MAC, so it is stable across

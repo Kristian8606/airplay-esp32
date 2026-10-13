@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "airplay_log.h"
 
 static const char *TAG = "amp_control";
 
@@ -52,7 +53,7 @@ static void amp_task(void *arg) {
       if (!amplifier_on) {
         amp_set_output(true);
         amplifier_on = true;
-        ESP_LOGI(TAG, "Amplifier ON GPIO=%d active=%s sessions=%u",
+        AP_LOGI(TAG, "Amplifier ON GPIO=%d active=%s sessions=%u",
                  CONFIG_AIRPLAY_AMP_GPIO,
                  amp_active_level() ? "HIGH" : "LOW", sessions);
       }
@@ -66,7 +67,7 @@ static void amp_task(void *arg) {
     }
 
 #if CONFIG_AIRPLAY_AMP_OFF_DELAY_SEC > 0
-    ESP_LOGI(TAG, "No AirPlay sessions; amplifier OFF in %d s",
+    AP_LOGI(TAG, "No AirPlay sessions; amplifier OFF in %d s",
              CONFIG_AIRPLAY_AMP_OFF_DELAY_SEC);
     const uint32_t notified = ulTaskNotifyTake(
         pdTRUE, pdMS_TO_TICKS((uint32_t)CONFIG_AIRPLAY_AMP_OFF_DELAY_SEC * 1000U));
@@ -84,7 +85,7 @@ static void amp_task(void *arg) {
     if (atomic_load_explicit(&s_active_sessions, memory_order_acquire) == 0U) {
       amp_set_output(false);
       amplifier_on = false;
-      ESP_LOGI(TAG, "Amplifier OFF GPIO=%d", CONFIG_AIRPLAY_AMP_GPIO);
+      AP_LOGI(TAG, "Amplifier OFF GPIO=%d", CONFIG_AIRPLAY_AMP_GPIO);
     }
   }
 }

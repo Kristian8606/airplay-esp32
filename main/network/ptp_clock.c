@@ -15,6 +15,7 @@
 #include "audio_diag.h"
 #include "ptp_clock.h"
 #include "ptp_clock_engine.h"
+#include "airplay_log.h"
 
 static const char *TAG = "ptp_clock";
 
@@ -37,21 +38,17 @@ static const char *TAG = "ptp_clock";
 
 // Synchronization parameters
 //
-// WiFi-side timestamping jitter on ESP32 is ~20–30 ms in practice, so a tight
-// 40 ms lock threshold can take 10+ seconds to satisfy.  Loosen the lock
-// criteria to converge in <1 s while still rejecting genuine outliers via
-// the median filter:
-//   • LOCK_THRESHOLD_NS:    50 ms  — accept normal WiFi jitter
-//   • OUTLIER_THRESHOLD_NS: 75 ms  — keep the threshold strictly larger than
-//                                   LOCK_THRESHOLD_NS so a borderline sample
-//                                   isn't both kept and counted against lock
-//   • MIN_SAMPLES_FOR_LOCK: 4      — ~500 ms at 8 Hz SYNC rate
-//   • LOCK_STABLE_TIME_MS:  250    — confirm stability without long wait
+// Local lock diagnostics tolerate WiFi timestamp jitter. Buffered startup
+// uses the upstream 400 ms mastership gate, independently of this flag.
 #define LOCK_THRESHOLD_NS    50000000LL // 50ms - tolerant of WiFi jitter
 #define MIN_SAMPLES_FOR_LOCK 4
 #define LOCK_STABLE_TIME_MS  250 // 250ms of stable readings to declare lock
 #define LOCK_TIMEOUT_MS      5000
-#define OUTLIER_THRESHOLD_NS 50000000LL // 50ms - reject samples beyond this
+// NQPTP development 0a88cd7, nqptp-message-handlers.c:442-488: smoothing
+// accepts positive jitter of any size. A symmetric rejection threshold would
+// delay startup convergence and restart mastership on a shorter network delay.
+// Zero disables the engine's optional outlier/reacquire policy.
+#define OUTLIER_THRESHOLD_NS 0LL
 // Asymmetric filter parameters (modeled after nqptp):
 // Network delays only ADD positive bias to the measured offset, so
 //   offset_measured = true_offset - one_way_delay
@@ -68,8 +65,8 @@ static const char *TAG = "ptp_clock";
 
 // Threshold above which we reset the PTP smoothing filter on resume.
 // E.g. at 50 ppm crystal accuracy, 30 s of pause accumulates ~1.5 ms of drift —
-// large enough to be audible in multi-room but well within the 50 ms outlier
-// window.  Below this threshold the drift is negligible (<0.25 ms at 5 s).
+// large enough to be audible in multi-room. Below this threshold the drift
+// is negligible (<0.25 ms at 5 s).
 #define PTP_LONG_PAUSE_THRESHOLD_MS 30000
 
 /* Shairport/NQPTP does not expose a newly elected GM immediately. Keep the
@@ -121,9 +118,7 @@ static struct {
   /* AirPlay 2 realtime-only clock-domain state. Buffered AAC does not use
    * these fields and continues through the legacy path above. */
   bool realtime_mode;
-  uint32_t timing_peer_ip;        // network byte order; 0 = accept any source
-  ptp_clock_peer_t peers[PTP_CLOCK_MAX_PEERS];
-  size_t peer_count;
+  uint32_t timing_peer_ip;        // network byte order; 0 = no selected timer
   uint64_t source_clock_id;       // PTP sourcePortIdentity clock id
   uint64_t grandmaster_clock_id;  // Announce grandmasterIdentity
 
@@ -149,14 +144,12 @@ static struct {
   uint32_t rt_sync_source_ip;
   bool rt_awaiting_followup;
 
-  // Master clock filter / realtime anchor-clock hint (0 = unspecified).
+  // Media-anchor clock hint for diagnostics (0 = unspecified).
   uint64_t expected_clock_id;
 
-  /* Legacy/buffered PTP can begin acquiring before RTSP delivers the
-   * SETRATEANCHORTIME clock id. Remember which PTP source built that
-   * pre-anchor estimator so a later matching anchor can confirm it instead
-   * of destroying a freshly acquired lock. If more than one source is seen
-   * before the anchor, be conservative and force the old reset path. */
+  /* Diagnostic history within the selected RTSP peer's timing record.
+   * A source identity change is handled by the estimator; a media-anchor
+   * hint never resets timing or changes packet admission. */
   uint64_t legacy_sample_clock_id;
   bool legacy_source_mixed;
 } ptp = {0};
@@ -266,7 +259,7 @@ static int64_t abs_i64(int64_t v) {
 
 static void log_ptp_step(const ptp_step_log_t *ev) {
   if (!ev || !ev->emit || !ev->reason) return;
-  ESP_LOGW(TAG,
+  AP_LOGW(TAG,
            "PTP | STEP | reason=%s | src=%016llx | gm=%016llx | epoch=%lu | "
            "raw=%+.3fms | filt=%+.3fms | ptpD=%+.3fms | dFilt=%+.3fms | "
            "rxLag=%.3fms | seq=%u",
@@ -413,28 +406,12 @@ static void fill_domain_step_locked(const char *reason,
   }
 }
 
-static bool peer_list_has_ipv4_locked(void);
-static bool peer_ipv4_matches_locked(uint32_t source_ip);
-
-/* Realtime source selection follows Shairport/NQPTP: the RTSP client IP is
- * the timing peer. sourcePortIdentity is diagnostic; Announce tells us which
- * grandmaster that peer is currently forwarding. Caller holds ptp_state_mux. */
+/* NQPTP development monitors only the first IP in T <ip>. SETPEERS
+ * membership and sourcePortIdentity are not timing-source selectors. */
 static bool realtime_source_matches_locked(uint32_t source_ip) {
-  /* timingPeerInfo from SETUP is authoritative for realtime AirPlay. Do not
-   * broaden an already-selected peer merely because SETPEERS lists every
-   * member of a multiroom group. The advertised peer set is only a fallback
-   * when SETUP did not provide a timing peer. */
-  if (ptp.timing_peer_ip != 0) {
-    if (source_ip == ptp.timing_peer_ip) return true;
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
-    return false;
-  }
-  if (peer_list_has_ipv4_locked()) {
-    if (peer_ipv4_matches_locked(source_ip)) return true;
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
-    return false;
-  }
-  return true;
+  if (ptp.timing_peer_ip != 0 && source_ip == ptp.timing_peer_ip) return true;
+  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
+  return false;
 }
 
 /* Reset only the estimator that belongs to one remote grandmaster. Audio
@@ -539,51 +516,13 @@ static void legacy_note_source_locked(uint64_t source_clock_id) {
   }
 }
 
-static bool peer_list_has_ipv4_locked(void) {
-  for (size_t i = 0; i < ptp.peer_count; ++i) {
-    if (ptp.peers[i].ipv4_addr != 0) return true;
-  }
-  return false;
-}
-
-static bool peer_ipv4_matches_locked(uint32_t source_ip) {
-  if (source_ip == 0) return false;
-  for (size_t i = 0; i < ptp.peer_count; ++i) {
-    if (ptp.peers[i].ipv4_addr != 0 && ptp.peers[i].ipv4_addr == source_ip)
-      return true;
-  }
-  return false;
-}
-
-/* Buffered mode follows one PTP source. Before SETRATEANCHORTIME gives us the
- * expected source, lock onto the first observed source and mark any competing
- * source as mixed rather than letting estimators alternate between clocks. */
+/* Buffered AAC uses the same T <RTSP client IP> source selection as
+ * Shairport/NQPTP. A forwarding peer's source clock may differ from the GM
+ * named by the anchor; Announce supplies that GM identity. */
 static bool legacy_source_admitted_locked(uint64_t source_clock_id,
                                           uint32_t source_ip) {
   if (source_clock_id == 0) return false;
-  if (ptp.expected_clock_id != 0) {
-    /* D7/networkTimeTimelineID is authoritative. An incomplete peer list must
-     * never block the already-confirmed timing domain. */
-    if (source_clock_id == ptp.expected_clock_id) return true;
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
-    return false;
-  }
-
-  /* Before the anchor arrives, use the AirPlay-advertised IPv4 peer set to
-   * avoid locking onto unrelated multicast PTP traffic. Fail open when the
-   * peer list has no usable IPv4 entries (for example IPv6-only SETPEERSX). */
-  if (peer_list_has_ipv4_locked() && !peer_ipv4_matches_locked(source_ip)) {
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
-    return false;
-  }
-
-  if (ptp.legacy_engine.source_clock_id == 0 ||
-      ptp.legacy_engine.source_clock_id == source_clock_id)
-    return true;
-
-  ptp.legacy_source_mixed = true;
-  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
-  return false;
+  return realtime_source_matches_locked(source_ip);
 }
 
 static void process_announce_legacy(const uint8_t *data, size_t len,
@@ -757,7 +696,7 @@ static void process_announce_realtime(const uint8_t *data, size_t len,
     char peer_text[INET_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET, &src, src_text, sizeof(src_text));
     if (peer_ip) inet_ntop(AF_INET, &peer, peer_text, sizeof(peer_text));
-    ESP_LOGI(TAG,
+    AP_LOGI(TAG,
              "RT ANNOUNCE | peer=%s | wanted=%s | source=%016llx | gm=%016llx | oldGM=%016llx",
              src_text, peer_ip ? peer_text : "any",
              (unsigned long long)source_clock, (unsigned long long)gm,
@@ -860,7 +799,7 @@ static void process_followup_realtime(const uint8_t *data, size_t len,
 
 #if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
   if (became_ready) {
-    ESP_LOGI(TAG,
+    AP_LOGI(TAG,
              "RT MASTER READY | gm=%016llx | source=%016llx | age=%lums | samples=%lu | masterOff=%+lldns",
              (unsigned long long)gm, (unsigned long long)source,
              (unsigned long)master_age, (unsigned long)samples,
@@ -1152,74 +1091,6 @@ void ptp_clock_clear(void) {
   taskEXIT_CRITICAL(&ptp_state_mux);
 }
 
-void ptp_clock_set_peers(const ptp_clock_peer_t *peers, size_t count) {
-  ptp_clock_peer_t normalized[PTP_CLOCK_MAX_PEERS] = {0};
-  size_t normalized_count = 0;
-
-  if (peers) {
-    for (size_t i = 0; i < count && normalized_count < PTP_CLOCK_MAX_PEERS;
-         ++i) {
-      if (peers[i].ipv4_addr == 0 && peers[i].clock_id == 0) continue;
-
-      bool duplicate = false;
-      for (size_t j = 0; j < normalized_count; ++j) {
-        if (normalized[j].ipv4_addr == peers[i].ipv4_addr &&
-            normalized[j].clock_id == peers[i].clock_id) {
-          duplicate = true;
-          break;
-        }
-      }
-      if (duplicate) continue;
-
-      normalized[normalized_count].ipv4_addr = peers[i].ipv4_addr;
-      normalized[normalized_count].clock_id = peers[i].clock_id;
-      normalized_count++;
-    }
-  }
-
-  bool changed = false;
-  bool reset_latch = false;
-  uint64_t dropped_source = 0;
-  taskENTER_CRITICAL(&ptp_state_mux);
-  if (ptp.peer_count != normalized_count) {
-    changed = true;
-  } else {
-    for (size_t i = 0; i < normalized_count; ++i) {
-      if (ptp.peers[i].ipv4_addr != normalized[i].ipv4_addr ||
-          ptp.peers[i].clock_id != normalized[i].clock_id) {
-        changed = true;
-        break;
-      }
-    }
-  }
-  if (changed) {
-    /* A session is starting (empty -> non-empty peer list). Before this
-     * point the task admits ANY PTP source it hears on the network (boot,
-     * other AirPlay/HomeKit devices) and latches onto the first one. Without
-     * this reset the real sender's packets would be rejected as a "mixed"
-     * source until the next full TEARDOWN, and the first session after boot
-     * could stay silent. Drop the pre-session estimator so only the
-     * advertised peers can seed it. Mid-session peer changes (group
-     * edits) keep the estimator and its handover logic. */
-    if (ptp.peer_count == 0 && normalized_count > 0 && !ptp.realtime_mode &&
-        (ptp.legacy_engine.source_clock_id != 0 || ptp.legacy_source_mixed)) {
-      dropped_source = ptp.legacy_engine.source_clock_id;
-      ptp_clear_estimators_locked();
-      reset_latch = true;
-    }
-    memset(ptp.peers, 0, sizeof(ptp.peers));
-    if (normalized_count > 0)
-      memcpy(ptp.peers, normalized,
-             normalized_count * sizeof(normalized[0]));
-    ptp.peer_count = normalized_count;
-  }
-  taskEXIT_CRITICAL(&ptp_state_mux);
-  if (reset_latch)
-    ESP_LOGI(TAG, "SETPEERS: session start, dropped pre-session PTP source %016llx",
-             (unsigned long long)dropped_source);
-
-}
-
 void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
   if (pause_duration_ms < PTP_LONG_PAUSE_THRESHOLD_MS) return;
 
@@ -1264,7 +1135,7 @@ void ptp_clock_notify_resume(uint32_t pause_duration_ms) {
 
   log_ptp_step(&step_ev);
 #if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
-  ESP_LOGI(TAG, "PTP resume reset | pause=%lums | mode=%s",
+  AP_LOGI(TAG, "PTP resume reset | pause=%lums | mode=%s",
            (unsigned long)pause_duration_ms,
            realtime ? "realtime" : "buffered");
 #endif
@@ -1295,7 +1166,6 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
   snapshot->locked = ptp.locked;
   snapshot->source_mixed = ptp.legacy_source_mixed;
   snapshot->expected_clock_id = ptp.expected_clock_id;
-  snapshot->peer_count = (uint32_t)ptp.peer_count;
   if (ptp.realtime_mode) {
     snapshot->valid = ptp.rt_master_ready && ptp.rt_last_followup_rx_ns > 0;
     snapshot->source_clock_id = ptp.source_clock_id;
@@ -1329,72 +1199,24 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
   }
 }
 
-void ptp_clock_set_realtime_mode(bool enabled, uint32_t timing_peer_ip) {
+void ptp_clock_start_timing(bool realtime, uint32_t timing_peer_ip) {
   SemaphoreHandle_t lifecycle = ptp_lifecycle_lock();
-  bool changed = false;
-  TaskHandle_t task_handle = NULL;
   taskENTER_CRITICAL(&ptp_state_mux);
-  if (ptp.realtime_mode != enabled ||
-      (enabled && ptp.timing_peer_ip != timing_peer_ip)) {
-    changed = true;
-    ptp.realtime_mode = enabled;
-    ptp.timing_peer_ip = enabled ? timing_peer_ip : 0;
-
-    /* Stream-mode transition starts the selected estimator fresh. This does
-     * not touch any PCM/ring/cursor/PID/DMA/I2S state. */
-    ptp.locked = false;
-    ptp.lock_candidate_start_ms = 0;
-    ptp.last_sync_ms = 0;
-    ptp.filtered_offset_ns = 0;
-    ptp.sample_count = 0;
-    ptp.last_sync_seq = 0;
-    ptp.last_sync_local_ns = 0;
-    ptp.last_sync_correction_ns = 0;
-    ptp.last_sync_source_clock_id = 0;
-    ptp.last_sync_source_ip = 0;
-    ptp.last_sync_process_lag_ns = 0;
-    ptp.awaiting_followup = false;
-    ptp.expected_clock_id = 0;
-    ptp.legacy_sample_clock_id = 0;
-    ptp.legacy_source_mixed = false;
-    ptp_clock_engine_init(&ptp.legacy_engine, OUTLIER_THRESHOLD_NS);
-    ptp.legacy_last_step_log_ns = 0;
-    ptp.source_clock_id = 0;
-    ptp.grandmaster_clock_id = 0;
-    ptp.rt_master_offset_ns = 0;
-    ptp.rt_previous_offset_ns = 0;
-    ptp.rt_previous_offset_time_ns = 0;
-    ptp.rt_mastership_start_ns = 0;
-    ptp.rt_last_followup_rx_ns = 0;
-    ptp.rt_sample_count = 0;
-    ptp.rt_master_ready = false;
-    ptp.rt_sync_seq = 0;
-    ptp.rt_sync_local_ns = 0;
-    ptp.rt_sync_correction_ns = 0;
-    ptp.rt_sync_source_clock_id = 0;
-    ptp.rt_sync_source_ip = 0;
-    ptp.rt_awaiting_followup = false;
-  }
-  task_handle = __atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE);
+  ptp.realtime_mode = realtime;
+  ptp.timing_peer_ip = timing_peer_ip;
+  /* NQPTP development handle_control_port_messages(T): clear the timing
+   * records, select the RTSP sender, then begin timing (B). Exactly one
+   * reset belongs to stream SETUP, even when the IP has not changed.
+   * Reference: 0a88cd7ca9325f023ca5d891714695167672bdb9. */
+  ptp_clear_estimators_locked();
+  TaskHandle_t task_handle =
+      __atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE);
   taskEXIT_CRITICAL(&ptp_state_mux);
-
-  if (changed && task_handle && ptp_is_running()) {
-    vTaskPrioritySet(task_handle, enabled ? PTP_TASK_PRIORITY_REALTIME
+  if (task_handle && ptp_is_running()) {
+    vTaskPrioritySet(task_handle, realtime ? PTP_TASK_PRIORITY_REALTIME
                                          : PTP_TASK_PRIORITY_LEGACY);
   }
   xSemaphoreGive(lifecycle);
-#if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
-  if (changed) {
-    struct in_addr peer = {.s_addr = timing_peer_ip};
-    char peer_text[INET_ADDRSTRLEN] = {0};
-    if (timing_peer_ip) inet_ntop(AF_INET, &peer, peer_text, sizeof(peer_text));
-    ESP_LOGI(TAG, "PTP mode=%s | timingPeer=%s",
-             enabled ? "AP2-realtime" : "legacy/buffered",
-             enabled && timing_peer_ip ? peer_text : "none");
-  }
-#else
-  (void)changed;
-#endif
 }
 
 void ptp_clock_note_realtime_d7(uint64_t clock_id) {
@@ -1433,85 +1255,10 @@ void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot) {
 }
 
 void ptp_clock_set_master_clock_id(uint64_t clock_id) {
-  bool changed = false;
-  bool realtime = false;
-  bool preserved_legacy = false;
-  bool was_locked = false;
-  uint64_t learned_source = 0;
-  bool source_mixed = false;
-  ptp_step_log_t step_ev = {0};
-
+  /* Shairport set_ptp_anchor_info only stores the media anchor. It never
+   * resets NQPTP or selects packets by the anchor's grandmaster identity.
+   * Keep the hint for diagnostics; T <IP> owns timing-source admission. */
   taskENTER_CRITICAL(&ptp_state_mux);
-  realtime = ptp.realtime_mode;
-  if (clock_id != ptp.expected_clock_id) {
-    changed = true;
-    was_locked = ptp.locked;
-    learned_source = ptp.legacy_engine.source_clock_id;
-    source_mixed = ptp.legacy_source_mixed;
-    ptp.expected_clock_id = clock_id;
-    if (!realtime) {
-      preserved_legacy = clock_id != 0 && ptp.legacy_engine.valid &&
-          !ptp.legacy_source_mixed &&
-          ptp.legacy_engine.source_clock_id == clock_id;
-      if (!preserved_legacy) {
-        const uint32_t old_epoch = ptp.legacy_engine.epoch;
-        ptp_clock_engine_domain_event_t de = {0};
-        if (clock_id != 0 && ptp.legacy_engine.source_clock_id != clock_id) {
-          (void)ptp_clock_engine_set_domain(&ptp.legacy_engine, clock_id, 0, &de);
-        } else {
-          ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
-        }
-        if (ptp.legacy_engine.epoch == old_epoch)
-          ptp_clock_engine_reset_filter(&ptp.legacy_engine, true);
-
-        ptp.locked = false;
-        ptp.lock_candidate_start_ms = 0;
-        ptp.last_sync_ms = 0;
-        ptp.filtered_offset_ns = 0;
-        ptp.sample_count = 0;
-        ptp.last_sync_seq = 0;
-        ptp.last_sync_local_ns = 0;
-        ptp.last_sync_correction_ns = 0;
-        ptp.last_sync_source_clock_id = 0;
-        ptp.last_sync_source_ip = 0;
-        ptp.last_sync_process_lag_ns = 0;
-        ptp.awaiting_followup = false;
-        ptp.legacy_sample_clock_id = clock_id;
-        ptp.legacy_source_mixed = false;
-
-        step_ev.emit = clock_id != 0;
-        step_ev.reason = "clock-reset";
-        step_ev.source_clock_id = clock_id;
-        step_ev.grandmaster_clock_id = ptp.legacy_engine.grandmaster_clock_id;
-        step_ev.epoch = ptp.legacy_engine.epoch;
-      }
-    }
-  }
+  ptp.expected_clock_id = clock_id;
   taskEXIT_CRITICAL(&ptp_state_mux);
-
-  log_ptp_step(&step_ev);
-  if (changed) {
-#if defined(CONFIG_AIRPLAY_DIAG_SYNC) && CONFIG_AIRPLAY_DIAG_SYNC
-    if (!realtime && preserved_legacy) {
-      ESP_LOGI(TAG,
-               "PTP anchor clock confirmed | clock=%016llx | source=%016llx | estimator=%s",
-               (unsigned long long)clock_id,
-               (unsigned long long)learned_source,
-               was_locked ? "locked" : "acquiring");
-    } else if (!realtime) {
-      ESP_LOGI(TAG,
-               "PTP anchor clock reset | clock=%016llx | source=%016llx | mixed=%d",
-               (unsigned long long)clock_id,
-               (unsigned long long)learned_source, source_mixed ? 1 : 0);
-    } else {
-      ESP_LOGI(TAG, "RT anchor clock hint | clock=%016llx",
-               (unsigned long long)clock_id);
-    }
-#else
-    (void)was_locked;
-    (void)learned_source;
-    (void)source_mixed;
-#endif
-  }
 }
-

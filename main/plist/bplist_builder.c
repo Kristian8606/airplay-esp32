@@ -448,14 +448,15 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_id,
                                   const char *device_name,
                                   const uint8_t *public_key,
-                                  size_t public_key_len, uint64_t features) {
+                                  size_t public_key_len, uint64_t features,
+                                  double initial_volume) {
   if (!out || !device_id || !device_name || !public_key ||
-      public_key_len == 0 || capacity < 512) {
+      public_key_len == 0 || capacity < 512 || !isfinite(initial_volume)) {
     return 0;
   }
 
   size_t pos = 0;
-  size_t offsets[39];
+  size_t offsets[41];
   size_t obj = 0;
 
 #define ADD_OFFSET()                                   \
@@ -644,11 +645,25 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
       return 0;
     }
   }
-  ADD_OFFSET(); // 38: top-level info dict
+  /* Shairport generateInfoPlist(): "initialVolume" is the AirPlay volume
+   * (-30..0 dB, -144 = mute) the receiver currently has, so the sender's
+   * slider starts from it instead of overwriting it. */
+  ADD_OFFSET(); // 38: "initialVolume"
+  if (!bplist_write_ascii_string(out, capacity, &pos, "initialVolume")) {
+    return 0;
+  }
+  ADD_OFFSET(); // 39: initial volume (real, 8 bytes)
   {
-    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28};
-    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 12)) {
+    if (!bplist_has_room(pos, 9, capacity)) return 0;
+    out[pos++] = 0x23; /* IEEE-754 double, big endian. */
+    union { double value; uint64_t bits; } real = {.value = initial_volume};
+    if (!bplist_write_u64(out, capacity, &pos, real.bits)) return 0;
+  }
+  ADD_OFFSET(); // 40: top-level info dict
+  {
+    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 38};
+    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 39};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 13)) {
       return 0;
     }
   }
@@ -656,7 +671,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
 #undef ADD_OFFSET
 
   if (obj != sizeof(offsets) / sizeof(offsets[0]) ||
-      !bplist_finish(out, capacity, &pos, offsets, obj, 38)) {
+      !bplist_finish(out, capacity, &pos, offsets, obj, 40)) {
     return 0;
   }
 

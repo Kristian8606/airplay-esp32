@@ -10,6 +10,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "airplay_log.h"
 
 #define BUTTON_STACK_BYTES 3072
 #define BUTTON_POLL_MS 10
@@ -105,9 +106,9 @@ static void button_worker(void *arg) {
       uint32_t id = 0;
       esp_err_t err = rtsp_remote_enqueue(b->command, &id);
       if (err == ESP_OK)
-        ESP_LOGI(TAG, "%s GPIO=%d queued id=%" PRIu32, b->name, b->gpio, id);
+        AP_LOGI(TAG, "%s GPIO=%d queued id=%" PRIu32, b->name, b->gpio, id);
       else
-        ESP_LOGW(TAG, "%s GPIO=%d not queued: %s", b->name, b->gpio,
+        AP_LOGW(TAG, "%s GPIO=%d not queued: %s", b->name, b->gpio,
                  err == ESP_ERR_NOT_FOUND ? "no AirPlay event connection" :
                  err == ESP_ERR_INVALID_STATE ? "command already pending" : esp_err_to_name(err));
     }

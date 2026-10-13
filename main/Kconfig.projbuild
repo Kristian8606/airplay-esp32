@@ -177,10 +177,24 @@ menu "Amplifier Power Control"
             during the delay keeps the amplifier on.
 endmenu
 
-menu "I2S Playout"
+menu "AirPlay Logging"
+    config AIRPLAY_LOG_RUNTIME
+        bool "Runtime event logs (RTSP, PTP, audio path, modules)"
+        default n
+        help
+            Logs written while the receiver runs: RTSP requests handled
+            (SETUP, FLUSH, SETRATEANCHORTIME, TEARDOWN...), play lock and
+            connections, PTP clock events, AAC/ALAC stream events, FIFO,
+            decoder warnings, LED/amplifier/buttons, Wi-Fi retries, web UI
+            actions.
+            When off, these calls are not compiled at all, so no running
+            RTSP/PTP/audio function spends time formatting or printing them.
+            Start-up messages, the 2-second audio_status line, SERVO CENTER
+            and all errors are always logged.
+
     config AIRPLAY_LOG_AUDIO_EVENTS
         bool "Log every audible audio event (I2S stop/start, silence, mutes)"
-        default y
+        default n
         help
             Prints one "AUDIO EVT" line, with its time since boot, for each
             event that can be heard as a click, pop or gap: the I2S clocks
@@ -191,18 +205,36 @@ menu "I2S Playout"
             low-priority status task prints them. Events are rare, so the
             cost is negligible. Turn off once the click source is found.
 
+    config AIRPLAY_LOG_RTSP_REQUESTS
+        bool "Log every RTSP request and response (temporary diagnostics)"
+        default n
+        help
+            Prints one "RTSP REQ" line for each request (connection, method,
+            URI, CSeq, content type and length, whether the connection holds
+            the play lock, and the readable strings found in the body) and one
+            "RTSP RSP" line for each answer. Used to see exactly what the
+            sender does around an AutoMix transition or a pause. Turn off when
+            not needed.
+
+endmenu
+
+menu "I2S Playout"
     config I2S_SCK_IO
-        int "I2S MCLK GPIO"
-        default 8
+        int "I2S MCLK GPIO (-1 = not used)"
+        default -1
+        help
+            MCLK output for DACs that need a master clock. -1 leaves it
+            unconnected (PCM5102A and most DACs make their own clock from
+            BCLK). The suggested pin, when a DAC needs it, is GPIO 2.
     config I2S_BCK_IO
         int "I2S BCLK GPIO"
-        default 11
+        default 5
     config I2S_WS_IO
         int "I2S LRCK/WS GPIO"
-        default 13
+        default 6
     config I2S_DO_IO
         int "I2S DATA OUT GPIO"
-        default 12
+        default 4
 
     choice AIRPLAY_I2S_SLOT_WIDTH
         prompt "I2S output slot width"
@@ -251,7 +283,7 @@ menu "I2S Playout"
 
     config AIRPLAY_LATENCY_CAL_GPIO
         int "Loopback ADC input GPIO (ADC1: 1-10)"
-        default 4
+        default 7
         range 1 10
         depends on AIRPLAY_LATENCY_CAL
 

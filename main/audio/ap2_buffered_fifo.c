@@ -15,6 +15,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "network/socket_utils.h"
+#include "airplay_log.h"
 
 /* Match Shairport Sync 5.x buffered_read.c: recv at most 4096 bytes, and once
  * more than 16 KiB is queued, sleep 10 ms after each recv. This intentionally
@@ -102,7 +103,7 @@ static void tcp_reader_task(void *arg) {
     if (c < 0) {
       if (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE) && errno != EAGAIN && errno != EWOULDBLOCK &&
           errno != EINTR)
-        ESP_LOGW(TAG, "accept errno=%d", errno);
+        AP_LOGW(TAG, "accept errno=%d", errno);
       if (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
@@ -119,7 +120,7 @@ static void tcp_reader_task(void *arg) {
     (void)next_epoch(fifo);
     xSemaphoreGive(fifo->fifo_mutex);
 
-    ESP_LOGI(TAG, "buffered TCP connected fifo=%uKiB",
+    AP_LOGI(TAG, "buffered TCP connected fifo=%uKiB",
              (unsigned)(fifo->capacity / 1024U));
     signal_all(fifo);
 
@@ -183,7 +184,7 @@ static void tcp_reader_task(void *arg) {
     (void)shutdown(c, SHUT_RDWR);
     close(c);
     signal_all(fifo);
-    ESP_LOGI(TAG, "buffered TCP disconnected");
+    AP_LOGI(TAG, "buffered TCP disconnected");
   }
 
   __atomic_store_n(&fifo->reader_task, NULL, __ATOMIC_RELEASE);
@@ -381,7 +382,7 @@ esp_err_t ap2_buffered_fifo_peek_head(ap2_buffered_fifo_t *fifo,
   if (wire_len < FIFO_MIN_WIRE_LEN || wire_len > fifo->capacity ||
       (size_t)wire_len - 2U > block_capacity) {
     xSemaphoreGive(fifo->fifo_mutex);
-    ESP_LOGW(TAG, "invalid buffered block length=%u; aborting client to restore framing",
+    AP_LOGW(TAG, "invalid buffered block length=%u; aborting client to restore framing",
              (unsigned)wire_len);
     ap2_buffered_fifo_abort_client(fifo);
     return ESP_ERR_INVALID_SIZE;

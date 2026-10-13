@@ -25,6 +25,7 @@
 
 #include "ptp_clock.h"
 #include "rtsp_events.h"
+#include "airplay_log.h"
 
 static const char *TAG = "rtsp_server";
 
@@ -32,7 +33,7 @@ static const char *TAG = "rtsp_server";
 #define RTSP_BUFFER_INITIAL 4096
 #define RTSP_BUFFER_LARGE   ((size_t)256 * 1024)
 
-#define CLIENT_STACK_SIZE 8192
+#define CLIENT_STACK_SIZE 10240
 #define SERVER_STACK_SIZE 4096
 
 /* RTSP control must run immediately after lwIP has delivered socket data.
@@ -62,6 +63,14 @@ typedef struct {
 
 static client_slot_t clients[2] = {{.socket = -1}, {.socket = -1}}; // Current and old
 static int current_slot = 0;
+
+/* Shairport principal_conn: the one connection allowed to drive the global
+ * audio / PTP / event-port state. */
+static rtsp_conn_t *s_owner;
+static portMUX_TYPE s_owner_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void signal_client_stop(int slot_idx);
+static bool wait_client_stopped(int slot_idx, TickType_t timeout_ticks);
 
 static void detach_client_socket(client_slot_t *slot) {
   xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
@@ -171,7 +180,7 @@ static void client_task(void *pvParameters) {
   if (getpeername(slot->socket, (struct sockaddr *)&peer_addr, &peer_len) ==
       0) {
     conn->client_ip = peer_addr.sin_addr.s_addr;
-    ESP_LOGI(TAG, "Client IP: %u.%u.%u.%u",
+    AP_LOGI(TAG, "Client IP: %u.%u.%u.%u",
              (unsigned int)(conn->client_ip & 0xFF),
              (unsigned int)((conn->client_ip >> 8) & 0xFF),
              (unsigned int)((conn->client_ip >> 16) & 0xFF),
@@ -204,6 +213,19 @@ static void client_task(void *pvParameters) {
   // latency to every command on this connection.
   int nodelay = 1;
   setsockopt(slot->socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+  /* Shairport rtsp.c: TCP keepalive on every RTSP connection (timeout 120 s:
+   * idle 95 s, then 5 probes 5 s apart). A sender that vanishes without
+   * closing (out of Wi-Fi, battery) is detected and its session released:
+   * recv() fails and the normal cleanup below runs. */
+  int keepalive = 1;
+  setsockopt(slot->socket, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+#if defined(TCP_KEEPIDLE) && defined(TCP_KEEPINTVL) && defined(TCP_KEEPCNT)
+  int keep_idle = 95, keep_intvl = 5, keep_cnt = 5;
+  setsockopt(slot->socket, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+  setsockopt(slot->socket, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+  setsockopt(slot->socket, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
+#endif
 
   while (server_running && !slot->should_stop) {
     if (conn->encrypted_mode) {
@@ -272,24 +294,29 @@ static void client_task(void *pvParameters) {
   }
 
 cleanup:
-  ESP_LOGI(TAG, "Client slot %d disconnected", slot_idx);
+  AP_LOGI(TAG, "Client slot %d disconnected", slot_idx);
   free(decrypted);
   free(buffer);
   detach_client_socket(slot);
 
-  // Immediate: stop audio and the event channel
-  audio_receiver_stop();
-  rtsp_stop_event_port_task();
-  /* A timeout requests cancellation, but does not release ownership. Keep
-   * this slot live until every producer and event socket actually exits. */
-  while (!audio_receiver_is_idle() || !rtsp_event_port_is_idle()) {
-    /* A late static DATA-task suspension must be reaped by another stop. */
-    if (!audio_receiver_is_idle()) audio_receiver_stop();
-    if (!rtsp_event_port_is_idle()) rtsp_stop_event_port_task();
-    vTaskDelay(1);
+  /* Only the owner of the session tears down the global audio / event state.
+   * A connection that never took the play lock (a probe) leaves the playing
+   * session alone, exactly as Shairport's release_play_lock() does. */
+  if (conn->owns_session) {
+    // Immediate: stop audio and the event channel
+    audio_receiver_stop();
+    rtsp_stop_event_port_task();
+    /* A timeout requests cancellation, but does not release ownership. Keep
+     * this slot live until every producer and event socket actually exits. */
+    while (!audio_receiver_is_idle() || !rtsp_event_port_is_idle()) {
+      /* A late static DATA-task suspension must be reaped by another stop. */
+      if (!audio_receiver_is_idle()) audio_receiver_stop();
+      if (!rtsp_event_port_is_idle()) rtsp_stop_event_port_task();
+      vTaskDelay(1);
+    }
+    audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
+    audio_receiver_set_encryption(NULL);
   }
-  audio_receiver_set_stream_type(AUDIO_STREAM_NONE);
-  audio_receiver_set_encryption(NULL);
 
   detach_client_conn(slot);
   rtsp_conn_free(conn);
@@ -309,7 +336,7 @@ static void signal_client_stop(int slot_idx) {
     return;
   }
 
-  ESP_LOGI(TAG, "Signaling client slot %d to stop", slot_idx);
+  AP_LOGI(TAG, "Signaling client slot %d to stop", slot_idx);
   slot->is_old = true;
   slot->should_stop = true;
 
@@ -330,6 +357,72 @@ static bool wait_client_stopped(int slot_idx, TickType_t timeout_ticks) {
     vTaskDelay(1);
   }
   return true;
+}
+
+
+/* Find the client slot that runs `conn` (NULL if none). */
+static int slot_of_conn(const rtsp_conn_t *conn) {
+  int idx = -1;
+  xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+  for (int i = 0; i < 2; i++) {
+    if (clients[i].live && clients[i].conn == conn) { idx = i; break; }
+  }
+  xSemaphoreGive(lifecycle_mutex);
+  return idx;
+}
+
+void rtsp_session_release(rtsp_conn_t *conn) {
+  taskENTER_CRITICAL(&s_owner_lock);
+  if (s_owner == conn) s_owner = NULL;
+  taskEXIT_CRITICAL(&s_owner_lock);
+  if (conn) conn->owns_session = false;
+}
+
+/* Shairport get_play_lock(). With break_in the previous owner is stopped and
+ * its global audio/PTP/event teardown completes before this returns, so the
+ * caller starts from a clean state. */
+bool rtsp_session_acquire(rtsp_conn_t *conn, bool break_in) {
+  if (!conn) return false;
+  const TickType_t start = xTaskGetTickCount();
+  bool signalled = false;
+  for (;;) {
+    rtsp_conn_t *old = NULL;
+    bool got = false;
+    taskENTER_CRITICAL(&s_owner_lock);
+    if (s_owner == conn) {
+      got = true;
+    } else if (s_owner == NULL) {
+      s_owner = conn;
+      got = true;
+    } else {
+      old = s_owner;
+    }
+    taskEXIT_CRITICAL(&s_owner_lock);
+    if (got) {
+      if (!conn->owns_session)
+        AP_LOGI(TAG, "play lock acquired%s", signalled ? " by breaking in" : "");
+      conn->owns_session = true;
+      return true;
+    }
+    if (!break_in) return false;
+
+    const int my_idx = slot_of_conn(conn);
+    if (my_idx >= 0 && clients[my_idx].should_stop) return false;
+    if ((TickType_t)(xTaskGetTickCount() - start) >= pdMS_TO_TICKS(3000)) {
+      ESP_LOGE(TAG, "play lock: the old session did not end in time");
+      return false;
+    }
+    if (!signalled) {
+      const int old_idx = slot_of_conn(old);
+      if (old_idx >= 0) {
+        AP_LOGI(TAG, "play lock: ending the session in slot %d for slot %d",
+                 old_idx, my_idx);
+        signal_client_stop(old_idx);
+        signalled = true;
+      }
+    }
+    vTaskDelay(1);
+  }
 }
 
 static void server_task(void *pvParameters) {
@@ -396,7 +489,7 @@ static void server_task(void *pvParameters) {
         static int64_t last_warn_us;
         const int64_t now_us = esp_timer_get_time();
         if (now_us - last_warn_us > 10000000LL) {
-          ESP_LOGW(TAG, "accept: no socket available (errno %d); retrying",
+          AP_LOGW(TAG, "accept: no socket available (errno %d); retrying",
                    accept_error);
           last_warn_us = now_us;
         }
@@ -408,42 +501,45 @@ static void server_task(void *pvParameters) {
     }
 
     if (!server_running) { close(new_socket); break; }
-    ESP_LOGI(TAG, "New client connected");
+    AP_LOGI(TAG, "New client connected");
 
-    // Find slot for new client (alternate between 0 and 1)
-    int new_slot = 1 - current_slot;
-
-    // A spare slot should normally already be free.  If a stale task is still
-    // finishing there, do not reuse its slot until cleanup is complete.
-    if (clients[new_slot].live) {
-      signal_client_stop(new_slot);
-      if (!wait_client_stopped(new_slot, pdMS_TO_TICKS(3000))) {
-        ESP_LOGE(TAG, "Slot %d task did not exit in time", new_slot);
+    /* Shairport 5.6-dev-157: a new connection must not end the playing
+     * session. It gets a slot beside the owner; the owner is replaced only
+     * when this connection later asks to play (SETUP with streams, see
+     * rtsp_session_acquire). Other AirPlay 2 senders open short "is the
+     * device still there" connections that never become audio sessions. */
+    int new_slot = -1;
+    for (int i = 0; i < 2; i++) {
+      if (!clients[i].live) { new_slot = i; break; }
+    }
+    if (new_slot < 0) {
+      /* Both slots busy: drop a connection that is not the session owner. */
+      rtsp_conn_t *owner;
+      taskENTER_CRITICAL(&s_owner_lock);
+      owner = s_owner;
+      taskEXIT_CRITICAL(&s_owner_lock);
+      int victim = -1;
+      xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
+      for (int i = 0; i < 2; i++) {
+        if (!clients[i].conn || clients[i].conn != owner) { victim = i; break; }
+      }
+      xSemaphoreGive(lifecycle_mutex);
+      if (victim < 0) { /* cannot happen: only one owner */
         close(new_socket);
         continue;
       }
-    }
-
-    // Serialize RTSP ownership.  client_task cleanup performs global
-    // audio_receiver_stop() and rtsp_conn_free() -> ptp_clock_clear().
-    // The replacement must not start until those operations are complete.
-    if (clients[current_slot].live) {
-      signal_client_stop(current_slot);
-      ESP_LOGI(TAG,
-               "Waiting for old client slot %d cleanup before replacement",
-               current_slot);
-      if (!wait_client_stopped(current_slot, pdMS_TO_TICKS(3000))) {
-        ESP_LOGE(TAG,
-                 "Old client slot %d did not release audio ownership in time",
-                 current_slot);
+      AP_LOGI(TAG, "Both client slots busy: dropping idle connection in slot %d",
+               victim);
+      signal_client_stop(victim);
+      if (!wait_client_stopped(victim, pdMS_TO_TICKS(3000))) {
+        ESP_LOGE(TAG, "Slot %d task did not exit in time", victim);
         close(new_socket);
         continue;
       }
-      ESP_LOGI(TAG, "Old client cleanup complete; starting replacement");
+      new_slot = victim;
     }
 
-    // Setup new slot only after the previous owner has completed all global
-    // audio/PTP cleanup.
+    // Set up the new slot (the playing session, if any, is untouched).
     xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
     if (!server_running) {
       xSemaphoreGive(lifecycle_mutex);
@@ -528,10 +624,10 @@ void rtsp_server_stop(void) {
     vTaskDelay(1);
   for (int i = 0; i < 2; ++i) {
     if (!wait_client_stopped(i, pdMS_TO_TICKS(3000)))
-      ESP_LOGW(TAG, "RTSP client slot %d still stopping", i);
+      AP_LOGW(TAG, "RTSP client slot %d still stopping", i);
   }
   if (!rtsp_server_is_idle())
-    ESP_LOGW(TAG,
+    AP_LOGW(TAG,
              "RTSP owners still stopping: listener=%d client0=%d client1=%d event=%d; "
              "restart/resource release forbidden",
              (int)atomic_load(&server_task_live), (int)atomic_load(&clients[0].live),

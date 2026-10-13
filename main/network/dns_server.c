@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <string.h>
+#include "airplay_log.h"
 
 static const char *TAG = "dns_server";
 
@@ -153,7 +154,7 @@ static void dns_server_task(void *pvParameters) {
   uint8_t tx_buffer[DNS_MAX_LEN];
   struct sockaddr_in client_addr;
 
-  ESP_LOGI(TAG, "DNS server task started");
+  AP_LOGI(TAG, "DNS server task started");
 
   while (!atomic_load_explicit(&s_dns_stop_requested, memory_order_acquire)) {
 
@@ -166,7 +167,7 @@ static void dns_server_task(void *pvParameters) {
         break;
       }
       if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-      ESP_LOGW(TAG, "recvfrom failed: %d", errno);
+      AP_LOGW(TAG, "recvfrom failed: %d", errno);
       break;
     }
 
@@ -180,11 +181,11 @@ static void dns_server_task(void *pvParameters) {
     if (sendto(sock, tx_buffer, resp_len, 0,
                (struct sockaddr *)&client_addr, addr_len) < 0 &&
         !atomic_load_explicit(&s_dns_stop_requested, memory_order_acquire)) {
-      ESP_LOGW(TAG, "sendto failed: %d", errno);
+      AP_LOGW(TAG, "sendto failed: %d", errno);
     }
   }
 
-  ESP_LOGI(TAG, "DNS server task exiting");
+  AP_LOGI(TAG, "DNS server task exiting");
   xSemaphoreTake(s_lifecycle_mutex, portMAX_DELAY);
   /* Only this task closes its descriptor. stop() only interrupts recvfrom. */
   close(sock);
@@ -268,8 +269,8 @@ void dns_server_stop(void) {
     vTaskDelay(1);
   }
   if (atomic_load_explicit(&s_dns_task_live, memory_order_acquire)) {
-    ESP_LOGW(TAG, "DNS server task did not stop within %d ms", DNS_STOP_WAIT_MS);
+    AP_LOGW(TAG, "DNS server task did not stop within %d ms", DNS_STOP_WAIT_MS);
   } else {
-    ESP_LOGI(TAG, "DNS server stopped");
+    AP_LOGI(TAG, "DNS server stopped");
   }
 }

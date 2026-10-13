@@ -7,6 +7,7 @@
 #include "decoder/impl/esp_aac_dec.h"
 #include "esp_audio_dec.h"
 #include "esp_log.h"
+#include "airplay_log.h"
 
 #define ADTS_HEADER_LEN AAC_DECODER_INPUT_HEADROOM
 #define AAC_INPUT_MAX   8192U
@@ -140,7 +141,7 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
      * Dropping the AU here lets the codec preserve/recover its overlap history
      * on the following block instead of manufacturing a new decoder epoch. */
     if ((++d->decode_errors & 63U) == 1U)
-      ESP_LOGW(TAG, "decode error=%d; dropping AAC block without decoder reset (%lu total)",
+      AP_LOGW(TAG, "decode error=%d; dropping AAC block without decoder reset (%lu total)",
                err, (unsigned long)d->decode_errors);
     return -1;
   }

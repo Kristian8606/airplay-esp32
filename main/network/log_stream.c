@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include "airplay_log.h"
 
 /* Ring buffer size — must be power of two for masking. */
 #define LOG_RING_SIZE 8192
@@ -181,7 +182,7 @@ static void close_ws_session(httpd_handle_t server, int fd, const char *reason) 
 
   esp_err_t err = httpd_sess_trigger_close(server, fd);
   if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
-    ESP_LOGD("log_stream", "WS close fd=%d (%s) failed: %s", fd,
+    AP_LOGD("log_stream", "WS close fd=%d (%s) failed: %s", fd,
              reason ? reason : "unknown", esp_err_to_name(err));
   }
 }
@@ -210,7 +211,7 @@ static esp_err_t ws_log_handler(httpd_req_t *req) {
    * control frames are tiny. If a client sends a larger payload, close the
    * session rather than leaving an unconsumed frame in the socket. */
   if (frame.len > WS_RX_MAX_PAYLOAD) {
-    ESP_LOGD("log_stream", "Closing WS fd=%d: unexpected payload %u bytes",
+    AP_LOGD("log_stream", "Closing WS fd=%d: unexpected payload %u bytes",
              fd, (unsigned)frame.len);
     close_ws_session(req->handle, fd, "oversize-frame");
     return ESP_OK;

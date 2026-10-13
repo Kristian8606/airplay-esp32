@@ -24,6 +24,7 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <unistd.h>
+#include "airplay_log.h"
 
 #define EVENT_STACK_SIZE 3072
 #define EVENT_TIMEOUT_US INT64_C(3000000)
@@ -125,7 +126,7 @@ static void remote_finish(uint32_t id, rtsp_remote_result_t result, int code) {
   }
   xSemaphoreGive(event_socket_mutex);
   if (updated)
-    ESP_LOGI(TAG, "Command id=%" PRIu32 " cmd=%s %s RTSP=%d", id,
+    AP_LOGI(TAG, "Command id=%" PRIu32 " cmd=%s %s RTSP=%d", id,
              remote_command_name(command), rtsp_remote_result_name(result), code);
 }
 
@@ -142,10 +143,10 @@ static void event_close_client(void) {
   if (interrupted) remote_status.result = RTSP_REMOTE_DISCONNECTED;
   xSemaphoreGive(event_socket_mutex);
   if (interrupted)
-    ESP_LOGW(TAG, "Command id=%" PRIu32 " cmd=%s disconnected before confirmation", id, remote_command_name(command));
+    AP_LOGW(TAG, "Command id=%" PRIu32 " cmd=%s disconnected before confirmation", id, remote_command_name(command));
   if (client >= 0) {
     close(client);
-    ESP_LOGI(TAG, "Event connection closed");
+    AP_LOGI(TAG, "Event connection closed");
   }
 }
 
@@ -200,7 +201,7 @@ static int event_message_done(event_context_t *ctx, int fd) {
           /* A sender volume update received meanwhile remains authoritative. */
           bool applied = rtsp_conn_set_volume_if_unchanged(
               ctx->volume_owner, ctx->pending_volume_base, ctx->pending_volume_target);
-          ESP_LOGI(TAG, "Volume target %.3f dB: %s", ctx->pending_volume_target,
+          AP_LOGI(TAG, "Volume target %.3f dB: %s", ctx->pending_volume_target,
                    applied ? "applied after acknowledgment" : "newer sender volume preserved");
         }
         ctx->pending_volume = false;
@@ -210,7 +211,7 @@ static int event_message_done(event_context_t *ctx, int fd) {
         ctx->pending_id = 0;
       }
     } else {
-      ESP_LOGW(TAG, "Unmatched event reply RTSP=%d CSeq=%d",
+      AP_LOGW(TAG, "Unmatched event reply RTSP=%d CSeq=%d",
                ctx->response_code, ctx->response_cseq);
     }
   } else {
@@ -259,7 +260,7 @@ static int event_consume(event_context_t *ctx, int fd, const uint8_t *p, size_t 
       if (!cseq) return -1;
       ctx->request_cseq = cseq;
       ctx->request_status = strncmp(ctx->header, "OPTIONS ", 8) == 0 ? 200 : 501;
-      ESP_LOGW(TAG, "Inbound event request: %.80s", ctx->header);
+      AP_LOGW(TAG, "Inbound event request: %.80s", ctx->header);
     }
     ctx->body_left = (size_t)length;
     ctx->reading_body = true;
@@ -335,7 +336,7 @@ static int event_send_pending(event_context_t *ctx, int fd) {
   if (event_send(ctx, fd, message, (size_t)n + len) != 0) goto failed;
   ctx->pending_id = status.id;
   ctx->pending_deadline = esp_timer_get_time() + EVENT_TIMEOUT_US;
-  ESP_LOGI(TAG, "Sent id=%" PRIu32 " cmd=%s on encrypted audio event channel",
+  AP_LOGI(TAG, "Sent id=%" PRIu32 " cmd=%s on encrypted audio event channel",
            status.id, remote_command_name(status.command));
   return 0;
 failed:
@@ -370,8 +371,8 @@ static void event_port_task(void *arg) {
     event_client_socket = client;
     remote_status.connected = ctx->encrypted && !event_task_should_stop;
     xSemaphoreGive(event_socket_mutex);
-    ESP_LOGI(TAG, "Audio event connected, encrypted=%d", ctx->encrypted);
-    rtsp_events_emit(RTSP_EVENT_CLIENT_CONNECTED, NULL);
+    AP_LOGI(TAG, "Audio event connected, encrypted=%d", ctx->encrypted);
+    rtsp_events_emit(RTSP_EVENT_CLIENT_CONNECTED);
     while (!event_task_should_stop) {
       if (event_send_pending(ctx, client) != 0) break;
       int64_t now = esp_timer_get_time();
@@ -380,7 +381,7 @@ static void event_port_task(void *arg) {
         break; /* No retry: a late response must not acknowledge the next command. */
       }
       if (ctx->read_deadline && now >= ctx->read_deadline) {
-        ESP_LOGW(TAG, "Incomplete event message timeout");
+        AP_LOGW(TAG, "Incomplete event message timeout");
         break;
       }
       FD_ZERO(&fds);
@@ -395,7 +396,7 @@ static void event_port_task(void *arg) {
         /* Keep legacy unencrypted events isolated from remote commands. */
         uint8_t byte;
         if (recv(client, &byte, 1, MSG_DONTWAIT) <= 0) break;
-        ESP_LOGW(TAG, "Unencrypted inbound event unsupported");
+        AP_LOGW(TAG, "Unencrypted inbound event unsupported");
         break;
       }
       if (event_read(ctx, client) != 0) break;
@@ -483,5 +484,5 @@ void rtsp_stop_event_port_task(void) {
   TickType_t start = xTaskGetTickCount();
   while (event_task_live && (TickType_t)(xTaskGetTickCount() - start) < pdMS_TO_TICKS(1000))
     vTaskDelay(1);
-  if (event_task_live) ESP_LOGW(TAG, "Event task still stopping");
+  if (event_task_live) AP_LOGW(TAG, "Event task still stopping");
 }

@@ -1,10 +1,13 @@
 #include "settings.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include "airplay_log.h"
 
 static const char *TAG = "settings";
 static const char *NS = "airplay";
@@ -206,7 +209,7 @@ esp_err_t settings_set_wifi_credentials(const char *ssid,
       index = store.next_replace % SETTINGS_MAX_WIFI_NETWORKS;
       store.next_replace =
           (uint16_t)((store.next_replace + 1U) % SETTINGS_MAX_WIFI_NETWORKS);
-      ESP_LOGW(TAG, "WiFi list full; replacing saved network slot %u",
+      AP_LOGW(TAG, "WiFi list full; replacing saved network slot %u",
                (unsigned)index);
     }
   }
@@ -231,7 +234,7 @@ esp_err_t settings_set_wifi_credentials(const char *ssid,
   nvs_close(h);
 
   if (e == ESP_OK) {
-    ESP_LOGI(TAG, "Saved WiFi network '%s' (%u/%u slots used)", ssid,
+    AP_LOGI(TAG, "Saved WiFi network '%s' (%u/%u slots used)", ssid,
              (unsigned)store.count, (unsigned)SETTINGS_MAX_WIFI_NETWORKS);
   }
   return e;
@@ -244,9 +247,15 @@ bool settings_has_wifi_credentials(void) {
 esp_err_t settings_get_device_name(char *name, size_t len) {
   if (!name || !len) return ESP_ERR_INVALID_ARG;
   esp_err_t e = get_str("device_name", name, len);
-  if (e != ESP_OK || name[0] == '\0') {
-    strlcpy(name, SETTINGS_DEFAULT_DEVICE_NAME, len);
-    return ESP_OK;
+  /* No name saved (or the plain default saved by an older firmware): add the
+   * last 3 hex digits of the Wi-Fi MAC, so two receivers on one network get
+   * different mDNS names and host names, e.g. "ESP32 AirPlay A3F". */
+  if (e != ESP_OK || name[0] == '\0' ||
+      strcmp(name, SETTINGS_DEFAULT_DEVICE_NAME) == 0) {
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(name, len, "%s %X%02X", SETTINGS_DEFAULT_DEVICE_NAME,
+             (unsigned)(mac[4] & 0x0F), (unsigned)mac[5]);
   }
   return ESP_OK;
 }

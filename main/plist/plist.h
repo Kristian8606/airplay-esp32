@@ -306,7 +306,8 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
                                   const char *device_id,
                                   const char *device_name,
                                   const uint8_t *public_key,
-                                  size_t public_key_len, uint64_t features);
+                                  size_t public_key_len, uint64_t features,
+                                  double initial_volume);
 
 /* Receiver-to-sender command on the AirPlay 2 audio event connection. */
 size_t bplist_build_media_remote_command(uint8_t *out, size_t capacity,

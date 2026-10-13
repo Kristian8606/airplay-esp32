@@ -7,6 +7,7 @@
 #include "decoder/impl/esp_alac_dec.h"
 #include "esp_audio_dec.h"
 #include "esp_log.h"
+#include "airplay_log.h"
 
 #define ALAC_COOKIE_LEN 24U
 
@@ -124,7 +125,7 @@ int alac_decoder_decode(alac_decoder_t *d, const uint8_t *input,
   esp_audio_err_t err = esp_alac_dec_decode(d->handle, &raw, &frame, &dec_info);
   if (err != ESP_AUDIO_ERR_OK) {
     if ((++d->decode_errors & 63U) == 1U)
-      ESP_LOGW(TAG, "decode error=%d; resetting ALAC decoder (%lu total)",
+      AP_LOGW(TAG, "decode error=%d; resetting ALAC decoder (%lu total)",
                err, (unsigned long)d->decode_errors);
     esp_alac_dec_reset(d->handle);
     return -1;

@@ -7,6 +7,7 @@
 #include "esp_ota_ops.h"
 #include <string.h>
 #include <sys/param.h>
+#include "airplay_log.h"
 
 static const char *TAG = "ota";
 
@@ -16,7 +17,7 @@ static const char *TAG = "ota";
 #define OTA_HTTP_IDLE_TIMEOUT_US (15LL * 1000LL * 1000LL)
 
 static void ota_log_memory(const char *where) {
-  ESP_LOGI(TAG,
+  AP_LOGI(TAG,
            "MEM %s internalFree=%u KiB internalLargest=%u KiB internalMin=%u KiB "
            "psramFree=%u KiB psramLargest=%u KiB psramMin=%u KiB",
            where,
@@ -60,7 +61,7 @@ static uint8_t *ota_alloc_stream_buffer(size_t *out_size) {
     return buf;
   }
 
-  ESP_LOGW(TAG, "Cannot allocate %u-byte internal OTA buffer; trying %u bytes",
+  AP_LOGW(TAG, "Cannot allocate %u-byte internal OTA buffer; trying %u bytes",
            (unsigned)OTA_STREAM_BUF_BYTES,
            (unsigned)OTA_STREAM_FALLBACK_BUF_BYTES);
   buf = heap_caps_malloc(OTA_STREAM_FALLBACK_BUF_BYTES, MALLOC_CAP_8BIT);
@@ -133,7 +134,7 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
     return err;
   }
 
-  ESP_LOGI(TAG,
+  AP_LOGI(TAG,
            "Receiving firmware via sequential streaming (%zu bytes, buffer=%zu bytes)...",
            fw_size, buf_size);
 
@@ -187,7 +188,7 @@ esp_err_t ota_start_from_http(httpd_req_t *req) {
     idle_deadline = esp_timer_get_time() + OTA_HTTP_IDLE_TIMEOUT_US;
 
     if (written >= next_progress) {
-      ESP_LOGI(TAG, "OTA progress: %zu/%zu bytes", written, fw_size);
+      AP_LOGI(TAG, "OTA progress: %zu/%zu bytes", written, fw_size);
       while (next_progress <= written) next_progress += OTA_PROGRESS_STEP_BYTES;
     }
   }

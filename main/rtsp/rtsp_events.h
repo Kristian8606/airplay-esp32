@@ -14,43 +14,14 @@ typedef enum {
   RTSP_EVENT_PLAYING,
   RTSP_EVENT_PAUSED,
   RTSP_EVENT_DISCONNECTED,
-  RTSP_EVENT_METADATA,
 } rtsp_event_t;
-
-// ============================================================================
-// Metadata Event Data
-// ============================================================================
-
-#define METADATA_STRING_MAX 64
-
-typedef struct {
-  char title[METADATA_STRING_MAX];  // Track title (DMAP minm / bplist itemName)
-  char artist[METADATA_STRING_MAX]; // Artist name (DMAP asar / bplist
-                                    // artistName)
-  char album[METADATA_STRING_MAX];  // Album name (DMAP asal / bplist albumName)
-  char genre[METADATA_STRING_MAX];  // Genre (DMAP asgn)
-  uint32_t duration_secs;           // Total track duration in seconds
-  uint32_t position_secs;           // Current playback position in seconds
-  bool has_artwork;                 // Whether artwork is available
-} rtsp_metadata_t;
-
-// ============================================================================
-// Event Data Union
-// ============================================================================
-
-typedef union {
-  rtsp_metadata_t metadata; // Valid when event == RTSP_EVENT_METADATA
-} rtsp_event_data_t;
 
 /**
  * Event callback function type.
  * @param event The event that occurred
- * @param data  Event-specific data (NULL for events with no data)
  * @param user_data Pointer registered with rtsp_events_register()
  */
-typedef void (*rtsp_event_callback_t)(rtsp_event_t event,
-                                      const rtsp_event_data_t *data,
-                                      void *user_data);
+typedef void (*rtsp_event_callback_t)(rtsp_event_t event, void *user_data);
 
 /**
  * Register a listener for RTSP events.
@@ -65,7 +36,6 @@ int rtsp_events_register(rtsp_event_callback_t callback, void *user_data);
  * Emit an event to all registered listeners.
  * Called internally by RTSP handlers.
  * @param event The event to emit
- * @param data  Event-specific data (NULL for events with no data)
  */
-void rtsp_events_emit(rtsp_event_t event, const rtsp_event_data_t *data);
+void rtsp_events_emit(rtsp_event_t event);
 

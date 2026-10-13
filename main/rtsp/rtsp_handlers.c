@@ -30,6 +30,7 @@
 #include "tlv8.h"
 
 #include "rtsp_events.h"
+#include "airplay_log.h"
 
 static const char *TAG = "rtsp_handlers";
 
@@ -62,62 +63,6 @@ static void notify_timing_resume(rtsp_conn_t *conn) {
 
   if (pause_ms > UINT32_MAX) pause_ms = UINT32_MAX;
   ptp_clock_notify_resume((uint32_t)pause_ms);
-}
-
-/* Logging-only de-duplication. This does not suppress parsing or metadata
- * events; it only avoids repeatedly formatting/streaming identical metadata.
- * Keep the state tiny: one 32-bit fingerprint plus progress log timing. */
-#define PROGRESS_LOG_INTERVAL_MS 5000U
-static uint32_t s_last_dmap_log_hash;
-static bool s_dmap_log_hash_valid;
-static TickType_t s_last_progress_log_tick;
-static uint32_t s_last_progress_duration_secs;
-static bool s_progress_log_valid;
-
-static uint32_t metadata_log_hash(const rtsp_metadata_t *meta) {
-  uint32_t hash = 2166136261U; /* FNV-1a */
-  const char *fields[] = {meta->title, meta->artist, meta->album, meta->genre};
-  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
-    const unsigned char *p = (const unsigned char *)fields[i];
-    while (*p) {
-      hash ^= (uint32_t)*p++;
-      hash *= 16777619U;
-    }
-    /* Field separator so {"ab","c"} != {"a","bc"}. */
-    hash ^= 0xffU;
-    hash *= 16777619U;
-  }
-  return hash;
-}
-
-static bool should_log_dmap_metadata(const rtsp_metadata_t *meta) {
-  const uint32_t hash = metadata_log_hash(meta);
-  if (s_dmap_log_hash_valid && hash == s_last_dmap_log_hash) return false;
-  s_last_dmap_log_hash = hash;
-  s_dmap_log_hash_valid = true;
-  return true;
-}
-
-static bool should_log_progress(uint32_t duration_secs) {
-  const TickType_t now = xTaskGetTickCount();
-  const TickType_t interval = pdMS_TO_TICKS(PROGRESS_LOG_INTERVAL_MS);
-  const bool duration_changed =
-      !s_progress_log_valid || duration_secs != s_last_progress_duration_secs;
-  const bool interval_elapsed =
-      !s_progress_log_valid ||
-      (TickType_t)(now - s_last_progress_log_tick) >= interval;
-
-  if (!duration_changed && !interval_elapsed) return false;
-
-  s_last_progress_log_tick = now;
-  s_last_progress_duration_secs = duration_secs;
-  s_progress_log_valid = true;
-  return true;
-}
-
-static void reset_metadata_log_dedup(void) {
-  s_dmap_log_hash_valid = false;
-  s_progress_log_valid = false;
 }
 
 // ============================================================================
@@ -154,7 +99,7 @@ static bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
   for (const rtsp_codec_t *codec = codec_registry; codec->name; codec++) {
     if (codec->type_id == type_id) {
       configure_codec(fmt, codec->name, sample_rate, samples_per_frame);
-      ESP_LOGI(TAG, "Configured codec: %s (ct=%lld, sr=%lld, spf=%lld)",
+      AP_LOGI(TAG, "Configured codec: %s (ct=%lld, sr=%lld, spf=%lld)",
                codec->name, (long long)type_id, (long long)sample_rate,
                (long long)samples_per_frame);
       return true;
@@ -164,7 +109,7 @@ static bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
   /* Never guess an unknown codec as ALAC. Doing so can send arbitrary
    * compressed payload into the ALAC decoder while the I2S/timeline remains
    * configured for 44.1 kHz. Unknown formats are rejected by SETUP. */
-  ESP_LOGW(TAG, "Unknown codec type %lld", (long long)type_id);
+  AP_LOGW(TAG, "Unknown codec type %lld", (long long)type_id);
   return false;
 }
 
@@ -383,15 +328,102 @@ static bool request_uses_rtsp(const rtsp_request_t *req) {
   return req && strncasecmp(req->protocol, "RTSP/", 5) == 0;
 }
 
+
+/* Apply the phase-1 state a non-owner accepted while another connection owned
+ * the session. Called once this connection has taken the play lock. */
+static bool session_apply_deferred(rtsp_conn_t *conn) {
+  if (conn->pending_encryption) {
+    audio_receiver_set_encryption(&conn->setup_encryption);
+    conn->pending_encryption = false;
+  }
+  if (conn->event_socket >= 0) {
+    if (rtsp_start_event_port_task(conn->event_socket, conn) != ESP_OK) {
+      close(conn->event_socket);
+      conn->event_socket = -1;
+      conn->event_port = 0;
+      return false;
+    }
+    AP_LOGI(TAG, "SETUP: event port %u started after taking the play lock",
+             conn->event_port);
+    conn->event_socket = -1; /* Ownership transferred to event task. */
+  }
+  return true;
+}
+
+/* Methods that act on the global audio / PTP state. Only the connection that
+ * holds the play lock may run them; one that merely probes the device gets a
+ * plain OK and changes nothing (Shairport handles each connection separately). */
+static bool method_needs_session(const char *m) {
+  static const char *const names[] = {"RECORD", "SET_PARAMETER", "PAUSE", "FLUSH",
+                                      "FLUSHBUFFERED", "TEARDOWN",
+                                      "SETRATEANCHORTIME", NULL};
+  for (int i = 0; names[i]; i++)
+    if (strcasecmp(m, names[i]) == 0) return true;
+  return false;
+}
+
+#if CONFIG_AIRPLAY_LOG_RTSP_REQUESTS
+/* One line per request: who sent it, what it is, and the readable strings of
+ * a binary-plist body (key names such as rate / networkTimeSecs / flushFrom). */
+__attribute__((noinline)) static void log_rtsp_request(int socket, const rtsp_conn_t *conn,
+                             const rtsp_request_t *req) {
+  char text[200];
+  size_t n = 0;
+  const uint8_t *b = req->body;
+  const size_t len = req->body_len;
+  if (b && len >= 8 && memcmp(b, "bplist00", 8) == 0) {
+    size_t run = 0;
+    for (size_t i = 8; i <= len && n + 2 < sizeof(text); i++) {
+      const bool pr = i < len && b[i] >= 0x20 && b[i] < 0x7f;
+      if (pr) {
+        run++;
+      } else {
+        if (run >= 4) {
+          size_t start = i - run;
+          for (size_t k = start; k < i && n + 2 < sizeof(text); k++)
+            text[n++] = (char)b[k];
+          text[n++] = ' ';
+        }
+        run = 0;
+      }
+    }
+  } else if (b && len) {
+    for (size_t i = 0; i < len && n + 1 < sizeof(text); i++) {
+      const uint8_t c = b[i];
+      text[n++] = (c >= 0x20 && c < 0x7f) ? (char)c : ((c == '\n' || c == '\r') ? ' ' : '.');
+    }
+  }
+  text[n] = '\0';
+  ESP_LOGI(TAG, "RTSP REQ c=%d %s %s %s cseq=%d ct=\"%s\" body=%zu lock=%d [%s]",
+           socket, req->method, req->path, req->protocol, req->cseq,
+           req->content_type, len, conn ? (int)conn->owns_session : -1, text);
+}
+#endif
+
 int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
                   size_t raw_len) {
   rtsp_request_t req;
   if (rtsp_request_parse(raw_request, raw_len, &req) < 0) {
-    ESP_LOGW(TAG, "Failed to parse RTSP request");
+    AP_LOGW(TAG, "Failed to parse RTSP request");
     return -1;
   }
 
   AUDIO_DIAG_FLUSH_RTSP_BEGIN(socket, req.method);
+#if CONFIG_AIRPLAY_LOG_RTSP_REQUESTS
+  log_rtsp_request(socket, conn, &req);
+#endif
+
+  if (method_needs_session(req.method) && !rtsp_session_acquire(conn, false)) {
+    AP_LOGI(TAG, "%s from a connection without the play lock: ignored",
+             req.method);
+    if (strcasecmp(req.method, "TEARDOWN") == 0) {
+      /* Nothing of this connection's is playing; let it go. */
+      conn->close_after_response = true;
+    }
+    rtsp_send_ok(socket, conn, req.cseq);
+    AUDIO_DIAG_FLUSH_RTSP_END(socket, req.method);
+    return 0;
+  }
 
   // Find handler in dispatch table
   for (const rtsp_method_handler_t *h = method_handlers; h->method; h++) {
@@ -402,7 +434,7 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
     }
   }
 
-  ESP_LOGW(TAG, "Unknown method: %s", req.method);
+  AP_LOGW(TAG, "Unknown method: %s", req.method);
   if (request_uses_rtsp(&req)) {
     rtsp_send_response(socket, conn, 501, "Not Implemented", req.cseq,
                        "Content-Type: text/plain\r\n", "Not Implemented", 15);
@@ -454,7 +486,8 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
       uint8_t *body = malloc(body_cap);
       size_t body_len =
           body ? bplist_build_info_response(body, body_cap, device_id,
-                                            device_name, pk, 32, features)
+                                            device_name, pk, 32, features,
+                                            rtsp_conn_get_volume_db(conn))
                : 0;
       if (body_len == 0) {
         ESP_LOGE(TAG, "Failed to build binary /info response");
@@ -533,7 +566,7 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
                             body, body_len);
     free(body);
   } else {
-    ESP_LOGW(TAG, "Unknown GET path: %s", req->path);
+    AP_LOGW(TAG, "Unknown GET path: %s", req->path);
     if (request_uses_rtsp(req)) {
       rtsp_send_response(socket, conn, 404, "Not Found", req->cseq,
                          "Content-Type: text/plain\r\n", "Not Found", 9);
@@ -656,7 +689,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
           if (err == ESP_OK &&
               conn->hap_session->pair_verify_state == PAIR_VERIFY_STATE_M4) {
             conn->encrypted_mode = true;
-            ESP_LOGI(TAG, "RTSP encryption enabled (TLV8 pair-verify)");
+            AP_LOGI(TAG, "RTSP encryption enabled (TLV8 pair-verify)");
           }
         }
       } else {
@@ -669,7 +702,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
           err = hap_pair_verify_m3_raw(conn->hap_session, body, body_len,
                                        response, 1024, &response_len);
           if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Raw pair-verify complete (RTSP unencrypted)");
+            AP_LOGI(TAG, "Raw pair-verify complete (RTSP unencrypted)");
           }
         }
       }
@@ -710,7 +743,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
     if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
       char cmd_type[64];
       if (bplist_find_string(body, body_len, "type", cmd_type, sizeof(cmd_type))) {
-        ESP_LOGI(TAG, "Sender /command type=%s", cmd_type);
+        AP_LOGI(TAG, "Sender /command type=%s", cmd_type);
       }
     }
     rtsp_send_ok(socket, conn, req->cseq);
@@ -719,7 +752,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
     if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
       int64_t value;
       if (bplist_find_int(body, body_len, "networkTimeSecs", &value)) {
-        ESP_LOGI(TAG, "/feedback has networkTimeSecs=%lld", (long long)value);
+        AP_LOGI(TAG, "/feedback has networkTimeSecs=%lld", (long long)value);
       }
     }
 
@@ -732,7 +765,7 @@ static void handle_post(int socket, rtsp_conn_t *conn,
           response, sizeof(response), conn->stream_type, 44100.0);
 
       if (response_len > 0) {
-        ESP_LOGD(
+        AP_LOGD(
             TAG,
             "/feedback responding with stream status (type=%lld, sr=44100)",
             (long long)conn->stream_type);
@@ -774,7 +807,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
    * streams[] and the stream SETUP with streams[]. Anything else is a classic
    * RAOP (AirPlay 1) request, which this receiver does not support. */
   if (!body || body_len < 8 || memcmp(body, "bplist00", 8) != 0) {
-    ESP_LOGW(TAG, "SETUP without binary plist rejected (AirPlay 1 not supported)");
+    AP_LOGW(TAG, "SETUP without binary plist rejected (AirPlay 1 not supported)");
     rtsp_send_response(socket, conn, 461, "Unsupported Transport", req->cseq,
                        NULL, NULL, 0);
     return;
@@ -785,7 +818,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   const bool request_has_streams =
       bplist_get_streams_count(body, body_len, &stream_count);
 
-  ESP_LOGI(TAG, "SETUP: has_streams=%d, stream_count=%zu", request_has_streams,
+  AP_LOGI(TAG, "SETUP: has_streams=%d, stream_count=%zu", request_has_streams,
            stream_count);
 
   if (request_has_streams) {
@@ -1011,12 +1044,29 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
         "Content-Type: application/x-apple-binary-plist\r\n", (const char *)reply, reply_len);
     return;
   }
-  if ((has_format || has_encryption) && !audio_receiver_is_idle()) {
+  /* Shairport 5.6-dev-157: the play lock (and so the right to end a running
+   * session) is taken at the stream SETUP, when this connection really wants
+   * to play. The session SETUP (no streams) takes it only if nobody has it. */
+  if (!rtsp_session_acquire(conn, request_has_streams)) {
+    if (request_has_streams) {
+      AP_LOGW(TAG, "SETUP: could not take the play lock");
+      rtsp_send_response(socket, conn, 503, "Service Unavailable", req->cseq,
+                         NULL, NULL, 0);
+      return;
+    }
+    AP_LOGI(TAG, "SETUP: another connection is playing; its session is kept");
+  } else if (request_has_streams && !session_apply_deferred(conn)) {
+    rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
+                       NULL, 0);
+    return;
+  }
+  if (conn->owns_session && (has_format || has_encryption) &&
+      !audio_receiver_is_idle()) {
     rtsp_send_response(socket, conn, 455, "Method Not Valid In This State",
                        req->cseq, NULL, NULL, 0);
     return;
   }
-  if (has_format) {
+  if (has_format && conn->owns_session) {
     conn->stream_type = proposed_type;
     conn->client_control_port = proposed_control_port;
     conn->setup_format = proposed_format;
@@ -1027,7 +1077,10 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   }
   if (has_encryption) {
     conn->setup_encryption = proposed_encryption;
-    audio_receiver_set_encryption(&proposed_encryption);
+    if (conn->owns_session)
+      audio_receiver_set_encryption(&proposed_encryption);
+    else
+      conn->pending_encryption = true;
   }
 
   // Create event port if needed
@@ -1038,9 +1091,13 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL, NULL, 0);
       return;
     }
-    if (conn->event_socket >= 0) {
+    if (!conn->owns_session) {
+      /* The event task is a single global one: keep the listener open (the
+       * port is reported to the sender) and start it after the play lock. */
+      AP_LOGI(TAG, "SETUP: event port %u reserved", conn->event_port);
+    } else if (conn->event_socket >= 0) {
       if (rtsp_start_event_port_task(conn->event_socket, conn) == ESP_OK) {
-        ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
+        AP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
         conn->event_socket = -1; /* Ownership transferred to event task. */
       } else {
         close(conn->event_socket);
@@ -1055,8 +1112,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
 
   // Handle initial SETUP vs stream SETUP
   if (!request_has_streams) {
-    reset_metadata_log_dedup();
-    ESP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
+    AP_LOGI(TAG, "SETUP: Initial connection setup (no streams)");
 
     uint8_t plist_body[128];
     size_t plist_len = bplist_build_initial_setup(
@@ -1069,7 +1125,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                        "Content-Type: application/x-apple-binary-plist\r\n",
                        (const char *)plist_body, plist_len);
-    amp_session_activate_once(conn);
+    if (conn->owns_session) amp_session_activate_once(conn);
     return;
   }
 
@@ -1079,31 +1135,16 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     stream_type = 96;
   }
 
-  ESP_LOGI(TAG, "SETUP: Stream setup, stream_type=%lld",
+  AP_LOGI(TAG, "SETUP: Stream setup, stream_type=%lld",
            (long long)stream_type);
 
   bool buffered = (stream_type == AUDIO_STREAM_BUFFERED);
 
-  /* Only AirPlay 2 realtime ALAC uses the NQPTP-style GM estimator plus
-   * local presentation-anchor path. Buffered AAC uses the PTP clock snapshot
-   * directly. For realtime, the RTSP peer IP (not the D7 clockIdentity)
-   * selects the PTP packet source. */
-  ptp_clock_set_realtime_mode(!buffered, !buffered ? conn->client_ip : 0);
-  /* PTP is a control-session clock, not an audio-stream buffer. Preserve a
-   * healthy same-session estimator across stream TEARDOWN/SETUP, exactly as
-   * the sender preserves its clock timeline. set_realtime_mode() already
-   * resets the estimator when the timing mode/peer really changes; a full
-   * RTSP disconnect still clears it in connection cleanup.
-   *
-   * The FIRST stream of a connection must not inherit what the PTP task
-   * collected before this session existed (boot, other devices on the
-   * network); that stale state kept the first session after boot silent.
-   * Clear exactly once per connection, after SETPEERS and mode selection. */
-  if (!conn->ptp_session_fresh) {
-    ptp_clock_clear();
-    conn->ptp_session_fresh = true;
-    ESP_LOGI(TAG, "SETUP: first stream of this connection, PTP estimator reset");
-  }
+  /* Shairport development rtsp.c:2642-2644 sends T <RTSP client IP>,
+   * then B. NQPTP starts one new timing record at this stream SETUP;
+   * SETPEERS and SETRATEANCHORTIME must not reset it again.
+   * Reference: 8c146e25183a354ae96f91fa069c2e7173f75a71. */
+  ptp_clock_start_timing(!buffered, conn->client_ip);
 
   if (buffered) {
     esp_err_t err = audio_receiver_start_buffered(0);
@@ -1145,7 +1186,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     audio_receiver_set_playout_latency_samples(0);
   } else {
     audio_receiver_set_playout_latency_samples(conn->setup_latency);
-    ESP_LOGI(TAG, "Realtime playout latency: %u samples", (unsigned)conn->setup_latency);
+    AP_LOGI(TAG, "Realtime playout latency: %u samples", (unsigned)conn->setup_latency);
   }
 
   uint8_t plist_body[256];
@@ -1160,7 +1201,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
                        NULL, 0);
     return;
   }
-  ESP_LOGI(TAG,
+  AP_LOGI(TAG,
            "SETUP response: type=%lld dataPort=%u controlPort=%u audioBufferSize=%u",
            (long long)stream_type, response_data_port, conn->control_port,
            (unsigned)audio_buffer_size);
@@ -1184,7 +1225,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
      * (type 103) remains gated exclusively by SETRATEANCHORTIME rate=1. */
     audio_receiver_set_playing(true);
     conn->stream_paused = false;
-    rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
+    rtsp_events_emit(RTSP_EVENT_PLAYING);
   }
 }
 
@@ -1206,278 +1247,29 @@ static void handle_record(int socket, rtsp_conn_t *conn,
                      NULL, 0);
 }
 
-// ============================================================================
-// Metadata and Progress Logging Helpers
-// ============================================================================
-
-/**
- * Format time in seconds as mm:ss string
- * @param seconds Time in seconds
- * @param out Output buffer (at least 8 bytes for "999:59\0")
- * @param out_size Size of output buffer
- */
-static void format_time_mmss(uint32_t seconds, char *out, size_t out_size) {
-  uint32_t mins = seconds / 60;
-  uint32_t secs = seconds % 60;
-  snprintf(out, out_size, "%" PRIu32 ":%02" PRIu32, mins, secs);
-}
-
-/**
- * Parse DMAP-tagged data and extract metadata into struct
- * DMAP format: 4-byte tag, 4-byte BE length, data
- * Common tags:
- *   minm = item name (track title)
- *   asar = artist
- *   asal = album
- *   asgn = genre
- *   asai = album id (64-bit)
- */
-#define DMAP_MAX_NESTING 8
-
-static void parse_dmap_metadata(const uint8_t *data, size_t len,
-                                rtsp_metadata_t *meta, int depth) {
-  size_t pos = 0;
-
-  if (depth > DMAP_MAX_NESTING) {
-    return;
-  }
-
-  while (pos + 8 <= len) {
-    // Read 4-byte tag
-    char tag[5] = {0};
-    memcpy(tag, data + pos, 4);
-    pos += 4;
-
-    // Read 4-byte big-endian length
-    uint32_t item_len = ((uint32_t)data[pos] << 24) |
-                        ((uint32_t)data[pos + 1] << 16) |
-                        ((uint32_t)data[pos + 2] << 8) | data[pos + 3];
-    pos += 4;
-
-    // Subtraction, not pos + item_len: that addition wraps on 32-bit size_t
-    // for a hostile length and would let a malformed frame read out of bounds.
-    if (item_len > len - pos) {
-      break; // Malformed
-    }
-
-    // Extract known metadata tags
-    if (strcmp(tag, "minm") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->title, data + pos, copy_len);
-      meta->title[copy_len] = '\0';
-    } else if (strcmp(tag, "asar") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->artist, data + pos, copy_len);
-      meta->artist[copy_len] = '\0';
-    } else if (strcmp(tag, "asal") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->album, data + pos, copy_len);
-      meta->album[copy_len] = '\0';
-    } else if (strcmp(tag, "asgn") == 0 && item_len > 0) {
-      size_t copy_len = item_len < METADATA_STRING_MAX - 1
-                            ? item_len
-                            : METADATA_STRING_MAX - 1;
-      memcpy(meta->genre, data + pos, copy_len);
-      meta->genre[copy_len] = '\0';
-    } else if (strcmp(tag, "mlit") == 0 || strcmp(tag, "cmst") == 0 ||
-               strcmp(tag, "mdst") == 0) {
-      // Container tags - recurse into them
-      parse_dmap_metadata(data + pos, item_len, meta, depth + 1);
-    }
-
-    pos += item_len;
-  }
-}
-
-/**
- * Parse progress string and populate metadata fields
- * Progress format: "start/current/end" in RTP timestamp units
- * Sample rate is typically 44100
- */
-static void parse_progress(const char *progress_str, uint32_t sample_rate,
-                           rtsp_metadata_t *meta) {
-  uint64_t start = 0, current = 0, end = 0;
-
-  // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
-  if (sscanf(progress_str, "%" PRIu64 "/%" PRIu64 "/%" PRIu64, &start, &current,
-             &end) == 3) {
-    if (sample_rate == 0) {
-      sample_rate = 44100; // Default sample rate
-    }
-
-    if (start > UINT32_MAX || current > UINT32_MAX || end > UINT32_MAX) return;
-    uint32_t duration = (uint32_t)end - (uint32_t)start;
-    uint32_t position = (uint32_t)current - (uint32_t)start;
-    /* RTP arithmetic is modulo 2^32; half-range intervals are ambiguous. */
-    if (duration >= UINT32_C(0x80000000) || position > duration) return;
-    meta->position_secs = position / sample_rate;
-    meta->duration_secs = duration / sample_rate;
-
-    char pos_str[16], dur_str[16];
-    format_time_mmss(meta->position_secs, pos_str, sizeof(pos_str));
-    format_time_mmss(meta->duration_secs, dur_str, sizeof(dur_str));
-
-    if (should_log_progress(meta->duration_secs)) {
-      ESP_LOGI(TAG,
-               "Progress: %s / %s (raw: %" PRIu64 "/%" PRIu64 "/%" PRIu64 ")",
-               pos_str, dur_str, start, current, end);
-    }
-  }
-}
-
 static void handle_set_parameter(int socket, rtsp_conn_t *conn,
                                  const rtsp_request_t *req, const uint8_t *raw,
                                  size_t raw_len) {
-  const uint8_t *body = req->body;
-  size_t body_len = req->body_len;
-  rtsp_event_data_t event_data;
-  memset(&event_data, 0, sizeof(event_data));
-  bool has_metadata = false;
+  (void)raw;
+  (void)raw_len;
 
-  // Check for progress header in raw request
-  const char *progress_hdr = strstr((const char *)raw, "progress:");
-  if (!progress_hdr) {
-    progress_hdr = strstr((const char *)raw, "Progress:");
-  }
-  if (progress_hdr) {
-    // Find end of header line
-    const char *line_end = strstr(progress_hdr, "\r\n");
-    if (line_end) {
-      size_t val_start = 9; // Length of "progress:"
-      while (progress_hdr[val_start] == ' ') {
-        val_start++;
+  /* Only the volume matters. Track metadata, progress and artwork are not
+   * used by this receiver, so those bodies are accepted and ignored. */
+  if (req->body && strstr(req->content_type, "text/parameters")) {
+    const char *vol = strstr((const char *)req->body, "volume:");
+    if (vol) {
+      char *end = NULL;
+      errno = 0;
+      float volume = strtof(vol + 7, &end);
+      const bool parsed = end != vol + 7 && errno != ERANGE && isfinite(volume);
+      while (*end == ' ' || *end == '\t') ++end;
+      if (!parsed || (*end != '\0' && *end != '\r' && *end != '\n')) {
+        rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL,
+                           NULL, 0);
+        return;
       }
-      char progress_val[64];
-      size_t val_len = line_end - (progress_hdr + val_start);
-      if (val_len < sizeof(progress_val)) {
-        memcpy(progress_val, progress_hdr + val_start, val_len);
-        progress_val[val_len] = '\0';
-        parse_progress(progress_val, 44100, &event_data.metadata);
-        has_metadata = true;
-      }
+      rtsp_conn_set_volume(conn, volume);
     }
-  }
-
-  if (strstr(req->content_type, "text/parameters")) {
-    if (body) {
-      if (strstr((const char *)body, "volume:")) {
-        const char *vol = strstr((const char *)body, "volume:");
-        if (vol) {
-          char *end = NULL;
-          errno = 0;
-          float volume = strtof(vol + 7, &end);
-          const bool parsed = end != vol + 7 && errno != ERANGE && isfinite(volume);
-          while (*end == ' ' || *end == '\t') ++end;
-          if (!parsed || (*end != '\0' && *end != '\r' && *end != '\n')) {
-            rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq,
-                               NULL, NULL, 0);
-            return;
-          }
-          rtsp_conn_set_volume(conn, volume);
-        }
-      }
-      // Progress may also arrive in the text/parameters body
-      const char *prog = strstr((const char *)body, "progress:");
-      if (prog) {
-        prog += 9;
-        while (*prog == ' ') {
-          prog++;
-        }
-        parse_progress(prog, 44100, &event_data.metadata);
-        has_metadata = true;
-      }
-    }
-  } else if (strstr(req->content_type, "application/x-dmap-tagged")) {
-    // DMAP-tagged track metadata (title/artist/album/genre)
-    if (body && body_len > 0) {
-      parse_dmap_metadata(body, body_len, &event_data.metadata, 0);
-      if (should_log_dmap_metadata(&event_data.metadata)) {
-        ESP_LOGI(TAG, "Received DMAP metadata (%zu bytes)", body_len);
-        if (event_data.metadata.album[0])
-          ESP_LOGI(TAG, "  Album  = %s", event_data.metadata.album);
-        if (event_data.metadata.artist[0])
-          ESP_LOGI(TAG, "  Artist = %s", event_data.metadata.artist);
-        if (event_data.metadata.genre[0])
-          ESP_LOGI(TAG, "  Genre  = %s", event_data.metadata.genre);
-        if (event_data.metadata.title[0])
-          ESP_LOGI(TAG, "  Title  = %s", event_data.metadata.title);
-      }
-      has_metadata = true;
-    }
-  } else if (strstr(req->content_type, "image/jpeg") ||
-             strstr(req->content_type, "image/png")) {
-#ifdef CONFIG_ENABLE_AIRPLAY_ARTWORK
-    // Artwork - log and flag in metadata
-    ESP_LOGI(TAG, "Received artwork: %s (%zu bytes)", req->content_type,
-             body_len);
-    event_data.metadata.has_artwork = true;
-    has_metadata = true;
-#else
-    // Artwork reception disabled — ignore it.  The md txt record already asks
-    // senders not to transmit cover art, but some send it regardless.
-    ESP_LOGD(TAG, "Ignoring artwork (%s, %zu bytes): disabled in config",
-             req->content_type, body_len);
-#endif
-  } else if (strstr(req->content_type, "application/x-apple-binary-plist")) {
-    if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-      int64_t value;
-      if (bplist_find_int(body, body_len, "networkTimeSecs", &value)) {
-        ESP_LOGI(TAG, "SET_PARAMETER: networkTimeSecs=%lld", (long long)value);
-      }
-      double rate;
-      if (bplist_find_real(body, body_len, "rate", &rate)) {
-        ESP_LOGI(TAG, "SET_PARAMETER: rate=%.2f", rate);
-      }
-      // Try to extract metadata from bplist (AirPlay 2)
-      char str_val[METADATA_STRING_MAX];
-      if (bplist_find_string(body, body_len, "itemName", str_val,
-                             sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Title = %s", str_val);
-        strlcpy(event_data.metadata.title, str_val, METADATA_STRING_MAX);
-        has_metadata = true;
-      }
-      if (bplist_find_string(body, body_len, "artistName", str_val,
-                             sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Artist = %s", str_val);
-        strlcpy(event_data.metadata.artist, str_val, METADATA_STRING_MAX);
-        has_metadata = true;
-      }
-      if (bplist_find_string(body, body_len, "albumName", str_val,
-                             sizeof(str_val))) {
-        ESP_LOGI(TAG, "Metadata: Album = %s", str_val);
-        strlcpy(event_data.metadata.album, str_val, METADATA_STRING_MAX);
-        has_metadata = true;
-      }
-      // Progress info from bplist
-      double elapsed = 0, duration = 0;
-      if (bplist_find_real(body, body_len, "elapsed", &elapsed)) {
-        event_data.metadata.position_secs = (uint32_t)elapsed;
-        has_metadata = true;
-        char elapsed_str[16];
-        format_time_mmss((uint32_t)elapsed, elapsed_str, sizeof(elapsed_str));
-        if (bplist_find_real(body, body_len, "duration", &duration)) {
-          event_data.metadata.duration_secs = (uint32_t)duration;
-          char duration_str[16];
-          format_time_mmss((uint32_t)duration, duration_str,
-                           sizeof(duration_str));
-          if (should_log_progress(event_data.metadata.duration_secs)) {
-            ESP_LOGI(TAG, "Progress: %s / %s", elapsed_str, duration_str);
-          }
-        } else if (should_log_progress(0)) {
-          ESP_LOGI(TAG, "Progress: %s", elapsed_str);
-        }
-      }
-    }
-  }
-
-  if (has_metadata) {
-    rtsp_events_emit(RTSP_EVENT_METADATA, &event_data);
   }
 
   rtsp_send_ok(socket, conn, req->cseq);
@@ -1521,7 +1313,7 @@ static void handle_pause(int socket, rtsp_conn_t *conn,
   (void)raw;
   (void)raw_len;
 
-  ESP_LOGI(TAG, "PAUSE received");
+  AP_LOGI(TAG, "PAUSE received");
 
   note_stream_pause_started(conn);
 
@@ -1537,11 +1329,11 @@ static void handle_pause(int socket, rtsp_conn_t *conn,
 static void handle_flush(int socket, rtsp_conn_t *conn,
                          const rtsp_request_t *req, const uint8_t *raw,
                          size_t raw_len) {
-  ESP_LOGI(TAG, "FLUSH received");
+  AP_LOGI(TAG, "FLUSH received");
   if (conn->stream_type == AUDIO_STREAM_REALTIME) {
     uint32_t flush_rtp = 0;
     if (parse_rtp_info_rtptime(raw, raw_len, &flush_rtp)) {
-      ESP_LOGI(TAG,
+      AP_LOGI(TAG,
                "FLUSH realtime RTP-Info rtptime=%" PRIu32
                " — preserving D7/SETRATE timing",
                flush_rtp);
@@ -1550,7 +1342,7 @@ static void handle_flush(int socket, rtsp_conn_t *conn,
       /* No RTP boundary means we cannot know which buffered realtime samples
        * remain valid. Invalidate the epoch and wait for the next REAL sender
        * D7/SETRATE anchor. realtime_pcm_sink has no local-arrival fallback. */
-      ESP_LOGW(TAG,
+      AP_LOGW(TAG,
                "FLUSH realtime without RTP-Info — waiting for fresh sender anchor");
       audio_receiver_realtime_flush_wait_sender_anchor();
     }
@@ -1594,7 +1386,7 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     /* Key presence is retained in diagnostics. A deferred zero endpoint may
      * be real sequence wrap; only immediate no-boundary recovery is special. */
     if (got_until_seq && flush_until_seq == 0) {
-      ESP_LOGW(TAG,
+      AP_LOGW(TAG,
                "FLUSHBUFFERED explicit untilSeq=0 (%s); "
                "%s",
                got_from_seq ? "deferred" : "immediate",
@@ -1606,7 +1398,7 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
     /* Shairport Sync 5.5.2 handle_flushbuffered(): deferred iff flushFromSeq is
      * present (the other fields default to 0 when missing). */
     if (got_from_seq) {
-      ESP_LOGI(TAG,
+      AP_LOGI(TAG,
                "FLUSHBUFFERED deferred: fromSeq=%" PRId64 " fromTS=%" PRId64
                " untilSeq=%" PRId64 " untilTS=%" PRId64,
                flush_from_seq, flush_from_ts, flush_until_seq, flush_until_ts);
@@ -1617,7 +1409,7 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
       if (flush_err != ESP_OK) {
         /* Shairport: "no more room for deferred flush request records" is
          * only logged; the reply is still 200. */
-        ESP_LOGW(TAG, "FLUSHBUFFERED deferred not stored (%s)",
+        AP_LOGW(TAG, "FLUSHBUFFERED deferred not stored (%s)",
                  esp_err_to_name(flush_err));
       }
     } else {
@@ -1626,11 +1418,11 @@ static void handle_flushbuffered(int socket, rtsp_conn_t *conn,
        * uses the receiver's experimental no-boundary policy: wait for the new
        * anchor, then sequentially classify compressed packets for admission. */
       if (!got_until_seq) {
-        ESP_LOGW(TAG,
+        AP_LOGW(TAG,
                  "FLUSHBUFFERED immediate without flushUntilSeq; "
                  "no sequence boundary; waiting for fresh anchor");
       }
-      ESP_LOGI(TAG,
+      AP_LOGI(TAG,
                "FLUSHBUFFERED immediate: untilSeq=%" PRId64
                " untilTS=%" PRId64,
                flush_until_seq, flush_until_ts);
@@ -1665,11 +1457,11 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   // TEARDOWN without streams = full session teardown (disconnect)
   /* Shairport Sync 5.5.2 handle_teardown_2(): no plist -> nothing done. */
   if (!(body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0)) {
-    ESP_LOGW(TAG, "TEARDOWN without plist - nothing done (as Shairport)");
+    AP_LOGW(TAG, "TEARDOWN without plist - nothing done (as Shairport)");
     rtsp_send_ok(socket, conn, req->cseq);
     return;
   }
-  ESP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
+  AP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
            stream_count);
   // Stream-level teardown is a pause: close the play gate immediately and
   // emit PAUSED (LED state) before the slower receiver/decoder teardown below
@@ -1677,7 +1469,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   if (has_streams) {
     note_stream_pause_started(conn);
     audio_receiver_set_playing(false);
-    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+    rtsp_events_emit(RTSP_EVENT_PAUSED);
   }
   audio_receiver_stop();
   /* A stream-level TEARDOWN preserves the control session and its PTP clock.
@@ -1759,7 +1551,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
       have_rtp_time = true;
     }
 
-    ESP_LOGI(TAG,
+    AP_LOGI(TAG,
              "SETRATEANCHORTIME: secs=%llu frac=0x%016llx rtp=%llu"
              " clock=%016llx rate=%.1f stream=%lld",
              (unsigned long long)network_time_secs,
@@ -1771,11 +1563,11 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
     /* Pause first.  Do not publish an anchor from a rate=0 message and wake a
      * processor immediately before closing the play gate. */
     if (have_rate && rate == 0.0) {
-      ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
+      AP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
       note_stream_pause_started(conn);
       conn->stream_paused = true;
       audio_receiver_pause();
-      rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+      rtsp_events_emit(RTSP_EVENT_PAUSED);
       rtsp_send_ok(socket, conn, req->cseq);
       return;
     }
@@ -1788,7 +1580,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
       uint64_t frac = network_time_frac >> 32;
       frac = (frac * 1000000000ULL) >> 32;
       uint64_t network_time_ns = network_time_secs * 1000000000ULL + frac;
-      ESP_LOGI(TAG,
+      AP_LOGI(TAG,
                "SETRATEANCHORTIME MAP: clock=%016llx ptp=%llu rtp=%llu",
                (unsigned long long)clock_id,
                (unsigned long long)network_time_ns,
@@ -1805,7 +1597,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
         uint64_t local_ns = 0;
         if (ptp_clock_realtime_snapshot_to_local(&ps, clock_id, network_time_ns,
                                               &local_ns)) {
-          ESP_LOGI(TAG,
+          AP_LOGI(TAG,
                    "SETRATEANCHORTIME RT local raw=%llu local=%llu gm=%016llx age=%lums",
                    (unsigned long long)network_time_ns,
                    (unsigned long long)local_ns,
@@ -1816,7 +1608,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
                   clock_id, ps.gm_change_count, ps.mastership_age_ms,
                   network_time_ns, local_ns, (uint32_t)rtp_time,
                   &anchor_result)) {
-            ESP_LOGI(TAG,
+            AP_LOGI(TAG,
                      "SETRATEANCHORTIME RT media rebase deferred clock=%016llx gm=%016llx epoch=%lu age=%lums",
                      (unsigned long long)clock_id,
                      (unsigned long long)ps.master_clock_id,
@@ -1824,7 +1616,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
                      (unsigned long)ps.mastership_age_ms);
           }
         } else {
-          ESP_LOGI(TAG,
+          AP_LOGI(TAG,
                    "SETRATEANCHORTIME RT deferred clock=%016llx gm=%016llx ready=%d age=%lums",
                    (unsigned long long)clock_id,
                    (unsigned long long)ps.master_clock_id,
@@ -1842,16 +1634,16 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
    * when "rate" is present. Without rate, update any supplied anchor and
    * leave the play state unchanged. */
   if (!have_rate) {
-    ESP_LOGI(TAG, "SETRATEANCHORTIME: no rate -> play state unchanged");
+    AP_LOGI(TAG, "SETRATEANCHORTIME: no rate -> play state unchanged");
     rtsp_send_ok(socket, conn, req->cseq);
     return;
   }
-  ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
+  AP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
            rate, conn->stream_paused);
   if (conn->stream_paused) notify_timing_resume(conn);
   conn->stream_paused = false;
   audio_receiver_set_playing(true);
-  rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
+  rtsp_events_emit(RTSP_EVENT_PLAYING);
 
   rtsp_send_ok(socket, conn, req->cseq);
 }
@@ -1861,119 +1653,9 @@ static void handle_setpeers(int socket, rtsp_conn_t *conn,
                             size_t raw_len) {
   (void)raw;
   (void)raw_len;
-
-  const uint8_t *body = req->body;
-  size_t body_len = req->body_len;
-  const bool extended = strcasecmp(req->method, "SETPEERSX") == 0;
-
-  /* An empty peer-list means there is no advertised admission set. Clearing
-   * it is safe: PTP falls back to the authoritative D7 clock id (buffered) or
-   * the RTSP timing peer (realtime). */
-  if (!body || body_len == 0) {
-    ptp_clock_set_peers(NULL, 0);
-    ESP_LOGI(TAG, "%s: peers cleared", req->method);
-    rtsp_send_ok(socket, conn, req->cseq);
-    return;
-  }
-
-  if (body_len < 8 || memcmp(body, "bplist00", 8) != 0) {
-    /* Keep the previous valid list when a sender uses an unsupported body
-     * encoding. Never let peer metadata break an active audio timeline. */
-    ESP_LOGW(TAG, "%s: unsupported peer-list body (%zu bytes)", req->method,
-             body_len);
-    rtsp_send_ok(socket, conn, req->cseq);
-    return;
-  }
-
-  bplist_peer_info_t parsed[PTP_CLOCK_MAX_PEERS] = {0};
-  size_t advertised_count = 0;
-  if (!bplist_get_peer_list(body, body_len, extended, parsed,
-                            PTP_CLOCK_MAX_PEERS, &advertised_count)) {
-    ESP_LOGW(TAG, "%s: invalid peer-list bplist", req->method);
-    rtsp_send_ok(socket, conn, req->cseq);
-    return;
-  }
-
-  ptp_clock_peer_t tracked[PTP_CLOCK_MAX_PEERS] = {0};
-  size_t tracked_count = 0;
-  size_t ipv4_count = 0;
-  size_t ipv6_count = 0;
-  size_t clock_count = 0;
-  size_t invalid_addr_count = 0;
-  const size_t parsed_count = advertised_count < PTP_CLOCK_MAX_PEERS
-                                  ? advertised_count
-                                  : PTP_CLOCK_MAX_PEERS;
-
-  for (size_t i = 0; i < parsed_count; ++i) {
-    bool stored_ipv4_for_peer = false;
-    if (parsed[i].has_clock_id) clock_count++;
-
-    for (size_t a = 0; a < parsed[i].address_count; ++a) {
-      struct in_addr addr4 = {0};
-      struct in6_addr addr6 = {0};
-      const char *address = parsed[i].addresses[a];
-
-      if (inet_pton(AF_INET, address, &addr4) == 1) {
-        ipv4_count++;
-        stored_ipv4_for_peer = true;
-        if (tracked_count < PTP_CLOCK_MAX_PEERS) {
-          bool duplicate = false;
-          for (size_t j = 0; j < tracked_count; ++j) {
-            if (tracked[j].ipv4_addr == addr4.s_addr &&
-                tracked[j].clock_id ==
-                    (parsed[i].has_clock_id ? parsed[i].clock_id : 0)) {
-              duplicate = true;
-              break;
-            }
-          }
-          if (!duplicate) {
-            tracked[tracked_count].ipv4_addr = addr4.s_addr;
-            tracked[tracked_count].clock_id =
-                parsed[i].has_clock_id ? parsed[i].clock_id : 0;
-            tracked_count++;
-          }
-        }
-      } else if (inet_pton(AF_INET6, address, &addr6) == 1) {
-        /* PTP sockets are currently AF_INET. Keep IPv6 visible in diagnostics,
-         * but never activate a filter from IPv6-only metadata. */
-        ipv6_count++;
-      } else {
-        invalid_addr_count++;
-      }
-    }
-
-    /* Preserve SETPEERSX identity even for IPv6-only peers. ClockID is tracked
-     * for diagnostics/future port matching but is intentionally not a hard
-     * admission key in ptp_clock. */
-    if (!stored_ipv4_for_peer && parsed[i].has_clock_id &&
-        tracked_count < PTP_CLOCK_MAX_PEERS) {
-      bool duplicate = false;
-      for (size_t j = 0; j < tracked_count; ++j) {
-        if (tracked[j].ipv4_addr == 0 &&
-            tracked[j].clock_id == parsed[i].clock_id) {
-          duplicate = true;
-          break;
-        }
-      }
-      if (!duplicate) {
-        tracked[tracked_count].clock_id = parsed[i].clock_id;
-        tracked_count++;
-      }
-    }
-  }
-
-  ptp_clock_set_peers(tracked, tracked_count);
-
-  ESP_LOGI(TAG,
-           "%s: peers=%zu tracked=%zu ipv4=%zu ipv6=%zu clocks=%zu%s%s",
-           req->method, advertised_count, tracked_count, ipv4_count,
-           ipv6_count, clock_count,
-           advertised_count > PTP_CLOCK_MAX_PEERS ? " truncated" : "",
-           invalid_addr_count ? " invalid-address" : "");
-
-  /* Do NOT reset audio timing here. Buffered AAC keeps its existing RTP<->PTP
-   * map; realtime ALAC keeps its RTP<->ESP-local anchor. A new admitted PTP
-   * source/GM is qualified by the existing handover logic. */
-
+  /* Shairport development handle_setpeers / handle_setpeersx only return
+   * 200. The timing source is selected at stream SETUP, not by these lists.
+   * Reference: rtsp.c:2158-2201 at
+   * 8c146e25183a354ae96f91fa069c2e7173f75a71. */
   rtsp_send_ok(socket, conn, req->cseq);
 }

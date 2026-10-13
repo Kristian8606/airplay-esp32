@@ -32,9 +32,9 @@ int rtsp_events_register(rtsp_event_callback_t callback, void *user_data) {
   return 0;
 }
 
-void rtsp_events_emit(rtsp_event_t event, const rtsp_event_data_t *data) {
+void rtsp_events_emit(rtsp_event_t event) {
   for (int i = 0; i < listener_count; i++) {
-    listeners[i].callback(event, data, listeners[i].user_data);
+    listeners[i].callback(event, listeners[i].user_data);
   }
 }
 

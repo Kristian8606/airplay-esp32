@@ -8,6 +8,7 @@
 #include "esp_mac.h"
 #include "aes/esp_aes.h"
 #include "sodium.h"
+#include "airplay_log.h"
 
 static const char *TAG = "hap_verify";
 
@@ -311,7 +312,7 @@ esp_err_t hap_pair_verify_m3_raw(hap_session_t *session, const uint8_t *input,
     return ESP_FAIL;
   }
 
-  ESP_LOGW(TAG, "Skipping signature verification (transient pairing)");
+  AP_LOGW(TAG, "Skipping signature verification (transient pairing)");
 
   hap_hkdf_sha512((uint8_t *)"Control-Salt", 12, session->shared_secret,
                   HAP_X25519_KEY_SIZE, (uint8_t *)"Control-Read-Encryption-Key",

@@ -4,6 +4,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "airplay_log.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -68,7 +69,7 @@ static void rgb_refresh_color(uint8_t r, uint8_t g, uint8_t b) {
   led_strip_set_pixel(s_strip, 0, r, g, b);
   esp_err_t err = led_strip_refresh(s_strip);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "refresh failed: %s", esp_err_to_name(err));
+    AP_LOGW(TAG, "refresh failed: %s", esp_err_to_name(err));
   }
 }
 
@@ -77,7 +78,7 @@ static void rgb_clear(void) {
   led_strip_clear(s_strip);
   esp_err_t err = led_strip_refresh(s_strip);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "clear refresh failed: %s", esp_err_to_name(err));
+    AP_LOGW(TAG, "clear refresh failed: %s", esp_err_to_name(err));
   }
 }
 
@@ -189,7 +190,7 @@ static void render_vu(const int16_t *pcm, size_t stereo_frames) {
   led_strip_set_pixel_hsv(s_strip, 0, hue, sat, val);
   esp_err_t err = led_strip_refresh(s_strip);
   if (err != ESP_OK) {
-    ESP_LOGW(TAG, "VU refresh failed: %s", esp_err_to_name(err));
+    AP_LOGW(TAG, "VU refresh failed: %s", esp_err_to_name(err));
   }
 #else
   (void)pcm;
@@ -211,7 +212,7 @@ static void led_task(void *arg) {
 
     if (!have_rendered_state || desired != last_state) {
       if (have_rendered_state) {
-        ESP_LOGI(TAG, "state %d -> %d", (int)last_state, (int)desired);
+        AP_LOGI(TAG, "state %d -> %d", (int)last_state, (int)desired);
       }
       last_state = desired;
       have_rendered_state = true;
@@ -229,9 +230,7 @@ static void led_task(void *arg) {
   }
 }
 
-static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
-                          void *user_data) {
-  (void)data;
+static void on_rtsp_event(rtsp_event_t event, void *user_data) {
   (void)user_data;
   led_state_t state;
   switch (event) {
@@ -247,7 +246,6 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
     case RTSP_EVENT_DISCONNECTED:
       state = LED_STATE_STANDBY;
       break;
-    case RTSP_EVENT_METADATA:
     default:
       return;
   }

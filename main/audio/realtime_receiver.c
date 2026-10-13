@@ -18,6 +18,7 @@
 #include "freertos/task.h"
 #include "network/socket_utils.h"
 #include "network/ptp_clock.h"
+#include "airplay_log.h"
 
 #define RT_PACKET_MAX             8192U
 #define RT_PCM_CAPACITY_FRAMES    1024U
@@ -320,7 +321,7 @@ static bool decode_audio_packet(alac_decoder_t *decoder,
   if (dec_len <= 0) {
     s_rt.decrypt_errors++;
     if (s_rt.decrypt_errors <= RT_FIRST_PACKET_LOGS) {
-      ESP_LOGW(TAG,
+      AP_LOGW(TAG,
                "decrypt failed seq=%u rtp=%" PRIu32 " packet=%u payload=%u%s",
                seq, rtp, (unsigned)packet_len, (unsigned)payload_len,
                retransmitted ? " retransmit" : "");
@@ -335,7 +336,7 @@ static bool decode_audio_packet(alac_decoder_t *decoder,
   if (frames <= 0) {
     s_rt.decode_errors++;
     if (s_rt.decode_errors <= RT_FIRST_PACKET_LOGS) {
-      ESP_LOGW(TAG, "ALAC decode failed seq=%u rtp=%" PRIu32 " bytes=%d%s",
+      AP_LOGW(TAG, "ALAC decode failed seq=%u rtp=%" PRIu32 " bytes=%d%s",
                seq, rtp, dec_len, retransmitted ? " retransmit" : "");
     }
     return false;
@@ -467,7 +468,7 @@ static void missing_add_range(uint32_t first_ext, uint16_t count,
     count = RT_MISSING_SLOTS;
     if (!s_rt.missing_overflow_logged) {
       s_rt.missing_overflow_logged = true;
-      ESP_LOGW(TAG, "ALAC missing tracker overflow");
+      AP_LOGW(TAG, "ALAC missing tracker overflow");
     }
   }
   const uint32_t frame_samples = s_rt.cfg.format.frame_size > 0
@@ -480,7 +481,7 @@ static void missing_add_range(uint32_t first_ext, uint16_t count,
         ext - min_active >= RT_MISSING_SLOTS) {
       if (!s_rt.missing_overflow_logged) {
         s_rt.missing_overflow_logged = true;
-        ESP_LOGW(TAG, "ALAC missing tracker overflow");
+        AP_LOGW(TAG, "ALAC missing tracker overflow");
       }
       break;
     }
@@ -492,7 +493,7 @@ static void missing_add_range(uint32_t first_ext, uint16_t count,
        * never cause a lower-audio resync/cursor jump. */
       if (!s_rt.missing_overflow_logged) {
         s_rt.missing_overflow_logged = true;
-        ESP_LOGW(TAG, "ALAC missing tracker overflow");
+        AP_LOGW(TAG, "ALAC missing tracker overflow");
       }
       continue;
     }
@@ -637,7 +638,7 @@ static void service_d7_anchor(void) {
     if (anchor_result.deferred &&
         s_rt.d7_defer_logged_epoch != ps.gm_change_count) {
       s_rt.d7_defer_logged_epoch = ps.gm_change_count;
-      ESP_LOGI(TAG,
+      AP_LOGI(TAG,
                "ALAC GM MEDIA HOLD gm=%016" PRIx64 " epoch=%lu age=%lums "
                "keeping current RTP<->local phase until 1000ms",
                ps.master_clock_id, (unsigned long)ps.gm_change_count,
@@ -649,7 +650,7 @@ static void service_d7_anchor(void) {
   s_rt.d7_last_committed_packet = s_rt.d7_packets;
 
   if (s_rt.d7_anchor_commit_count == 1U) {
-    ESP_LOGI(TAG,
+    AP_LOGI(TAG,
              "ALAC D7 LOCAL ANCHOR raw=%" PRIu64
              " rawLocal=%" PRIu64 " local=%" PRIu64
              " bias=%+.3fms"
@@ -693,16 +694,14 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
   if (pt == RT_AP2_ANCHOR_PT) {
     if (len < 28U) {
       s_rt.d7_malformed++;
-      ESP_LOGW(TAG, "AP2 D7 malformed len=%u bad=%" PRIu32,
+      AP_LOGW(TAG, "AP2 D7 malformed len=%u bad=%" PRIu32,
                (unsigned)len, s_rt.d7_malformed);
       goto done;
     }
 
     const uint32_t frame1 = read_be32(buf + 4);
     const uint64_t network_time_ns = read_be64(buf + 8);
-    const uint32_t frame2 = read_be32(buf + 16);
     const uint64_t clock_id = read_be64(buf + 20);
-    const uint32_t delta_frames = frame2 - frame1;
 
     s_rt.last_d7_frame1 = frame1;
     s_rt.last_d7_raw_ptp_ns = network_time_ns;
@@ -712,7 +711,10 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
     ptp_clock_note_realtime_d7(clock_id);
     service_d7_anchor();
 
+#if defined(CONFIG_AIRPLAY_LOG_RUNTIME) && CONFIG_AIRPLAY_LOG_RUNTIME
     if (s_rt.d7_packets == 1U) {
+      const uint32_t frame2 = read_be32(buf + 16);
+      const uint32_t delta_frames = frame2 - frame1;
       const int sr = s_rt.cfg.format.sample_rate > 0
                          ? s_rt.cfg.format.sample_rate
                          : 44100;
@@ -722,7 +724,7 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
       uint64_t local_ns = 0;
       (void)ptp_clock_realtime_snapshot_to_local(&ps, clock_id,
                                                   network_time_ns, &local_ns);
-      ESP_LOGI(TAG,
+      AP_LOGI(TAG,
                "AP2 D7 n=%" PRIu32 " frame1=%" PRIu32
                " frame2=%" PRIu32 " delta=%" PRIu32 "(%.2fms)"
                " rawPTP=%" PRIu64 " clock=%016" PRIx64
@@ -734,6 +736,7 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
                (unsigned long)ps.mastership_age_ms,
                (unsigned long)ps.sample_count, local_ns);
     }
+#endif
     goto done;
   }
 
@@ -749,7 +752,7 @@ static void process_control_packet(const uint8_t *buf, size_t len) {
     const uint64_t bit = 1ULL << (pt & 63U);
     if (word < 2U && (s_rt.unhandled_control_seen[word] & bit) == 0U) {
       s_rt.unhandled_control_seen[word] |= bit;
-      ESP_LOGI(TAG, "AP2 CTRL unhandled raw=0x%02x pt=%u len=%u",
+      AP_LOGI(TAG, "AP2 CTRL unhandled raw=0x%02x pt=%u len=%u",
                (unsigned)buf[1], (unsigned)pt, (unsigned)len);
     }
   }
@@ -1071,7 +1074,7 @@ static esp_err_t ensure_transport_resources(void) {
     s_rt.resend_event_storage = storage;
     s_rt.resend_event_control = control;
     s_rt.resend_event_q = queue;
-    ESP_LOGI(TAG, "ALAC resend queue: %u events, %u bytes in PSRAM; control internal",
+    AP_LOGI(TAG, "ALAC resend queue: %u events, %u bytes in PSRAM; control internal",
              (unsigned)RT_RESEND_EVENT_SLOTS, (unsigned)event_bytes);
   }
 

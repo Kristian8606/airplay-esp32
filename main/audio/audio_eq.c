@@ -8,6 +8,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#include "airplay_log.h"
 
 static const char *TAG = "audio_eq";
 static const char *EQ_NS = "audio_eq";
@@ -369,7 +370,7 @@ static bool prepare_for_rate_unlocked(int sample_rate) {
   s_eq.sample_rate = sample_rate;
   s_eq.ready = true;
   reset_state_unlocked();
-  ESP_LOGI(TAG,
+  AP_LOGI(TAG,
            "Ready: enabled=%u mode=%s left=%u/%u right=%u/%u preamp L=%.2fdB R=%.2fdB sr=%d",
            (unsigned)s_eq.config.enabled,
            audio_eq_channel_mode_name(
@@ -477,7 +478,7 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
   }
   eq_unlock();
 
-  ESP_LOGI(TAG,
+  AP_LOGI(TAG,
            "Live apply: enabled=%u mode=%s left=%u right=%u preamp L=%.2fdB R=%.2fdB%s",
            (unsigned)config->enabled,
            audio_eq_channel_mode_name(
