@@ -55,6 +55,10 @@ struct pcm_fifo {
   uint32_t head;          /* RTP of the oldest frame */
   uint32_t tail;          /* RTP one past the newest frame */
   uint32_t seq;           /* odd while frames inside the window change */
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+  uint32_t gap_events;    /* silence inserted by writes; writer mutex held */
+  uint32_t gap_frames;
+#endif
 #ifndef PCM_FIFO_HOST_TEST
   portMUX_TYPE mux;       /* makes each odd-seq section non-preemptible */
 #endif
@@ -174,6 +178,21 @@ void pcm_fifo_set_generation(pcm_fifo_t *f, uint32_t generation) {
   if (f) st(&f->generation, generation);
 }
 
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+void pcm_fifo_diag_take(pcm_fifo_t *f, uint32_t *gap_events,
+                        uint32_t *gap_frames) {
+  if (gap_events) *gap_events = 0U;
+  if (gap_frames) *gap_frames = 0U;
+  if (!f) return;
+  FIFO_LOCK(f->mutex);
+  if (gap_events) *gap_events = f->gap_events;
+  if (gap_frames) *gap_frames = f->gap_frames;
+  f->gap_events = 0U;
+  f->gap_frames = 0U;
+  FIFO_UNLOCK(f->mutex);
+}
+#endif
+
 static bool write_locked(pcm_fifo_t *f, uint32_t rtp, const int16_t *pcm,
                          uint32_t frames, uint32_t generation,
                          uint32_t wanted, bool wanted_valid) {
@@ -239,6 +258,10 @@ static bool write_locked(pcm_fifo_t *f, uint32_t rtp, const int16_t *pcm,
   /* Gap after tail: a lost block plays as silence. Not yet visible. */
   if (rtp_delta(rtp, tail) > 0) {
     zero_in(f, tail, rtp - tail);
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+    ++f->gap_events;
+    f->gap_frames += rtp - tail;
+#endif
   }
 
   /* Append and publish. */

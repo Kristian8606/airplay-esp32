@@ -35,12 +35,12 @@ if AIRPLAY_DIAGNOSTICS
         bool "PLAYOUT - scheduler, I2S, DMA and late/early diagnostics"
         default n
         help
-            Adds a "PLAYOUT |" line to the 2-second audio status: longest
-            gap between DMA writes and longest block processing time, DMA
-            underruns, holes filled with silence, silent blocks and
-            re-primes. The line is a warning when any of them happened.
-            Use it to tell clicks from the ESP (counted here) from clicks
-            on the I2S wiring (nothing counted).
+            Checks playout every 2 seconds and prints a "PLAYOUT |" warning
+            only for counted DMA underruns, tag faults, PCM holes, silent
+            blocks, re-primes or silence inserted into PCM FIFO gaps.
+            Includes maximum DMA write gap and block processing time as
+            context; timing alone does not trigger a warning.
+            Counters, timing state and helpers are not compiled when disabled.
 
     config AIRPLAY_DIAG_LIFECYCLE
         bool "LIFECYCLE - task/session/generation/race diagnostics"

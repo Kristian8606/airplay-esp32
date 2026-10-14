@@ -5,6 +5,9 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#ifndef PCM_FIFO_HOST_TEST
+#include "sdkconfig.h"
+#endif
 
 /*
  * Final playout PCM store: one contiguous circular FIFO of decoded stereo
@@ -79,3 +82,14 @@ void pcm_fifo_invalidate_before(pcm_fifo_t *fifo, uint32_t until_rtp,
 
 /* Drop every frame from from_rtp on (the newest end of the window). */
 void pcm_fifo_truncate(pcm_fifo_t *fifo, uint32_t from_rtp, uint32_t generation);
+
+#if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
+/* Take and clear silence inserted for RTP gaps since the previous snapshot.
+ * Frames are stereo frames, not individual channel samples. Counts describe
+ * inserted PCM, which a later FLUSH may discard before it is heard. Normal
+ * zero-valued PCM and silence returned outside the window are not counted.
+ * Takes the writer mutex; call from the status task, never a critical section.
+ * Generation/position changes preserve pending counts. */
+void pcm_fifo_diag_take(pcm_fifo_t *fifo, uint32_t *gap_events,
+                        uint32_t *gap_frames);
+#endif

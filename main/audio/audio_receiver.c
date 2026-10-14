@@ -1254,8 +1254,9 @@ static void status_print_playout_events(void) {
 }
 
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
-/* PLAYOUT diagnostics (menuconfig): what reaches the DAC, per status period.
- * Written by the playout task, read and cleared by the status line. */
+/* PLAYOUT diagnostics (menuconfig), per status period. s_pd describes what
+ * reaches the DAC; FIFO gap counters describe silence inserted on write,
+ * which a later FLUSH can discard. Read and cleared by the status line. */
 static struct {
   uint32_t max_gap_us;     /* longest time between two running DMA writes */
   uint32_t max_work_us;    /* longest PCM read + output stage of one block */
@@ -1281,19 +1282,20 @@ static void status_print_playout_diag(void) {
   const uint32_t cf = __atomic_exchange_n(&s_pd.conceal_frames, 0U, __ATOMIC_RELAXED);
   const uint32_t sb = __atomic_exchange_n(&s_pd.silent_blocks, 0U, __ATOMIC_RELAXED);
   const uint32_t wf = __atomic_exchange_n(&s_pd.write_fails, 0U, __ATOMIC_RELAXED);
-  /* One block is 5805 us: a gap above two blocks (11610 us) means the DMA
-   * queue ran dry before this write. */
-  const bool bad = underruns || tag_faults || cb || sb || wf || gap > 11000U;
+  uint32_t fifo_gaps = 0, fifo_gap_frames = 0;
+  pcm_fifo_diag_take(s.pcm_fifo, &fifo_gaps, &fifo_gap_frames);
+  /* Batching normally creates gaps between DMA writes. Use counted faults
+   * to trigger warnings; the timing maxima provide context only. */
+  const bool bad = underruns || tag_faults || cb || sb || wf || fifo_gaps;
   if (bad) {
     ESP_LOGW(STATUS_TAG,
              "PLAYOUT | gap max %lu us | work max %lu us | underrun %lu | "
-             "tag fault %lu | holes %lu blk/%lu fr | silent %lu blk | rewrite %lu",
+             "tag fault %lu | holes %lu blk/%lu fr | silent %lu blk | rewrite %lu | "
+             "fifo inserted %lu gaps/%lu fr",
              (unsigned long)gap, (unsigned long)work, (unsigned long)underruns,
              (unsigned long)tag_faults, (unsigned long)cb, (unsigned long)cf,
-             (unsigned long)sb, (unsigned long)wf);
-  } else {
-    ESP_LOGI(STATUS_TAG, "PLAYOUT | gap max %lu us | work max %lu us | clean",
-             (unsigned long)gap, (unsigned long)work);
+             (unsigned long)sb, (unsigned long)wf, (unsigned long)fifo_gaps,
+             (unsigned long)fifo_gap_frames);
   }
 }
 #else
