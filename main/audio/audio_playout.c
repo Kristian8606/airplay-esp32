@@ -24,15 +24,19 @@
  * running. */
 #include "hal/i2s_ll.h"
 #define LIVE_SCLK_HZ 160000000U /* PLL_F160M, tx_clk_sel == 2 */
-static uint32_t s_live_div_int; /* 0: not available, fall back to
-                                 * disable -> i2s_channel_tune_rate -> enable */
+static uint32_t s_live_div_int; /* 0: live tuning not available (no tuning) */
 static void live_tune_init(void);
 
-#define I2S_DMA_DESC_NUM  2U
+#define I2S_DMA_DESC_NUM  AUDIO_PLAYOUT_DMA_BLOCKS
 #define I2S_DMA_FRAME_NUM AUDIO_PLAYOUT_FRAMES
 #define I2S_RATE_HZ       44100U
-#define TX_TAG_Q_CAP      8U
-#define TX_DONE_Q_CAP     8U
+/* Every descriptor holds one tagged block, plus the batch being written. */
+#define TX_TAG_Q_CAP      16U
+#define TX_DONE_Q_CAP     16U
+_Static_assert(TX_TAG_Q_CAP > I2S_DMA_DESC_NUM + AUDIO_PLAYOUT_BATCH,
+               "tag queue must cover every descriptor plus one batch");
+_Static_assert(I2S_DMA_FRAME_NUM * 8U <= 4092U,
+               "one DMA descriptor holds at most 4092 bytes");
 
 /* Slot width follows menuconfig "I2S output slot width" (audio_out_sample.h).
  * MCLK stays 256 x fs in both modes; 32-bit slots only double BCLK. */
@@ -81,15 +85,32 @@ static DRAM_ATTR uint32_t s_fault;
 /* Only the single playout owner may wait; ISR never dereferences this handle
  * after the task exits (the persistent playout task owns I2S for its lifetime). */
 static DRAM_ATTR TaskHandle_t s_completion_waiter;
+/* 0: wake the waiter on every EOF. N: only once N descriptors are free. */
+static DRAM_ATTR uint32_t s_wake_free_blocks;
 
 bool audio_playout_has_fault(void) {
   return __atomic_load_n(&s_fault, __ATOMIC_ACQUIRE) != 0U;
 }
 
+static inline uint32_t IRAM_ATTR queued_tags(void) {
+  const uint32_t head = __atomic_load_n(&s_tag_head, __ATOMIC_ACQUIRE);
+  const uint32_t tail = __atomic_load_n(&s_tag_tail, __ATOMIC_ACQUIRE);
+  return (head + TX_TAG_Q_CAP - tail) % TX_TAG_Q_CAP;
+}
+
+static inline uint32_t IRAM_ATTR free_blocks(void) {
+  const uint32_t queued = queued_tags();
+  return queued >= I2S_DMA_DESC_NUM ? 0U : I2S_DMA_DESC_NUM - queued;
+}
+
 static bool IRAM_ATTR wake_completion_waiter(void) {
   BaseType_t woken = pdFALSE;
   TaskHandle_t waiter = __atomic_load_n(&s_completion_waiter, __ATOMIC_ACQUIRE);
-  if (waiter) vTaskNotifyGiveFromISR(waiter, &woken);
+  const uint32_t want = __atomic_load_n(&s_wake_free_blocks, __ATOMIC_ACQUIRE);
+  if (waiter && (want == 0U || free_blocks() >= want ||
+                 __atomic_load_n(&s_fault, __ATOMIC_ACQUIRE) != 0U)) {
+    vTaskNotifyGiveFromISR(waiter, &woken);
+  }
   return woken == pdTRUE;
 }
 
@@ -263,7 +284,7 @@ static esp_err_t audio_playout_init_current_core(void) {
 
   live_tune_init();
 
-  /* Keep the channel READY/disabled. Both DMA descriptors are preloaded before
+  /* Keep the channel READY/disabled. Every DMA descriptor is preloaded before
    * the exact PTP start edge, then the channel is enabled. This removes the
    * zero-descriptor ambiguity that would make EOF counting unreliable. */
   AUDIO_DIAG_PLAYOUT_I2S(
@@ -420,9 +441,9 @@ esp_err_t audio_playout_write_tagged(const audio_out_sample_t *stereo,
     return ESP_ERR_INVALID_STATE;
   }
 
-  /* Publish the tag before entering the blocking write. With two descriptors
-   * there are already outstanding tagged blocks while running, so an EOF that
-   * wakes this write always consumes the oldest earlier tag, never this one. */
+  /* Publish the tag before entering the write. While running there are
+   * already outstanding tagged blocks, so an EOF that frees a descriptor for
+   * this write always consumes the oldest earlier tag, never this one. */
   if (!tag_push(rtp, generation, frames)) {
     return ESP_ERR_NO_MEM;
   }
@@ -479,6 +500,24 @@ bool audio_playout_is_enabled(void) {
   return s_enabled;
 }
 
+uint32_t audio_playout_free_blocks(void) {
+  return free_blocks();
+}
+
+bool audio_playout_wait_free(uint32_t blocks, uint32_t timeout_ticks) {
+  if (blocks > I2S_DMA_DESC_NUM) blocks = I2S_DMA_DESC_NUM;
+  __atomic_store_n(&s_wake_free_blocks, blocks, __ATOMIC_RELEASE);
+  __atomic_store_n(&s_completion_waiter, xTaskGetCurrentTaskHandle(), __ATOMIC_RELEASE);
+  bool ready = free_blocks() >= blocks;
+  if (!ready && !audio_playout_has_fault()) {
+    (void)ulTaskNotifyTake(pdTRUE, (TickType_t)timeout_ticks);
+    ready = free_blocks() >= blocks;
+  }
+  __atomic_store_n(&s_completion_waiter, NULL, __ATOMIC_RELEASE);
+  __atomic_store_n(&s_wake_free_blocks, 0U, __ATOMIC_RELEASE);
+  return ready;
+}
+
 
 static void live_tune_init(void) {
   i2s_dev_t *hw = I2S_LL_GET_HW(I2S_NUM_0);
@@ -486,7 +525,7 @@ static void live_tune_init(void) {
   const uint32_t sel = hw->tx_clkm_conf.tx_clk_sel;
   const uint32_t n = hw->tx_clkm_conf.tx_clkm_div_num;
   if (sel != 2U || s_nominal_mclk_hz == 0U) {
-    ESP_LOGW(TAG, "live I2S tuning off: clock source %u, using disable/tune/enable",
+    ESP_LOGE(TAG, "I2S clock tuning unavailable: clock source %u is not PLL_F160M",
              (unsigned)sel);
     return;
   }
@@ -495,7 +534,7 @@ static void live_tune_init(void) {
   const uint64_t hi = (uint64_t)s_nominal_mclk_hz * (1000000U + 200U);
   const uint64_t sclk_u = (uint64_t)LIVE_SCLK_HZ * 1000000ULL;
   if (sclk_u / lo != n || sclk_u / hi != n) {
-    ESP_LOGW(TAG, "live I2S tuning off: divider %u not constant over +/-200 ppm",
+    ESP_LOGE(TAG, "I2S clock tuning unavailable: divider %u not constant over +/-200 ppm",
              (unsigned)n);
     return;
   }
@@ -557,48 +596,20 @@ esp_err_t audio_playout_reset_tune(void) {
   if (s_tune_ppm == 0) {
     return ESP_OK;
   }
-  if (s_live_div_int) {
-    const esp_err_t le = live_tune_write(0, NULL);
-    if (le == ESP_OK) s_tune_ppm = 0;
-    return le;
-  }
-
-  /* ADDSUB is relative to the current MCLK. Query the actual clock first and
-   * return it to the nominal value. This avoids retaining a few Hz of rounding
-   * residue after several incremental ppm changes in the previous session. */
-  i2s_tuning_info_t before = {0};
-  esp_err_t query_err = i2s_channel_tune_rate(s_tx, NULL, &before);
-  const int32_t step_delta_hz = query_err == ESP_OK
-      ? (int32_t)s_nominal_mclk_hz - (int32_t)before.curr_mclk_hz
-      : (int32_t)(-((int64_t)s_nominal_mclk_hz *
-                    (int64_t)s_tune_ppm) / 1000000LL);
-  const int32_t limit_hz = (int32_t)(
-      ((int64_t)s_nominal_mclk_hz * 160LL) / 1000000LL) + 4;
-  i2s_tuning_config_t cfg = {
-      .tune_mode = I2S_TUNING_MODE_ADDSUB,
-      .tune_mclk_val = step_delta_hz,
-      .max_delta_mclk = limit_hz,
-      .min_delta_mclk = -limit_hz,
-  };
-  i2s_tuning_info_t info = {0};
-  esp_err_t err = i2s_channel_tune_rate(s_tx, &cfg, &info);
-  if (err == ESP_OK) {
-    s_tune_ppm = 0;
-  }
-
-  return err;
+  const esp_err_t le = live_tune_write(0, NULL);
+  if (le == ESP_OK) s_tune_ppm = 0;
+  return le;
 }
 
-static esp_err_t tune_ppm_impl(int32_t target_ppm,
-                               const audio_out_sample_t *playing,
-                               const audio_out_sample_t *next,
-                               uint32_t frames,
-                               audio_playout_tune_info_t *out,
-                               uint32_t *halt_us) {
+esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
+                                 audio_playout_tune_info_t *out,
+                                 uint32_t *halt_us) {
   if (halt_us) *halt_us = 0;
-  if (!s_tx || s_nominal_mclk_hz == 0U ||
-      (!audio_playout_tune_is_live() && !s_enabled)) {
+  if (!s_tx || s_nominal_mclk_hz == 0U) {
     return ESP_ERR_INVALID_STATE;
+  }
+  if (!audio_playout_tune_is_live()) {
+    return ESP_ERR_NOT_SUPPORTED;
   }
   if (target_ppm > 160) target_ppm = 160;
   if (target_ppm < -160) target_ppm = -160;
@@ -613,95 +624,19 @@ static esp_err_t tune_ppm_impl(int32_t target_ppm,
     return ESP_OK;
   }
 
-  if (s_live_div_int) {
-    /* Live: one register store, nothing stops, the DMA is not touched, so
-     * playing/next are not needed. halt_us = time spent here. */
-    (void)playing; (void)next; (void)frames;
-    const int64_t lt0 = esp_timer_get_time();
-    uint32_t mclk_hz = 0;
-    const esp_err_t le = live_tune_write(target_ppm, &mclk_hz);
-    if (halt_us) *halt_us = (uint32_t)(esp_timer_get_time() - lt0);
-    if (le == ESP_OK) {
-      s_tune_ppm = target_ppm;
-      if (out) {
-        out->requested_ppm = target_ppm;
-        out->curr_mclk_hz = mclk_hz;
-        out->actual_delta_mclk_hz = (int32_t)mclk_hz - (int32_t)s_nominal_mclk_hz;
-      }
-    }
-    return le;
-  }
-
-  /* ADDSUB is relative to the CURRENT clock, so apply only the requested
-   * ppm step. The max/min bounds remain relative to the initial MCLK. */
-  const int32_t step_ppm = target_ppm - s_tune_ppm;
-  const int32_t step_delta_hz = (int32_t)(
-      ((int64_t)s_nominal_mclk_hz * step_ppm) / 1000000LL);
-  const int32_t limit_hz = (int32_t)(
-      ((int64_t)s_nominal_mclk_hz * 160LL) / 1000000LL) + 4;
-  i2s_tuning_config_t cfg = {
-      .tune_mode = I2S_TUNING_MODE_ADDSUB,
-      .tune_mclk_val = step_delta_hz,
-      .max_delta_mclk = limit_hz,
-      .min_delta_mclk = -limit_hz,
-  };
-  i2s_tuning_info_t info = {0};
-
-  /* The IDF allows rate tuning only on a READY channel: disable, tune,
-   * enable, as in Espressif's dynamic-tuning example and as this project did
-   * until 2026-09-14 (commit 1cf3509 switched to tuning the running channel, whose
-   * divider sequence sends a burst of fast clocks to the DAC: a click).
-   * Called only between application writes on the playout task. */
-  const int64_t t0 = esp_timer_get_time();
-  esp_err_t err = i2s_channel_disable(s_tx);
-  if (err != ESP_OK) return err;
-  s_enabled = false;
-  err = i2s_channel_tune_rate(s_tx, &cfg, &info);
-  if (err == ESP_OK) {
+  /* One register store: nothing stops, the DMA is not touched.
+   * halt_us = time spent here. */
+  const int64_t lt0 = esp_timer_get_time();
+  uint32_t mclk_hz = 0;
+  const esp_err_t le = live_tune_write(target_ppm, &mclk_hz);
+  if (halt_us) *halt_us = (uint32_t)(esp_timer_get_time() - lt0);
+  if (le == ESP_OK) {
     s_tune_ppm = target_ppm;
+    if (out) {
+      out->requested_ppm = target_ppm;
+      out->curr_mclk_hz = mclk_hz;
+      out->actual_delta_mclk_hz = (int32_t)mclk_hz - (int32_t)s_nominal_mclk_hz;
+    }
   }
-  /* enable() always restarts the DMA at descriptor 0. Without a reload the
-   * two descriptors replay whatever they hold, and when the newer block sits
-   * in descriptor 0 the playing block and the next one come out swapped
-   * (heard as a click on about every second retune). Reload them in play
-   * order: the block that was playing, then the one queued after it. Their
-   * tags are already in the tag FIFO in this order. */
-  bool reloaded = false;
-  if (playing && next && frames) {
-    const size_t bytes = (size_t)frames * I2S_FRAME_BYTES;
-    size_t l1 = 0, l2 = 0;
-    const esp_err_t p1 = i2s_channel_preload_data(s_tx, playing, bytes, &l1);
-    const esp_err_t p2 = i2s_channel_preload_data(s_tx, next, bytes, &l2);
-    reloaded = p1 == ESP_OK && p2 == ESP_OK && l1 == bytes && l2 == bytes;
-  }
-  esp_err_t en_err = i2s_channel_enable(s_tx);
-  if (en_err == ESP_OK) s_enabled = true;
-  s_preload_pending = false;
-  if (err == ESP_OK && en_err != ESP_OK) err = en_err;
-  if (playing && next && frames && !reloaded) {
-    /* DMA order unknown: let the playout task flush and re-prime. */
-    __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
-  }
-  if (halt_us) *halt_us = (uint32_t)(esp_timer_get_time() - t0);
-
-  if (out) {
-    out->requested_ppm = s_tune_ppm;
-    out->curr_mclk_hz = info.curr_mclk_hz;
-    out->actual_delta_mclk_hz = info.delta_mclk_hz;
-  }
-  return err;
-}
-
-esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
-                                 audio_playout_tune_info_t *out) {
-  return tune_ppm_impl(target_ppm, NULL, NULL, 0U, out, NULL);
-}
-
-esp_err_t audio_playout_tune_ppm_in_order(int32_t target_ppm,
-                                          const audio_out_sample_t *playing,
-                                          const audio_out_sample_t *next,
-                                          uint32_t frames,
-                                          audio_playout_tune_info_t *out,
-                                          uint32_t *halt_us) {
-  return tune_ppm_impl(target_ppm, playing, next, frames, out, halt_us);
+  return le;
 }

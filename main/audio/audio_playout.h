@@ -5,13 +5,23 @@
 #include "esp_err.h"
 #include "audio_out_sample.h"
 
-/* I2S playout backend: two 256-frame DMA descriptors. Every application audio
- * block is tagged with its RTP/generation before it reaches DMA. The TX EOF
- * ISR records the local completion timestamp for that exact tag, allowing the
- * playout task to compare the physical DMA completion edge against AirPlay PTP.
+/* I2S playout backend: AUDIO_PLAYOUT_DMA_BLOCKS DMA descriptors of
+ * AUDIO_PLAYOUT_FRAMES frames each. Every application audio block (one
+ * descriptor) is tagged with its RTP/generation before it reaches DMA. The TX
+ * EOF ISR records the local completion timestamp for that exact tag, allowing
+ * the playout task to compare the physical DMA completion edge against
+ * AirPlay PTP.
+ *
+ * 480 frames x 8 bytes (32-bit stereo slots) = 3840 bytes, inside the IDF
+ * limit of 4092 bytes per descriptor. 8 descriptors = 30 KiB internal DMA RAM
+ * and ~87 ms of audio queued at 44.1 kHz. The playout task wakes once per
+ * AUDIO_PLAYOUT_BATCH free descriptors and then writes that many blocks
+ * without blocking.
  */
 
-#define AUDIO_PLAYOUT_FRAMES 256U
+#define AUDIO_PLAYOUT_FRAMES     480U
+#define AUDIO_PLAYOUT_DMA_BLOCKS 8U
+#define AUDIO_PLAYOUT_BATCH      2U
 
 typedef struct {
   uint32_t rtp;
@@ -32,14 +42,15 @@ esp_err_t audio_playout_init(void);
 esp_err_t audio_playout_flush(void);
 
 /* Preload is valid only while the TX channel is disabled/READY. It is used for
- * the first two blocks of an epoch so the channel starts with known audio in
- * both DMA descriptors instead of clocking zero-filled descriptors first. */
+ * the first AUDIO_PLAYOUT_DMA_BLOCKS blocks of an epoch so the channel starts
+ * with known audio in every DMA descriptor instead of clocking zero-filled
+ * descriptors first (each EOF must have a tag). */
 esp_err_t audio_playout_preload_tagged(const audio_out_sample_t *stereo,
                                        uint32_t frames,
                                        uint32_t rtp, uint32_t generation);
 
-/* Enable after the first two blocks have been preloaded and the PTP start edge
- * has been reached. */
+/* Enable after all DMA blocks have been preloaded and the PTP start edge has
+ * been reached. */
 esp_err_t audio_playout_enable(void);
 
 /* Normal steady-state write. The RTP tag is paired FIFO-wise with the TX EOF
@@ -64,28 +75,26 @@ bool audio_playout_wait_completion(audio_playout_completion_t *out,
 
 bool audio_playout_is_enabled(void);
 
-/* Fine tune the TX master clock of a running channel: disable -> tune ->
- * enable (the IDF allows i2s_channel_tune_rate() only in the READY state).
- * Call only from the playout task between writes. target_ppm is relative to
- * the nominal MCLK measured at init (+/-160 ppm). */
-esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
-                                 audio_playout_tune_info_t *out);
+/* Descriptors free for writing right now (DMA blocks - queued tagged blocks). */
+uint32_t audio_playout_free_blocks(void);
 
-/* Same, but reloads the two DMA descriptors in play order before enable():
- * `playing` is the block the DMA was sending, `next` the block queued after
- * it (the last one written). Call right after a write returned, so only a
- * few frames of `playing` are repeated. halt_us = how long TX was stopped. */
-esp_err_t audio_playout_tune_ppm_in_order(int32_t target_ppm,
-                                          const audio_out_sample_t *playing,
-                                          const audio_out_sample_t *next,
-                                          uint32_t frames,
-                                          audio_playout_tune_info_t *out,
-                                          uint32_t *halt_us);
-/* Reset the physical MCLK correction to nominal while preserving the current
- * enabled/disabled channel state. Intended for a hard audio-session boundary,
- * not for normal track/anchor changes inside one session. */
+/* Single playout owner only: sleep until at least `blocks` descriptors are
+ * free (the TX ISR wakes the task only then), a fault, or the timeout.
+ * Returns true when that many descriptors are free. */
+bool audio_playout_wait_free(uint32_t blocks, uint32_t timeout_ticks);
+
+/* Fine tune the TX master clock while I2S keeps running: one write of the
+ * fractional MCLK divider register (no disable/enable, the DMA is not
+ * touched). target_ppm is relative to the nominal MCLK measured at init
+ * (+/-160 ppm). Call only from the playout task. ESP_ERR_NOT_SUPPORTED when
+ * live tuning is unavailable (see the boot log). halt_us = time spent. */
+esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
+                                 audio_playout_tune_info_t *out,
+                                 uint32_t *halt_us);
+/* Reset the MCLK correction to nominal (hard audio-session boundary, not
+ * normal track/anchor changes inside one session). */
 esp_err_t audio_playout_reset_tune(void);
 
-/* True when retunes rewrite only the fractional MCLK divider register while
- * I2S keeps running (the normal case; checked at init). */
+/* True when the clock can be tuned: the fractional MCLK divider register is
+ * rewritten while I2S keeps running (checked at init). */
 bool audio_playout_tune_is_live(void);

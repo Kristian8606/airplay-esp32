@@ -16,6 +16,7 @@
 #include "audio_crypto.h"
 #include "audio_diag.h"
 #include "ap2_buffered_fifo.h"
+#include "pcm_fifo.h"
 #include "pcm_rtp_ring.h"
 #include "audio_playout.h"
 #include "realtime_receiver.h"
@@ -137,16 +138,22 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 #define AP2_PID_MAX_JUMP_PPM            80
 
 /* Continuous-start alignment. A new generation enables I2S only once.
- * Two silent DMA blocks establish the actual running sample-clock phase.  The
- * first tagged EOF gives a precise PTP observation; while the second silent
- * block is still playing, the first real block is queued from the RTP sample
- * that belongs at the next physical DMA boundary.  I2S is never disabled
- * between phase measurement and real audio, avoiding non-repeatable
- * second-enable latency. */
-#define AP2_START_SILENCE_FUTURE_BLOCKS    4U
-#define AP2_START_REAL_BOUNDARY_BLOCKS      (AP2_START_SILENCE_FUTURE_BLOCKS + 2U)
-#define AP2_START_ALIGN_TIMEOUT_US      30000LL
-#define AP2_START_PRIME_GUARD_BLOCKS        8U
+ * Every DMA descriptor is preloaded with a silent block; they establish the
+ * actual running sample-clock phase. The first tagged EOF gives a precise PTP
+ * observation; while the remaining silent blocks are still playing, the first
+ * real block is queued from the RTP sample that belongs at the physical DMA
+ * boundary after them. I2S is never disabled between phase measurement and
+ * real audio, avoiding non-repeatable second-enable latency.
+ * (Blocks are AUDIO_PLAYOUT_FRAMES = 480 frames, 10.9 ms.) */
+#define AP2_START_SILENCE_FUTURE_BLOCKS    2U
+#define AP2_START_REAL_BOUNDARY_BLOCKS \
+  (AP2_START_SILENCE_FUTURE_BLOCKS + AUDIO_PLAYOUT_DMA_BLOCKS)
+/* Longest wait for a probe EOF: a warm prime's probe plays after up to all
+ * queued descriptors; allow two more blocks. */
+#define AP2_START_ALIGN_TIMEOUT_US \
+  ((int64_t)(AUDIO_PLAYOUT_DMA_BLOCKS + 2U) * AUDIO_PLAYOUT_FRAMES * \
+   1000000LL / 44100LL + 10000LL)
+#define AP2_START_PRIME_GUARD_BLOCKS        4U
 
 /* PID servo around tagged DMA-EOF phase.
  * P reacts to phase error, I learns the steady crystal/rate bias, D damps
@@ -267,7 +274,7 @@ typedef struct {
   uint8_t *codec_workspace;       /* shared AAC payload / ALAC large buffers */
   size_t codec_workspace_size;
   bool realtime_workspace_bound;
-  pcm_rtp_ring_t *pcm_ring;          /* final EQ'd PCM -> PTP/I2S */
+  pcm_fifo_t *pcm_fifo;              /* final EQ'd PCM -> PTP/I2S, play order */
   pcm_rtp_ring_t *realtime_stage_ring; /* raw decoded ALAC, RTP-addressed */
 
   portMUX_TYPE state_mux;
@@ -918,8 +925,8 @@ static uint32_t reset_buffered_pcm_store(void) {
    * allocator. A hard media reset is also a hard timing boundary; incrementing
    * a separate AAC counter could reuse the preceding ALAC ring generation. */
   const uint32_t new_gen = s.generation = next_generation(s.generation);
-  if (s.pcm_ring) {
-    pcm_rtp_ring_set_generation(s.pcm_ring, new_gen);
+  if (s.pcm_fifo) {
+    pcm_fifo_set_generation(s.pcm_fifo, new_gen);
   }
   s.buffered_pcm_generation = new_gen;
   taskEXIT_CRITICAL(&s.state_mux);
@@ -975,8 +982,8 @@ static uint32_t commit_anchor_epoch_locked(void) {
      * rewind cache. Realtime ALAC still owns generation-scoped raw/final rings
      * because its recovery/EQ chronology is one continuous realtime epoch. */
     if (s.stream_type == AUDIO_STREAM_REALTIME) {
-      if (s.pcm_ring) {
-        pcm_rtp_ring_set_generation(s.pcm_ring, gen);
+      if (s.pcm_fifo) {
+        pcm_fifo_set_generation(s.pcm_fifo, gen);
       }
       if (s.realtime_stage_ring) {
         pcm_rtp_ring_set_generation(s.realtime_stage_ring, gen);
@@ -1327,9 +1334,9 @@ static void audio_status_task(void *arg) {
     uint32_t wanted = 0;
     const bool wanted_valid = wanted_rtp_now(&snap, &wanted);
     uint32_t pcm_frames = 0;
-    if (wanted_valid && s.pcm_ring) {
-      pcm_frames = pcm_rtp_ring_contiguous_frames(
-          s.pcm_ring, wanted, snap.pcm_generation, PCM_RTP_FINAL_RING_FRAMES);
+    if (wanted_valid && s.pcm_fifo) {
+      pcm_frames = pcm_fifo_contiguous_frames(
+          s.pcm_fifo, wanted, snap.pcm_generation, PCM_FIFO_FRAMES);
     }
 
     const bool sync_valid =
@@ -1487,9 +1494,9 @@ static void audio_status_notify(void) {
 typedef enum {
   AEVT_I2S_STOP = 0,  /* str = reason, a = generation */
   AEVT_PLAY_START,    /* a = generation, b = first RTP, c = stream type */
-  AEVT_SILENCE_BEGIN, /* a = RTP: whole 256-frame blocks played as zeros */
+  AEVT_SILENCE_BEGIN, /* a = RTP: whole playout blocks played as zeros */
   AEVT_SILENCE_END,   /* a = RTP, b = silent blocks */
-  AEVT_CONCEAL,       /* a = RTP, b = missing frames in a 256-frame block */
+  AEVT_CONCEAL,       /* a = RTP, b = missing frames in a playout block */
   AEVT_TUNE,          /* a = old ppm, b = new ppm */
   AEVT_AAC_MUTE,      /* a = seq, b = RTP, c = RTP gap (0: first of sequence) */
   AEVT_AAC_LOST,      /* str = why, a = seq */
@@ -1597,15 +1604,10 @@ static void status_print_audio_events(void) {
                  ms, (unsigned long)(uint32_t)e.a, (long)e.b);
         break;
       case AEVT_TUNE:
-        if (audio_playout_tune_is_live())
-          ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
-                        " (step %+ld, LIVE: one register write in %ld us,"
-                        " I2S not stopped)",
-                   ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
-        else
-          ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
-                        " (step %+ld, TX stopped %ld us, DMA reloaded in order)",
-                   ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
+        ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
+                      " (step %+ld, LIVE: one register write in %ld us,"
+                      " I2S not stopped)",
+                 ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
         break;
       case AEVT_AAC_MUTE:
         if (e.c == 0)
@@ -1771,14 +1773,12 @@ static pcm_store_result_t pcm_store_with_backpressure(
       }
     }
 
-    bool stored = pcm_rtp_ring_write(s.pcm_ring, rtp, pcm, frames,
-                                           channels, pcm_generation, wanted,
-                                           wanted_valid);
+    bool stored = pcm_fifo_write(s.pcm_fifo, rtp, pcm, frames,
+                                 pcm_generation, wanted, wanted_valid);
     if (stored && !ap2_buffered_fifo_epoch_is_current(s.transport, stream_epoch)) {
       /* Disconnect/reconnect during the copy must not leave old-stream PCM.
        * Publication mutex still excludes any replacement producer. */
-      pcm_rtp_ring_invalidate_range(s.pcm_ring, rtp, rtp + (uint32_t)frames,
-                                    pcm_generation);
+      pcm_fifo_truncate(s.pcm_fifo, rtp, pcm_generation);
       stored = false;
     }
     xSemaphoreGive(s.publish_mutex);
@@ -2468,8 +2468,8 @@ static void realtime_stage_task(void *arg) {
         xSemaphoreGive(s.publish_mutex);
         break;
       }
-      published = pcm_rtp_ring_write(s.pcm_ring, cursor, pcm, frames, 2,
-                                      snap.generation, 0U, false);
+      published = pcm_fifo_write(s.pcm_fifo, cursor, pcm, frames,
+                                 snap.generation, 0U, false);
       if (published) {
         taskENTER_CRITICAL(&s.state_mux);
         if (s.realtime_stage_generation == snap.generation &&
@@ -2726,9 +2726,9 @@ static audio_out_sample_t s_silence_block[AUDIO_PLAYOUT_FRAMES * 2U];
  * the sync servo uses. AirPlay is restored afterwards by the caller. */
 #if CONFIG_AIRPLAY_LATENCY_CAL
 #define CAL_GENERATION      0xCA1B0000U
-#define CAL_LEAD_BLOCKS     16U   /* ~93 ms silence before the first chirp */
-#define CAL_BURST_EVERY     20U   /* ~116 ms between chirps */
-#define CAL_TAIL_BLOCKS     20U   /* covers up to ~116 ms of chain latency */
+#define CAL_LEAD_BLOCKS     16U   /* ~174 ms silence before the first chirp */
+#define CAL_BURST_EVERY     20U   /* ~218 ms between chirps */
+#define CAL_TAIL_BLOCKS     20U   /* covers up to ~218 ms of chain latency */
 #define CAL_TOTAL_BLOCKS    (CAL_LEAD_BLOCKS + LATENCY_CAL_BURSTS * CAL_BURST_EVERY + CAL_TAIL_BLOCKS)
 #define CAL_I2S_RATE_HZ     44100U
 
@@ -2765,16 +2765,17 @@ static esp_err_t playout_run_latency_calibration_blocks(
   for (int k = 0; k < LATENCY_CAL_BURSTS; ++k) s_cal.emit_us[k] = 0;
 
   if (!playout_flush_checked("latency-cal")) return ESP_FAIL;
-  if (audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES, 0U,
-                                   CAL_GENERATION) != ESP_OK ||
-      audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES, 1U,
-                                   CAL_GENERATION) != ESP_OK ||
-      audio_playout_enable() != ESP_OK) {
+  bool preload_ok = true;
+  for (uint32_t k = 0; k < AUDIO_PLAYOUT_DMA_BLOCKS && preload_ok; ++k) {
+    preload_ok = audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES, k,
+                                              CAL_GENERATION) == ESP_OK;
+  }
+  if (!preload_ok || audio_playout_enable() != ESP_OK) {
     (void)playout_flush_checked("latency-cal-start");
     return ESP_FAIL;
   }
   audio_playout_completion_t d;
-  for (uint32_t idx = 2U; idx < CAL_TOTAL_BLOCKS; ++idx) {
+  for (uint32_t idx = AUDIO_PLAYOUT_DMA_BLOCKS; idx < CAL_TOTAL_BLOCKS; ++idx) {
     const bool is_burst = cal_block_is_burst(idx, NULL);
     if (is_burst) {
       latency_cal_fill_burst(burst, AUDIO_PLAYOUT_FRAMES, CAL_I2S_RATE_HZ);
@@ -2821,80 +2822,42 @@ static esp_err_t playout_run_latency_calibration(void) {
 
 #endif /* CONFIG_AIRPLAY_LATENCY_CAL */
 
-/* The last two blocks handed to the DMA, oldest first. A clock retune
- * reloads them in this order (audio_playout_tune_ppm_in_order). */
-typedef struct {
-  const audio_out_sample_t *prev;
-  const audio_out_sample_t *last;
-} playout_hist_t;
-
-static esp_err_t playout_write(playout_hist_t *h, const audio_out_sample_t *blk,
-                               uint32_t frames, uint32_t rtp,
-                               uint32_t generation) {
-  const esp_err_t e = audio_playout_write_tagged(blk, frames, rtp, generation);
-  if (e == ESP_OK) {
-    h->prev = h->last;
-    h->last = blk;
-  } else {
-    h->prev = h->last = NULL;
-  }
-  return e;
+static esp_err_t playout_write(const audio_out_sample_t *blk, uint32_t frames,
+                               uint32_t rtp, uint32_t generation) {
+  return audio_playout_write_tagged(blk, frames, rtp, generation);
 }
 
 static void ap2_playout_task(void *arg) {
   (void)arg;
-  /* Two of each block buffer, used in turn: the output block written last
-   * and the one before it stay intact while the next one is built, so a
-   * clock retune can reload both into the DMA in play order. */
-  int16_t *block_buf[2] = {NULL, NULL};
-  for (int i = 0; i < 2; ++i) {
-    block_buf[i] = heap_caps_malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t),
+  /* `block` holds 16-bit PCM from the FIFO; `out_block` is what goes to I2S.
+   * i2s_channel_write() copies it into the DMA before returning, so one of
+   * each is enough. With 16-bit slots they are the same buffer (volume works
+   * in place). */
+  int16_t *block = heap_caps_malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t),
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!block_buf[i]) block_buf[i] = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
-  }
-  if (!block_buf[0] || !block_buf[1]) {
+  if (!block) block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
+  if (!block) {
     ESP_LOGE(TAG, "playout block allocation failed");
-    free(block_buf[0]);
-    free(block_buf[1]);
     s.playout_task = NULL;
     vTaskDelete(NULL);
     return;
   }
-  int16_t *block = block_buf[0];
-  /* `block` holds 16-bit PCM from the ring; `out_block` is what goes to I2S.
-   * With 16-bit slots they are the same buffer (volume works in place). */
 #if AUDIO_OUT_SLOT_BITS == 32
-  audio_out_sample_t *out_buf[2] = {NULL, NULL};
-  for (int i = 0; i < 2; ++i) {
-    out_buf[i] = heap_caps_malloc(
-        AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!out_buf[i])
-      out_buf[i] = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
-  }
-  if (!out_buf[0] || !out_buf[1]) {
+  audio_out_sample_t *out_block = heap_caps_malloc(
+      AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!out_block)
+    out_block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
+  if (!out_block) {
     ESP_LOGE(TAG, "playout output block allocation failed");
-    free(out_buf[0]);
-    free(out_buf[1]);
-    free(block_buf[0]);
-    free(block_buf[1]);
+    free(block);
     s.playout_task = NULL;
     vTaskDelete(NULL);
     return;
   }
 #else
-  audio_out_sample_t *out_buf[2] = {block_buf[0], block_buf[1]};
+  audio_out_sample_t *out_block = block;
 #endif
-  audio_out_sample_t *out_block = out_buf[0];
-  unsigned buf_index = 0;
-  playout_hist_t hist = {NULL, NULL};
-  /* Use the other buffer pair for the next block (after writing out_block). */
-#define PLAYOUT_NEXT_BUFFERS()            \
-  do {                                    \
-    buf_index ^= 1U;                      \
-    block = block_buf[buf_index];         \
-    out_block = out_buf[buf_index];       \
-  } while (0)
 
   typedef enum {
     PLAYOUT_STOPPED = 0,
@@ -2902,7 +2865,7 @@ static void ap2_playout_task(void *arg) {
     PLAYOUT_RUNNING = 2,
   } playout_state_t;
 
-  uint32_t cursor_rtp = 0; /* next block to submit after two preloaded blocks */
+  uint32_t cursor_rtp = 0; /* next block to submit after the preloaded blocks */
   uint32_t cursor_generation = 0;
   const int32_t initial_volume =
       __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
@@ -3163,11 +3126,18 @@ static void ap2_playout_task(void *arg) {
       if (snap.stream_type == AUDIO_STREAM_REALTIME)
         guard_frames += (uint32_t)(((uint64_t)sr * AP2_REALTIME_PRIME_MS) / 1000ULL);
       const audio_out_sample_t *silence = s_silence_block;
-      if (!pcm_rtp_ring_has_range(s.pcm_ring,
-                                  desired_rtp + 2U * AUDIO_PLAYOUT_FRAMES,
-                                  guard_frames, snap.pcm_generation)) {
-        /* Not enough PCM yet: one more block of zeros (paces the loop). */
-        if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+      /* The first real block starts after the probe, i.e. after up to every
+       * queued descriptor: check PCM from there. */
+      if (!pcm_fifo_has_range(s.pcm_fifo,
+                              desired_rtp + (AUDIO_PLAYOUT_DMA_BLOCKS + 1U) *
+                                                AUDIO_PLAYOUT_FRAMES,
+                              guard_frames, snap.pcm_generation)) {
+        /* Not enough PCM yet: more zeros, one batch per wake. */
+        if (audio_playout_free_blocks() == 0U) {
+          (void)audio_playout_wait_free(AUDIO_PLAYOUT_BATCH, pdMS_TO_TICKS(200));
+          continue;
+        }
+        if (playout_write(silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
           (void)playout_flush_checked("warm-zeros-write-fail");
           idle_zeros = false;
           state = PLAYOUT_STOPPED;
@@ -3179,8 +3149,8 @@ static void ap2_playout_task(void *arg) {
       /* Probe tags: generation 0, RTP field = private counter (never a
        * generation's sync observation). */
       const uint32_t probe_id = 0x80000000U | (++warm_probe_seq & 0x7FFFFFFFU);
-      if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, probe_id, 0U) != ESP_OK ||
-          playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+      if (playout_write(silence, AUDIO_PLAYOUT_FRAMES, probe_id, 0U) != ESP_OK ||
+          playout_write(silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
         (void)playout_flush_checked("warm-probe-write-fail");
         idle_zeros = false;
         state = PLAYOUT_STOPPED;
@@ -3239,11 +3209,11 @@ static void ap2_playout_task(void *arg) {
           still_valid &&
           wanted_rtp_at_presentation_ns(&snap, boundary_ns + half_sample_ns,
                                         &real_start_rtp) &&
-          pcm_rtp_ring_read_256(s.pcm_ring, real_start_rtp,
-                                snap.pcm_generation, block);
+          pcm_fifo_read(s.pcm_fifo, real_start_rtp, AUDIO_PLAYOUT_FRAMES,
+                        snap.pcm_generation, block) == AUDIO_PLAYOUT_FRAMES;
       if (!have_real) {
         /* Keep the free slot fed and try again on the next pass. */
-        if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+        if (playout_write(silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
           (void)playout_flush_checked("warm-zeros-write-fail");
           idle_zeros = false;
           state = PLAYOUT_STOPPED;
@@ -3253,16 +3223,14 @@ static void ap2_playout_task(void *arg) {
       }
 
       output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
-      if (playout_write(&hist, out_block, AUDIO_PLAYOUT_FRAMES,
+      if (playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                      real_start_rtp, snap.generation) != ESP_OK) {
-        PLAYOUT_NEXT_BUFFERS();
-        (void)playout_flush_checked("warm-write-fail");
+          (void)playout_flush_checked("warm-write-fail");
         idle_zeros = false;
         state = PLAYOUT_STOPPED;
         vTaskDelay(1);
         continue;
       }
-      PLAYOUT_NEXT_BUFFERS();
       cursor_rtp = real_start_rtp + AUDIO_PLAYOUT_FRAMES;
       state = PLAYOUT_RUNNING;
       warm_prime = false;
@@ -3297,7 +3265,7 @@ static void ap2_playout_task(void *arg) {
        * short guard on the alignment procedure itself. Buffered AAC uses the
        * normal short guard from the predicted first-real boundary. Realtime
        * ALAC keeps its existing guard/recovery prime. The exact measured first
-       * 256-frame PCM block is still required after the silent EOF probe. */
+       * PCM block is still required after the silent EOF probe. */
       uint32_t guard_start = desired_rtp;
       uint32_t guard_frames =
           AP2_START_PRIME_GUARD_BLOCKS * AUDIO_PLAYOUT_FRAMES;
@@ -3308,8 +3276,8 @@ static void ap2_playout_task(void *arg) {
         guard_start = desired_rtp +
                       AP2_START_REAL_BOUNDARY_BLOCKS * AUDIO_PLAYOUT_FRAMES;
       }
-      if (!pcm_rtp_ring_has_range(s.pcm_ring, guard_start, guard_frames,
-                                  snap.pcm_generation)) {
+      if (!pcm_fifo_has_range(s.pcm_fifo, guard_start, guard_frames,
+                              snap.pcm_generation)) {
         (void)xSemaphoreTake(s.playout_wake, 1);
         continue;
       }
@@ -3328,12 +3296,13 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      hist.prev = hist.last = silence;
-      if (audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
-                                       silence_rtp, 0U) != ESP_OK ||
-          audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
-                                       silence_rtp + AUDIO_PLAYOUT_FRAMES,
-                                       0U) != ESP_OK) {
+      bool preload_ok = true;
+      for (uint32_t k = 0; k < AUDIO_PLAYOUT_DMA_BLOCKS && preload_ok; ++k) {
+        preload_ok = audio_playout_preload_tagged(
+                         silence, AUDIO_PLAYOUT_FRAMES,
+                         silence_rtp + k * AUDIO_PLAYOUT_FRAMES, 0U) == ESP_OK;
+      }
+      if (!preload_ok) {
         (void)playout_flush_checked("prime-preload-fail");
         state = PLAYOUT_STOPPED;
         vTaskDelay(1);
@@ -3368,9 +3337,9 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      /* Wait for EOF of the first silent block.  The second silent descriptor
-       * is already running, leaving one full block (~5.8 ms) to calculate the
-       * exact RTP sample for descriptor #3 and queue it without stopping I2S. */
+      /* Wait for EOF of the first silent block. The other silent descriptors
+       * are still queued, leaving several blocks to calculate the exact RTP
+       * sample for the first real block and queue it without stopping I2S. */
       const int64_t align_deadline = esp_timer_get_time() + AP2_START_ALIGN_TIMEOUT_US;
       audio_playout_completion_t probe_done;
       bool have_probe = false;
@@ -3395,8 +3364,9 @@ static void ap2_playout_task(void *arg) {
 
       /* Convert the measured EOF edge into the stream presentation clock.
        * For realtime ALAC this stays as the ISR's ESP-local timestamp; AAC
-       * keeps the original local+PTP-offset conversion. Descriptor #3 starts
-       * one block after descriptor #1 EOF because descriptor #2 is in flight. */
+       * keeps the original local+PTP-offset conversion. The first real block
+       * starts AUDIO_PLAYOUT_DMA_BLOCKS - 1 blocks after the first silent EOF:
+       * the remaining silent blocks are queued in front of it. */
       const int64_t probe_done_time_ns = completion_presentation_ns(&snap, &probe_done);
       int64_t rate_scale_ppm = 1000000LL + (int64_t)servo_ppm;
       if (rate_scale_ppm < 900000LL) rate_scale_ppm = 900000LL;
@@ -3405,8 +3375,11 @@ static void ap2_playout_task(void *arg) {
           ((uint64_t)AUDIO_PLAYOUT_FRAMES * 1000000000ULL * 1000000ULL +
            block_den / 2ULL) / block_den;
       uint64_t real_boundary_time_ns =
-          probe_done_time_ns > 0 ? (uint64_t)probe_done_time_ns + block_ns
-                                 : silence_start_time_ns + 2ULL * block_ns;
+          probe_done_time_ns > 0
+              ? (uint64_t)probe_done_time_ns +
+                    (uint64_t)(AUDIO_PLAYOUT_DMA_BLOCKS - 1U) * block_ns
+              : silence_start_time_ns +
+                    (uint64_t)AUDIO_PLAYOUT_DMA_BLOCKS * block_ns;
 
       /* Round the measured physical I2S boundary to the nearest RTP sample.
        * This keeps startup alignment resolution at one sample (22.68 us at
@@ -3441,8 +3414,8 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      bool ok = pcm_rtp_ring_read_256(s.pcm_ring, real_start_rtp,
-                                      snap.pcm_generation, block);
+      bool ok = pcm_fifo_read(s.pcm_fifo, real_start_rtp, AUDIO_PLAYOUT_FRAMES,
+                              snap.pcm_generation, block) == AUDIO_PLAYOUT_FRAMES;
       if (!ok) {
         /* Do not allow the already-running silent probe to leak into audible
          * timing indefinitely. A miss restarts the one-enable alignment epoch
@@ -3453,9 +3426,8 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
       output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
-      const esp_err_t first_err = playout_write(&hist, out_block, AUDIO_PLAYOUT_FRAMES,
+      const esp_err_t first_err = playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                                 real_start_rtp, snap.generation);
-      PLAYOUT_NEXT_BUFFERS();
       if (first_err != ESP_OK) {
         (void)playout_flush_checked("prime-write-fail");
         state = PLAYOUT_STOPPED;
@@ -3511,87 +3483,58 @@ static void ap2_playout_task(void *arg) {
       continue;
     }
 
-    /* In RUNNING, cursor_rtp is the next future block to queue. The two DMA
-     * descriptors are paced by their EOF interrupts. No guessed current+1
-     * subtraction is used for sync any more; the ISR completion tags are the
-     * source of truth. */
+    /* In RUNNING, cursor_rtp is the next future block to queue. The DMA
+     * descriptors are paced by their EOF interrupts; the ISR completion tags
+     * are the source of truth for sync. Sleep until AUDIO_PLAYOUT_BATCH
+     * descriptors are free, then queue that many blocks without blocking:
+     * Core1 wakes once per batch instead of once per descriptor. The loop top
+     * (FLUSH, timeline, completions) runs again after every wake. */
+    if (audio_playout_free_blocks() == 0U) {
+      (void)audio_playout_wait_free(AUDIO_PLAYOUT_BATCH, pdMS_TO_TICKS(200));
+      continue;
+    }
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
     const int64_t pd_work_start_us = esp_timer_get_time();
 #endif
-    bool have_pcm = pcm_rtp_ring_read_256(
-        s.pcm_ring, cursor_rtp, snap.pcm_generation, block);
-    if (!have_pcm && snap.stream_type == AUDIO_STREAM_BUFFERED) {
-      /* AutoMix/revision recovery can leave a small RTP-addressed validity
-       * hole even though the surrounding AAC packets are complete. Keep the
-       * normal exact read as the zero-overhead fast path. Only on a real miss,
-       * retry with sparse concealment so N missing samples become exactly N
-       * silent samples instead of discarding the whole 256-frame block. */
-#if defined(CONFIG_AIRPLAY_DIAG_BUFFER) && CONFIG_AIRPLAY_DIAG_BUFFER
-      /* Diagnostic-only work is deliberately inside the category guard. When
-       * BUFFER diagnostics are off there is no extra contiguous scan, local
-       * state, missing-frame count, or hook in the playout hot path. */
-      uint32_t diag_missing_frames = 0U;
-      const uint32_t diag_contiguous_before_gap =
-          pcm_rtp_ring_contiguous_frames(s.pcm_ring, cursor_rtp,
-                                         snap.pcm_generation,
-                                         AUDIO_PLAYOUT_FRAMES);
-      const bool diag_conceal_ok = pcm_rtp_ring_read_256_conceal(
-          s.pcm_ring, cursor_rtp, snap.pcm_generation, block,
-          &diag_missing_frames);
-
-      /* A RUNNING-loop snapshot can become stale immediately if Core0
-       * publishes PAUSE/FLUSH/new anchor while this task is doing the PCM
-       * lookup. Classify a hard miss from fresh state so the diagnostics can
-       * distinguish an audible while-playing underrun from a cancelled
-       * transition. This work exists only with BUFFER diagnostics enabled. */
-      uint32_t diag_transition = 0U;
-      if (!diag_conceal_ok) {
-        timing_snapshot_t diag_now;
-        snapshot_state(&diag_now);
-        diag_transition =
-            !diag_now.playing || !diag_now.anchor_valid ||
-            diag_now.timeline_reset_pending ||
-            diag_now.generation != snap.generation ||
-            diag_now.media_revision != snap.media_revision ||
-            __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&s.playout_servo_reset_requested, __ATOMIC_ACQUIRE) ||
-            __atomic_load_n(&s.playout_quiesce_req, __ATOMIC_ACQUIRE) !=
-                __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_ACQUIRE);
-      }
-      AUDIO_DIAG_BUFFER_PLAYOUT_MISS(diag_conceal_ok ? 1U : 0U,
-                                     diag_missing_frames,
-                                     diag_contiguous_before_gap,
-                                     diag_transition);
-      if (diag_conceal_ok) {
-        have_pcm = true;
-        if (diag_missing_frames)
-          aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp,
-                    (int32_t)diag_missing_frames, 0, 0);
-      }
-#else
+    /* Plain copy from the PCM FIFO; frames it does not hold (a lost packet,
+     * audio not decoded yet) come back as silence. */
+    const uint32_t got = pcm_fifo_read(s.pcm_fifo, cursor_rtp,
+                                       AUDIO_PLAYOUT_FRAMES,
+                                       snap.pcm_generation, block);
+    const bool have_pcm = got > 0U;
+    if (have_pcm && got < AUDIO_PLAYOUT_FRAMES) {
+      const uint32_t missing = AUDIO_PLAYOUT_FRAMES - got;
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
-      uint32_t pd_missing = 0U;
-      if (pcm_rtp_ring_read_256_conceal(
-              s.pcm_ring, cursor_rtp, snap.pcm_generation, block, &pd_missing)) {
-        have_pcm = true;
-        PD_ADD(conceal_blocks, 1U);
-        PD_ADD(conceal_frames, pd_missing);
-        if (pd_missing)
-          aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp,
-                    (int32_t)pd_missing, 0, 0);
-      }
-#else
-      uint32_t missing = 0U;
-      if (pcm_rtp_ring_read_256_conceal(
-              s.pcm_ring, cursor_rtp, snap.pcm_generation, block, &missing)) {
-        have_pcm = true;
-        if (missing)
-          aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp,
-                    (int32_t)missing, 0, 0);
-      }
+      PD_ADD(conceal_blocks, 1U);
+      PD_ADD(conceal_frames, missing);
 #endif
-#endif
+      aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp, (int32_t)missing,
+                0, 0);
     }
+#if defined(CONFIG_AIRPLAY_DIAG_BUFFER) && CONFIG_AIRPLAY_DIAG_BUFFER
+    if (got < AUDIO_PLAYOUT_FRAMES && snap.stream_type == AUDIO_STREAM_BUFFERED) {
+      /* Classify a miss from fresh state so the diagnostics can tell an
+       * audible underrun from a cancelled transition. */
+      timing_snapshot_t diag_now;
+      snapshot_state(&diag_now);
+      const uint32_t diag_transition =
+          !diag_now.playing || !diag_now.anchor_valid ||
+          diag_now.timeline_reset_pending ||
+          diag_now.generation != snap.generation ||
+          diag_now.media_revision != snap.media_revision ||
+          __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
+          __atomic_load_n(&s.playout_servo_reset_requested, __ATOMIC_ACQUIRE) ||
+          __atomic_load_n(&s.playout_quiesce_req, __ATOMIC_ACQUIRE) !=
+              __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_ACQUIRE);
+      AUDIO_DIAG_BUFFER_PLAYOUT_MISS(have_pcm ? 1U : 0U,
+                                     AUDIO_PLAYOUT_FRAMES - got,
+                                     pcm_fifo_contiguous_frames(
+                                         s.pcm_fifo, cursor_rtp,
+                                         snap.pcm_generation,
+                                         AUDIO_PLAYOUT_FRAMES),
+                                     have_pcm ? 0U : diag_transition);
+    }
+#endif
     if (!have_pcm) {
       /* A stop (FLUSH, track change) may have cleared the PCM just now. Do
        * not send that gap as silence while I2S still runs: stop I2S first
@@ -3614,20 +3557,15 @@ static void ap2_playout_task(void *arg) {
     PD_MAX(max_work_us, esp_timer_get_time() - pd_work_start_us);
 #endif
 
-    const esp_err_t write_err = playout_write(&hist,
+    const esp_err_t write_err = playout_write(
         out_block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
-    PLAYOUT_NEXT_BUFFERS();
-    /* A clock retune decided by the servo runs here, right after the write
-     * returned: the DMA has just started hist.prev and hist.last is queued
-     * behind it, so the in-order reload repeats only a few frames. */
+    /* A clock retune decided by the servo: one register write, I2S and the
+     * DMA keep running. */
     if (write_err == ESP_OK && retune_pending) {
       retune_pending = false;
       audio_playout_tune_info_t ti = {0};
       uint32_t halt_us = 0;
-      const esp_err_t te = (hist.prev && hist.last)
-          ? audio_playout_tune_ppm_in_order(retune_ppm, hist.prev, hist.last,
-                                            AUDIO_PLAYOUT_FRAMES, &ti, &halt_us)
-          : audio_playout_tune_ppm(retune_ppm, &ti);
+      const esp_err_t te = audio_playout_tune_ppm(retune_ppm, &ti, &halt_us);
       if (te == ESP_OK) {
         aevt_post(AEVT_TUNE, NULL, servo_ppm, retune_ppm, (int32_t)halt_us, 0);
         servo_ppm = retune_ppm;
@@ -3861,13 +3799,10 @@ static void ap2_playout_task(void *arg) {
   }
 
   (void)playout_flush_checked("task-exit");
-#undef PLAYOUT_NEXT_BUFFERS
 #if AUDIO_OUT_SLOT_BITS == 32
-  free(out_buf[0]);
-  free(out_buf[1]);
+  free(out_block);
 #endif
-  free(block_buf[0]);
-  free(block_buf[1]);
+  free(block);
   s.playout_task = NULL;
   vTaskDelete(NULL);
 }
@@ -3957,7 +3892,7 @@ esp_err_t audio_receiver_init(void) {
                         TAG, "buffered FIFO create failed");
   }
 
-  if (!s.pcm_ring && pcm_rtp_ring_create(&s.pcm_ring) != ESP_OK) {
+  if (!s.pcm_fifo && pcm_fifo_create(&s.pcm_fifo) != ESP_OK) {
     return ESP_ERR_NO_MEM;
   }
 
@@ -3986,11 +3921,11 @@ esp_err_t audio_receiver_init(void) {
     s.realtime_workspace_bound = true;
   }
   if (!s.buffered_packet || !s.decrypt_buf || !s.decode_pcm ||
-      !s.realtime_stage_pcm || !s.pcm_ring || !s.realtime_stage_ring) {
+      !s.realtime_stage_pcm || !s.pcm_fifo || !s.realtime_stage_ring) {
     return ESP_ERR_NO_MEM;
   }
 
-  pcm_rtp_ring_set_generation(s.pcm_ring, s.buffered_pcm_generation);
+  pcm_fifo_set_generation(s.pcm_fifo, s.buffered_pcm_generation);
   pcm_rtp_ring_set_generation(s.realtime_stage_ring, s.generation);
   AUDIO_DIAG_BUFFER_PSRAM(
       AUDIO_DIAG_PSRAM_AFTER_SHARED,
@@ -4042,7 +3977,7 @@ esp_err_t audio_receiver_init(void) {
 
 bool audio_receiver_is_initialized(void) {
   return __atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE) && s.playout_task && s.realtime_stage_task &&
-         s.codec_workspace && s.transport && s.pcm_ring && s.realtime_stage_ring;
+         s.codec_workspace && s.transport && s.pcm_fifo && s.realtime_stage_ring;
 }
 
 esp_err_t audio_receiver_release_for_wifi_scan(void) {
@@ -4109,9 +4044,9 @@ esp_err_t audio_receiver_release_for_wifi_scan(void) {
     pcm_rtp_ring_destroy(s.realtime_stage_ring);
     s.realtime_stage_ring = NULL;
   }
-  if (s.pcm_ring) {
-    pcm_rtp_ring_destroy(s.pcm_ring);
-    s.pcm_ring = NULL;
+  if (s.pcm_fifo) {
+    pcm_fifo_destroy(s.pcm_fifo);
+    s.pcm_fifo = NULL;
   }
 
   free(s.buffered_packet);
@@ -4481,8 +4416,8 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
     pcm_rtp_ring_invalidate_before(s.realtime_stage_ring, flush_rtp,
                                    snap.generation);
   }
-  if (s.pcm_ring) {
-    pcm_rtp_ring_invalidate_before(s.pcm_ring, flush_rtp, snap.generation);
+  if (s.pcm_fifo) {
+    pcm_fifo_invalidate_before(s.pcm_fifo, flush_rtp, snap.generation);
   }
 
   uint32_t old_cursor = 0;
@@ -4541,20 +4476,12 @@ esp_err_t audio_receiver_set_deferred_flush_range(
       ? buffered_control_add_deferred_locked(from_seq, from_ts, until_seq,
                                               until_ts, timestamps_valid)
       : ESP_ERR_INVALID_STATE;
-  const bool pcm_range_valid = timestamps_valid &&
-                              (int32_t)(until_ts - from_ts) > 0;
-  if (err == ESP_OK && (from_seq & 0x7fffffU) != (until_seq & 0x7fffffU) &&
-      pcm_range_valid && s.pcm_ring) {
-    pcm_rtp_ring_invalidate_range(s.pcm_ring, from_ts, until_ts,
-                                  snap.pcm_generation);
-  }
+  /* As in Shairport Sync, a deferred FLUSH acts only on the compressed
+   * packets as the decoder reaches flushFromSeq; PCM already decoded (at
+   * most the 0.85 s decode window) is not touched. */
   xSemaphoreGive(s.publish_mutex);
   xSemaphoreGive(s_buffered_control.mutex);
-  if (err == ESP_OK) {
-    if (!pcm_range_valid)
-      AP_LOGW(TAG, "deferred FLUSH: no usable PCM timestamp interval; sequence-only discard");
-    media_control_wake();
-  }
+  if (err == ESP_OK) media_control_wake();
   return err;
 }
 

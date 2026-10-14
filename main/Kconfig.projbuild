@@ -216,6 +216,15 @@ menu "AirPlay Logging"
             sender does around an AutoMix transition or a pause. Turn off when
             not needed.
 
+    config AIRPLAY_LOG_METADATA
+        bool "Log track metadata (title, artist, album) and progress"
+        default n
+        help
+            Prints "Now playing" (title and artist, then album and genre)
+            whenever the sender changes the track metadata, and "Progress:
+            position / duration" when it sends the play position. Only
+            logged, never used by playback. Not compiled when off.
+
 endmenu
 
 menu "I2S Playout"

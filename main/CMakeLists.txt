@@ -11,6 +11,7 @@ set(SRC_FILES
     "audio/aac_decoder.c"
     "audio/alac_decoder.c"
     "audio/realtime_receiver.c"
+    "audio/pcm_fifo.c"
     "audio/pcm_rtp_ring.c"
     "audio/audio_playout.c"
     "audio/audio_crypto.c"
