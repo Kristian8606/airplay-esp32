@@ -1597,15 +1597,10 @@ static void status_print_audio_events(void) {
                  ms, (unsigned long)(uint32_t)e.a, (long)e.b);
         break;
       case AEVT_TUNE:
-        if (audio_playout_tune_is_live())
-          ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
-                        " (step %+ld, LIVE: one register write in %ld us,"
-                        " I2S not stopped)",
-                   ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
-        else
-          ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
-                        " (step %+ld, TX stopped %ld us, DMA reloaded in order)",
-                   ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
+        ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
+                      " (step %+ld, LIVE: one register write in %ld us,"
+                      " I2S not stopped)",
+                 ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
         break;
       case AEVT_AAC_MUTE:
         if (e.c == 0)
@@ -2821,80 +2816,42 @@ static esp_err_t playout_run_latency_calibration(void) {
 
 #endif /* CONFIG_AIRPLAY_LATENCY_CAL */
 
-/* The last two blocks handed to the DMA, oldest first. A clock retune
- * reloads them in this order (audio_playout_tune_ppm_in_order). */
-typedef struct {
-  const audio_out_sample_t *prev;
-  const audio_out_sample_t *last;
-} playout_hist_t;
-
-static esp_err_t playout_write(playout_hist_t *h, const audio_out_sample_t *blk,
-                               uint32_t frames, uint32_t rtp,
-                               uint32_t generation) {
-  const esp_err_t e = audio_playout_write_tagged(blk, frames, rtp, generation);
-  if (e == ESP_OK) {
-    h->prev = h->last;
-    h->last = blk;
-  } else {
-    h->prev = h->last = NULL;
-  }
-  return e;
+static esp_err_t playout_write(const audio_out_sample_t *blk, uint32_t frames,
+                               uint32_t rtp, uint32_t generation) {
+  return audio_playout_write_tagged(blk, frames, rtp, generation);
 }
 
 static void ap2_playout_task(void *arg) {
   (void)arg;
-  /* Two of each block buffer, used in turn: the output block written last
-   * and the one before it stay intact while the next one is built, so a
-   * clock retune can reload both into the DMA in play order. */
-  int16_t *block_buf[2] = {NULL, NULL};
-  for (int i = 0; i < 2; ++i) {
-    block_buf[i] = heap_caps_malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t),
+  /* `block` holds 16-bit PCM from the ring; `out_block` is what goes to I2S.
+   * i2s_channel_write() copies it into the DMA before returning, so one of
+   * each is enough. With 16-bit slots they are the same buffer (volume works
+   * in place). */
+  int16_t *block = heap_caps_malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t),
                                     MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!block_buf[i]) block_buf[i] = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
-  }
-  if (!block_buf[0] || !block_buf[1]) {
+  if (!block) block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
+  if (!block) {
     ESP_LOGE(TAG, "playout block allocation failed");
-    free(block_buf[0]);
-    free(block_buf[1]);
     s.playout_task = NULL;
     vTaskDelete(NULL);
     return;
   }
-  int16_t *block = block_buf[0];
-  /* `block` holds 16-bit PCM from the ring; `out_block` is what goes to I2S.
-   * With 16-bit slots they are the same buffer (volume works in place). */
 #if AUDIO_OUT_SLOT_BITS == 32
-  audio_out_sample_t *out_buf[2] = {NULL, NULL};
-  for (int i = 0; i < 2; ++i) {
-    out_buf[i] = heap_caps_malloc(
-        AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!out_buf[i])
-      out_buf[i] = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
-  }
-  if (!out_buf[0] || !out_buf[1]) {
+  audio_out_sample_t *out_block = heap_caps_malloc(
+      AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!out_block)
+    out_block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
+  if (!out_block) {
     ESP_LOGE(TAG, "playout output block allocation failed");
-    free(out_buf[0]);
-    free(out_buf[1]);
-    free(block_buf[0]);
-    free(block_buf[1]);
+    free(block);
     s.playout_task = NULL;
     vTaskDelete(NULL);
     return;
   }
 #else
-  audio_out_sample_t *out_buf[2] = {block_buf[0], block_buf[1]};
+  audio_out_sample_t *out_block = block;
 #endif
-  audio_out_sample_t *out_block = out_buf[0];
-  unsigned buf_index = 0;
-  playout_hist_t hist = {NULL, NULL};
-  /* Use the other buffer pair for the next block (after writing out_block). */
-#define PLAYOUT_NEXT_BUFFERS()            \
-  do {                                    \
-    buf_index ^= 1U;                      \
-    block = block_buf[buf_index];         \
-    out_block = out_buf[buf_index];       \
-  } while (0)
 
   typedef enum {
     PLAYOUT_STOPPED = 0,
@@ -3167,7 +3124,7 @@ static void ap2_playout_task(void *arg) {
                                   desired_rtp + 2U * AUDIO_PLAYOUT_FRAMES,
                                   guard_frames, snap.pcm_generation)) {
         /* Not enough PCM yet: one more block of zeros (paces the loop). */
-        if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+        if (playout_write(silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
           (void)playout_flush_checked("warm-zeros-write-fail");
           idle_zeros = false;
           state = PLAYOUT_STOPPED;
@@ -3179,8 +3136,8 @@ static void ap2_playout_task(void *arg) {
       /* Probe tags: generation 0, RTP field = private counter (never a
        * generation's sync observation). */
       const uint32_t probe_id = 0x80000000U | (++warm_probe_seq & 0x7FFFFFFFU);
-      if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, probe_id, 0U) != ESP_OK ||
-          playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+      if (playout_write(silence, AUDIO_PLAYOUT_FRAMES, probe_id, 0U) != ESP_OK ||
+          playout_write(silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
         (void)playout_flush_checked("warm-probe-write-fail");
         idle_zeros = false;
         state = PLAYOUT_STOPPED;
@@ -3243,7 +3200,7 @@ static void ap2_playout_task(void *arg) {
                                 snap.pcm_generation, block);
       if (!have_real) {
         /* Keep the free slot fed and try again on the next pass. */
-        if (playout_write(&hist, silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
+        if (playout_write(silence, AUDIO_PLAYOUT_FRAMES, 0U, 0U) != ESP_OK) {
           (void)playout_flush_checked("warm-zeros-write-fail");
           idle_zeros = false;
           state = PLAYOUT_STOPPED;
@@ -3253,16 +3210,14 @@ static void ap2_playout_task(void *arg) {
       }
 
       output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
-      if (playout_write(&hist, out_block, AUDIO_PLAYOUT_FRAMES,
+      if (playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                      real_start_rtp, snap.generation) != ESP_OK) {
-        PLAYOUT_NEXT_BUFFERS();
-        (void)playout_flush_checked("warm-write-fail");
+          (void)playout_flush_checked("warm-write-fail");
         idle_zeros = false;
         state = PLAYOUT_STOPPED;
         vTaskDelay(1);
         continue;
       }
-      PLAYOUT_NEXT_BUFFERS();
       cursor_rtp = real_start_rtp + AUDIO_PLAYOUT_FRAMES;
       state = PLAYOUT_RUNNING;
       warm_prime = false;
@@ -3328,7 +3283,6 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      hist.prev = hist.last = silence;
       if (audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
                                        silence_rtp, 0U) != ESP_OK ||
           audio_playout_preload_tagged(silence, AUDIO_PLAYOUT_FRAMES,
@@ -3453,9 +3407,8 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
       output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
-      const esp_err_t first_err = playout_write(&hist, out_block, AUDIO_PLAYOUT_FRAMES,
+      const esp_err_t first_err = playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                                 real_start_rtp, snap.generation);
-      PLAYOUT_NEXT_BUFFERS();
       if (first_err != ESP_OK) {
         (void)playout_flush_checked("prime-write-fail");
         state = PLAYOUT_STOPPED;
@@ -3614,20 +3567,15 @@ static void ap2_playout_task(void *arg) {
     PD_MAX(max_work_us, esp_timer_get_time() - pd_work_start_us);
 #endif
 
-    const esp_err_t write_err = playout_write(&hist,
+    const esp_err_t write_err = playout_write(
         out_block, AUDIO_PLAYOUT_FRAMES, cursor_rtp, snap.generation);
-    PLAYOUT_NEXT_BUFFERS();
-    /* A clock retune decided by the servo runs here, right after the write
-     * returned: the DMA has just started hist.prev and hist.last is queued
-     * behind it, so the in-order reload repeats only a few frames. */
+    /* A clock retune decided by the servo: one register write, I2S and the
+     * DMA keep running. */
     if (write_err == ESP_OK && retune_pending) {
       retune_pending = false;
       audio_playout_tune_info_t ti = {0};
       uint32_t halt_us = 0;
-      const esp_err_t te = (hist.prev && hist.last)
-          ? audio_playout_tune_ppm_in_order(retune_ppm, hist.prev, hist.last,
-                                            AUDIO_PLAYOUT_FRAMES, &ti, &halt_us)
-          : audio_playout_tune_ppm(retune_ppm, &ti);
+      const esp_err_t te = audio_playout_tune_ppm(retune_ppm, &ti, &halt_us);
       if (te == ESP_OK) {
         aevt_post(AEVT_TUNE, NULL, servo_ppm, retune_ppm, (int32_t)halt_us, 0);
         servo_ppm = retune_ppm;
@@ -3861,13 +3809,10 @@ static void ap2_playout_task(void *arg) {
   }
 
   (void)playout_flush_checked("task-exit");
-#undef PLAYOUT_NEXT_BUFFERS
 #if AUDIO_OUT_SLOT_BITS == 32
-  free(out_buf[0]);
-  free(out_buf[1]);
+  free(out_block);
 #endif
-  free(block_buf[0]);
-  free(block_buf[1]);
+  free(block);
   s.playout_task = NULL;
   vTaskDelete(NULL);
 }

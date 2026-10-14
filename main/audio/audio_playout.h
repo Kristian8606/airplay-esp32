@@ -64,28 +64,18 @@ bool audio_playout_wait_completion(audio_playout_completion_t *out,
 
 bool audio_playout_is_enabled(void);
 
-/* Fine tune the TX master clock of a running channel: disable -> tune ->
- * enable (the IDF allows i2s_channel_tune_rate() only in the READY state).
- * Call only from the playout task between writes. target_ppm is relative to
- * the nominal MCLK measured at init (+/-160 ppm). */
+/* Fine tune the TX master clock while I2S keeps running: one write of the
+ * fractional MCLK divider register (no disable/enable, the DMA is not
+ * touched). target_ppm is relative to the nominal MCLK measured at init
+ * (+/-160 ppm). Call only from the playout task. ESP_ERR_NOT_SUPPORTED when
+ * live tuning is unavailable (see the boot log). halt_us = time spent. */
 esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
-                                 audio_playout_tune_info_t *out);
-
-/* Same, but reloads the two DMA descriptors in play order before enable():
- * `playing` is the block the DMA was sending, `next` the block queued after
- * it (the last one written). Call right after a write returned, so only a
- * few frames of `playing` are repeated. halt_us = how long TX was stopped. */
-esp_err_t audio_playout_tune_ppm_in_order(int32_t target_ppm,
-                                          const audio_out_sample_t *playing,
-                                          const audio_out_sample_t *next,
-                                          uint32_t frames,
-                                          audio_playout_tune_info_t *out,
-                                          uint32_t *halt_us);
-/* Reset the physical MCLK correction to nominal while preserving the current
- * enabled/disabled channel state. Intended for a hard audio-session boundary,
- * not for normal track/anchor changes inside one session. */
+                                 audio_playout_tune_info_t *out,
+                                 uint32_t *halt_us);
+/* Reset the MCLK correction to nominal (hard audio-session boundary, not
+ * normal track/anchor changes inside one session). */
 esp_err_t audio_playout_reset_tune(void);
 
-/* True when retunes rewrite only the fractional MCLK divider register while
- * I2S keeps running (the normal case; checked at init). */
+/* True when the clock can be tuned: the fractional MCLK divider register is
+ * rewritten while I2S keeps running (checked at init). */
 bool audio_playout_tune_is_live(void);

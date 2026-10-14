@@ -1247,14 +1247,137 @@ static void handle_record(int socket, rtsp_conn_t *conn,
                      NULL, 0);
 }
 
+#if defined(CONFIG_AIRPLAY_LOG_METADATA) && CONFIG_AIRPLAY_LOG_METADATA
+/* Track metadata log (menuconfig: AirPlay Logging -> Log track metadata).
+ * Only logged, never used: title/artist/album/genre from the DMAP body and
+ * the "progress: start/current/end" RTP triple. Compiled out when off. */
+#define META_FIELD_MAX    96
+#define DMAP_MAX_NESTING  8
+
+typedef struct {
+  char title[META_FIELD_MAX];
+  char artist[META_FIELD_MAX];
+  char album[META_FIELD_MAX];
+  char genre[META_FIELD_MAX];
+} meta_log_t;
+
+static uint32_t s_meta_log_hash;
+static bool s_meta_log_hash_valid;
+
+static void meta_copy(char *dst, const uint8_t *src, uint32_t len) {
+  const uint32_t n = len < META_FIELD_MAX - 1U ? len : META_FIELD_MAX - 1U;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
+/* DMAP: 4-byte tag, 4-byte big-endian length, payload. */
+static void dmap_collect(const uint8_t *data, size_t len, meta_log_t *m,
+                         int depth) {
+  if (depth > DMAP_MAX_NESTING) return;
+  size_t pos = 0;
+  while (pos + 8U <= len) {
+    const uint8_t *tag = data + pos;
+    const uint32_t item_len = ((uint32_t)data[pos + 4] << 24) |
+                              ((uint32_t)data[pos + 5] << 16) |
+                              ((uint32_t)data[pos + 6] << 8) | data[pos + 7];
+    pos += 8U;
+    if (item_len > len - pos) break; /* malformed */
+    if (memcmp(tag, "minm", 4) == 0) {
+      meta_copy(m->title, data + pos, item_len);
+    } else if (memcmp(tag, "asar", 4) == 0) {
+      meta_copy(m->artist, data + pos, item_len);
+    } else if (memcmp(tag, "asal", 4) == 0) {
+      meta_copy(m->album, data + pos, item_len);
+    } else if (memcmp(tag, "asgn", 4) == 0) {
+      meta_copy(m->genre, data + pos, item_len);
+    } else if (memcmp(tag, "mlit", 4) == 0 || memcmp(tag, "cmst", 4) == 0 ||
+               memcmp(tag, "mdst", 4) == 0) {
+      dmap_collect(data + pos, item_len, m, depth + 1); /* containers */
+    }
+    pos += item_len;
+  }
+}
+
+static void log_dmap_metadata(const uint8_t *data, size_t len) {
+  meta_log_t m = {0};
+  dmap_collect(data, len, &m, 0);
+  /* The sender repeats identical metadata: log only changes (FNV-1a). */
+  uint32_t hash = 2166136261U;
+  const char *fields[] = {m.title, m.artist, m.album, m.genre};
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i) {
+    for (const unsigned char *c = (const unsigned char *)fields[i]; *c; ++c) {
+      hash ^= *c;
+      hash *= 16777619U;
+    }
+    hash ^= 0xffU;
+    hash *= 16777619U;
+  }
+  if (s_meta_log_hash_valid && hash == s_meta_log_hash) return;
+  s_meta_log_hash = hash;
+  s_meta_log_hash_valid = true;
+  ESP_LOGI(TAG, "Now playing: \"%s\" - %s", m.title[0] ? m.title : "?",
+           m.artist[0] ? m.artist : "?");
+  if (m.album[0] || m.genre[0]) {
+    ESP_LOGI(TAG, "  Album: %s%s%s", m.album[0] ? m.album : "?",
+             m.genre[0] ? " | Genre: " : "", m.genre);
+  }
+}
+
+/* Find "key" inside text[0..len) (text need not be NUL-terminated). */
+static const char *find_param(const char *text, size_t len, const char *key) {
+  const size_t klen = strlen(key);
+  for (size_t i = 0; i + klen <= len; ++i) {
+    if (strncasecmp(text + i, key, klen) == 0) return text + i + klen;
+  }
+  return NULL;
+}
+
+static void log_progress(const char *text, size_t len) {
+  const char *v = find_param(text, len, "progress:");
+  if (!v) return;
+  char buf[64];
+  size_t n = 0;
+  while (v + n < text + len && n < sizeof(buf) - 1U && v[n] != '\r' &&
+         v[n] != '\n') {
+    buf[n] = v[n];
+    ++n;
+  }
+  buf[n] = '\0';
+  uint64_t start = 0, current = 0, end = 0;
+  // NOLINTNEXTLINE(bugprone-unchecked-string-to-number-conversion)
+  if (sscanf(buf, " %" SCNu64 "/%" SCNu64 "/%" SCNu64, &start, &current,
+             &end) != 3) {
+    return;
+  }
+  /* RTP timestamps, modulo 2^32, at 44.1 kHz. */
+  const uint32_t duration = (uint32_t)end - (uint32_t)start;
+  const uint32_t position = (uint32_t)current - (uint32_t)start;
+  if (duration >= UINT32_C(0x80000000) || position > duration) return;
+  const uint32_t pos_s = position / 44100U, dur_s = duration / 44100U;
+  ESP_LOGI(TAG, "Progress: %" PRIu32 ":%02" PRIu32 " / %" PRIu32 ":%02" PRIu32,
+           pos_s / 60U, pos_s % 60U, dur_s / 60U, dur_s % 60U);
+}
+#endif /* CONFIG_AIRPLAY_LOG_METADATA */
+
 static void handle_set_parameter(int socket, rtsp_conn_t *conn,
                                  const rtsp_request_t *req, const uint8_t *raw,
                                  size_t raw_len) {
+#if defined(CONFIG_AIRPLAY_LOG_METADATA) && CONFIG_AIRPLAY_LOG_METADATA
+  if (req->body && req->body_len > 0 &&
+      strstr(req->content_type, "application/x-dmap-tagged")) {
+    log_dmap_metadata(req->body, req->body_len);
+  }
+  /* Progress comes as a header or inside a text/parameters body. */
+  if (raw && raw_len > 0) {
+    log_progress((const char *)raw, raw_len);
+  }
+#else
   (void)raw;
   (void)raw_len;
+#endif
 
-  /* Only the volume matters. Track metadata, progress and artwork are not
-   * used by this receiver, so those bodies are accepted and ignored. */
+  /* Only the volume changes playback. Metadata/progress above are just
+   * logged (menuconfig); artwork and other bodies are accepted and ignored. */
   if (req->body && strstr(req->content_type, "text/parameters")) {
     const char *vol = strstr((const char *)req->body, "volume:");
     if (vol) {
