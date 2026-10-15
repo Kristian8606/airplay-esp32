@@ -366,28 +366,12 @@ typedef struct {
   uint32_t immediate_until_seq;
   uint32_t immediate_until_rtp;
 
-  /* Experimental no-sequence-boundary recovery. External implementations do
-   * not establish Apple's zero semantics. Wait for a fresh anchor, then use
-   * its normal decode window as a bounded admission checkpoint; old RTP is
-   * diagnostic only. Normal AutoMix future holding resumes after admission. */
-  bool zero_seq_wait_anchor;
-  bool zero_seq_resync_active;
-  uint32_t zero_seq_anchor_rtp;
-  uint32_t zero_seq_dropped;
-
   buffered_deferred_flush_t deferred[AP2_MAX_DEFERRED_FLUSH];
 } buffered_control_t;
 
 typedef struct {
   bool drop;
-  bool hold;
   uint32_t revision;
-  bool zero_seq_candidate; /* recovery completes only after a successful read */
-  bool zero_seq_dropped;
-  uint32_t zero_anchor_rtp;
-  uint32_t zero_admission_rtp;
-  int32_t zero_lead;
-  uint32_t zero_drop_count;
   bool immediate_completed;
   bool immediate_overshoot;
   uint32_t immediate_target_seq;
@@ -422,10 +406,6 @@ static void buffered_control_reset(void) {
   s_buffered_control.immediate_active = false;
   s_buffered_control.immediate_until_seq = 0;
   s_buffered_control.immediate_until_rtp = 0;
-  s_buffered_control.zero_seq_wait_anchor = false;
-  s_buffered_control.zero_seq_resync_active = false;
-  s_buffered_control.zero_seq_anchor_rtp = 0;
-  s_buffered_control.zero_seq_dropped = 0;
   memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
   xSemaphoreGive(s_buffered_control.mutex);
 }
@@ -442,63 +422,10 @@ static void buffered_control_snapshot(buffered_control_snapshot_t *out) {
   xSemaphoreGive(s_buffered_control.mutex);
 }
 
-/* Caller holds control mutex and publish mutex, so the anchor and zero-seq
- * admission state become visible as one control transaction. */
-static void buffered_control_anchor_committed_locked(uint32_t anchor_rtp) {
-  if (s_buffered_control.zero_seq_wait_anchor ||
-      s_buffered_control.zero_seq_resync_active) {
-    s_buffered_control.zero_seq_wait_anchor = false;
-    s_buffered_control.zero_seq_resync_active = true;
-    s_buffered_control.zero_seq_anchor_rtp = anchor_rtp;
-  }
-}
-
-static void buffered_control_zero_seq_classify_locked(
-    const buffered_packet_t *packet, buffered_packet_decision_t *decision) {
-  if (s_buffered_control.zero_seq_wait_anchor) {
-    decision->hold = true;
-    return;
-  }
-  if (!s_buffered_control.zero_seq_resync_active) return;
-
-  timing_snapshot_t snap;
-  snapshot_state(&snap);
-  uint32_t wanted;
-  if (!wanted_rtp_now(&snap, &wanted)) {
-    decision->hold = true; /* Never classify against an unqualified PTP map. */
-    return;
-  }
-  decision->zero_anchor_rtp = s_buffered_control.zero_seq_anchor_rtp;
-  /* A late SETRATE/PTP mapping must not freeze admission in an already-past
-   * window. Conversely, before a future anchor becomes due, its first packet
-   * remains admissible and then waits at the normal future timing gate. */
-  const uint32_t admission_rtp = (int32_t)(wanted - decision->zero_anchor_rtp) > 0
-      ? wanted : decision->zero_anchor_rtp;
-  decision->zero_admission_rtp = admission_rtp;
-  decision->zero_lead = (int32_t)(packet->rtp - admission_rtp);
-  /* Buffered format is validated as 44100 Hz AAC at SETUP. This uses the
-   * existing 850 ms decode gate, not a midpoint against an old RTP value.
-   * It is an explicit experimental exception ONLY during zero-seq admission.
-   * A distant valid first packet cannot be identified without more protocol
-   * metadata/captures; logs expose every admission and sampled rejections. */
-  const int32_t admission_frames = (44100 * AP2_BUFFERED_LEAD_MS) / 1000U;
-  if (packet->ssrc != AP2_SSRC_AAC_44100_F24_2 ||
-      decision->zero_lead < 0 || decision->zero_lead >= admission_frames) {
-    decision->drop = true;
-    decision->zero_seq_dropped = true;
-    decision->zero_drop_count = ++s_buffered_control.zero_seq_dropped;
-  } else {
-    decision->zero_seq_candidate = true;
-    decision->zero_drop_count = s_buffered_control.zero_seq_dropped;
-  }
-}
-
 /* Publication recheck: a FLUSH can arrive while AAC decode/EQ runs. This
  * predicate is intentionally side-effect-free; the sole consumer remains
  * responsible for range activation/completion. Caller holds control mutex. */
 static bool buffered_control_packet_flushed_locked(uint32_t seq) {
-  if (s_buffered_control.zero_seq_wait_anchor ||
-      s_buffered_control.zero_seq_resync_active) return true;
   if (s_buffered_control.immediate_active &&
       seq23_delta(seq, s_buffered_control.immediate_until_seq) < 0) return true;
   for (uint32_t i = 0; i < AP2_MAX_DEFERRED_FLUSH; ++i) {
@@ -577,7 +504,6 @@ static void buffered_control_classify_current_head(void *context) {
   uint32_t event_count = 0;
 
   decision->revision = s_buffered_control.revision;
-  buffered_control_zero_seq_classify_locked(packet, decision);
 
   /* Shairport 5.5.2: immediate FLUSH consumes every sequential block before
    * flushUntilSeq. The endpoint block itself survives; overshoot also ends the
@@ -656,15 +582,6 @@ static esp_err_t buffered_control_classify(
              : e->kind == FLUSH_EV_OBSOLETE ? "already obsolete"
              : e->kind == FLUSH_EV_END ? "ended" : "ended by overshoot",
              packet->seq, packet->rtp);
-  }
-  if (decision->zero_seq_dropped &&
-       (decision->zero_drop_count <= 3U ||
-        (decision->zero_drop_count & 0xffU) == 0U)) {
-    AP_LOGI(TAG,
-             "AAC zero-seq resync DROP seq=%" PRIu32 " rtp=%" PRIu32
-             " anchor=%" PRIu32 " floor=%" PRIu32 " lead=%" PRId32 " dropped=%" PRIu32,
-             packet->seq, packet->rtp, decision->zero_anchor_rtp, decision->zero_admission_rtp,
-             decision->zero_lead, decision->zero_drop_count);
   }
   return ESP_OK;
 }
@@ -918,12 +835,12 @@ static uint32_t next_generation(uint32_t generation) {
 
 /* Whole-store buffered media invalidation. Used at real stream/session
  * boundaries and immediate FLUSH registration. Ordinary pause and harmless
- * anchor refresh preserve still-valid RTP-addressed PCM. */
+ * anchor refresh preserve the decoded PCM already in the PCM FIFO. */
 static uint32_t reset_buffered_pcm_store(void) {
   taskENTER_CRITICAL(&s.state_mux);
-  /* All identities used by the shared final ring come from the timing epoch
+  /* All identities used by the shared PCM FIFO come from the timing epoch
    * allocator. A hard media reset is also a hard timing boundary; incrementing
-   * a separate AAC counter could reuse the preceding ALAC ring generation. */
+   * a separate AAC counter could reuse the preceding ALAC FIFO generation. */
   const uint32_t new_gen = s.generation = next_generation(s.generation);
   if (s.pcm_fifo) {
     pcm_fifo_set_generation(s.pcm_fifo, new_gen);
@@ -977,10 +894,11 @@ static uint32_t commit_anchor_epoch_locked(void) {
   if (s.timeline_reset_pending) {
     gen = next_generation(gen);
     /* Timing/playout epoch changes are not automatically PCM-store resets.
-     * Buffered AAC may keep still-valid RTP-addressed PCM across an ordinary
+     * Buffered AAC may keep the decoded PCM in the FIFO across an ordinary
      * pause/anchor refresh, but compressed packets behind the decoder are not a
-     * rewind cache. Realtime ALAC still owns generation-scoped raw/final rings
-     * because its recovery/EQ chronology is one continuous realtime epoch. */
+     * rewind cache. Realtime ALAC still owns a generation-scoped raw stage ring
+     * and the PCM FIFO, because its recovery/EQ chronology is one continuous
+     * realtime epoch. */
     if (s.stream_type == AUDIO_STREAM_REALTIME) {
       if (s.pcm_fifo) {
         pcm_fifo_set_generation(s.pcm_fifo, gen);
@@ -1720,8 +1638,9 @@ static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
 
 /* The buffered AAC side now follows Shairport Sync's topology: the TCP task
  * owns only a raw byte FIFO, while this single consumer owns packet framing,
- * FLUSH decisions, timing, decrypt/decode and publication into the existing
- * RTP-addressed PCM ring. There is no compressed-media search or rebind. */
+ * FLUSH decisions, timing, decrypt/decode and publication into the PCM FIFO
+ * (appended in play order, like Shairport's player queue). There is no
+ * compressed-media search or rebind. */
 typedef enum {
   PCM_STORE_DROPPED = 0,
   PCM_STORE_PUBLISHED,
@@ -1827,18 +1746,8 @@ static esp_err_t buffered_consume_head(const ap2_buffered_fifo_head_t *head,
   if (s_buffered_control.revision == decision->revision) {
     err = dst ? ap2_buffered_fifo_read_head(s.transport, head, dst, AP2_PACKET_MAX)
               : ap2_buffered_fifo_discard_head(s.transport, head);
-    if (err == ESP_OK && dst && decision->zero_seq_candidate)
-      s_buffered_control.zero_seq_resync_active = false;
   }
   xSemaphoreGive(s_buffered_control.mutex);
-  if (err == ESP_OK && dst && decision->zero_seq_candidate) {
-    AP_LOGI(TAG,
-             "AAC zero-seq resync ACCEPT seq=%" PRIu32 " rtp=%" PRIu32
-             " anchor=%" PRIu32 " floor=%" PRIu32 " lead=%" PRId32 " dropped=%" PRIu32,
-             read_be32_local(head->header) & 0x007fffffU,
-             read_be32_local(head->header + 4), decision->zero_anchor_rtp,
-             decision->zero_admission_rtp, decision->zero_lead, decision->zero_drop_count);
-  }
   return err;
 }
 
@@ -1892,7 +1801,7 @@ static void ap2_buffered_processor_task(void *arg) {
 
     /* Immediate FLUSH invalidates PCM synchronously on the control core.
      * Observe its generation even if stop/resume both happened between loop
-     * iterations. Ordinary pause preserves received RTP-addressed PCM (Apple
+     * iterations. Ordinary pause preserves the decoded PCM in the FIFO (Apple
      * does not resend it), so a pause is not a new play sequence: the next
      * packet continues the RTP timeline and is not muted. A real gap after
      * the pause is still muted by the expected_timestamp check; FLUSH, seek
@@ -1960,10 +1869,6 @@ static void ap2_buffered_processor_task(void *arg) {
       AP_LOGI(TAG, "AAC FLUSH complete target=%" PRIu32 " at seq=%" PRIu32 "%s",
                decision.immediate_target_seq, packet.seq,
                decision.immediate_overshoot ? " overshoot" : "");
-    }
-    if (decision.hold) {
-      ap2_buffered_fifo_wait(s.transport, AP2_NO_TIMING_WAIT_MS);
-      continue;
     }
     if (decision.drop) {
       (void)buffered_consume_head(&head, &decision, NULL);
@@ -2292,7 +2197,7 @@ static bool realtime_pcm_sink_locked(uint32_t rtp, int16_t *pcm, size_t frames,
   }
 
   /* Realtime ALAC is decoded immediately by the UDP receiver. This sink does
-   * not run EQ and does not write the final playout ring; it only places raw
+   * not run EQ and does not write the PCM FIFO; it only places raw
    * PCM at its exact RTP address so later/RTX packets can fill holes without
    * blocking newer packets. */
   timing_snapshot_t snap;
@@ -3029,7 +2934,7 @@ static void ap2_playout_task(void *arg) {
     /* A new buffered anchor (pause/resume, AutoMix) only changes timing, as
      * in Shairport: playback continues and the resync rules below decide.
      * Only a jump far outside the PCM window (a new RTP base) cannot be
-     * followed by the RTP-addressed cursor and needs a fresh PRIME. */
+     * followed by the playout cursor and needs a fresh PRIME. */
     if (state == PLAYOUT_RUNNING) {
       const int sr_now = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
       const int32_t ahead = rtp_delta(cursor_rtp, desired_rtp);
@@ -4388,7 +4293,7 @@ void audio_receiver_seek_flush(void) {
   snapshot_state(&snap);
   if (snap.stream_type == AUDIO_STREAM_BUFFERED) {
     /* Plain buffered FLUSH supplies no 23-bit endpoint. Use the same single
-     * no-boundary owner as zero-seq FLUSHBUFFERED, including immediate PCM
+     * no-boundary path as FLUSHBUFFERED until seq 0, including immediate PCM
      * invalidation; it must not retain old PCM through the next anchor. */
     audio_receiver_set_immediate_flush(0U, 0U);
   } else {
@@ -4406,7 +4311,7 @@ void audio_receiver_realtime_flush_to_rtp(uint32_t flush_rtp) {
 
   /* RTP-Info names the first timestamp that may remain after FLUSH. Preserve
    * the validated sender timing map and current generation, invalidate only
-   * older audio resident in the finite RTP-addressed stores, and move the
+   * older audio resident in the ALAC stage ring and PCM FIFO, and move the
    * chronological staging floor forward to the same RTP boundary. */
   xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
   snapshot_state(&snap);
@@ -4517,17 +4422,9 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
      * when any immediate flush finishes, all deferred requests are cancelled.
      * Play stop, anchor reset and PCM reset below still apply. */
     s_buffered_control.immediate_active = false;
-    s_buffered_control.zero_seq_wait_anchor = false;
-    s_buffered_control.zero_seq_resync_active = false;
-    s_buffered_control.zero_seq_anchor_rtp = 0;
-    s_buffered_control.zero_seq_dropped = 0;
     memset(s_buffered_control.deferred, 0, sizeof(s_buffered_control.deferred));
   } else {
     s_buffered_control.immediate_active = true;
-    s_buffered_control.zero_seq_wait_anchor = false;
-    s_buffered_control.zero_seq_resync_active = false;
-    s_buffered_control.zero_seq_anchor_rtp = 0;
-    s_buffered_control.zero_seq_dropped = 0;
   }
   taskENTER_CRITICAL(&s.state_mux);
   s.playing = false;
@@ -4714,13 +4611,8 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_valid = true;
   taskEXIT_CRITICAL(&s.state_mux);
   if (++s_buffered_control.revision == 0U) ++s_buffered_control.revision;
-  buffered_control_anchor_committed_locked(rtp);
-  const bool zero_resync = s_buffered_control.zero_seq_resync_active;
   xSemaphoreGive(s.publish_mutex);
   xSemaphoreGive(s_buffered_control.mutex);
-  if (zero_resync)
-    AP_LOGI(TAG, "AAC zero-seq resync armed: newAnchorRTP=%" PRIu32 " admission=%ums (experimental)",
-             rtp, (unsigned)AP2_BUFFERED_LEAD_MS);
   if (committed) {
     s_anchor_commit_us = esp_timer_get_time();
     s_anchor_commit_gen = gen;

@@ -37,6 +37,14 @@ _Static_assert(TX_TAG_Q_CAP > I2S_DMA_DESC_NUM + AUDIO_PLAYOUT_BATCH,
                "tag queue must cover every descriptor plus one batch");
 _Static_assert(I2S_DMA_FRAME_NUM * 8U <= 4092U,
                "one DMA descriptor holds at most 4092 bytes");
+/* Bounded DMA write. Normally a write never waits (playout writes only when
+ * a descriptor is free); at most it waits for one descriptor, i.e. one block.
+ * The bound only matters if the driver stops completing descriptors: then the
+ * write fails, the caller flushes and re-primes instead of hanging forever. */
+#define I2S_WRITE_TIMEOUT_MS 200U
+_Static_assert(I2S_WRITE_TIMEOUT_MS * I2S_RATE_HZ >
+                   2U * 1000U * I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM,
+               "write timeout must exceed twice the whole DMA queue");
 
 /* Slot width follows menuconfig "I2S output slot width" (audio_out_sample.h).
  * MCLK stays 256 x fs in both modes; 32-bit slots only double BCLK. */
@@ -451,7 +459,7 @@ esp_err_t audio_playout_write_tagged(const audio_out_sample_t *stereo,
   size_t written = 0;
   const size_t bytes = (size_t)frames * I2S_FRAME_BYTES;
   esp_err_t err = i2s_channel_write(s_tx, stereo, bytes, &written,
-                                    portMAX_DELAY);
+                                    pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
 
 
   if (err == ESP_OK && written == bytes && !audio_playout_has_fault()) {
