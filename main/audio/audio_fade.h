@@ -28,10 +28,16 @@ static inline float audio_fade_smoothstep(float t) {
   return t * t * (3.0f - 2.0f * t);
 }
 
-/* Gain of frame j (1-based, 1..total) of a fade-in: the last frame is
- * exactly 1. A fade-out uses 1 - this: its last frame is exactly 0. */
+/* Gain of frame j (1-based, 1..total) of a fade-in, inv = 1 / total: the
+ * last frame is exactly 1. A fade-out uses 1 - this: its last frame is
+ * exactly 0. The loops pass inv computed once: the ESP32-S3 FPU has no
+ * divide, a float division per frame is a library call. */
+static inline float audio_fade_gain_inv(uint32_t j, uint32_t total, float inv) {
+  return j >= total ? 1.0f : audio_fade_smoothstep((float)j * inv);
+}
+
 static inline float audio_fade_in_gain(uint32_t j, uint32_t total) {
-  return audio_fade_smoothstep((float)j / (float)total);
+  return audio_fade_gain_inv(j, total, 1.0f / (float)total);
 }
 
 /* Fade-in on float stereo (1.0 = full scale) in place: frames pos+1 ..
@@ -39,8 +45,9 @@ static inline float audio_fade_in_gain(uint32_t j, uint32_t total) {
  * untouched (bit-exact). Returns the new position. */
 static inline uint32_t audio_fade_in_f32(float *pcm, uint32_t frames,
                                          uint32_t pos, uint32_t total) {
+  const float inv = 1.0f / (float)total;
   for (uint32_t f = 0; f < frames && pos < total; ++f) {
-    const float g = audio_fade_in_gain(++pos, total);
+    const float g = audio_fade_gain_inv(++pos, total, inv);
     pcm[2U * f] *= g;
     pcm[2U * f + 1U] *= g;
   }
@@ -84,8 +91,9 @@ static inline void audio_fade_in_block(float *pcm, uint32_t frames,
 static inline uint32_t audio_fade_out_s32(audio_out_sample_t *x,
                                           uint32_t frames, uint32_t j,
                                           uint32_t total) {
+  const float inv = 1.0f / (float)total;
   for (uint32_t f = 0; f < frames && j < total; ++f) {
-    const float g = (1.0f - audio_fade_in_gain(++j, total)) *
+    const float g = (1.0f - audio_fade_gain_inv(++j, total, inv)) *
                     (1.0f / 2147483648.0f);
     x[2U * f] = audio_out_from_float((float)x[2U * f] * g);
     x[2U * f + 1U] = audio_out_from_float((float)x[2U * f + 1U] * g);

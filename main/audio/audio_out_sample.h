@@ -53,17 +53,17 @@ static inline int32_t audio_out_from_float(float x) {
 }
 
 /* Convert a float block to 32-bit slots in place and return it as the I2S
- * block (same memory, same 4 bytes per sample). memcpy keeps this free of
- * strict-aliasing problems; the compiler turns it into plain loads/stores. */
+ * block (same memory, same 4 bytes per sample). The int32 results are stored
+ * through a may_alias type, so the compiler knows each store may overwrite
+ * floats of the block: no strict-aliasing problem, and one load plus one
+ * store per sample (a memcpy per sample stays a library call in the IDF
+ * build). */
+typedef int32_t __attribute__((may_alias)) audio_out_sample_alias_t;
+
 static inline const audio_out_sample_t *audio_out_from_float_block_inplace(
     float *buf, size_t samples) {
-  unsigned char *p = (unsigned char *)buf;
-  for (size_t i = 0; i < samples; ++i) {
-    float x;
-    memcpy(&x, p + i * sizeof(float), sizeof(x));
-    const int32_t y = audio_out_from_float(x);
-    memcpy(p + i * sizeof(float), &y, sizeof(y));
-  }
+  audio_out_sample_alias_t *out = (audio_out_sample_alias_t *)(void *)buf;
+  for (size_t i = 0; i < samples; ++i) out[i] = audio_out_from_float(buf[i]);
   return (const audio_out_sample_t *)(const void *)buf;
 }
 

@@ -47,7 +47,9 @@ _Static_assert(I2S_DMA_FRAME_NUM * 8U <= 4092U,
 /* Bounded DMA write. Normally a write never waits (playout writes only when
  * a descriptor is free); at most it waits for one descriptor, i.e. one block.
  * The bound only matters if the driver stops completing descriptors: then the
- * write fails, the caller flushes and re-primes instead of hanging forever. */
+ * write fails, the caller flushes and re-primes instead of hanging forever.
+ * i2s_channel_write() takes milliseconds (it converts to ticks itself): pass
+ * this value as it is, never through pdMS_TO_TICKS(). */
 #define I2S_WRITE_TIMEOUT_MS 200U
 _Static_assert(I2S_WRITE_TIMEOUT_MS * I2S_RATE_HZ >
                    2U * 1000U * I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM,
@@ -487,7 +489,7 @@ esp_err_t audio_playout_write_tagged(const audio_out_sample_t *stereo,
   size_t written = 0;
   const size_t bytes = (size_t)frames * I2S_FRAME_BYTES;
   esp_err_t err = i2s_channel_write(s_tx, stereo, bytes, &written,
-                                    pdMS_TO_TICKS(I2S_WRITE_TIMEOUT_MS));
+                                    I2S_WRITE_TIMEOUT_MS);
 
 
   if (err == ESP_OK && written == bytes && !audio_playout_has_fault()) {
@@ -579,12 +581,21 @@ esp_err_t audio_playout_fade_out_queued(uint32_t *faded_frames) {
     return ESP_ERR_NOT_FOUND;
   }
 
-  /* 1. One consistent picture under the lock: which descriptor finished last
-   *    and when, and the queued tags. The queued tags now describe silence:
-   *    generation 0, RTP 0, like the idle zeros (never a generation's sync
-   *    observation, never a warm-prime probe id); the ISR sees either the old
-   *    or the new tag, never half of each. */
+  /* Everything below runs as one critical section on this core (~0.4 ms
+   * for a full fade: one multiply-add chain per frame, no division). The
+   * plan picks descriptors the DMA will not start within FADE_GUARD_US; with
+   * interrupts masked nothing can delay this task between the plan and the
+   * last modified frame (no preemption, and a flash operation on the other
+   * core has to wait until we are done), so the DMA can never read a
+   * descriptor while it is being faded. The TX ISR is held off for that
+   * time; the DMA itself keeps playing and the ISR has a whole block
+   * (~11 ms) of slack. */
   portENTER_CRITICAL(&s_tag_mux);
+
+  /* 1. One consistent picture: which descriptor finished last and when, and
+   *    the queued tags. The queued tags now describe silence: generation 0,
+   *    RTP 0, like the idle zeros (never a generation's sync observation,
+   *    never a warm-prime probe id). */
   const uint32_t last = s_ring.last;
   const int64_t last_us = s_ring.last_us;
   const bool order_ok = s_ring.bad == 0U;
@@ -595,7 +606,6 @@ esp_err_t audio_playout_fade_out_queued(uint32_t *faded_frames) {
     s_tag_q[i].rtp = 0U;
     s_tag_q[i].generation = 0U;
   }
-  portEXIT_CRITICAL(&s_tag_mux);
 
   /* 2. Drop the completions reported before step 1 (consumer side, so this
    *    is safe against the producing ISR). */
@@ -616,22 +626,21 @@ esp_err_t audio_playout_fade_out_queued(uint32_t *faded_frames) {
                                       DMA_BLOCK_US, FADE_GUARD_US, &first);
   }
 
+  uint32_t j = 0U;
   if (fade_blocks == 0U) {
     /* Nothing that can still be faded safely: cut to zeros at once, the one
      * playing included, as with a disable. */
-    for (uint32_t i = 0; i < I2S_DMA_DESC_NUM; ++i) {
+    for (uint32_t i = 0; i < I2S_DMA_DESC_NUM; ++i)
       memset(s_ring.buf[i], 0, s_ring.size);
-      sync_dma_buf(s_ring.buf[i]);
-    }
-    return ESP_OK;
+  } else {
+    /* Nearest descriptor first, as one continuous fade. */
+    j = audio_fade_out_ring(s_ring.buf, I2S_DMA_DESC_NUM, last, first,
+                            fade_blocks, I2S_DMA_FRAME_NUM);
   }
+  portEXIT_CRITICAL(&s_tag_mux);
 
-  /* Nearest descriptor first. Should the DMA still overtake us, the first
-   * gains are ~1.0: no step. */
-  const uint32_t j = audio_fade_out_ring(s_ring.buf, I2S_DMA_DESC_NUM, last,
-                                         first, fade_blocks, I2S_DMA_FRAME_NUM);
-  for (uint32_t b = 0; b < fade_blocks; ++b)
-    sync_dma_buf(s_ring.buf[(last + first + b) % I2S_DMA_DESC_NUM]);
+  /* Cache write-back (targets with cached internal RAM only; none on S3). */
+  for (uint32_t i = 0; i < I2S_DMA_DESC_NUM; ++i) sync_dma_buf(s_ring.buf[i]);
   if (faded_frames) *faded_frames = j;
   return ESP_OK;
 }
