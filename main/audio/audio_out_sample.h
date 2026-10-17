@@ -1,44 +1,75 @@
 #pragma once
 
-/* Final I2S output sample format.
+/* Sample formats of the playout chain.
  *
- * Decoders, EQ and the PCM ring stay 16-bit. Only the very last stage, the
- * output volume in the playout task, writes this format before I2S.
+ * The decoders deliver 16-bit PCM. Right after decoding every sample becomes a
+ * float with 1.0 = full scale, and the whole chain stays float: EQ, the PCM
+ * FIFO, output volume and loudness. A float cannot overflow on the way, so
+ * there is no clipping or requantisation anywhere in between.
  *
- * 32-bit slots (default): 24-bit audio, left-justified in a 32-bit I2S slot
- * (low 8 bits zero), 64 BCLK per stereo frame. Volume is applied without
- * truncating back to 16 bits, so attenuation keeps the full 16-bit detail
- * and no dither is needed (rounding error ~ -144 dBFS).
+ * The one and only conversion with saturation is the last step before DMA:
+ * float -> signed 32-bit, full scale 2^31, sent in 32-bit I2S slots (32-bit
+ * data width, 64 BCLK per stereo frame). Nothing is rounded to 24 bits: the
+ * DAC takes as many MSBs as it has (I2S is MSB first).
  *
- * 16-bit slots (menuconfig fallback): previous behaviour, 32 BCLK per frame,
- * volume requantised to 16 bits with TPDF dither.
+ * At unity gain with EQ and loudness off the chain is bit-exact: a 16-bit
+ * sample x arrives at the DAC as exactly x << 16.
  *
  * This header is pure C (no IDF calls) so the math can be host-tested. */
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
-#if defined(__has_include)
-#if __has_include("sdkconfig.h")
-#include "sdkconfig.h"
-#endif
-#endif
-
-#if defined(CONFIG_AIRPLAY_I2S_SLOT_16) && CONFIG_AIRPLAY_I2S_SLOT_16
-#define AUDIO_OUT_SLOT_BITS 16
-typedef int16_t audio_out_sample_t;
-#else
-#define AUDIO_OUT_SLOT_BITS 32
+/* One I2S slot value: signed 32-bit, full scale 2^31. */
 typedef int32_t audio_out_sample_t;
-#endif
 
-/* 16-bit PCM sample -> output slot at unity gain (bit-exact). */
+#define AUDIO_PCM16_TO_FLOAT (1.0f / 32768.0f)
+
+/* 16-bit PCM -> float, exact (every int16 value is representable). */
+static inline float audio_pcm16_to_float(int16_t x) {
+  return (float)x * AUDIO_PCM16_TO_FLOAT;
+}
+
+static inline void audio_pcm16_to_float_block(const int16_t *in, float *out,
+                                              size_t samples) {
+  for (size_t i = 0; i < samples; ++i) out[i] = audio_pcm16_to_float(in[i]);
+}
+
+/* Largest float below 1.0 (1 - 2^-24); times 2^31 it is 0x7FFFFF80, the
+ * largest float that still fits an int32. (float)INT32_MAX would round up to
+ * 2^31 and overflow. */
+#define AUDIO_OUT_FLOAT_MAX 0.99999994f
+#define AUDIO_OUT_S32_MAX   ((int32_t)0x7FFFFF80)
+
+/* The single saturation of the chain: float (1.0 = full scale) -> 32-bit
+ * slot. No rounding: the conversion truncates below the 32nd bit, far below
+ * any DAC. NaN (a broken filter) becomes silence instead of full scale. */
+static inline int32_t audio_out_from_float(float x) {
+  if (x < AUDIO_OUT_FLOAT_MAX && x > -1.0f) return (int32_t)(x * 2147483648.0f);
+  if (x >= AUDIO_OUT_FLOAT_MAX) return AUDIO_OUT_S32_MAX;
+  if (x <= -1.0f) return INT32_MIN;
+  return 0; /* NaN */
+}
+
+/* Convert a float block to 32-bit slots in place and return it as the I2S
+ * block (same memory, same 4 bytes per sample). memcpy keeps this free of
+ * strict-aliasing problems; the compiler turns it into plain loads/stores. */
+static inline const audio_out_sample_t *audio_out_from_float_block_inplace(
+    float *buf, size_t samples) {
+  unsigned char *p = (unsigned char *)buf;
+  for (size_t i = 0; i < samples; ++i) {
+    float x;
+    memcpy(&x, p + i * sizeof(float), sizeof(x));
+    const int32_t y = audio_out_from_float(x);
+    memcpy(p + i * sizeof(float), &y, sizeof(y));
+  }
+  return (const audio_out_sample_t *)(const void *)buf;
+}
+
+/* 16-bit PCM -> 32-bit slot at unity gain (bit-exact; latency chirp only). */
 static inline audio_out_sample_t audio_out_from_pcm16(int16_t x) {
-#if AUDIO_OUT_SLOT_BITS == 32
   return (int32_t)x * 65536;
-#else
-  return x;
-#endif
 }
 
 static inline void audio_out_from_pcm16_block(const int16_t *in,
@@ -49,26 +80,5 @@ static inline void audio_out_from_pcm16_block(const int16_t *in,
 
 /* 32-bit slot -> 16-bit view (LED/VU meter only). */
 static inline int16_t audio_out_to_pcm16(audio_out_sample_t x) {
-#if AUDIO_OUT_SLOT_BITS == 32
   return (int16_t)(x >> 16);
-#else
-  return x;
-#endif
 }
-
-#if AUDIO_OUT_SLOT_BITS == 32
-/* x * gain with gain in Q15 (0..32768, 32768 = 0 dB). The result is rounded
- * to 24 bits and left-justified in a 32-bit slot. gain 32768 gives exactly
- * x << 16; x == 0 or gain == 0 gives exactly 0. */
-static inline int32_t audio_out_scale_q15(int16_t x, int32_t gain_q15) {
-  if (gain_q15 <= 0 || x == 0) return 0;
-  if (gain_q15 > 32768) gain_q15 = 32768;
-  /* x (Q15) * gain (Q15) = Q30; << 1 = Q31 full scale of the 32-bit slot. */
-  const int64_t y = (int64_t)x * (int64_t)gain_q15 * 2;
-  /* Round half up to a multiple of 256 (24-bit resolution). */
-  int64_t r = (y + 128) & ~(int64_t)255;
-  if (r > (int64_t)INT32_MAX) r = (int64_t)INT32_MAX & ~(int64_t)255;
-  if (r < (int64_t)INT32_MIN) r = (int64_t)INT32_MIN;
-  return (int32_t)r;
-}
-#endif

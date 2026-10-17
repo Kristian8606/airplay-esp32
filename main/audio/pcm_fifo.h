@@ -11,7 +11,7 @@
 
 /*
  * Final playout PCM store: one contiguous circular FIFO of decoded stereo
- * 16-bit PCM in play order.
+ * PCM in play order, as float (1.0 = full scale; see audio_out_sample.h).
  *
  * The FIFO holds the RTP window [head, tail). Writers (buffered AAC decoder,
  * realtime ALAC stage) append at tail; the I2S playout task reads a block at
@@ -37,9 +37,14 @@
  */
 
 #define PCM_FIFO_CHANNELS 2U
-/* 2^17 frames = 2.97 s at 44.1 kHz, 512 KiB in PSRAM: the same horizon as
- * the former RTP-addressed ring (realtime ALAC publishes up to its latency). */
+/* 2^17 frames = 2.97 s at 44.1 kHz, 1 MiB of float in PSRAM: the same horizon
+ * as the former RTP-addressed ring (realtime ALAC publishes up to its
+ * latency). */
 #define PCM_FIFO_FRAMES (1U << 17)
+
+/* One stored sample. Silence (gaps, frames outside the window) is 0.0f,
+ * i.e. all-zero bytes. */
+typedef float pcm_fifo_sample_t;
 
 typedef struct pcm_fifo pcm_fifo_t;
 
@@ -56,7 +61,7 @@ void pcm_fifo_set_generation(pcm_fifo_t *fifo, uint32_t generation);
  * Without a valid playhead the oldest frames are dropped as needed. A write
  * that lies entirely before the window is ignored (returns true).
  */
-bool pcm_fifo_write(pcm_fifo_t *fifo, uint32_t rtp, const int16_t *pcm,
+bool pcm_fifo_write(pcm_fifo_t *fifo, uint32_t rtp, const pcm_fifo_sample_t *pcm,
                     size_t frames, uint32_t generation, uint32_t wanted_rtp,
                     bool wanted_valid);
 
@@ -66,7 +71,7 @@ bool pcm_fifo_write(pcm_fifo_t *fifo, uint32_t rtp, const int16_t *pcm,
  * (frames == full block, 0 == nothing). Never blocks.
  */
 uint32_t pcm_fifo_read(const pcm_fifo_t *fifo, uint32_t rtp, uint32_t frames,
-                       uint32_t generation, int16_t *out_stereo);
+                       uint32_t generation, pcm_fifo_sample_t *out_stereo);
 
 /* True when the whole range is inside the window. No copy. */
 bool pcm_fifo_has_range(const pcm_fifo_t *fifo, uint32_t rtp, uint32_t frames,

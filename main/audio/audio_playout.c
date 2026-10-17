@@ -46,13 +46,9 @@ _Static_assert(I2S_WRITE_TIMEOUT_MS * I2S_RATE_HZ >
                    2U * 1000U * I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM,
                "write timeout must exceed twice the whole DMA queue");
 
-/* Slot width follows menuconfig "I2S output slot width" (audio_out_sample.h).
- * MCLK stays 256 x fs in both modes; 32-bit slots only double BCLK. */
-#if AUDIO_OUT_SLOT_BITS == 32
+/* 32-bit data in 32-bit slots (audio_out_sample.h): 64 BCLK per stereo
+ * frame, MCLK 256 x fs. */
 #define I2S_SLOT_DATA_WIDTH I2S_DATA_BIT_WIDTH_32BIT
-#else
-#define I2S_SLOT_DATA_WIDTH I2S_DATA_BIT_WIDTH_16BIT
-#endif
 #define I2S_FRAME_BYTES ((size_t)2U * sizeof(audio_out_sample_t))
 
 /* Allocate the I2S/GDMA channel from Core1 so its external interrupt is
@@ -305,9 +301,7 @@ static esp_err_t audio_playout_init_current_core(void) {
 #endif
   );
   s_tx = tx; /* Publish only a fully initialised channel. */
-  ESP_LOGI(TAG, "I2S TX %u-bit slots (%s), %u Hz, MCLK=%" PRIu32 " Hz",
-           (unsigned)AUDIO_OUT_SLOT_BITS,
-           AUDIO_OUT_SLOT_BITS == 32 ? "24-bit audio" : "16-bit audio",
+  ESP_LOGI(TAG, "I2S TX 32-bit data in 32-bit slots, %u Hz, MCLK=%" PRIu32 " Hz",
            (unsigned)I2S_RATE_HZ, s_nominal_mclk_hz);
   return ESP_OK;
 

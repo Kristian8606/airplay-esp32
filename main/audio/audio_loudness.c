@@ -133,8 +133,8 @@ static void shelf(lb_coeff_t *c, bool high, float f0, float slope, float gain_db
 }
 
 /* After digital silence the filter memory decays toward denormal floats,
- * which some FPUs handle slowly. Clear values far below the 24-bit LSB
- * (2^-23 of full scale ~ 1e-7) once per block. */
+ * which some FPUs handle slowly. Clear values far below the 32-bit LSB
+ * (2^-31 of full scale ~ 5e-10) once per block. */
 static void flush_tiny_state(void) {
   float *v = &s_state[0][0].x1;
   for (size_t i = 0; i < sizeof(s_state) / sizeof(float); ++i) {
@@ -190,32 +190,14 @@ void audio_loudness_reset(void) {
   memset(s_state, 0, sizeof(s_state));
 }
 
-void audio_loudness_process_s32(int32_t *out, uint32_t frames, int32_t gain_q15) {
-  if (!out || frames == 0U || !loudness_prepare(gain_q15)) return;
-  const float in_scale = 1.0f / 2147483648.0f;
-  const float out_scale = 2147483648.0f;
-  for (uint32_t i = 0; i < frames * 2U; ++i) {
-    lb_state_t *st = s_state[i & 1U];
-    float y = biquad((float)out[i] * in_scale, &s_low, &st[0]);
-    y = biquad(y, &s_high, &st[1]) * out_scale;
-    /* 24-bit audio left-justified in the 32-bit slot, like the volume stage. */
-    if (y > 2147483008.0f) y = 2147483008.0f;   /* 0x7fffff00 - 128 */
-    else if (y < -2147483648.0f) y = -2147483648.0f;
-    out[i] = (int32_t)(((int32_t)y + 128) & ~255);
-  }
-  flush_tiny_state();
-}
-
-void audio_loudness_process_s16(int16_t *pcm, uint32_t frames, int32_t gain_q15) {
+/* Float PCM in place (1.0 = full scale), after the output volume. No
+ * clipping here: the single saturation is the float -> int32 step before DMA. */
+void audio_loudness_process_f32(float *pcm, uint32_t frames, int32_t gain_q15) {
   if (!pcm || frames == 0U || !loudness_prepare(gain_q15)) return;
   for (uint32_t i = 0; i < frames * 2U; ++i) {
     lb_state_t *st = s_state[i & 1U];
-    float y = biquad((float)pcm[i], &s_low, &st[0]);
-    y = biquad(y, &s_high, &st[1]);
-    y += y >= 0.0f ? 0.5f : -0.5f;
-    if (y > 32767.0f) y = 32767.0f;
-    else if (y < -32768.0f) y = -32768.0f;
-    pcm[i] = (int16_t)y;
+    const float y = biquad(pcm[i], &s_low, &st[0]);
+    pcm[i] = biquad(y, &s_high, &st[1]);
   }
   flush_tiny_state();
 }

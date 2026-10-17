@@ -51,8 +51,7 @@ void audio_loudness_get_status(audio_loudness_status_t *out);
 
 /* Playout task only. gain_q15 is the output volume just applied
  * (0..32768, 32768 = 0 dB). Samples are interleaved stereo. */
-void audio_loudness_process_s32(int32_t *out, uint32_t frames, int32_t gain_q15);
-void audio_loudness_process_s16(int16_t *pcm, uint32_t frames, int32_t gain_q15);
+void audio_loudness_process_f32(float *pcm, uint32_t frames, int32_t gain_q15);
 /* Playout task only: the output stopped (flush). Clear the filter memory so
  * the next audio starts from silence, as the output did. */
 void audio_loudness_reset(void);

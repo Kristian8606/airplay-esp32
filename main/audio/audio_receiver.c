@@ -269,8 +269,9 @@ typedef struct {
   esp_timer_handle_t playout_timer;
   uint8_t *buffered_packet;
   uint8_t *decrypt_buf;
-  int16_t *decode_pcm;
-  int16_t *realtime_stage_pcm;
+  int16_t *decode_pcm;            /* AAC decoder output (16-bit) */
+  int16_t *realtime_stage_pcm;    /* ALAC raw stage read (alias of decode_pcm) */
+  float *pcm_f32;                 /* the same block as float, EQ -> PCM FIFO */
   uint8_t *codec_workspace;       /* shared AAC payload / ALAC large buffers */
   size_t codec_workspace_size;
   bool realtime_workspace_bound;
@@ -1629,7 +1630,7 @@ static void wait_until_presentation_ns(const timing_snapshot_t *snap,
   (void)esp_timer_stop(s.playout_timer);
 }
 
-static void pcm_process_common_eq(int16_t *pcm, size_t frames, int channels,
+static void pcm_process_common_eq(float *pcm, size_t frames, int channels,
                                   int sample_rate) {
   /* This is the codec boundary: AAC and ALAC are fully independent up to
    * decoded PCM. From here both formats use the same EQ implementation. */
@@ -1647,7 +1648,7 @@ typedef enum {
 } pcm_store_result_t;
 
 static pcm_store_result_t pcm_store_with_backpressure(
-    uint32_t rtp, const int16_t *pcm, size_t frames, int channels,
+    uint32_t rtp, const float *pcm, size_t frames, int channels,
     uint32_t pcm_generation, uint32_t packet_seq, uint32_t stream_epoch) {
   if (!pcm || channels != 2 || frames == 0 || frames > PCM_RTP_SLOT_FRAMES)
     return PCM_STORE_DROPPED;
@@ -2121,14 +2122,18 @@ static void ap2_buffered_processor_task(void *arg) {
         aevt_post(AEVT_AAC_MUTE, NULL, (int32_t)packet.seq, (int32_t)packet.rtp,
                   timestamp_difference, lead_ms);
       }
-      memset(s.decode_pcm, 0,
-             (size_t)frames * (size_t)info.channels * sizeof(int16_t));
+      memset(s.pcm_f32, 0,
+             (size_t)frames * (size_t)info.channels * sizeof(float));
+    } else {
+      /* 16-bit decoder output -> float; from here to DMA it stays float. */
+      audio_pcm16_to_float_block(s.decode_pcm, s.pcm_f32,
+                                 (size_t)frames * (size_t)info.channels);
     }
-    pcm_process_common_eq(s.decode_pcm, (size_t)frames, info.channels,
+    pcm_process_common_eq(s.pcm_f32, (size_t)frames, info.channels,
                           snap.format.sample_rate);
 
     const pcm_store_result_t stored = pcm_store_with_backpressure(
-        packet.rtp, s.decode_pcm, (size_t)frames, info.channels,
+        packet.rtp, s.pcm_f32, (size_t)frames, info.channels,
         snap.pcm_generation, packet.seq, packet.stream_epoch);
     if (stored == PCM_STORE_PUBLISHED) {
       expected_timestamp = packet.rtp + (uint32_t)frames;
@@ -2275,7 +2280,8 @@ static bool realtime_pcm_sink(uint32_t rtp, int16_t *pcm, size_t frames,
 
 static void realtime_stage_task(void *arg) {
   (void)arg;
-  int16_t *pcm = s.realtime_stage_pcm;
+  int16_t *raw = s.realtime_stage_pcm; /* raw 16-bit ALAC from the stage ring */
+  float *pcm = s.pcm_f32;              /* float from here to DMA */
 
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_ALAC_STAGE,
                                     xPortGetCoreID(), AP2_RT_STAGE_PRIORITY, 0U);
@@ -2325,7 +2331,7 @@ static void realtime_stage_task(void *arg) {
     const bool have_deadline =
         realtime_playout_deadline(cursor, &time_to_play_us, NULL);
     bool have = pcm_rtp_ring_read(s.realtime_stage_ring, cursor, frames,
-                                  snap.generation, pcm);
+                                  snap.generation, raw);
     if (!have) {
       if (!have_deadline || time_to_play_us > AP2_RT_STAGE_COMMIT_MARGIN_US) {
         /* No polling: sleep until RAW PCM/RTX publication changes the ring,
@@ -2344,12 +2350,13 @@ static void realtime_stage_task(void *arg) {
       /* Recovery time is exhausted. Preserve RTP duration and EQ chronology
        * with one silent ALAC-sized PCM block. A later RTX is too late to
        * rewrite filter history and is discarded by realtime_pcm_sink(). */
-      memset(pcm, 0, (size_t)frames * 2U * sizeof(int16_t));
+      memset(pcm, 0, (size_t)frames * 2U * sizeof(float));
       if (!alac_in_silence)
         aevt_post(AEVT_ALAC_SILENCE, NULL, (int32_t)cursor, (int32_t)frames,
                   0, have_deadline ? (int32_t)(time_to_play_us / 1000LL) : -1);
       alac_in_silence = true;
     } else {
+      audio_pcm16_to_float_block(raw, pcm, (size_t)frames * 2U);
       alac_in_silence = false;
     }
 
@@ -2452,35 +2459,12 @@ static void process_i2s_completions(const timing_snapshot_t *snap) {
 }
 
 
-#if AUDIO_OUT_SLOT_BITS == 16
-/* Volume scaling is the LAST requantisation to 16 bit, so it is where TPDF
- * dither belongs. The Q15 product carries 15 fractional bits; adding +-1 LSB
- * triangular noise before rounding decorrelates the rounding error from the
- * signal (no harmonic distortion on fades / quiet passages). Unity gain is
- * bit-perfect and is never dithered; exact-zero input samples stay exactly
- * zero (digital silence stays silent). Only the playout task calls this, so
- * the PRNG state needs no locking. */
-static uint32_t s_vol_dither_state[2] = {0x9E3779B9U, 0x85EBCA6BU};
-
-static inline uint32_t vol_dither_rng(uint32_t *st) {
-  uint32_t x = *st;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  *st = x;
-  return x;
-}
-
-/* Difference of two independent uniform values in [0, 32767]: TPDF noise
- * spanning (-1 LSB, +1 LSB) expressed in Q15 units. */
-static inline int32_t vol_dither_tpdf_q15(uint32_t *st) {
-  const int32_t a = (int32_t)(vol_dither_rng(st) >> 17);
-  const int32_t b = (int32_t)(vol_dither_rng(st) >> 17);
-  return a - b;
-}
-
-static void apply_output_volume(int16_t *pcm, uint32_t frames,
-                                int32_t current_q15[2]) {
+/* Output volume on float PCM in place (1.0 = full scale), Q15 targets
+ * (0..32768, 32768 = 0 dB). A changed target fades over one DMA block. Unity
+ * gain leaves the samples untouched (bit-exact); no clipping here, the single
+ * saturation is the float -> int32 step in output_stage(). Playout task only. */
+static void apply_output_volume_f32(float *pcm, uint32_t frames,
+                                    int32_t current_q15[2]) {
   if (!pcm || !current_q15 || frames == 0U) return;
   int32_t volume = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
   if (volume < 0) volume = 0;
@@ -2495,21 +2479,13 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
       memset(pcm, 0, (size_t)frames * 2U * sizeof(*pcm));
       return;
     }
-    for (uint32_t i = 0; i < frames * 2U; ++i) {
-      const uint32_t ch = i & 1U;
-      const int32_t gain = target[ch];
-      if (gain == 0) { pcm[i] = 0; continue; }
-      if (gain == 32768 || pcm[i] == 0) continue;
-      int32_t y = (pcm[i] * gain + vol_dither_tpdf_q15(&s_vol_dither_state[ch]) +
-                   16384) >> 15;
-      if (y > INT16_MAX) y = INT16_MAX;
-      else if (y < INT16_MIN) y = INT16_MIN;
-      pcm[i] = (int16_t)y;
-    }
+    const float g[2] = {(float)target[0] * (1.0f / 32768.0f),
+                        (float)target[1] * (1.0f / 32768.0f)};
+    for (uint32_t i = 0; i < frames * 2U; ++i) pcm[i] *= g[i & 1U];
     return;
   }
-  /* Fade each changed output over one DMA block, like volume changes.
-   * Leave an unchanged unity-gain channel bit-exact, even during a fade. */
+  /* Fade each changed output over one DMA block. An unchanged unity-gain
+   * channel stays bit-exact, even while the other one fades. */
   const int64_t dg[2] = {
       (int64_t)target[0] - start[0], (int64_t)target[1] - start[1]};
   for (uint32_t f = 0; f < frames; ++f) {
@@ -2517,82 +2493,25 @@ static void apply_output_volume(int16_t *pcm, uint32_t frames,
       const uint32_t i = f * 2U + ch;
       const int32_t gain = start[ch] +
           (int32_t)((dg[ch] * (int64_t)(f + 1U)) / (int64_t)frames);
-      if (gain == 0) { pcm[i] = 0; continue; }
-      if (gain == 32768 || pcm[i] == 0) continue;
-      int64_t y = (int64_t)pcm[i] * gain +
-                  vol_dither_tpdf_q15(&s_vol_dither_state[ch]);
-      y = (y + 16384) >> 15;
-      if (y > INT16_MAX) y = INT16_MAX;
-      else if (y < INT16_MIN) y = INT16_MIN;
-      pcm[i] = (int16_t)y;
+      if (gain == 32768) continue;
+      pcm[i] *= (float)gain * (1.0f / 32768.0f);
     }
   }
   current_q15[0] = target[0];
   current_q15[1] = target[1];
 }
 
-/* 16-bit slots: volume works in place, the PCM block is the I2S block. */
-static void output_stage(int16_t *pcm, audio_out_sample_t *out,
-                         uint32_t frames, int32_t current_q15[2]) {
-  (void)out;
-  apply_output_volume(pcm, frames, current_q15);
-  audio_loudness_process_s16(pcm, frames, current_q15[0] > current_q15[1]
-                                              ? current_q15[0] : current_q15[1]);
-}
-
-#else /* AUDIO_OUT_SLOT_BITS == 32 */
-
-/* 32-bit slots, 24-bit audio. Same volume target, mute mask and one-block
- * fade as the 16-bit path, but the result is written to a separate 32-bit
- * block without rounding back to 16 bits (audio_out_scale_q15). There is no
- * dither: the 24-bit rounding error is ~-144 dBFS. Unity gain is exactly
- * x << 16 and zero stays zero. Only the playout task calls this. */
-static void apply_output_volume_s32(const int16_t *pcm, int32_t *out,
-                                    uint32_t frames, int32_t current_q15[2]) {
-  if (!pcm || !out || !current_q15 || frames == 0U) return;
-  int32_t volume = __atomic_load_n(&s_volume_target_q15, __ATOMIC_ACQUIRE);
-  if (volume < 0) volume = 0;
-  if (volume > 32768) volume = 32768;
-  const uint32_t muted = audio_receiver_get_output_mute_mask();
-  const int32_t target[2] = {
-      (muted & 1U) ? 0 : volume, (muted & 2U) ? 0 : volume};
-  const int32_t start[2] = {current_q15[0], current_q15[1]};
-  if (start[0] == target[0] && start[1] == target[1]) {
-    if (target[0] == 32768 && target[1] == 32768) {
-      audio_out_from_pcm16_block(pcm, out, (size_t)frames * 2U);
-      return;
-    }
-    if (target[0] == 0 && target[1] == 0) {
-      memset(out, 0, (size_t)frames * 2U * sizeof(*out));
-      return;
-    }
-    for (uint32_t i = 0; i < frames * 2U; ++i)
-      out[i] = audio_out_scale_q15(pcm[i], target[i & 1U]);
-    return;
-  }
-  /* Fade each changed output over one DMA block, like volume changes. */
-  const int64_t dg[2] = {
-      (int64_t)target[0] - start[0], (int64_t)target[1] - start[1]};
-  for (uint32_t f = 0; f < frames; ++f) {
-    for (uint32_t ch = 0; ch < 2U; ++ch) {
-      const uint32_t i = f * 2U + ch;
-      const int32_t gain = start[ch] +
-          (int32_t)((dg[ch] * (int64_t)(f + 1U)) / (int64_t)frames);
-      out[i] = audio_out_scale_q15(pcm[i], gain);
-    }
-  }
-  current_q15[0] = target[0];
-  current_q15[1] = target[1];
-}
-
-static void output_stage(int16_t *pcm, audio_out_sample_t *out,
-                         uint32_t frames, int32_t current_q15[2]) {
-  apply_output_volume_s32(pcm, out, frames, current_q15);
+/* The end of the float chain: volume, loudness, then the one and only
+ * saturation float -> 32-bit slot, in place. Returns the same memory as the
+ * I2S block. Only the playout task calls this. */
+static const audio_out_sample_t *output_stage(float *block, uint32_t frames,
+                                              int32_t current_q15[2]) {
+  apply_output_volume_f32(block, frames, current_q15);
   /* Loudness follows the volume just applied (current_q15 = its target). */
-  audio_loudness_process_s32(out, frames, current_q15[0] > current_q15[1]
-                                              ? current_q15[0] : current_q15[1]);
+  audio_loudness_process_f32(block, frames, current_q15[0] > current_q15[1]
+                                                ? current_q15[0] : current_q15[1]);
+  return audio_out_from_float_block_inplace(block, (size_t)frames * 2U);
 }
-#endif /* AUDIO_OUT_SLOT_BITS */
 
 
 /* I2S lifecycle is single-owner on the playout task.  A failed flush must
@@ -2736,35 +2655,21 @@ static esp_err_t playout_write(const audio_out_sample_t *blk, uint32_t frames,
 
 static void ap2_playout_task(void *arg) {
   (void)arg;
-  /* `block` holds 16-bit PCM from the FIFO; `out_block` is what goes to I2S.
-   * i2s_channel_write() copies it into the DMA before returning, so one of
-   * each is enough. With 16-bit slots they are the same buffer (volume works
-   * in place). */
-  int16_t *block = heap_caps_malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t),
-                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!block) block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
+  /* One block: float PCM read from the FIFO, then volume and loudness in
+   * place, then converted in place to the 32-bit I2S slots (float and int32
+   * are both 4 bytes). i2s_channel_write() copies it into the DMA before
+   * returning, so one block is enough. */
+  _Static_assert(sizeof(float) == sizeof(audio_out_sample_t),
+                 "in-place float -> int32 conversion needs equal sizes");
+  float *block = heap_caps_malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(float),
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!block) block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(float));
   if (!block) {
     ESP_LOGE(TAG, "playout block allocation failed");
     s.playout_task = NULL;
     vTaskDelete(NULL);
     return;
   }
-#if AUDIO_OUT_SLOT_BITS == 32
-  audio_out_sample_t *out_block = heap_caps_malloc(
-      AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t),
-      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (!out_block)
-    out_block = malloc(AUDIO_PLAYOUT_FRAMES * 2U * sizeof(audio_out_sample_t));
-  if (!out_block) {
-    ESP_LOGE(TAG, "playout output block allocation failed");
-    free(block);
-    s.playout_task = NULL;
-    vTaskDelete(NULL);
-    return;
-  }
-#else
-  audio_out_sample_t *out_block = block;
-#endif
 
   typedef enum {
     PLAYOUT_STOPPED = 0,
@@ -3129,7 +3034,8 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
 
-      output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+      const audio_out_sample_t *out_block =
+          output_stage(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
       if (playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                      real_start_rtp, snap.generation) != ESP_OK) {
           (void)playout_flush_checked("warm-write-fail");
@@ -3332,7 +3238,8 @@ static void ap2_playout_task(void *arg) {
         vTaskDelay(1);
         continue;
       }
-      output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+      const audio_out_sample_t *out_block =
+          output_stage(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
       const esp_err_t first_err = playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                                 real_start_rtp, snap.generation);
       if (first_err != ESP_OK) {
@@ -3450,7 +3357,7 @@ static void ap2_playout_task(void *arg) {
       if (__atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
           __atomic_load_n(&s.playout_servo_reset_requested, __ATOMIC_ACQUIRE))
         continue;
-      memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(int16_t));
+      memset(block, 0, AUDIO_PLAYOUT_FRAMES * 2U * sizeof(float));
       PD_ADD(silent_blocks, 1U);
       if (zero_blocks++ == 0U)
         aevt_post(AEVT_SILENCE_BEGIN, NULL, (int32_t)cursor_rtp, 0, 0, 0);
@@ -3459,7 +3366,8 @@ static void ap2_playout_task(void *arg) {
                 (int32_t)zero_blocks, 0, 0);
       zero_blocks = 0;
     }
-    output_stage(block, out_block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+    const audio_out_sample_t *out_block =
+        output_stage(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
     PD_MAX(max_work_us, esp_timer_get_time() - pd_work_start_us);
 #endif
@@ -3706,9 +3614,6 @@ static void ap2_playout_task(void *arg) {
   }
 
   (void)playout_flush_checked("task-exit");
-#if AUDIO_OUT_SLOT_BITS == 32
-  free(out_block);
-#endif
   free(block);
   s.playout_task = NULL;
   vTaskDelete(NULL);
@@ -3785,6 +3690,13 @@ esp_err_t audio_receiver_init(void) {
   /* AAC and ordered ALAC staging are mutually exclusive producers.
    * start paths require the former owner to acknowledge idle before reuse. */
   s.realtime_stage_pcm = s.decode_pcm;
+  if (!s.pcm_f32) {
+    /* One decoded block as float (8 KiB). PSRAM: EQ walks it through the
+     * cache and internal RAM is the scarcer resource. */
+    s.pcm_f32 = heap_caps_malloc(AP2_PCM_CAPACITY_FRAMES * 2U * sizeof(float),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s.pcm_f32) s.pcm_f32 = malloc(AP2_PCM_CAPACITY_FRAMES * 2U * sizeof(float));
+  }
 
   if (!s.transport) {
     ap2_buffered_fifo_config_t tcfg = {
@@ -3828,7 +3740,8 @@ esp_err_t audio_receiver_init(void) {
     s.realtime_workspace_bound = true;
   }
   if (!s.buffered_packet || !s.decrypt_buf || !s.decode_pcm ||
-      !s.realtime_stage_pcm || !s.pcm_fifo || !s.realtime_stage_ring) {
+      !s.realtime_stage_pcm || !s.pcm_f32 || !s.pcm_fifo ||
+      !s.realtime_stage_ring) {
     return ESP_ERR_NO_MEM;
   }
 
@@ -3964,6 +3877,8 @@ esp_err_t audio_receiver_release_for_wifi_scan(void) {
   s.decode_pcm = NULL;
   /* Alias of decode_pcm: one allocation and one free. */
   s.realtime_stage_pcm = NULL;
+  free(s.pcm_f32);
+  s.pcm_f32 = NULL;
   free(s.codec_workspace);
   s.codec_workspace = NULL;
   s.codec_workspace_size = 0;

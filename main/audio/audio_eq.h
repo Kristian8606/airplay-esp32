@@ -67,14 +67,16 @@ esp_err_t audio_eq_get_active_config(audio_eq_config_t *out);
 void audio_eq_default_config(audio_eq_config_t *out);
 bool audio_eq_validate_config(const audio_eq_config_t *config);
 
-/* Process interleaved signed 16-bit stereo PCM in place.
+/* Process interleaved float stereo PCM in place (1.0 = full scale; see
+ * audio_out_sample.h). Output is not clipped: values above full scale are
+ * saturated only once, right before DMA.
  * Source selection:
  *   stereo: L source -> left EQ, R source -> right EQ
  *   mono:   (L+R)/2 -> both independent EQ chains
  *   left:   L source -> both independent EQ chains
  *   right:  R source -> both independent EQ chains
  * Coefficients are calculated once per sample-rate change, never per sample. */
-void audio_eq_process(int16_t *pcm, size_t frames, int channels,
+void audio_eq_process(float *pcm, size_t frames, int channels,
                       int sample_rate);
 
 /* Clear biquad delay state only at a real output-chain boundary (new stream/

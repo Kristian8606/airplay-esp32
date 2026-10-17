@@ -35,7 +35,7 @@ typedef SemaphoreHandle_t pcm_fifo_mutex_t;
 
 #define CAP        PCM_FIFO_FRAMES
 #define CAP_MASK   (PCM_FIFO_FRAMES - 1U)
-#define FRAME_SZ   (PCM_FIFO_CHANNELS * sizeof(int16_t))
+#define FRAME_SZ   (PCM_FIFO_CHANNELS * sizeof(pcm_fifo_sample_t))
 #define MAX_WRITE  4096U
 /* Written frames are never changed. Only the rare window resets (new
  * position, FLUSH, truncate) bump seq, each in a critical section of a few
@@ -47,7 +47,7 @@ _Static_assert((PCM_FIFO_FRAMES & (PCM_FIFO_FRAMES - 1U)) == 0,
                "PCM_FIFO_FRAMES must be a power of two");
 
 struct pcm_fifo {
-  int16_t *pcm;
+  pcm_fifo_sample_t *pcm;
   pcm_fifo_mutex_t mutex; /* writers and control operations */
   uint32_t generation;    /* requested generation (set_generation) */
   uint32_t data_gen;      /* generation the window belongs to */
@@ -77,7 +77,7 @@ static inline void st(uint32_t *p, uint32_t v) {
 }
 
 /* Physical copy helpers: at most two pieces around the wrap. */
-static void copy_in(pcm_fifo_t *f, uint32_t rtp, const int16_t *src,
+static void copy_in(pcm_fifo_t *f, uint32_t rtp, const pcm_fifo_sample_t *src,
                     uint32_t n) {
   const uint32_t idx = rtp & CAP_MASK;
   const uint32_t first = n < CAP - idx ? n : CAP - idx;
@@ -99,7 +99,7 @@ static void zero_in(pcm_fifo_t *f, uint32_t rtp, uint32_t n) {
   if (n > first) memset(f->pcm, 0, (size_t)(n - first) * FRAME_SZ);
 }
 
-static void copy_out(const pcm_fifo_t *f, uint32_t rtp, int16_t *dst,
+static void copy_out(const pcm_fifo_t *f, uint32_t rtp, pcm_fifo_sample_t *dst,
                      uint32_t n) {
   const uint32_t idx = rtp & CAP_MASK;
   const uint32_t first = n < CAP - idx ? n : CAP - idx;
@@ -193,7 +193,7 @@ void pcm_fifo_diag_take(pcm_fifo_t *f, uint32_t *gap_events,
 }
 #endif
 
-static bool write_locked(pcm_fifo_t *f, uint32_t rtp, const int16_t *pcm,
+static bool write_locked(pcm_fifo_t *f, uint32_t rtp, const pcm_fifo_sample_t *pcm,
                          uint32_t frames, uint32_t generation,
                          uint32_t wanted, bool wanted_valid) {
   if (ld(&f->generation) != generation) return false;
@@ -275,7 +275,7 @@ static bool write_locked(pcm_fifo_t *f, uint32_t rtp, const int16_t *pcm,
   return true;
 }
 
-bool pcm_fifo_write(pcm_fifo_t *f, uint32_t rtp, const int16_t *pcm,
+bool pcm_fifo_write(pcm_fifo_t *f, uint32_t rtp, const pcm_fifo_sample_t *pcm,
                     size_t frames, uint32_t generation, uint32_t wanted_rtp,
                     bool wanted_valid) {
   if (!f || !pcm || frames == 0U || frames > MAX_WRITE) return false;
@@ -287,7 +287,7 @@ bool pcm_fifo_write(pcm_fifo_t *f, uint32_t rtp, const int16_t *pcm,
 }
 
 uint32_t pcm_fifo_read(const pcm_fifo_t *f, uint32_t rtp, uint32_t frames,
-                       uint32_t generation, int16_t *out) {
+                       uint32_t generation, pcm_fifo_sample_t *out) {
   if (!out || frames == 0U) return 0U;
   if (!f) {
     memset(out, 0, (size_t)frames * FRAME_SZ);

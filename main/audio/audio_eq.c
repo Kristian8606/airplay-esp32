@@ -33,17 +33,6 @@ typedef struct {
   float z2;
 } biquad_state_t;
 
-/* TPDF dither for the float -> int16 requantisation at the EQ output. */
-typedef struct {
-  uint32_t rng;       /* xorshift32 state, must never be 0 */
-  uint32_t zero_run;  /* consecutive exactly-zero input samples */
-} eq_dither_t;
-
-/* After this many consecutive zero input samples (~93 ms at 44.1 kHz) the
- * filter tails have decayed and dither is muted, so digital silence stays
- * silent instead of turning into +-1 LSB hiss. */
-#define EQ_DITHER_SILENCE_SAMPLES 4096U
-
 typedef struct {
   audio_eq_config_t config;
   biquad_coeff_t coeff_l[AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
@@ -62,8 +51,6 @@ typedef struct {
   float preamp_gain_l;
   float preamp_gain_r;
   bool ready;
-  eq_dither_t dith_l;
-  eq_dither_t dith_r;
 } audio_eq_runtime_t;
 
 static audio_eq_runtime_t s_eq;
@@ -495,10 +482,6 @@ esp_err_t audio_eq_init(void) {
     if (!s_eq_mutex) return ESP_ERR_NO_MEM;
   }
   memset(&s_eq, 0, sizeof(s_eq));
-  /* xorshift32 must never start at 0; use different seeds per channel so the
-   * dither noise of left and right is uncorrelated. */
-  s_eq.dith_l.rng = 0x2545F491U;
-  s_eq.dith_r.rng = 0x9E3779B1U;
   esp_err_t err = audio_eq_load_config(&s_eq.config);
   if (err != ESP_OK) {
     audio_eq_default_config(&s_eq.config);
@@ -534,162 +517,61 @@ static inline float process_chain_hot(float x, const biquad_coeff_t *coeff,
   return x;
 }
 
-static inline int16_t saturate_s16(float sample) {
-  if (sample > 32767.0f) {
-    return 32767;
+/* The EQ works on float PCM (1.0 = full scale, see audio_out_sample.h) and
+ * writes float back: nothing is clipped or requantised here. A boost above
+ * full scale simply stays above 1.0 until the single saturation right before
+ * DMA, so lowering the volume brings it back without distortion. */
+
+/* After digital silence the delay lines decay toward denormal floats, which
+ * the FPU handles slowly. Clear values far below the 32-bit LSB (2^-31 of full
+ * scale ~ 5e-10) once per block. */
+static void flush_tiny_state(biquad_state_t *states, uint8_t count) {
+  for (uint8_t i = 0; i < count; ++i) {
+    if (fabsf(states[i].z1) < 1e-20f) states[i].z1 = 0.0f;
+    if (fabsf(states[i].z2) < 1e-20f) states[i].z2 = 0.0f;
   }
-  if (sample < -32768.0f) {
-    return -32768;
-  }
-  return (int16_t)lrintf(sample);
 }
 
-static inline uint32_t eq_rng(uint32_t *st) {
-  uint32_t x = *st;
-  x ^= x << 13;
-  x ^= x >> 17;
-  x ^= x << 5;
-  *st = x;
-  return x;
-}
-
-/* Triangular PDF noise, +-1 LSB: difference of two uniform [0,1) values. */
-static inline float eq_tpdf(uint32_t *st) {
-  const float a = (float)(eq_rng(st) >> 8) * (1.0f / 16777216.0f);
-  const float b = (float)(eq_rng(st) >> 8) * (1.0f / 16777216.0f);
-  return a - b;
-}
-
-/* Final float -> int16 requantisation of the EQ. Plain rounding makes the
- * rounding error follow the signal (harmonic distortion on quiet passages and
- * fades); TPDF dither turns it into signal-independent noise. `alters` is
- * false when the chain is an exact pass-through (no filters, 0 dB preamp):
- * the value is already an integer and must not be touched. */
-static inline int16_t eq_quantize(float y, bool in_zero, bool alters,
-                                  eq_dither_t *d) {
-  if (in_zero) {
-    if (d->zero_run < EQ_DITHER_SILENCE_SAMPLES) d->zero_run++;
-  } else {
-    d->zero_run = 0U;
-  }
-  /* An exact zero has no rounding error: digital silence stays silent. */
-  if (y == 0.0f) return 0;
-  if (alters && d->zero_run < EQ_DITHER_SILENCE_SAMPLES)
-    y += eq_tpdf(&d->rng);
-  return saturate_s16(y);
-}
-
-static inline bool eq_chain_alters(uint8_t active_count, float preamp_gain) {
-  return active_count > 0U || preamp_gain != 1.0f;
-}
-
-static inline void process_stereo_eq(int16_t *pcm, size_t frames) {
-  const bool alters_l = eq_chain_alters(s_eq.active_l, s_eq.preamp_gain_l);
-  const bool alters_r = eq_chain_alters(s_eq.active_r, s_eq.preamp_gain_r);
+static inline void process_stereo_eq(float *pcm, size_t frames) {
   for (size_t i = 0; i < frames; ++i) {
     const size_t p = i * 2;
-    const int16_t in_l = pcm[p];
-    const int16_t in_r = pcm[p + 1];
-    const float out_l = process_chain_hot((float)in_l, s_eq.coeff_l,
-                                          s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
-    const float out_r = process_chain_hot((float)in_r, s_eq.coeff_r,
-                                          s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
-    pcm[p] = eq_quantize(out_l, in_l == 0, alters_l, &s_eq.dith_l);
-    pcm[p + 1] = eq_quantize(out_r, in_r == 0, alters_r, &s_eq.dith_r);
+    pcm[p] = process_chain_hot(pcm[p], s_eq.coeff_l, s_eq.state_l,
+                               s_eq.active_l, s_eq.preamp_gain_l);
+    pcm[p + 1] = process_chain_hot(pcm[p + 1], s_eq.coeff_r, s_eq.state_r,
+                                   s_eq.active_r, s_eq.preamp_gain_r);
   }
 }
 
-static inline void process_mono_eq(int16_t *pcm, size_t frames) {
+/* One source feeds both independent chains (mono mix, left or right). */
+static inline void process_source_eq(float *pcm, size_t frames,
+                                     audio_eq_channel_mode_t mode) {
   for (size_t i = 0; i < frames; ++i) {
     const size_t p = i * 2;
-    const int32_t sum = (int32_t)pcm[p] + (int32_t)pcm[p + 1];
-    const float source = 0.5f * (float)sum;
-    const float out_l =
-        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
-    const float out_r =
-        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
-    /* The mono mix itself can land on a half LSB, so it always counts as an
-     * altering stage. */
-    pcm[p] = eq_quantize(out_l, sum == 0, true, &s_eq.dith_l);
-    pcm[p + 1] = eq_quantize(out_r, sum == 0, true, &s_eq.dith_r);
+    const float source = mode == AUDIO_EQ_CHANNEL_MONO
+                             ? 0.5f * (pcm[p] + pcm[p + 1])
+                         : mode == AUDIO_EQ_CHANNEL_LEFT ? pcm[p] : pcm[p + 1];
+    pcm[p] = process_chain_hot(source, s_eq.coeff_l, s_eq.state_l,
+                               s_eq.active_l, s_eq.preamp_gain_l);
+    pcm[p + 1] = process_chain_hot(source, s_eq.coeff_r, s_eq.state_r,
+                                   s_eq.active_r, s_eq.preamp_gain_r);
   }
 }
 
-static inline void process_left_eq(int16_t *pcm, size_t frames) {
-  const bool alters_l = eq_chain_alters(s_eq.active_l, s_eq.preamp_gain_l);
-  const bool alters_r = eq_chain_alters(s_eq.active_r, s_eq.preamp_gain_r);
+/* EQ disabled: only the source selection. The mono mix of two float samples
+ * is exact (no rounding back to 16 bits any more). */
+static inline void process_source_bypass(float *pcm, size_t frames,
+                                         audio_eq_channel_mode_t mode) {
   for (size_t i = 0; i < frames; ++i) {
     const size_t p = i * 2;
-    const int16_t in = pcm[p];
-    const float source = (float)in;
-    const float out_l =
-        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
-    const float out_r =
-        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
-    pcm[p] = eq_quantize(out_l, in == 0, alters_l, &s_eq.dith_l);
-    pcm[p + 1] = eq_quantize(out_r, in == 0, alters_r, &s_eq.dith_r);
+    const float source = mode == AUDIO_EQ_CHANNEL_MONO
+                             ? 0.5f * (pcm[p] + pcm[p + 1])
+                         : mode == AUDIO_EQ_CHANNEL_LEFT ? pcm[p] : pcm[p + 1];
+    pcm[p] = source;
+    pcm[p + 1] = source;
   }
 }
 
-static inline void process_right_eq(int16_t *pcm, size_t frames) {
-  const bool alters_l = eq_chain_alters(s_eq.active_l, s_eq.preamp_gain_l);
-  const bool alters_r = eq_chain_alters(s_eq.active_r, s_eq.preamp_gain_r);
-  for (size_t i = 0; i < frames; ++i) {
-    const size_t p = i * 2;
-    const int16_t in = pcm[p + 1];
-    const float source = (float)in;
-    const float out_l =
-        process_chain_hot(source, s_eq.coeff_l, s_eq.state_l, s_eq.active_l, s_eq.preamp_gain_l);
-    const float out_r =
-        process_chain_hot(source, s_eq.coeff_r, s_eq.state_r, s_eq.active_r, s_eq.preamp_gain_r);
-    pcm[p] = eq_quantize(out_l, in == 0, alters_l, &s_eq.dith_l);
-    pcm[p + 1] = eq_quantize(out_r, in == 0, alters_r, &s_eq.dith_r);
-  }
-}
-
-static inline void process_mono_bypass(int16_t *pcm, size_t frames) {
-  for (size_t i = 0; i < frames; ++i) {
-    const size_t p = i * 2;
-    const int32_t sum = (int32_t)pcm[p] + (int32_t)pcm[p + 1];
-    /* An even sum halves exactly; only an odd sum needs requantising. */
-    const int16_t out = (sum & 1) == 0
-        ? (int16_t)(sum / 2)
-        : eq_quantize(0.5f * (float)sum, false, true, &s_eq.dith_l);
-    pcm[p] = out;
-    pcm[p + 1] = out;
-  }
-}
-
-static inline void process_left_bypass(int16_t *pcm, size_t frames) {
-  for (size_t i = 0; i < frames; ++i) {
-    const size_t p = i * 2;
-    pcm[p + 1] = pcm[p];
-  }
-}
-
-static inline void process_right_bypass(int16_t *pcm, size_t frames) {
-  for (size_t i = 0; i < frames; ++i) {
-    const size_t p = i * 2;
-    pcm[p] = pcm[p + 1];
-  }
-}
-
-/* Neutral EQ does not advance RNG/filter states. Preserve precisely the
- * trailing-silence counter without float conversion/quantisation per sample. */
-static void neutral_update_silence(const int16_t *pcm, size_t frames,
-                                   unsigned channel, eq_dither_t *d) {
-  size_t tail = 0;
-  while (tail < frames && tail < EQ_DITHER_SILENCE_SAMPLES &&
-         pcm[(frames - 1U - tail) * 2U + channel] == 0) {
-    ++tail;
-  }
-  uint32_t zeros = (uint32_t)tail;
-  if (tail == frames) zeros += d->zero_run;
-  d->zero_run = zeros < EQ_DITHER_SILENCE_SAMPLES
-                    ? zeros : EQ_DITHER_SILENCE_SAMPLES;
-}
-
-void audio_eq_process(int16_t *pcm, size_t frames, int channels,
+void audio_eq_process(float *pcm, size_t frames, int channels,
                       int sample_rate) {
   if (!pcm || frames == 0 || channels != 2) return;
 
@@ -703,20 +585,7 @@ void audio_eq_process(int16_t *pcm, size_t frames, int channels,
       (audio_eq_channel_mode_t)s_eq.config.channel_mode;
 
   if (!s_eq.config.enabled) {
-    switch (mode) {
-      case AUDIO_EQ_CHANNEL_MONO:
-        process_mono_bypass(pcm, frames);
-        break;
-      case AUDIO_EQ_CHANNEL_LEFT:
-        process_left_bypass(pcm, frames);
-        break;
-      case AUDIO_EQ_CHANNEL_RIGHT:
-        process_right_bypass(pcm, frames);
-        break;
-      case AUDIO_EQ_CHANNEL_STEREO:
-      default:
-        break;
-    }
+    if (mode != AUDIO_EQ_CHANNEL_STEREO) process_source_bypass(pcm, frames, mode);
     eq_unlock();
     return;
   }
@@ -724,27 +593,18 @@ void audio_eq_process(int16_t *pcm, size_t frames, int channels,
   if (mode == AUDIO_EQ_CHANNEL_STEREO && s_eq.active_l == 0U &&
       s_eq.active_r == 0U && s_eq.preamp_gain_l == 1.0f &&
       s_eq.preamp_gain_r == 1.0f) {
-    neutral_update_silence(pcm, frames, 0U, &s_eq.dith_l);
-    neutral_update_silence(pcm, frames, 1U, &s_eq.dith_r);
+    /* Neutral chain: exact pass-through, filter state untouched. */
     eq_unlock();
     return;
   }
 
-  switch (mode) {
-    case AUDIO_EQ_CHANNEL_MONO:
-      process_mono_eq(pcm, frames);
-      break;
-    case AUDIO_EQ_CHANNEL_LEFT:
-      process_left_eq(pcm, frames);
-      break;
-    case AUDIO_EQ_CHANNEL_RIGHT:
-      process_right_eq(pcm, frames);
-      break;
-    case AUDIO_EQ_CHANNEL_STEREO:
-    default:
-      process_stereo_eq(pcm, frames);
-      break;
+  if (mode == AUDIO_EQ_CHANNEL_STEREO) {
+    process_stereo_eq(pcm, frames);
+  } else {
+    process_source_eq(pcm, frames, mode);
   }
+  flush_tiny_state(s_eq.state_l, s_eq.active_l);
+  flush_tiny_state(s_eq.state_r, s_eq.active_r);
   eq_unlock();
 }
 
