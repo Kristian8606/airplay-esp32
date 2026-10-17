@@ -50,6 +50,16 @@ CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
 CONFIG_LOG_COLORS=y
+# Console UART at 921600: without a UART driver every log line busy-waits
+# until it is sent; at 115200 a 100-char line blocks its task ~9 ms (RTSP
+# logs run at priority 17 on core 0, above PTP/ALAC/AAC). 921600 = ~1.1 ms.
+# Same UART0 and pins (TX 43 / RX 44) as the default console; only the ROM
+# boot messages stay at 115200. idf.py monitor follows this rate.
+CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+CONFIG_ESP_CONSOLE_UART_CUSTOM_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_TX_GPIO=43
+CONFIG_ESP_CONSOLE_UART_RX_GPIO=44
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
