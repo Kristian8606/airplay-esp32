@@ -245,6 +245,22 @@ menu "I2S Playout"
         int "I2S DATA OUT GPIO"
         default 4
 
+    config AIRPLAY_I2S_KEEP_RUNNING
+        bool "Keep I2S running (zeros) on pause, seek and track change"
+        default y
+        help
+            On pause, FLUSH, seek and next/previous track the audio already
+            queued fades out (~60 ms), the I2S clocks keep running and the DAC
+            gets digital silence (zeros) until playback resumes; the next
+            start is aligned on the running clocks. Most DACs like this best:
+            no lost lock, no relock pop. Every start after a stop fades in
+            (~87 ms) in both modes; a running stream (gapless, AutoMix) is
+            never faded.
+            I2S is still stopped at a session end, a codec change and after a
+            DMA fault.
+            Turn it off if your DAC pops or clicks with it, or needs the
+            clocks to stop to go to standby: then I2S stops on every pause.
+
     config AIRPLAY_OUTPUT_LATENCY_US
         int "Default output latency after the ESP (microseconds)"
         default 0

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "sdkconfig.h"
 #include "audio_out_sample.h"
 
 /* I2S playout backend: AUDIO_PLAYOUT_DMA_BLOCKS DMA descriptors of
@@ -82,6 +83,19 @@ uint32_t audio_playout_free_blocks(void);
  * free (the TX ISR wakes the task only then), a fault, or the timeout.
  * Returns true when that many descriptors are free. */
 bool audio_playout_wait_free(uint32_t blocks, uint32_t timeout_ticks);
+
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+/* Single playout owner only. Soft stop with the clocks running: the audio
+ * already queued in the DMA fades out in place (S-curve, ~55-75 ms: what is
+ * queued minus the block playing now) and ends in exact zeros; if that is not
+ * possible it is cut to zeros at once. The queued tags become silence tags
+ * (generation 0, RTP 0) and completions already reported are dropped. The
+ * caller keeps feeding tagged zero blocks afterwards. *faded_frames = frames
+ * faded (0: cut). ESP_ERR_NOT_FOUND before the first DMA round (descriptors
+ * not known yet), ESP_ERR_INVALID_STATE when disabled or after a fault: stop
+ * I2S instead. */
+esp_err_t audio_playout_fade_out_queued(uint32_t *faded_frames);
+#endif
 
 /* Fine tune the TX master clock while I2S keeps running: one write of the
  * fractional MCLK divider register (no disable/enable, the DMA is not

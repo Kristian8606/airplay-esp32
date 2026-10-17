@@ -14,6 +14,13 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "led.h"
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+#include "audio_fade.h"
+#include "soc/soc_caps.h"
+#if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+#include "esp_cache.h"
+#endif
+#endif
 
 #define TAG "audio_playout"
 
@@ -92,6 +99,19 @@ static DRAM_ATTR TaskHandle_t s_completion_waiter;
 /* 0: wake the waiter on every EOF. N: only once N descriptors are free. */
 static DRAM_ATTR uint32_t s_wake_free_blocks;
 
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+/* Keep-running stop (audio_playout_fade_out_queued): the audio already queued
+ * in the DMA fades out in place. The TX ISR learns the descriptor buffers, in
+ * ring order, from its EOF events (the channel is created once and never
+ * reconfigured, so they never move) and remembers which one finished last
+ * and when (audio_fade.h). Every EOF re-checks the ring order; one mismatch
+ * turns the fade off for good (the stop then cuts to zeros). Written by the
+ * TX ISR under s_tag_mux. */
+static DRAM_ATTR audio_dma_ring_t s_ring = {.last = AUDIO_DMA_IDX_UNKNOWN};
+/* Keeps the TX ISR's tag pop out while the playout task retags the queue. */
+static DRAM_ATTR portMUX_TYPE s_tag_mux = portMUX_INITIALIZER_UNLOCKED;
+#endif
+
 bool audio_playout_has_fault(void) {
   return __atomic_load_n(&s_fault, __ATOMIC_ACQUIRE) != 0U;
 }
@@ -147,6 +167,10 @@ static inline void queues_reset(void) {
   __atomic_store_n(&s_tag_tail, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&s_done_head, 0U, __ATOMIC_RELEASE);
   __atomic_store_n(&s_done_tail, 0U, __ATOMIC_RELEASE);
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+  /* The next start may begin at any descriptor. */
+  audio_dma_ring_restart(&s_ring);
+#endif
 }
 
 static bool tag_push(uint32_t rtp, uint32_t generation, uint32_t frames) {
@@ -202,7 +226,17 @@ static bool IRAM_ATTR on_sent(i2s_chan_handle_t handle,
   (void)user_ctx;
 
   tx_tag_t tag;
-  if (!tag_pop_isr(&tag)) {
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+  const int64_t eof_us = esp_timer_get_time();
+  portENTER_CRITICAL_ISR(&s_tag_mux);
+  audio_dma_ring_track(&s_ring, I2S_DMA_DESC_NUM, event ? event->dma_buf : NULL,
+                       event ? (uint32_t)event->size : 0U, eof_us);
+  const bool have_tag = tag_pop_isr(&tag);
+  portEXIT_CRITICAL_ISR(&s_tag_mux);
+#else
+  const bool have_tag = tag_pop_isr(&tag);
+#endif
+  if (!have_tag) {
     DIAG_ISR_COUNT(s_diag_tag_faults);
     __atomic_store_n(&s_fault, 1U, __ATOMIC_RELEASE);
     return wake_completion_waiter();
@@ -519,6 +553,89 @@ bool audio_playout_wait_free(uint32_t blocks, uint32_t timeout_ticks) {
   __atomic_store_n(&s_wake_free_blocks, 0U, __ATOMIC_RELEASE);
   return ready;
 }
+
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+/* Do not touch a descriptor the DMA starts reading within this time. */
+#define FADE_GUARD_US 2000LL
+#define DMA_BLOCK_US \
+  ((int64_t)I2S_DMA_FRAME_NUM * 1000000LL / (int64_t)I2S_RATE_HZ)
+
+static inline void sync_dma_buf(void *buf) {
+#if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
+  (void)esp_cache_msync(buf, s_ring.size, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+#else
+  (void)buf;
+#endif
+}
+
+esp_err_t audio_playout_fade_out_queued(uint32_t *faded_frames) {
+  if (faded_frames) *faded_frames = 0U;
+  if (!s_tx || !s_enabled || audio_playout_has_fault()) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  /* All descriptors are known after the first DMA round (~87 ms of the first
+   * start); before that the caller stops I2S instead. */
+  if (__atomic_load_n(&s_ring.count, __ATOMIC_ACQUIRE) < I2S_DMA_DESC_NUM) {
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  /* 1. One consistent picture under the lock: which descriptor finished last
+   *    and when, and the queued tags. The queued tags now describe silence:
+   *    generation 0, RTP 0, like the idle zeros (never a generation's sync
+   *    observation, never a warm-prime probe id); the ISR sees either the old
+   *    or the new tag, never half of each. */
+  portENTER_CRITICAL(&s_tag_mux);
+  const uint32_t last = s_ring.last;
+  const int64_t last_us = s_ring.last_us;
+  const bool order_ok = s_ring.bad == 0U;
+  const uint32_t head = __atomic_load_n(&s_tag_head, __ATOMIC_RELAXED);
+  const uint32_t tail = __atomic_load_n(&s_tag_tail, __ATOMIC_RELAXED);
+  const uint32_t queued = (head + TX_TAG_Q_CAP - tail) % TX_TAG_Q_CAP;
+  for (uint32_t i = tail; i != head; i = (i + 1U) % TX_TAG_Q_CAP) {
+    s_tag_q[i].rtp = 0U;
+    s_tag_q[i].generation = 0U;
+  }
+  portEXIT_CRITICAL(&s_tag_mux);
+
+  /* 2. Drop the completions reported before step 1 (consumer side, so this
+   *    is safe against the producing ISR). */
+  __atomic_store_n(&s_done_tail, __atomic_load_n(&s_done_head, __ATOMIC_ACQUIRE),
+                   __ATOMIC_RELEASE);
+
+  /* 3. In flight, in ring order: last+1 (playing now, its tag is the tail)
+   *    up to last+queued (the newest). The playing one, and any the DMA
+   *    starts within FADE_GUARD_US, play as they are; last+first ..
+   *    last+queued fade to exactly zero (audio_fade_out_plan). Free
+   *    descriptors are zero already (auto_clear); only this task writes
+   *    descriptors, the ISR only zeroes finished ones. */
+  uint32_t first = 0U;
+  uint32_t fade_blocks = 0U;
+  if (order_ok && last < I2S_DMA_DESC_NUM && queued <= I2S_DMA_DESC_NUM &&
+      s_ring.size == I2S_DMA_FRAME_NUM * I2S_FRAME_BYTES) {
+    fade_blocks = audio_fade_out_plan(queued, esp_timer_get_time() - last_us,
+                                      DMA_BLOCK_US, FADE_GUARD_US, &first);
+  }
+
+  if (fade_blocks == 0U) {
+    /* Nothing that can still be faded safely: cut to zeros at once, the one
+     * playing included, as with a disable. */
+    for (uint32_t i = 0; i < I2S_DMA_DESC_NUM; ++i) {
+      memset(s_ring.buf[i], 0, s_ring.size);
+      sync_dma_buf(s_ring.buf[i]);
+    }
+    return ESP_OK;
+  }
+
+  /* Nearest descriptor first. Should the DMA still overtake us, the first
+   * gains are ~1.0: no step. */
+  const uint32_t j = audio_fade_out_ring(s_ring.buf, I2S_DMA_DESC_NUM, last,
+                                         first, fade_blocks, I2S_DMA_FRAME_NUM);
+  for (uint32_t b = 0; b < fade_blocks; ++b)
+    sync_dma_buf(s_ring.buf[(last + first + b) % I2S_DMA_DESC_NUM]);
+  if (faded_frames) *faded_frames = j;
+  return ESP_OK;
+}
+#endif
 
 
 static void live_tune_init(void) {

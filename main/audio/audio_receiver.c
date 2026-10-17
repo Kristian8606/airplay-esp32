@@ -12,6 +12,7 @@
 
 #include "aac_decoder.h"
 #include "audio_eq.h"
+#include "audio_fade.h"
 #include "audio_loudness.h"
 #include "audio_crypto.h"
 #include "audio_diag.h"
@@ -1422,7 +1423,8 @@ typedef enum {
   AEVT_AAC_MUTE,      /* a = seq, b = RTP, c = RTP gap (0: first of sequence) */
   AEVT_AAC_LOST,      /* str = why, a = seq */
   AEVT_ALAC_SILENCE,  /* a = RTP, b = frames (recovery window ran out) */
-  AEVT_I2S_IDLE,      /* str = reason: I2S keeps running and plays zeros */
+  AEVT_I2S_IDLE,      /* str = reason, a = generation, b = fade-out ms (0: none):
+                         I2S keeps running and plays zeros */
   AEVT_AAC_FIRST_PACKET, /* a = seq, b = RTP, c = anchor age ms, d = lead us */
   AEVT_AAC_FIRST_DECODE, /* a = seq, b = lead us, c = elapsed ms, d = late count */
 } aevt_kind_t;
@@ -1508,8 +1510,13 @@ static void status_print_audio_events(void) {
         break;
       case AEVT_I2S_IDLE:
         last_idle_us = e.t_us;
-        ESP_LOGW(TAG, "AUDIO EVT %lu ms: I2S KEEPS RUNNING, playing zeros (%s) gen=%ld",
-                 ms, e.str ? e.str : "?", (long)e.a);
+        if (e.b > 0)
+          ESP_LOGW(TAG, "AUDIO EVT %lu ms: I2S KEEPS RUNNING, playing zeros after a"
+                        " %ld ms fade-out (%s) gen=%ld",
+                   ms, (long)e.b, e.str ? e.str : "?", (long)e.a);
+        else
+          ESP_LOGW(TAG, "AUDIO EVT %lu ms: I2S KEEPS RUNNING, playing zeros (%s) gen=%ld",
+                   ms, e.str ? e.str : "?", (long)e.a);
         break;
       case AEVT_SILENCE_BEGIN:
         ESP_LOGW(TAG, "AUDIO EVT %lu ms: SILENCE begins while running, no PCM at rtp=%lu",
@@ -2501,18 +2508,57 @@ static void apply_output_volume_f32(float *pcm, uint32_t frames,
   current_q15[1] = target[1];
 }
 
-/* The end of the float chain: volume, loudness, then the one and only
- * saturation float -> 32-bit slot, in place. Returns the same memory as the
- * I2S block. Only the playout task calls this. */
+/* Fade-in after a stop (audio_fade.h): the first AP2_FADE_IN_FRAMES frames
+ * of every start that follows a stop (pause, FLUSH, track change, seek, lost
+ * timing, the first start, any I2S stop) rise from 0 along an S-curve, so
+ * a song resumed mid-waveform starts without a click. Only a stop arms it:
+ * inside a running stream (gapless, AutoMix, a re-prime while playing) the
+ * audio is never touched. After the fade the chain is bit-exact again.
+ * The fade begins at the first frame that is not exact digital silence,
+ * at most AP2_FADE_IN_WAIT_FRAMES after the start: the first AAC block of a
+ * play sequence is muted to zeros and a start often falls inside it.
+ * Playout task only. */
+#define AP2_FADE_IN_FRAMES (8U * AUDIO_PLAYOUT_FRAMES) /* ~87 ms at 44.1 kHz */
+#define AP2_FADE_IN_WAIT_FRAMES 2048U /* ~46 ms: one muted AAC block + margin */
+static bool s_fade_in_armed = true;                 /* the first start fades in */
+static uint32_t s_fade_in_pos = AP2_FADE_IN_FRAMES; /* == FRAMES: no fade */
+static uint32_t s_fade_in_wait;                     /* zero frames still skipped */
+
+static void fade_in_arm(void) {
+  s_fade_in_armed = true;
+  s_fade_in_pos = AP2_FADE_IN_FRAMES;
+}
+
+static void fade_in_apply(float *pcm, uint32_t frames) {
+  if (s_fade_in_armed) { /* the first block of a start after a stop */
+    s_fade_in_armed = false;
+    s_fade_in_pos = 0U;
+    s_fade_in_wait = AP2_FADE_IN_WAIT_FRAMES;
+  }
+  audio_fade_in_block(pcm, frames, &s_fade_in_pos, &s_fade_in_wait,
+                      AP2_FADE_IN_FRAMES);
+}
+
+/* The end of the float chain: volume, loudness, the fade-in after a stop,
+ * then the one and only saturation float -> 32-bit slot, in place. Returns
+ * the same memory as the I2S block. Only the playout task calls this, and
+ * only for blocks that are really played. */
 static const audio_out_sample_t *output_stage(float *block, uint32_t frames,
                                               int32_t current_q15[2]) {
   apply_output_volume_f32(block, frames, current_q15);
   /* Loudness follows the volume just applied (current_q15 = its target). */
   audio_loudness_process_f32(block, frames, current_q15[0] > current_q15[1]
                                                 ? current_q15[0] : current_q15[1]);
+  fade_in_apply(block, frames);
   return audio_out_from_float_block_inplace(block, (size_t)frames * 2U);
 }
 
+
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+/* A failed I2S stop stays pending (i2s_flush_requested) and is retried as a
+ * real stop, never answered with zeros. Playout task only. */
+static bool s_stop_retry;
+#endif
 
 /* I2S lifecycle is single-owner on the playout task.  A failed flush must
  * never be treated as a successful STOPPED boundary: the driver may still be
@@ -2523,6 +2569,9 @@ static bool playout_flush_checked(const char *reason) {
   const bool was_running = audio_playout_is_enabled();
   const esp_err_t err = audio_playout_flush();
   if (err == ESP_OK) {
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+    s_stop_retry = false;
+#endif
     if (was_running) {
       aevt_post(AEVT_I2S_STOP, reason ? reason : "unknown",
                 (int32_t)__atomic_load_n(&s.generation, __ATOMIC_RELAXED), 0, 0, 0);
@@ -2530,8 +2579,12 @@ static bool playout_flush_checked(const char *reason) {
     /* I2S is stopped. Only now forget the loudness filters' memory of the
      * audio before the stop, so whatever plays next starts from silence. */
     audio_loudness_reset();
+    fade_in_arm();
     return true;
   }
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+  s_stop_retry = true;
+#endif
   __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
   media_control_wake();
   pevt_post(PEVT_FLUSH_FAIL, (int32_t)err, 0, 0, 0, 0,
@@ -2539,8 +2592,42 @@ static bool playout_flush_checked(const char *reason) {
   return false;
 }
 
-/* One block of digital silence, shared read-only by the start-up phase probe
- * and the latency measurement (zero-initialised, never written). */
+/* Soft stop (pause, FLUSH, seek, track change, lost timing) with the I2S
+ * clocks running: the audio queued in the DMA fades out (~55-75 ms) and the
+ * caller keeps feeding zeros (*idle_zeros) until the next warm start, which
+ * fades in. Returns false when that is not possible (option off, I2S not
+ * running, a stop retry pending, descriptors not known yet): the caller then
+ * stops I2S as before. */
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+static bool playout_keep_running_stop(const char *reason, bool *idle_zeros) {
+  uint32_t faded_frames = 0U;
+  if (s_stop_retry || !audio_playout_is_enabled() ||
+      audio_playout_fade_out_queued(&faded_frames) != ESP_OK) {
+    return false;
+  }
+  /* What plays next starts from silence, as after a real stop. */
+  audio_loudness_reset();
+  fade_in_arm();
+  if (!*idle_zeros) {
+    aevt_post(AEVT_I2S_IDLE, reason ? reason : "unknown",
+              (int32_t)__atomic_load_n(&s.generation, __ATOMIC_RELAXED),
+              (int32_t)(((uint64_t)faded_frames * 1000ULL) / 44100ULL), 0, 0);
+    *idle_zeros = true;
+  }
+  return true;
+}
+#else
+static inline bool playout_keep_running_stop(const char *reason,
+                                             bool *idle_zeros) {
+  (void)reason;
+  (void)idle_zeros;
+  return false;
+}
+#endif
+
+/* One block of digital silence, shared read-only by the start-up phase probe,
+ * the idle zeros and the latency measurement (zero-initialised, never
+ * written). */
 static audio_out_sample_t s_silence_block[AUDIO_PLAYOUT_FRAMES * 2U];
 
 /* ---- wired latency measurement: the I2S side ----
@@ -2689,9 +2776,12 @@ static void ap2_playout_task(void *arg) {
   uint32_t zero_blocks = 0; /* consecutive whole blocks played as zeros */
   /* Why the next PRIMING flush happens, for the AUDIO EVT log. */
   const char *restart_reason = "prime-start";
-  /* Pause, FLUSH and track changes keep the I2S clocks running and play
-   * zeros; a new start is then aligned on the running DMA ("warm" prime).
-   * I2S is disabled only at hard boundaries (session/codec, DMA fault). */
+  /* With CONFIG_AIRPLAY_I2S_KEEP_RUNNING, pause, FLUSH and track changes
+   * fade out the queued audio, keep the I2S clocks running and play zeros;
+   * a new start is then aligned on the running DMA ("warm" prime). I2S is
+   * disabled only at hard boundaries (session/codec, DMA fault). Without it
+   * every stop disables I2S; the warm prime is then used only for a re-prime
+   * while playing. Every start after a stop fades in (fade_in_apply). */
   bool warm_prime = false;
   bool retune_pending = false;
   int32_t retune_ppm = 0;
@@ -2771,13 +2861,19 @@ static void ap2_playout_task(void *arg) {
         __atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL);
     const bool dma_fault = audio_playout_has_fault();
     if (flush_requested || dma_fault) {
-      /* Pause, FLUSH, track change, seek: stop I2S (clocks halted). */
-      if (!playout_flush_checked(dma_fault ? "dma-underrun-or-tag-fault"
-                                           : "pause/FLUSH/track change")) {
-        vTaskDelay(1);
-        continue;
+      /* Pause, FLUSH, track change, seek: silence the DMA and keep the
+       * clocks running (CONFIG_AIRPLAY_I2S_KEEP_RUNNING), otherwise stop I2S
+       * (clocks halted). A DMA fault always stops I2S: only a disable resets
+       * the tag bookkeeping. */
+      if (dma_fault ||
+          !playout_keep_running_stop("pause/FLUSH/track change", &idle_zeros)) {
+        if (!playout_flush_checked(dma_fault ? "dma-underrun-or-tag-fault"
+                                             : "pause/FLUSH/track change")) {
+          vTaskDelay(1);
+          continue;
+        }
+        idle_zeros = false;
       }
-      idle_zeros = false;
       s.output_sync.valid = false;
       status_invalidate_sync();
       state = PLAYOUT_STOPPED;
@@ -2820,16 +2916,36 @@ static void ap2_playout_task(void *arg) {
     }
 
     if (!timeline_ok) {
-      /* Pause, FLUSH, track change, lost clock: stop I2S now (clocks
-       * halted) instead of playing zeros. */
+#if CONFIG_AIRPLAY_I2S_KEEP_RUNNING
+      if (state == PLAYOUT_STOPPED && idle_zeros && audio_playout_is_enabled()) {
+        /* Stopped with the clocks running (the DMA was silenced by the
+         * stop): keep every descriptor fed with tagged zeros, an EOF without
+         * a tag would be a fault. Sleep until a batch is free, then one
+         * block per pass, as in the warm prime. */
+        if (audio_playout_free_blocks() == 0U) {
+          (void)audio_playout_wait_free(AUDIO_PLAYOUT_BATCH, pdMS_TO_TICKS(50));
+        } else if (playout_write(s_silence_block, AUDIO_PLAYOUT_FRAMES, 0U, 0U) !=
+                   ESP_OK) {
+          (void)playout_flush_checked("idle-zeros-write-fail");
+          idle_zeros = false;
+          vTaskDelay(1);
+        }
+        continue;
+      }
+#endif
+      /* Pause, FLUSH, track change, lost clock: silence the DMA and keep the
+       * clocks running (CONFIG_AIRPLAY_I2S_KEEP_RUNNING), otherwise stop I2S
+       * now (clocks halted). */
       if (audio_playout_is_enabled()) {
         const char *why = !snap.playing ? "not playing (pause/FLUSH/track change)"
             : !snap.anchor_valid ? "no anchor"
             : snap.timeline_reset_pending ? "timeline reset pending"
             : !timing_clock_ready(&snap) ? "PTP/clock map not ready"
             : "RTP position not computable";
-        (void)playout_flush_checked(why);
-        idle_zeros = false;
+        if (!playout_keep_running_stop(why, &idle_zeros)) {
+          (void)playout_flush_checked(why);
+          idle_zeros = false;
+        }
       }
       state = PLAYOUT_STOPPED;
       (void)xSemaphoreTake(s.playout_wake, 1);
