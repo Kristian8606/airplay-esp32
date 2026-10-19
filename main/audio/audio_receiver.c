@@ -170,6 +170,18 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 #define AP2_PID_KD_PPM_PER_MS_PER_S    55.0
 #define AP2_PID_D_ALPHA                  0.20
 #define AP2_PID_I_TERM_LIMIT_PPM       110.0
+/* Outside the +/-1 ms zone (a PTP clock step, a new anchor) the PID terms
+ * are replaced by phase recovery: hold the learned clock (I) and approach 0
+ * at -sync / AP2_RECOVER_TIME_S, like the centring loop. The full PID wound
+ * its integrator up on such a step and overshot: a +3 ms step went to
+ * -1.8 ms on the board and took ~90 s to settle (simulation: -0.5 ms, 82 s;
+ * a -6 ms step overshot +1.6 ms, 164 s). With recovery: ~0.2 ms, 35-75 s. */
+#define AP2_RECOVER_TIME_S              15.0
+#define AP2_RECOVER_MAX_SLOPE_US_S     120.0
+/* The integrator learns only within the soft band and only while sync is not
+ * already returning towards 0 faster than this, so a transient is never
+ * learned as a clock error. */
+#define AP2_PID_CONVERGING_MS_S          0.02
 
 /* Slow centring inside the +/-1 ms good zone (multiroom accuracy).
  * The PID alone only holds the clock inside the zone, so sync would park near
@@ -1238,6 +1250,7 @@ static void audio_status_task(void *arg) {
   (void)arg;
   bool stack_headroom_warned = false;
   uint32_t last_rt_pressure[4] = {0};
+  int64_t next_status_us = 0;
   while (__atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE)) {
     status_print_audio_events();
     status_print_playout_events();
@@ -1246,11 +1259,26 @@ static void audio_status_task(void *arg) {
     const bool active = __atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE) && snap.playing &&
         (snap.stream_type == AUDIO_STREAM_BUFFERED ||
          snap.stream_type == AUDIO_STREAM_REALTIME);
-    if (xSemaphoreTake(s.status_wake, active ? pdMS_TO_TICKS(AP2_STATUS_PERIOD_MS)
-                                            : portMAX_DELAY) == pdTRUE) {
+    /* Events wake this task early; the status line keeps its own 2 s
+     * deadline (restarting the full wait on every wake hid it for a minute
+     * while the servo retuned every second). */
+    TickType_t wait = portMAX_DELAY;
+    if (active) {
+      const int64_t now_us = esp_timer_get_time();
+      const int64_t period_us = (int64_t)AP2_STATUS_PERIOD_MS * 1000LL;
+      if (next_status_us == 0 || next_status_us - now_us > period_us)
+        next_status_us = now_us + period_us;
+      const int64_t left_us = next_status_us - now_us;
+      wait = left_us > 0 ? pdMS_TO_TICKS((uint32_t)(left_us / 1000LL)) : 0;
+    } else {
+      next_status_us = 0;
+    }
+    if (xSemaphoreTake(s.status_wake, wait) == pdTRUE) {
       if (!__atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE)) break;
       continue;
     }
+    next_status_us += (int64_t)AP2_STATUS_PERIOD_MS * 1000LL;
+    if (next_status_us < esp_timer_get_time()) next_status_us = 0;
     snapshot_state(&snap);
     if (!__atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE) || !snap.playing ||
         (snap.stream_type != AUDIO_STREAM_BUFFERED &&
@@ -1475,9 +1503,15 @@ static void aevt_post(aevt_kind_t kind, const char *str, int32_t a, int32_t b,
   audio_status_notify();
 }
 
+#define AEVT_TUNE_LOG_US 10000000LL
+
 static void status_print_audio_events(void) {
   static int64_t last_stop_us = 0;
   static int64_t last_idle_us = 0;
+  static int64_t tune_logged_us = INT64_MIN / 2;
+  static int32_t tune_from = 0;
+  static int32_t tune_to = 0;
+  static uint32_t tune_steps = 0;
   for (;;) {
     aevt_t e = {0};
     uint32_t dropped = 0;
@@ -1494,7 +1528,19 @@ static void status_print_audio_events(void) {
     if (dropped)
       ESP_LOGW(TAG, "AUDIO EVT: %lu events lost (ring full)",
                (unsigned long)dropped);
-    if (!have) return;
+    if (!have) {
+      const int64_t now_us = esp_timer_get_time();
+      if (tune_steps != 0 && now_us - tune_logged_us >= AEVT_TUNE_LOG_US) {
+        ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
+                      " in %lu steps over the last %ld s (LIVE, I2S not stopped)",
+                 (unsigned long)(now_us / 1000LL), (long)tune_from,
+                 (long)tune_to, (unsigned long)tune_steps,
+                 (long)((now_us - tune_logged_us) / 1000000LL));
+        tune_logged_us = now_us;
+        tune_steps = 0;
+      }
+      return;
+    }
 
     const unsigned long ms = (unsigned long)(e.t_us / 1000LL);
     switch ((aevt_kind_t)e.kind) {
@@ -1541,10 +1587,19 @@ static void status_print_audio_events(void) {
                  ms, (unsigned long)(uint32_t)e.a, (long)e.b);
         break;
       case AEVT_TUNE:
-        ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
-                      " (step %+ld, LIVE: one register write in %ld us,"
-                      " I2S not stopped)",
-                 ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
+        /* Phase recovery retunes up to once a second: print the first step,
+         * then one summary line per AEVT_TUNE_LOG_US. */
+        if (tune_steps == 0 && e.t_us - tune_logged_us >= AEVT_TUNE_LOG_US) {
+          ESP_LOGI(TAG, "AUDIO EVT %lu ms: I2S clock retune %+ld -> %+ld ppm"
+                        " (step %+ld, LIVE: one register write in %ld us,"
+                        " I2S not stopped)",
+                   ms, (long)e.a, (long)e.b, (long)(e.b - e.a), (long)e.c);
+          tune_logged_us = e.t_us;
+        } else {
+          if (tune_steps == 0) tune_from = e.a;
+          tune_to = e.b;
+          ++tune_steps;
+        }
         break;
       case AEVT_AAC_MUTE:
         if (e.c == 0)
@@ -3746,10 +3801,16 @@ static void ap2_playout_task(void *arg) {
        * allow it to unwind. */
       double i_term = AP2_PID_KI_PPM_PER_MS_S * pid_integral_ms_s;
       double unsat = p_term + i_term + d_term;
-      bool allow_i = !in_deadband;
+      bool allow_i = !in_deadband && abs_sync_us <= AP2_PID_SOFTBAND_US;
       if (allow_i) {
         if ((unsat >= AP2_PID_MAX_PPM && error_ms > 0.0) ||
             (unsat <= -AP2_PID_MAX_PPM && error_ms < 0.0)) {
+          allow_i = false;
+        }
+        /* Already converging: error and its derivative have opposite signs. */
+        if ((error_ms > 0.0) != (pid_d_filtered_ms_s > 0.0) &&
+            (pid_d_filtered_ms_s > AP2_PID_CONVERGING_MS_S ||
+             pid_d_filtered_ms_s < -AP2_PID_CONVERGING_MS_S)) {
           allow_i = false;
         }
       }
@@ -3763,6 +3824,15 @@ static void ap2_playout_task(void *arg) {
       }
 
       double command = p_term + i_term + d_term;
+      if (!in_deadband) {
+        /* Phase recovery (1 ppm = 1 us/s of sync slope). */
+        double recover_us_s = -(double)s.output_sync.us / AP2_RECOVER_TIME_S;
+        if (recover_us_s > AP2_RECOVER_MAX_SLOPE_US_S)
+          recover_us_s = AP2_RECOVER_MAX_SLOPE_US_S;
+        if (recover_us_s < -AP2_RECOVER_MAX_SLOPE_US_S)
+          recover_us_s = -AP2_RECOVER_MAX_SLOPE_US_S;
+        command = i_term + recover_us_s;
+      }
       if (command > AP2_PID_MAX_PPM) command = AP2_PID_MAX_PPM;
       if (command < -AP2_PID_MAX_PPM) command = -AP2_PID_MAX_PPM;
       int32_t next_target = (int32_t)(command >= 0.0 ? command + 0.5 : command - 0.5);
