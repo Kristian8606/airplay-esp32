@@ -24,6 +24,8 @@ esp_err_t settings_get_device_name(char *name, size_t len);
 esp_err_t settings_set_device_name(const char *name);
 esp_err_t settings_get_volume(float *volume_db);
 esp_err_t settings_set_volume(float volume_db);
+/* Write the volume to NVS if it changed since the last write. Call only
+ * when playback stops: a flash write stalls the caches for a moment. */
 esp_err_t settings_persist_volume(void);
 /* Output latency after the ESP (us). Returns the Kconfig default
  * CONFIG_AIRPLAY_OUTPUT_LATENCY_US when nothing was saved. */

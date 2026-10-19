@@ -9,6 +9,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "rtsp_events.h"
 
 static const char *TAG = "rgb_vu";
@@ -301,9 +302,11 @@ void led_init(void) {
     return;
   }
 
-  BaseType_t ok = xTaskCreatePinnedToCore(
+  /* Stack in PSRAM: internal RAM is scarce during a session, and this task
+   * never exits and never writes flash. */
+  BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(
       led_task, "rgb_led", LED_TASK_STACK, NULL, LED_TASK_PRIO, &s_led_task,
-      LED_TASK_CORE);
+      LED_TASK_CORE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "LED task creation failed");
     s_led_task = NULL;

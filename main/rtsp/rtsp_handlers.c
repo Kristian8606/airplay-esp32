@@ -396,7 +396,11 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
   log_rtsp_request(socket, conn, &req);
 #endif
 
-  if (method_needs_session(req.method) && !rtsp_session_acquire(conn, false)) {
+  /* Only the SETUP of a connection takes the play lock (Shairport). These
+   * methods never take it on their own: a connection that only probes the
+   * device must not become the owner (and take over the volume) because it
+   * sent a volume or FLUSH while nobody else happened to be playing. */
+  if (method_needs_session(req.method) && !conn->owns_session) {
     AP_LOGI(TAG, "%s from a connection without the play lock: ignored",
              req.method);
     if (strcasecmp(req.method, "TEARDOWN") == 0) {
@@ -1425,6 +1429,7 @@ static void handle_pause(int socket, rtsp_conn_t *conn,
   conn->stream_paused = true;
 
   rtsp_send_ok(socket, conn, req->cseq);
+  (void)settings_persist_volume(); /* playback stopped: no flash write mid-music */
 }
 
 static void handle_flush(int socket, rtsp_conn_t *conn,
@@ -1565,8 +1570,8 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   AP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
            stream_count);
   // Stream-level teardown is a pause: close the play gate immediately and
-  // emit PAUSED (LED state) before the slower receiver/decoder teardown below
-  // (audio_receiver_stop can block ~1 s waiting for the listener task).
+  // emit PAUSED (LED state) before the receiver/decoder teardown below
+  // (normally 10-30 ms; its waits are only capped at ~1.25 s).
   if (has_streams) {
     audio_receiver_set_playing(false);
     rtsp_events_emit(RTSP_EVENT_PAUSED);
@@ -1603,6 +1608,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   }
 
   rtsp_send_ok(socket, conn, req->cseq);
+  (void)settings_persist_volume(); /* stream stopped: no flash write mid-music */
 }
 
 static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
@@ -1668,6 +1674,7 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
       audio_receiver_pause();
       rtsp_events_emit(RTSP_EVENT_PAUSED);
       rtsp_send_ok(socket, conn, req->cseq);
+      (void)settings_persist_volume(); /* playback stopped: no flash write mid-music */
       return;
     }
 

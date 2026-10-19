@@ -13,6 +13,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "airplay_log.h"
 
 static const char *TAG = "amp_control";
@@ -105,9 +107,12 @@ esp_err_t amp_control_init(void) {
 
   amp_set_output(false);
 
-  if (xTaskCreatePinnedToCore(amp_task, "amp_ctrl", AMP_TASK_STACK_BYTES, NULL,
-                              AMP_TASK_PRIORITY, &s_amp_task,
-                              AMP_TASK_CORE) != pdPASS ||
+  /* Stack in PSRAM: internal RAM is scarce during a session, and this task
+   * never exits and never writes flash. */
+  if (xTaskCreatePinnedToCoreWithCaps(amp_task, "amp_ctrl", AMP_TASK_STACK_BYTES,
+                                      NULL, AMP_TASK_PRIORITY, &s_amp_task,
+                                      AMP_TASK_CORE,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS ||
       s_amp_task == NULL) {
     s_amp_task = NULL;
     return ESP_ERR_NO_MEM;

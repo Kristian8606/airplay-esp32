@@ -260,10 +260,13 @@ esp_err_t settings_get_device_name(char *name, size_t len) {
   return ESP_OK;
 }
 esp_err_t settings_set_device_name(const char *name) { return set_str("device_name", name); }
-/* The live volume is the RAM value; NVS only holds the value persisted at
- * the last disconnect. Read NVS once, so a later read (a new connection) can
- * never replace the playing session's volume with the stale stored one. */
+/* The live volume is the RAM value; NVS holds the value persisted when
+ * playback last stopped (pause, stream teardown, disconnect). Read NVS once,
+ * so a later read (a new connection) can never replace the playing session's
+ * volume with the stale stored one. */
 static bool s_volume_known;
+static bool s_volume_stored_valid; /* s_volume_stored_mdb is what NVS holds */
+static int32_t s_volume_stored_mdb;
 
 esp_err_t settings_get_volume(float *volume_db) {
   if (!volume_db) return ESP_ERR_INVALID_ARG;
@@ -280,6 +283,8 @@ esp_err_t settings_get_volume(float *volume_db) {
   if (e == ESP_OK) {
     s_volume_db = (float)mv / 1000.0f;
     s_volume_known = true;
+    s_volume_stored_mdb = mv;
+    s_volume_stored_valid = true;
   }
   *volume_db = s_volume_db;
   return e;
@@ -346,11 +351,20 @@ esp_err_t settings_set_loudness(bool enabled, int32_t reference_db) {
   return e;
 }
 esp_err_t settings_persist_volume(void) {
+  /* Called whenever playback stops: write only a changed volume, so pauses
+   * do not wear the flash. */
+  if (!s_volume_known) return ESP_OK;
+  const int32_t mdb = (int32_t)(s_volume_db * 1000.0f);
+  if (s_volume_stored_valid && s_volume_stored_mdb == mdb) return ESP_OK;
   nvs_handle_t h;
   esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
   if (e != ESP_OK) return e;
-  e = nvs_set_i32(h, "volume_mdb", (int32_t)(s_volume_db * 1000.0f));
+  e = nvs_set_i32(h, "volume_mdb", mdb);
   if (e == ESP_OK) e = nvs_commit(h);
   nvs_close(h);
+  if (e == ESP_OK) {
+    s_volume_stored_mdb = mdb;
+    s_volume_stored_valid = true;
+  }
   return e;
 }

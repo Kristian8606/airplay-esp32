@@ -1701,13 +1701,6 @@ static void wait_until_presentation_ns(const timing_snapshot_t *snap,
   (void)esp_timer_stop(s.playout_timer);
 }
 
-static void pcm_process_common_eq(float *pcm, size_t frames, int channels,
-                                  int sample_rate) {
-  /* This is the codec boundary: AAC and ALAC are fully independent up to
-   * decoded PCM. From here both formats use the same EQ implementation. */
-  audio_eq_process(pcm, frames, channels, sample_rate);
-}
-
 /* The buffered AAC side now follows Shairport Sync's topology: the TCP task
  * owns only a raw byte FIFO, while this single consumer owns packet framing,
  * FLUSH decisions, timing, decrypt/decode and publication into the PCM FIFO
@@ -1941,7 +1934,6 @@ static void ap2_buffered_processor_task(void *arg) {
   taskENTER_CRITICAL(&s.state_mux);
   session_encrypt = s.encrypt;
   taskEXIT_CRITICAL(&s.state_mux);
-  audio_eq_reset_state();
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_AAC_PROCESSOR,
                                     xPortGetCoreID(), AP2_DECODE_PRIORITY, 0U);
 
@@ -1959,7 +1951,6 @@ static void ap2_buffered_processor_task(void *arg) {
     if (seen_pcm_generation != snap.pcm_generation) {
       packets_played_in_sequence = 0;
       expected_timestamp = 0;
-      audio_eq_reset_state();
       seen_pcm_generation = snap.pcm_generation;
 #if defined(CONFIG_AIRPLAY_LOG_AUDIO_EVENTS) && CONFIG_AIRPLAY_LOG_AUDIO_EVENTS
       sd_active = false; /* next packet starts diagnostics for this PCM epoch */
@@ -1998,7 +1989,6 @@ static void ap2_buffered_processor_task(void *arg) {
 #if defined(CONFIG_AIRPLAY_LOG_AUDIO_EVENTS) && CONFIG_AIRPLAY_LOG_AUDIO_EVENTS
       sd_active = false;
 #endif
-      audio_eq_reset_state();
       /* New connection: stop I2S before the old PCM is invalidated. */
       __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
       media_control_wake();
@@ -2089,7 +2079,6 @@ static void ap2_buffered_processor_task(void *arg) {
     if (seen_pcm_generation != snap.pcm_generation) {
       packets_played_in_sequence = 0;
       expected_timestamp = 0;
-      audio_eq_reset_state();
       seen_pcm_generation = snap.pcm_generation;
 #if defined(CONFIG_AIRPLAY_LOG_AUDIO_EVENTS) && CONFIG_AIRPLAY_LOG_AUDIO_EVENTS
       sd_active = false;
@@ -2223,8 +2212,7 @@ static void ap2_buffered_processor_task(void *arg) {
                                 packet.stream_epoch)) {
         /* Re-sent timeline: this packet and the ones after it replace the
          * PCM from packet.rtp on. The block is still muted (the decoder's
-         * history is from the other timeline); EQ history starts over. */
-        audio_eq_reset_state();
+         * history is from the other timeline). */
         ++resend_replaced;
 #if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
         ESP_LOGW(TAG, "AUTOMIX RESEND seq=%" PRIu32 " rtp=%" PRIu32
@@ -2335,9 +2323,6 @@ static void ap2_buffered_processor_task(void *arg) {
       audio_pcm16_to_float_block(s.decode_pcm, s.pcm_f32,
                                  (size_t)frames * (size_t)info.channels);
     }
-    pcm_process_common_eq(s.pcm_f32, (size_t)frames, info.channels,
-                          snap.format.sample_rate);
-
     const pcm_store_result_t stored = pcm_store_with_backpressure(
         packet.rtp, s.pcm_f32, (size_t)frames, info.channels,
         snap.pcm_generation, packet.seq, packet.stream_epoch);
@@ -2365,10 +2350,8 @@ static void ap2_buffered_processor_task(void *arg) {
                  ds.pcm_generation == snap.pcm_generation ? "same" : "changed");
       }
 #endif
-      /* EQ already consumed this AU, but FLUSH/anchor changes may cancel its
-       * publication without changing the PCM generation. Discard that filter
-       * history before the next surviving block starts a new play sequence. */
-      audio_eq_reset_state();
+      /* FLUSH/anchor changes may cancel its publication without changing the
+       * PCM generation: the next surviving block starts a new play sequence. */
       expected_timestamp = 0;
       packets_played_in_sequence = 0;
     }
@@ -2512,7 +2495,6 @@ static void realtime_stage_task(void *arg) {
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_ALAC_STAGE,
                                     xPortGetCoreID(), AP2_RT_STAGE_PRIORITY, 0U);
 
-  uint32_t local_generation = 0;
   bool alac_in_silence = false; /* log only the first of a silent run */
   __atomic_store_n(&s.realtime_stage_idle, true, __ATOMIC_RELEASE);
 
@@ -2573,9 +2555,9 @@ static void realtime_stage_task(void *arg) {
         continue;
       }
 
-      /* Recovery time is exhausted. Preserve RTP duration and EQ chronology
-       * with one silent ALAC-sized PCM block. A later RTX is too late to
-       * rewrite filter history and is discarded by realtime_pcm_sink(). */
+      /* Recovery time is exhausted. Preserve RTP duration with one silent
+       * ALAC-sized PCM block. A later RTX is too late and is discarded by
+       * realtime_pcm_sink(). */
       memset(pcm, 0, (size_t)frames * 2U * sizeof(float));
       if (!alac_in_silence)
         aevt_post(AEVT_ALAC_SILENCE, NULL, (int32_t)cursor, (int32_t)frames,
@@ -2585,13 +2567,6 @@ static void realtime_stage_task(void *arg) {
       audio_pcm16_to_float_block(raw, pcm, (size_t)frames * 2U);
       alac_in_silence = false;
     }
-
-    if (local_generation != snap.generation) {
-      audio_eq_reset_state();
-      local_generation = snap.generation;
-    }
-
-    pcm_process_common_eq(pcm, frames, 2, snap.format.sample_rate);
 
     bool published = false;
     while (__atomic_load_n(&s.engine_running, __ATOMIC_ACQUIRE)) {
@@ -2619,15 +2594,9 @@ static void realtime_stage_task(void *arg) {
       }
       xSemaphoreGive(s.publish_mutex);
       if (published) break;
-      /* Retry the processed samples. Do not run a stateful EQ twice. */
       vTaskDelay(1);
     }
-    if (!published) {
-      /* The processed block was canceled by FLUSH/stop/generation change.
-       * Its EQ history cannot become the next chronology's initial state. */
-      local_generation = 0;
-      continue;
-    }
+    if (!published) continue; /* canceled by FLUSH/stop/generation change */
 
   }
 
@@ -2761,12 +2730,17 @@ static void fade_in_apply(float *pcm, uint32_t frames) {
                       AP2_FADE_IN_FRAMES);
 }
 
-/* The end of the float chain: volume, loudness, the fade-in after a stop,
- * then the one and only saturation float -> 32-bit slot, in place. Returns
- * the same memory as the I2S block. Only the playout task calls this, and
- * only for blocks that are really played. */
+/* The end of the float chain: EQ, volume, loudness, the fade-in after a
+ * stop, then the one and only saturation float -> 32-bit slot, in place.
+ * Returns the same memory as the I2S block. Only the playout task calls this,
+ * and only for blocks that are really played, so the EQ filter history is
+ * exactly the audio that was heard: PCM replaced in the FIFO (AutoMix
+ * re-send, FLUSH) never passed through it, and EQ changes are heard within
+ * the DMA queue (~87 ms) instead of the whole PCM window. */
 static const audio_out_sample_t *output_stage(float *block, uint32_t frames,
+                                              int sample_rate,
                                               int32_t current_q15[2]) {
+  audio_eq_process(block, frames, 2, sample_rate > 0 ? sample_rate : 44100);
   apply_output_volume_f32(block, frames, current_q15);
   /* Loudness follows the volume just applied (current_q15 = its target). */
   audio_loudness_process_f32(block, frames, current_q15[0] > current_q15[1]
@@ -2798,8 +2772,9 @@ static bool playout_flush_checked(const char *reason) {
       aevt_post(AEVT_I2S_STOP, reason ? reason : "unknown",
                 (int32_t)__atomic_load_n(&s.generation, __ATOMIC_RELAXED), 0, 0, 0);
     }
-    /* I2S is stopped. Only now forget the loudness filters' memory of the
-     * audio before the stop, so whatever plays next starts from silence. */
+    /* I2S is stopped. Only now forget the EQ and loudness filters' memory of
+     * the audio before the stop, so whatever plays next starts from silence. */
+    audio_eq_reset_state();
     audio_loudness_reset();
     fade_in_arm();
     return true;
@@ -2828,6 +2803,7 @@ static bool playout_keep_running_stop(const char *reason, bool *idle_zeros) {
     return false;
   }
   /* What plays next starts from silence, as after a real stop. */
+  audio_eq_reset_state();
   audio_loudness_reset();
   fade_in_arm();
   if (!*idle_zeros) {
@@ -3391,7 +3367,8 @@ static void ap2_playout_task(void *arg) {
       }
 
       const audio_out_sample_t *out_block =
-          output_stage(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+          output_stage(block, AUDIO_PLAYOUT_FRAMES, snap.format.sample_rate,
+                     volume_current_q15);
       if (playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                      real_start_rtp, snap.generation) != ESP_OK) {
           (void)playout_flush_checked("warm-write-fail");
@@ -3595,7 +3572,8 @@ static void ap2_playout_task(void *arg) {
         continue;
       }
       const audio_out_sample_t *out_block =
-          output_stage(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+          output_stage(block, AUDIO_PLAYOUT_FRAMES, snap.format.sample_rate,
+                     volume_current_q15);
       const esp_err_t first_err = playout_write(out_block, AUDIO_PLAYOUT_FRAMES,
                                                 real_start_rtp, snap.generation);
       if (first_err != ESP_OK) {
@@ -3699,7 +3677,8 @@ static void ap2_playout_task(void *arg) {
       zero_blocks = 0;
     }
     const audio_out_sample_t *out_block =
-        output_stage(block, AUDIO_PLAYOUT_FRAMES, volume_current_q15);
+        output_stage(block, AUDIO_PLAYOUT_FRAMES, snap.format.sample_rate,
+                     volume_current_q15);
 #if defined(CONFIG_AIRPLAY_DIAG_PLAYOUT) && CONFIG_AIRPLAY_DIAG_PLAYOUT
     PD_MAX(max_work_us, esp_timer_get_time() - pd_work_start_us);
 #endif
