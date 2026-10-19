@@ -1,68 +1,3 @@
-menuconfig AIRPLAY_DIAGNOSTICS
-    bool "Enable temporary AirPlay diagnostics"
-    default n
-    help
-        Master compile-time switch for temporary AirPlay diagnostics.
-        The permanent 2-second audio_status log is independent and remains
-        available when this option is disabled.
-
-        When disabled, category counters, timestamps, arrays, buffers, helper
-        functions and the low-priority audio_diag task are not compiled.
-
-if AIRPLAY_DIAGNOSTICS
-
-    config AIRPLAY_DIAG_TRANSPORT
-        bool "TRANSPORT - TCP/UDP RX, sequence and retransmit diagnostics"
-        default n
-
-    config AIRPLAY_DIAG_BUFFER
-        bool "BUFFER - AAC store, ALAC queues and PCM ring diagnostics"
-        default n
-
-    config AIRPLAY_DIAG_FLUSH
-        bool "FLUSH - FLUSH/FLUSHBUFFERED/AutoMix diagnostics"
-        default n
-
-    config AIRPLAY_DIAG_CODEC
-        bool "CODEC - AAC/ALAC decoder diagnostics"
-        default n
-
-    config AIRPLAY_DIAG_SYNC
-        bool "SYNC - PTP, anchors, PID and ppm diagnostics"
-        default n
-
-    config AIRPLAY_DIAG_PLAYOUT
-        bool "PLAYOUT - scheduler, I2S, DMA and late/early diagnostics"
-        default n
-        help
-            Checks playout every 2 seconds and prints a "PLAYOUT |" warning
-            only for counted DMA underruns, tag faults, PCM holes, silent
-            blocks, re-primes or silence inserted into PCM FIFO gaps.
-            Includes maximum DMA write gap and block processing time as
-            context; timing alone does not trigger a warning.
-            Counters, timing state and helpers are not compiled when disabled.
-
-    config AIRPLAY_DIAG_LIFECYCLE
-        bool "LIFECYCLE - task/session/generation/race diagnostics"
-        default n
-
-    config AIRPLAY_DIAG_ACTIVE
-        bool
-        default y if AIRPLAY_DIAG_TRANSPORT || AIRPLAY_DIAG_BUFFER || AIRPLAY_DIAG_FLUSH || AIRPLAY_DIAG_CODEC || AIRPLAY_DIAG_SYNC || AIRPLAY_DIAG_PLAYOUT || AIRPLAY_DIAG_LIFECYCLE
-        default n
-
-    config AIRPLAY_DIAG_HIGH_RATE_TRACE
-        bool "Allow high-rate packet/sample/block tracing"
-        depends on AIRPLAY_DIAG_ACTIVE
-        default n
-        help
-            Enables diagnostics which may record every packet, sample block or
-            other high-frequency event. Use only for short targeted tests.
-            Audio must never block waiting for diagnostic output; trace data
-            may be dropped instead.
-
-endif
-
 menu "AirPlay Receiver"
     config DEFAULT_AP_SSID
         string "Setup AP SSID"
@@ -177,7 +112,9 @@ menu "Amplifier Power Control"
             during the delay keeps the amplifier on.
 endmenu
 
-menu "AirPlay Logging"
+menu "AirPlay Logs and Diagnostics"
+    comment "Every option is compiled out completely when off"
+
     config AIRPLAY_LOG_RUNTIME
         bool "Runtime event logs (RTSP, PTP, audio path, modules)"
         default n
@@ -205,6 +142,15 @@ menu "AirPlay Logging"
             low-priority status task prints them. Events are rare, so the
             cost is negligible. Turn off once the click source is found.
 
+    config AIRPLAY_LOG_METADATA
+        bool "Log track metadata (title, artist, album) and progress"
+        default n
+        help
+            Prints "Now playing" (title and artist, then album and genre)
+            whenever the sender changes the track metadata, and "Progress:
+            position / duration" when it sends the play position. Only
+            logged, never used by playback. Not compiled when off.
+
     config AIRPLAY_LOG_RTSP_REQUESTS
         bool "Log every RTSP request and response (temporary diagnostics)"
         default n
@@ -216,15 +162,37 @@ menu "AirPlay Logging"
             sender does around an AutoMix transition or a pause. Turn off when
             not needed.
 
-    config AIRPLAY_LOG_METADATA
-        bool "Log track metadata (title, artist, album) and progress"
+    config AIRPLAY_DIAG_PLAYOUT
+        bool "Playout diagnostics (DMA underruns, holes, silence, re-primes)"
         default n
         help
-            Prints "Now playing" (title and artist, then album and genre)
-            whenever the sender changes the track metadata, and "Progress:
-            position / duration" when it sends the play position. Only
-            logged, never used by playback. Not compiled when off.
+            Checks playout every 2 seconds and prints a "PLAYOUT |" warning
+            only for counted DMA underruns, tag faults, PCM holes, silent
+            blocks, re-primes or silence inserted into PCM FIFO gaps.
+            Includes maximum DMA write gap and block processing time as
+            context; timing alone does not trigger a warning.
 
+    config AIRPLAY_DIAG_LIFECYCLE
+        bool "Task and session lifecycle diagnostics"
+        default n
+        help
+            Logs each audio task start (core, priority) and realtime
+            session stop/epoch changes.
+
+    config AIRPLAY_DIAG_AUTOMIX
+        bool "AutoMix / buffered stream continuity diagnostics"
+        default n
+        help
+            For buffered (AAC) audio, logs every RTP timestamp discontinuity
+            with the sequence numbers around it (does the sender skip
+            packets or only jump the timeline?), blocks dropped as too old,
+            blocks the PCM FIFO refused, and the active FLUSH state. Used to
+            find the cause of silences during AutoMix transitions.
+
+    config AIRPLAY_DIAG_ACTIVE
+        bool
+        default y if AIRPLAY_DIAG_PLAYOUT || AIRPLAY_DIAG_LIFECYCLE
+        default n
 endmenu
 
 menu "I2S Playout"

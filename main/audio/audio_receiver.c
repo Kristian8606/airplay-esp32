@@ -1820,6 +1820,15 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t decode_failures = 0;
   uint32_t too_old_skipped = 0;
   uint32_t unsupported_skipped = 0;
+#if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
+  /* Every packet in TCP order (before FLUSH decisions): a sequence jump means
+   * the sender skipped packets; a timestamp jump with consecutive sequence
+   * numbers means it moved its timeline. */
+  bool am_seq_valid = false;
+  uint32_t am_last_seq = 0;
+  uint32_t am_last_published_seq = 0;
+  uint32_t am_late_dropped = 0;
+#endif
   uint32_t unrecognised_ssrc_skipped = 0;
   buffered_packet_t packet = {0};
 #if defined(CONFIG_AIRPLAY_LOG_AUDIO_EVENTS) && CONFIG_AIRPLAY_LOG_AUDIO_EVENTS
@@ -1905,6 +1914,21 @@ static void ap2_buffered_processor_task(void *arg) {
       xSemaphoreGive(s_buffered_control.mutex);
     }
     seen_stream_epoch = packet.stream_epoch;
+#if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
+    if (!am_seq_valid || packet.seq != am_last_seq) {
+      if (am_seq_valid && seq23_delta(packet.seq, am_last_seq) != 1) {
+        buffered_control_snapshot_t fc = {0};
+        buffered_control_snapshot(&fc);
+        ESP_LOGW(TAG, "AUTOMIX SEQ JUMP %" PRIu32 " -> %" PRIu32 " (%+" PRId32
+                      " packets) rtp=%" PRIu32 " | flush imm=%d deferred=%" PRIu32,
+                 am_last_seq, packet.seq, seq23_delta(packet.seq, am_last_seq),
+                 packet.rtp, fc.immediate_active ? 1 : 0,
+                 (uint32_t)fc.deferred_requests);
+      }
+      am_last_seq = packet.seq;
+      am_seq_valid = true;
+    }
+#endif
 
     /* FLUSH state is applied to the one sequentially-held packet before any
      * timing/decrypt/decode work. Re-run this on every pass so a control command
@@ -2070,6 +2094,28 @@ static void ap2_buffered_processor_task(void *arg) {
       timestamp_difference = rtp_delta(packet.rtp, expected_timestamp);
       if (timestamp_difference != 0) {
         mute = true;
+#if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
+        {
+          buffered_control_snapshot_t fc = {0};
+          buffered_control_snapshot(&fc);
+          uint32_t now_rtp = 0;
+          const bool now_valid = wanted_rtp_now(&snap, &now_rtp);
+          ESP_LOGW(TAG, "AUTOMIX RTP JUMP %+" PRId32 " frames (%+.1f ms): last "
+                        "published seq=%" PRIu32 " -> seq=%" PRIu32 " (%+" PRId32
+                        " packets), expected rtp=%" PRIu32 " got %" PRIu32
+                        " | lead %ld ms | flush imm=%d deferred=%" PRIu32
+                        " | too old so far %" PRIu32 ", late dropped %" PRIu32,
+                   timestamp_difference,
+                   (double)timestamp_difference * 1000.0 / 44100.0,
+                   am_last_published_seq, packet.seq,
+                   seq23_delta(packet.seq, am_last_published_seq),
+                   expected_timestamp, packet.rtp,
+                   now_valid ? (long)((int64_t)rtp_delta(packet.rtp, now_rtp) *
+                                      1000LL / 44100LL) : -1L,
+                   fc.immediate_active ? 1 : 0, (uint32_t)fc.deferred_requests,
+                   too_old_skipped, am_late_dropped);
+        }
+#endif
         AP_LOGD(TAG,
                  "AAC timestamp discontinuity seq=%lu actual=%lu expected=%lu diff=%ld",
                  (unsigned long)packet.seq, (unsigned long)packet.rtp,
@@ -2079,6 +2125,11 @@ static void ap2_buffered_processor_task(void *arg) {
       if (timestamp_difference < 0 &&
           (uint32_t)(-(int64_t)timestamp_difference) > frame_samples) {
         (void)buffered_consume_head(&head, &decision, NULL);
+#if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
+        ESP_LOGW(TAG, "AUTOMIX TOO OLD seq=%" PRIu32 " rtp=%" PRIu32
+                      " (%+" PRId32 " frames before expected %" PRIu32 ") dropped",
+                 packet.seq, packet.rtp, timestamp_difference, expected_timestamp);
+#endif
         if ((++too_old_skipped & 0x3FU) == 1U)
           AP_LOGI(TAG,
                    "skipping block seq=%lu because it is too old (%ld frames; %lu so far)",
@@ -2102,13 +2153,10 @@ static void ap2_buffered_processor_task(void *arg) {
         continue; /* keep the FIFO head and retry */
       }
       decoder_format_generation = snap.format_generation;
-      AUDIO_DIAG_CODEC_AAC_READY((uint32_t)snap.format.sample_rate,
-                                 (uint32_t)snap.format.channels);
     }
 
     if (buffered_consume_head(&head, &decision, s.buffered_packet) != ESP_OK)
       continue; /* new control command or transport epoch: inspect again */
-    AUDIO_DIAG_TRANSPORT_AAC_RX_BLOCK((uint32_t)packet.len);
 
     const int dec_len = audio_crypto_decrypt_buffered(
         &session_encrypt, s.buffered_packet, packet.len,
@@ -2183,7 +2231,27 @@ static void ap2_buffered_processor_task(void *arg) {
     if (stored == PCM_STORE_PUBLISHED) {
       expected_timestamp = packet.rtp + (uint32_t)frames;
       packets_played_in_sequence++;
+#if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
+      am_last_published_seq = packet.seq;
+#endif
     } else {
+#if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
+      {
+        timing_snapshot_t ds;
+        snapshot_state(&ds);
+        uint32_t now_rtp = 0;
+        const bool now_valid = wanted_rtp_now(&ds, &now_rtp);
+        ++am_late_dropped;
+        ESP_LOGW(TAG, "AUTOMIX DECODED BLOCK NOT STORED seq=%" PRIu32
+                      " rtp=%" PRIu32 " lead %ld ms (playing=%d anchor=%d "
+                      "pcm_gen %s)",
+                 packet.seq, packet.rtp,
+                 now_valid ? (long)((int64_t)rtp_delta(packet.rtp, now_rtp) *
+                                    1000LL / 44100LL) : -1L,
+                 ds.playing ? 1 : 0, ds.anchor_valid ? 1 : 0,
+                 ds.pcm_generation == snap.pcm_generation ? "same" : "changed");
+      }
+#endif
       /* EQ already consumed this AU, but FLUSH/anchor changes may cancel its
        * publication without changing the PCM generation. Discard that filter
        * history before the next surviving block starts a new play sequence. */
@@ -3500,30 +3568,6 @@ static void ap2_playout_task(void *arg) {
       aevt_post(AEVT_CONCEAL, NULL, (int32_t)cursor_rtp, (int32_t)missing,
                 0, 0);
     }
-#if defined(CONFIG_AIRPLAY_DIAG_BUFFER) && CONFIG_AIRPLAY_DIAG_BUFFER
-    if (got < AUDIO_PLAYOUT_FRAMES && snap.stream_type == AUDIO_STREAM_BUFFERED) {
-      /* Classify a miss from fresh state so the diagnostics can tell an
-       * audible underrun from a cancelled transition. */
-      timing_snapshot_t diag_now;
-      snapshot_state(&diag_now);
-      const uint32_t diag_transition =
-          !diag_now.playing || !diag_now.anchor_valid ||
-          diag_now.timeline_reset_pending ||
-          diag_now.generation != snap.generation ||
-          diag_now.media_revision != snap.media_revision ||
-          __atomic_load_n(&s.i2s_flush_requested, __ATOMIC_ACQUIRE) ||
-          __atomic_load_n(&s.playout_servo_reset_requested, __ATOMIC_ACQUIRE) ||
-          __atomic_load_n(&s.playout_quiesce_req, __ATOMIC_ACQUIRE) !=
-              __atomic_load_n(&s.playout_quiesce_ack, __ATOMIC_ACQUIRE);
-      AUDIO_DIAG_BUFFER_PLAYOUT_MISS(have_pcm ? 1U : 0U,
-                                     AUDIO_PLAYOUT_FRAMES - got,
-                                     pcm_fifo_contiguous_frames(
-                                         s.pcm_fifo, cursor_rtp,
-                                         snap.pcm_generation,
-                                         AUDIO_PLAYOUT_FRAMES),
-                                     have_pcm ? 0U : diag_transition);
-    }
-#endif
     if (!have_pcm) {
       /* A stop (FLUSH, track change) may have cleared the PCM just now. Do
        * not send that gap as silence while I2S still runs: stop I2S first
@@ -3826,13 +3870,6 @@ esp_err_t audio_receiver_init(void) {
                         "playout timer create failed");
   }
 
-  AUDIO_DIAG_BUFFER_PSRAM(
-      AUDIO_DIAG_PSRAM_BEFORE_AUDIO,
-      (uint32_t)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
-      (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-      (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
-      0U);
-
   /* Allocate the one large codec backing store first while PSRAM is least
    * fragmented. Buffered AAC uses the full configured store as its contiguous
    * circular byte buffer.
@@ -3926,22 +3963,6 @@ esp_err_t audio_receiver_init(void) {
 
   pcm_fifo_set_generation(s.pcm_fifo, s.buffered_pcm_generation);
   pcm_rtp_ring_set_generation(s.realtime_stage_ring, s.generation);
-  AUDIO_DIAG_BUFFER_PSRAM(
-      AUDIO_DIAG_PSRAM_AFTER_SHARED,
-      (uint32_t)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
-      (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-      (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
-      0U);
-  AUDIO_DIAG_BUFFER_WORKSPACE(
-      (uint32_t)(s.codec_workspace_size / 1024U),
-      (uint32_t)(ap2_buffered_fifo_capacity(s.transport) / 1024U),
-      (uint32_t)((rt_stage_bytes + rt_pool_bytes) / 1024U));
-  AUDIO_DIAG_BUFFER_PSRAM(
-      AUDIO_DIAG_PSRAM_AFTER_STORES,
-      (uint32_t)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024U),
-      (uint32_t)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
-      (uint32_t)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024U),
-      (uint32_t)(ap2_buffered_fifo_capacity(s.transport) / 1024U));
 
   ESP_RETURN_ON_ERROR(audio_playout_init(), TAG, "I2S playout init failed");
   __atomic_store_n(&s.engine_running, true, __ATOMIC_RELEASE);
@@ -4488,7 +4509,6 @@ esp_err_t audio_receiver_set_deferred_flush_range(
 
 void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
   if (!s_buffered_control.mutex || !s.publish_mutex) return;
-  AUDIO_DIAG_FLUSH_IMMEDIATE_BEGIN();
 
   /* Shairport 5.5.2 handle_flushbuffered() immediate path:
    *   1. arm the sequential flush endpoint;
@@ -4504,7 +4524,6 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
    * state/anchor still published. */
   xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
   xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
-  AUDIO_DIAG_FLUSH_IMMEDIATE_PUBLISH_ACQUIRED();
   const uint32_t masked_until_seq = until_seq & 0x007fffffU;
   if (++s_buffered_control.revision == 0U) ++s_buffered_control.revision;
   s_buffered_control.immediate_until_seq = masked_until_seq;
@@ -4531,8 +4550,6 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
    * FLUSH/anchor/resume can otherwise bypass the consumer's old PCM reset. */
   (void)reset_buffered_pcm_store();
   mark_timeline_discontinuity();
-  AUDIO_DIAG_FLUSH_IMMEDIATE_TRANSPORT_DONE();
-  AUDIO_DIAG_FLUSH_IMMEDIATE_PCM_DONE();
   xSemaphoreGive(s.publish_mutex);
   xSemaphoreGive(s_buffered_control.mutex);
 
@@ -4543,7 +4560,6 @@ void audio_receiver_set_immediate_flush(uint32_t until_seq, uint32_t until_ts) {
 
   media_control_wake();
   audio_status_notify();
-  AUDIO_DIAG_FLUSH_IMMEDIATE_END();
 }
 
 void audio_receiver_pause(void) {

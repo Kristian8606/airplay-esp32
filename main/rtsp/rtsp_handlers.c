@@ -392,7 +392,6 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
     return -1;
   }
 
-  AUDIO_DIAG_FLUSH_RTSP_BEGIN(socket, req.method);
 #if CONFIG_AIRPLAY_LOG_RTSP_REQUESTS
   log_rtsp_request(socket, conn, &req);
 #endif
@@ -405,7 +404,6 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
       conn->close_after_response = true;
     }
     rtsp_send_ok(socket, conn, req.cseq);
-    AUDIO_DIAG_FLUSH_RTSP_END(socket, req.method);
     return 0;
   }
 
@@ -413,7 +411,6 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
   for (const rtsp_method_handler_t *h = method_handlers; h->method; h++) {
     if (strcasecmp(req.method, h->method) == 0) {
       h->handler(socket, conn, &req, raw_request, raw_len);
-      AUDIO_DIAG_FLUSH_RTSP_END(socket, req.method);
       return 0;
     }
   }
@@ -426,7 +423,6 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
     rtsp_send_http_response(socket, conn, 501, "Not Implemented", "text/plain",
                             "Not Implemented", 15);
   }
-  AUDIO_DIAG_FLUSH_RTSP_END(socket, req.method);
   return 0;
 }
 

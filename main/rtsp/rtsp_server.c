@@ -172,7 +172,6 @@ static void client_task(void *pvParameters) {
   xSemaphoreTake(lifecycle_mutex, portMAX_DELAY);
   slot->conn = conn;
   xSemaphoreGive(lifecycle_mutex);
-  AUDIO_DIAG_FLUSH_RTSP_SESSION_RESET(slot->socket);
 
   // Sender IP: PTP timing peer, event-port filter, realtime retransmits
   struct sockaddr_in peer_addr;

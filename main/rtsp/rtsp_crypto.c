@@ -56,8 +56,6 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
     return -1;
   }
 
-  AUDIO_DIAG_FLUSH_CONTROL_RX_BEGIN(socket);
-
   // Read 2-byte length header (little-endian).  The socket has SO_RCVTIMEO
   // set for shutdown responsiveness; if it fires after a partial read we
   // must keep waiting rather than return — abandoning N consumed bytes here
@@ -80,8 +78,6 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
     }
     return -1;
   }
-
-  AUDIO_DIAG_FLUSH_CONTROL_RX_HEADER_DONE(socket);
 
   uint16_t block_len = (uint16_t)len_buf[0] | ((uint16_t)len_buf[1] << 8);
 
@@ -115,8 +111,6 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
     return -1;
   }
 
-  AUDIO_DIAG_FLUSH_CONTROL_RX_PAYLOAD_DONE(socket);
-
   // Decrypt using session keys
   uint8_t nonce[12] = {0};
   memcpy(nonce + 4, &conn->hap_session->decrypt_nonce, 8);
@@ -130,7 +124,6 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
   }
 
   conn->hap_session->decrypt_nonce++;
-  AUDIO_DIAG_FLUSH_CONTROL_RX_END(socket, (uint32_t)plaintext_len);
 
   return (int)plaintext_len;
 }

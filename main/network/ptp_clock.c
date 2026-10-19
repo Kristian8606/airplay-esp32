@@ -274,7 +274,6 @@ static void add_sample_locked(int64_t raw_offset_ns, int64_t reception_ns,
   if (!ptp.realtime_mode) update_lock_locked(&r, reception_ns);
 
   if (r.reacquired) {
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_OUTLIER);
     fill_step_log_locked(step_ev, "clock-step-reacquire", &r, rx_lag_ns, seq);
     ptp.last_step_log_ns = reception_ns;
   } else if (r.restarted) {
@@ -335,7 +334,6 @@ static bool source_admitted_locked(uint64_t source_clock_id,
   if (source_clock_id != 0 && ptp.timing_peer_ip != 0 &&
       source_ip == ptp.timing_peer_ip)
     return true;
-  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_REJECTED_SOURCE);
   return false;
 }
 
@@ -355,7 +353,6 @@ static void process_announce(const uint8_t *data, size_t len,
 
   ptp_step_log_t step_ev = {0};
   taskENTER_CRITICAL(&ptp_state_mux);
-  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_ANNOUNCE);
   if (source_admitted_locked(source_clock, source_ip)) {
     note_source_locked(source_clock);
     /* Realtime timing follows the GM only: a source identity change on the
@@ -411,12 +408,8 @@ static void process_sync(const uint8_t *data, size_t len, uint16_t seq,
                             &step_ev);
   }
 
-  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_SYNC);
   /* A new Sync before the previous pair completed: the old pair can no
    * longer be used safely. Replace it with the newest Sync. */
-  if (ptp.pending.awaiting)
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_PAIR_MISMATCH);
-
   ptp.pending.awaiting = true;
   ptp.pending.seq = seq;
   ptp.pending.local_ns = reception_ns;
@@ -458,9 +451,7 @@ static void process_followup(const uint8_t *data, size_t len, uint16_t seq,
     return;
   }
 
-  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_RX_FOLLOWUP);
   if (!ptp.pending.awaiting) {
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_ORPHAN_FOLLOWUP);
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
@@ -468,7 +459,6 @@ static void process_followup(const uint8_t *data, size_t len, uint16_t seq,
       followup_source != ptp.pending.source_clock_id) {
     /* Keep the pending Sync: an out-of-order/old Follow_Up must not destroy
      * the chance to receive the correct Follow_Up for it. */
-    AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_PAIR_MISMATCH);
     taskEXIT_CRITICAL(&ptp_state_mux);
     return;
   }
@@ -477,9 +467,6 @@ static void process_followup(const uint8_t *data, size_t len, uint16_t seq,
   const int64_t raw_offset = (int64_t)ptp_time_ns + ptp.pending.correction_ns +
                              followup_correction_ns - sync_local_ns;
   ptp.pending.awaiting = false;
-  AUDIO_DIAG_SYNC_GAP_NS(reception_ns >= sync_local_ns
-                             ? reception_ns - sync_local_ns : 0);
-  AUDIO_DIAG_SYNC_COUNT(AUDIO_DIAG_SYNC_PAIR_OK);
   /* The engine works in Sync reception time: that is when the measured
    * offset was true. */
   add_sample_locked(raw_offset, sync_local_ns, ptp.pending.process_lag_ns, seq,

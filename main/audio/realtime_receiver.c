@@ -992,9 +992,6 @@ esp_err_t realtime_receiver_set_packet_workspace(void *workspace,
   s_rt.data_pool = (rt_packet_slot_t *)aligned;
   s_rt.rtx_pool = (rt_packet_slot_t *)(aligned + data_bytes);
   s_rt.packet_workspace_external = true;
-  AUDIO_DIAG_BUFFER_PACKET_WORKSPACE(
-      (uint32_t)(data_bytes / 1024U), (uint32_t)(rtx_bytes / 1024U),
-      (uint32_t)((data_bytes + rtx_bytes) / 1024U));
   return ESP_OK;
 }
 
@@ -1160,15 +1157,6 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
   struct timeval tv = {.tv_sec = 0, .tv_usec = RT_SOCKET_TIMEOUT_MS * 1000U};
   (void)setsockopt(s_rt.data_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-#if defined(CONFIG_AIRPLAY_DIAG_TRANSPORT) && CONFIG_AIRPLAY_DIAG_TRANSPORT
-  int actual_rcvbuf = 0;
-  socklen_t actual_rcvbuf_len = sizeof(actual_rcvbuf);
-  if (getsockopt(s_rt.data_sock, SOL_SOCKET, SO_RCVBUF, &actual_rcvbuf,
-                 &actual_rcvbuf_len) == 0) {
-    AUDIO_DIAG_TRANSPORT_SOCKET_BUFFER(131072U, (uint32_t)actual_rcvbuf);
-  }
-#endif
-
   if (control_port != 0) {
     uint16_t bound_control = 0;
     s_rt.control_sock = socket_utils_bind_udp(control_port, 0, 64 * 1024, &bound_control);
@@ -1239,7 +1227,6 @@ esp_err_t realtime_receiver_start(uint16_t data_port, uint16_t control_port,
     return ESP_FAIL;
   }
 
-  AUDIO_DIAG_TRANSPORT_PORTS((uint32_t)data_port, (uint32_t)control_port);
   return ESP_OK;
 }
 
@@ -1289,11 +1276,6 @@ void realtime_receiver_set_client_control(uint32_t client_ip,
   s_rt.client_control_addr = next;
   s_rt.client_control_valid = valid;
   taskEXIT_CRITICAL(&s_rt_control_mux);
-
-  if (valid) {
-    AUDIO_DIAG_TRANSPORT_RETRANSMIT_TARGET(next.sin_addr.s_addr,
-                                           client_control_port);
-  }
 }
 
 void realtime_receiver_get_usage(realtime_receiver_usage_t *out) {

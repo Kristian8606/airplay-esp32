@@ -175,15 +175,6 @@ static esp_err_t pcm_rtp_ring_create_internal(
     return ESP_ERR_NO_MEM;
   }
 
-#if defined(CONFIG_AIRPLAY_DIAG_BUFFER) && CONFIG_AIRPLAY_DIAG_BUFFER
-  const audio_diag_pcm_ring_id_t diag_ring_id =
-      storage ? AUDIO_DIAG_PCM_RING_ALAC_STAGE : AUDIO_DIAG_PCM_RING_FINAL;
-  AUDIO_DIAG_BUFFER_PCM_RING(diag_ring_id,
-                             slot_count,
-                             (uint32_t)PCM_RTP_SLOT_FRAMES,
-                             slot_count * PCM_RTP_SLOT_FRAMES,
-                             (uint32_t)pcm_bytes);
-#endif
   *out = r;
   return ESP_OK;
 }
