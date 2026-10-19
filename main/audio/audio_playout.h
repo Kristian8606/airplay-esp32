@@ -97,10 +97,11 @@ bool audio_playout_wait_free(uint32_t blocks, uint32_t timeout_ticks);
 esp_err_t audio_playout_fade_out_queued(uint32_t *faded_frames);
 #endif
 
-/* Fine tune the TX master clock while I2S keeps running: one write of the
- * fractional MCLK divider register (no disable/enable, the DMA is not
- * touched). target_ppm is relative to the nominal MCLK measured at init
- * (+/-160 ppm). Call only from the playout task. ESP_ERR_NOT_SUPPORTED when
+/* Fine tune the TX master clock while I2S keeps running: only the
+ * fractional MCLK divider register is written (no disable/enable, the DMA is
+ * not touched). The two divider levels around target_ppm are alternated per
+ * written block, so the average clock is exactly target_ppm relative to the
+ * nominal MCLK measured at init (+/-160 ppm). Call only from the playout task. ESP_ERR_NOT_SUPPORTED when
  * live tuning is unavailable (see the boot log). halt_us = time spent. */
 esp_err_t audio_playout_tune_ppm(int32_t target_ppm,
                                  audio_playout_tune_info_t *out,

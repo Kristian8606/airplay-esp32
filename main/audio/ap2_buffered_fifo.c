@@ -6,6 +6,8 @@
 #include <sys/socket.h>
 #if defined(ESP_PLATFORM)
 #include "lwip/sockets.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #endif
 #include <unistd.h>
 
@@ -25,6 +27,10 @@
 #define FIFO_PACE_THRESHOLD  16384U
 #define FIFO_PACE_SLEEP_MS      10U
 #define FIFO_MIN_WIRE_LEN       14U
+/* Diagnostics: the sender paces buffered audio in bursts several seconds
+ * apart. A silence much longer than that, with room in the FIFO, means the
+ * sender stopped feeding this connection. */
+#define FIFO_STALL_LOG_MS    20000U
 
 static const char *TAG = "aac_fifo";
 
@@ -91,6 +97,37 @@ static void fifo_discard_all(ap2_buffered_fifo_t *fifo) {
   signal_all(fifo);
 }
 
+#if defined(ESP_PLATFORM)
+/* True when another TCP connection is waiting on the listener (the sender
+ * opened a new data connection while this one is still attached). */
+static bool listener_has_pending(int listen_sock) {
+  if (listen_sock < 0) return false;
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(listen_sock, &rfds);
+  struct timeval tv = {0, 0};
+  return select(listen_sock + 1, &rfds, NULL, NULL, &tv) > 0 &&
+         FD_ISSET(listen_sock, &rfds);
+}
+
+static void log_rx_stall(ap2_buffered_fifo_t *fifo, int64_t silent_ms) {
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  const size_t used = fifo->occupancy;
+  const uint64_t total = fifo->total_written;
+  xSemaphoreGive(fifo->fifo_mutex);
+  AP_LOGW(TAG,
+           "RX STALL: no data from the sender for %lld ms with %u/%u KiB used "
+           "(total rx %llu KiB); new connection pending=%d; internal heap "
+           "free=%u min=%u largest=%u",
+           (long long)silent_ms, (unsigned)(used / 1024U),
+           (unsigned)(fifo->capacity / 1024U), (unsigned long long)(total / 1024U),
+           listener_has_pending(fifo->listen_sock) ? 1 : 0,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+#endif
+
 static void tcp_reader_task(void *arg) {
   ap2_buffered_fifo_t *fifo = (ap2_buffered_fifo_t *)arg;
   AUDIO_DIAG_LIFECYCLE_TASK_STARTED(AUDIO_DIAG_TASK_TCP_READER,
@@ -123,6 +160,13 @@ static void tcp_reader_task(void *arg) {
     AP_LOGI(TAG, "buffered TCP connected fifo=%uKiB",
              (unsigned)(fifo->capacity / 1024U));
     signal_all(fifo);
+#if defined(ESP_PLATFORM)
+    /* recv wakes at least once a second so a stalled sender is noticed. */
+    const struct timeval rx_tv = {.tv_sec = 1, .tv_usec = 0};
+    (void)setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &rx_tv, sizeof(rx_tv));
+    int64_t last_rx_us = esp_timer_get_time();
+    bool stall_logged = false;
+#endif
 
     while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
       size_t write_pos = 0;
@@ -146,10 +190,35 @@ static void tcp_reader_task(void *arg) {
 
       const ssize_t n = recv(c, fifo->buffer + write_pos, request, 0);
       if (n <= 0) {
-        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+#if defined(ESP_PLATFORM)
+          const int64_t silent_ms = (esp_timer_get_time() - last_rx_us) / 1000LL;
+          if (!stall_logged && silent_ms >= (int64_t)FIFO_STALL_LOG_MS) {
+            stall_logged = true;
+            log_rx_stall(fifo, silent_ms);
+          }
+#endif
           continue;
+        }
+        /* Our own stop/abort shuts the socket down first: log only a close
+         * that came from the sender or the network. */
+        if (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE) &&
+            fifo->client_sock == c)
+          AP_LOGI(TAG, "buffered TCP: %s from the sender (errno %d)",
+                   n == 0 ? "orderly close" : "receive error", n == 0 ? 0 : errno);
         break;
       }
+#if defined(ESP_PLATFORM)
+      {
+        const int64_t now_us = esp_timer_get_time();
+        if (stall_logged) {
+          AP_LOGI(TAG, "RX resumed after %lld ms without data",
+                   (long long)((now_us - last_rx_us) / 1000LL));
+          stall_logged = false;
+        }
+        last_rx_us = now_us;
+      }
+#endif
 
       xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
       if (__atomic_load_n(&fifo->stream_epoch, __ATOMIC_ACQUIRE) == write_epoch &&

@@ -399,8 +399,10 @@ bool rtsp_session_acquire(rtsp_conn_t *conn, bool break_in) {
     }
     taskEXIT_CRITICAL(&s_owner_lock);
     if (got) {
-      if (!conn->owns_session)
+      if (!conn->owns_session) {
         AP_LOGI(TAG, "play lock acquired%s", signalled ? " by breaking in" : "");
+        rtsp_conn_take_volume(conn);
+      }
       conn->owns_session = true;
       return true;
     }

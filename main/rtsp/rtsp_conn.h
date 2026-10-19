@@ -90,5 +90,8 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db);
 /* Event volume acknowledgments can race sender SET_PARAMETER. These APIs
  * serialize scalar gain state; the conditional update preserves newer input. */
 float rtsp_conn_get_volume_db(rtsp_conn_t *conn);
+/* The connection has just taken the play lock: start from the current
+ * receiver volume and apply it to the output. */
+void rtsp_conn_take_volume(rtsp_conn_t *conn);
 bool rtsp_conn_set_volume_if_unchanged(rtsp_conn_t *conn, float expected_db,
                                       float volume_db);

@@ -33,14 +33,15 @@ rtsp_conn_t *rtsp_conn_create(void) {
     return NULL;
   }
 
-  // Load saved AirPlay volume or use a conservative default.
+  /* Current AirPlay volume (reported by GET /info) or a conservative
+   * default. A connection does not touch the output until it takes the play
+   * lock: a sender that merely connects never moves the playing volume. */
   float saved_volume;
   if (settings_get_volume(&saved_volume) == ESP_OK) {
     conn->volume_db = saved_volume;
   } else {
     conn->volume_db = -15.0f;
   }
-  audio_receiver_set_volume_q15(volume_db_to_q15(conn->volume_db));
 
   conn->event_socket = -1;
 
@@ -138,6 +139,16 @@ void rtsp_conn_set_volume(rtsp_conn_t *conn, float volume_db) {
 bool rtsp_conn_set_volume_if_unchanged(rtsp_conn_t *conn, float expected_db,
                                       float volume_db) {
   return conn_update_volume(conn, volume_db, true, expected_db);
+}
+
+void rtsp_conn_take_volume(rtsp_conn_t *conn) {
+  if (!conn) return;
+  float volume_db;
+  const bool known = settings_get_volume(&volume_db) == ESP_OK;
+  portENTER_CRITICAL(&volume_lock);
+  if (known) conn->volume_db = volume_db;
+  audio_receiver_set_volume_q15(volume_db_to_q15(conn->volume_db));
+  portEXIT_CRITICAL(&volume_lock);
 }
 
 float rtsp_conn_get_volume_db(rtsp_conn_t *conn) {

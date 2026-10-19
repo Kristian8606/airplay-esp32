@@ -59,6 +59,7 @@ typedef struct {
    * crystal), so a drifting envelope is tracked without a drift-dependent
    * lag. Measured over windows of filtered values. */
   int64_t drift_ns_per_s;
+  bool drift_valid; /* at least one full window measured */
   int64_t drift_window_start_ns;
   int64_t drift_window_start_offset_ns;
 

@@ -260,19 +260,35 @@ esp_err_t settings_get_device_name(char *name, size_t len) {
   return ESP_OK;
 }
 esp_err_t settings_set_device_name(const char *name) { return set_str("device_name", name); }
+/* The live volume is the RAM value; NVS only holds the value persisted at
+ * the last disconnect. Read NVS once, so a later read (a new connection) can
+ * never replace the playing session's volume with the stale stored one. */
+static bool s_volume_known;
+
 esp_err_t settings_get_volume(float *volume_db) {
   if (!volume_db) return ESP_ERR_INVALID_ARG;
+  if (s_volume_known) {
+    *volume_db = s_volume_db;
+    return ESP_OK;
+  }
   nvs_handle_t h;
   esp_err_t e = nvs_open(NS, NVS_READONLY, &h);
   if (e != ESP_OK) { *volume_db = s_volume_db; return e; }
   int32_t mv = 0;
   e = nvs_get_i32(h, "volume_mdb", &mv);
   nvs_close(h);
-  if (e == ESP_OK) s_volume_db = (float)mv / 1000.0f;
+  if (e == ESP_OK) {
+    s_volume_db = (float)mv / 1000.0f;
+    s_volume_known = true;
+  }
   *volume_db = s_volume_db;
   return e;
 }
-esp_err_t settings_set_volume(float volume_db) { s_volume_db = volume_db; return ESP_OK; }
+esp_err_t settings_set_volume(float volume_db) {
+  s_volume_db = volume_db;
+  s_volume_known = true;
+  return ESP_OK;
+}
 
 #ifndef CONFIG_AIRPLAY_OUTPUT_LATENCY_US
 #define CONFIG_AIRPLAY_OUTPUT_LATENCY_US 0

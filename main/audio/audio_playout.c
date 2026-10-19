@@ -33,6 +33,8 @@
 #define LIVE_SCLK_HZ 160000000U /* PLL_F160M, tx_clk_sel == 2 */
 static uint32_t s_live_div_int; /* 0: live tuning not available (no tuning) */
 static void live_tune_init(void);
+static esp_err_t live_tune_write(int32_t ppm, uint32_t *mclk_hz_out);
+static void live_dither_step(void);
 
 #define I2S_DMA_DESC_NUM  AUDIO_PLAYOUT_DMA_BLOCKS
 #define I2S_DMA_FRAME_NUM AUDIO_PLAYOUT_FRAMES
@@ -496,6 +498,7 @@ esp_err_t audio_playout_write_tagged(const audio_out_sample_t *stereo,
     /* RGB/VU is fed from the final I2S submission path. When disabled
      * in menuconfig this compiles to a no-op. */
     led_audio_feed(stereo, frames);
+    live_dither_step();
     return ESP_OK;
   }
 
@@ -667,50 +670,119 @@ static void live_tune_init(void) {
     return;
   }
   s_live_div_int = n;
+  if (live_tune_write(0, NULL) != ESP_OK) {
+    s_live_div_int = 0;
+    ESP_LOGE(TAG, "I2S clock tuning unavailable: no divider levels around nominal");
+    return;
+  }
   ESP_LOGI(TAG, "I2S clock tuning: LIVE, one register write, I2S never stops"
                 " (MCLK = 160 MHz / %u.xxx)", (unsigned)n);
 }
 
-/* Set the TX MCLK to nominal * (1 + ppm / 1e6) by rewriting only the
- * fractional divider register. Integer math, best b/a with a < 512. */
-static esp_err_t live_tune_write(int32_t ppm, uint32_t *mclk_hz_out) {
+/* Fractional divider levels and dithering.
+ *
+ * MCLK = 160 MHz / (n + b/a) with a < 512. Around 44.1 kHz x 256 (n = 14,
+ * fraction ~0.172) the reachable frequencies are up to ~6 ppm apart, and the
+ * nearest level can miss a requested ppm by ~3 ppm. The servo then hunts
+ * between levels and parks hundreds of microseconds off. Instead, every
+ * requested ppm is bracketed by the two nearest levels and the playout task
+ * alternates them per DMA block (first-order sigma-delta), so the AVERAGE
+ * clock is exactly the requested one. Adjacent levels differ by a few ppm:
+ * per block that is a phase wobble of tens of nanoseconds. */
+typedef struct {
+  uint32_t reg;    /* tx_clkm_div_conf value (x, y, z, yn1; reserved kept) */
+  int64_t ppb;     /* exact MCLK offset of this level vs nominal */
+} live_level_t;
+
+static live_level_t s_dith_lo, s_dith_hi; /* lo.ppb <= target <= hi.ppb */
+static int64_t s_dith_num;  /* target - lo */
+static int64_t s_dith_den;  /* hi - lo (0: a single exact level) */
+static int64_t s_dith_acc;
+static uint32_t s_dith_reg; /* level currently in the register */
+
+static uint32_t live_level_reg(uint64_t a, uint64_t b) {
+  uint32_t x = 0, y = 0, z = 0, yn1 = 0;
+  if (b) {
+    yn1 = b * 2U > a;
+    z = (uint32_t)(yn1 ? a - b : b);
+    x = (uint32_t)(a / z) - 1U;
+    y = (uint32_t)(a % z);
+  }
+  i2s_dev_t *hw = I2S_LL_GET_HW(I2S_NUM_0);
+  return (hw->tx_clkm_div_conf.val & 0xF0000000U) | (z & 0x1FFU) |
+         ((y & 0x1FFU) << 9) | ((x & 0x1FFU) << 18) | ((yn1 & 1U) << 27);
+}
+
+/* Exact offset of MCLK = sclk / (n + b/a) from nominal, in ppb. */
+static int64_t live_level_ppb(uint64_t n, uint64_t a, uint64_t b) {
+  const int64_t num = (int64_t)((uint64_t)LIVE_SCLK_HZ * a);
+  const int64_t den = (int64_t)((uint64_t)s_nominal_mclk_hz * (n * a + b));
+  return (num - den) * 1000000000LL / den;
+}
+
+/* The two divider levels around target_ppb. Integer math, a < 512. */
+static esp_err_t live_bracket(int32_t target_ppm, live_level_t *lo,
+                              live_level_t *hi) {
   if (s_live_div_int == 0U) return ESP_ERR_INVALID_STATE;
   /* M = target MCLK in micro-Hz; LIVE_SCLK_HZ * 1e6 = n * M + r. */
-  const uint64_t M = (uint64_t)s_nominal_mclk_hz * (uint64_t)(1000000 + ppm);
+  const uint64_t M = (uint64_t)s_nominal_mclk_hz * (uint64_t)(1000000 + target_ppm);
   const uint64_t sclk_u = (uint64_t)LIVE_SCLK_HZ * 1000000ULL;
   const uint64_t n = sclk_u / M;
   if (n != s_live_div_int) return ESP_ERR_INVALID_ARG;
-  const uint64_t r = sclk_u - n * M; /* fraction = r / M */
-  uint64_t best_a = 1, best_b = 0, best_e = r; /* error of b/a = |r*a - b*M| / a */
+  const uint64_t r = sclk_u - n * M; /* target fraction = r / M */
+  /* fl = largest b/a <= r/M (higher MCLK), ce = smallest b/a >= r/M. */
+  uint64_t fl_a = 1, fl_b = 0, ce_a = 1, ce_b = 1;
   for (uint64_t a = 2; a < I2S_LL_CLK_FRAC_DIV_AB_MAX; ++a) {
-    const uint64_t b = (r * a + M / 2U) / M;
-    if (b == 0U || b >= a) continue;
-    const uint64_t ra = r * a, bm = b * M;
-    const uint64_t e = ra > bm ? ra - bm : bm - ra;
-    if (e * best_a < best_e * a) {
-      best_e = e;
-      best_a = a;
-      best_b = b;
-    }
+    const uint64_t ra = r * a;
+    const uint64_t bf = ra / M;
+    const uint64_t bc = bf + (ra % M != 0U ? 1U : 0U);
+    if (bf >= 1U && bf < a && bf * fl_a > fl_b * a) { fl_a = a; fl_b = bf; }
+    if (bc >= 1U && bc < a && bc * ce_a < ce_b * a) { ce_a = a; ce_b = bc; }
   }
-  uint32_t x = 0, y = 0, z = 0, yn1 = 0;
-  if (best_b) {
-    yn1 = best_b * 2U > best_a;
-    z = (uint32_t)(yn1 ? best_a - best_b : best_b);
-    x = (uint32_t)(best_a / z) - 1U;
-    y = (uint32_t)(best_a % z);
-  }
-  i2s_dev_t *hw = I2S_LL_GET_HW(I2S_NUM_0);
-  uint32_t v = hw->tx_clkm_div_conf.val & 0xF0000000U; /* keep reserved bits */
-  v |= (z & 0x1FFU) | ((y & 0x1FFU) << 9) | ((x & 0x1FFU) << 18) |
-       ((yn1 & 1U) << 27);
-  hw->tx_clkm_div_conf.val = v; /* the single store: x, y, z, yn1 together */
+  if (fl_b == 0U || ce_b >= ce_a) return ESP_ERR_INVALID_ARG;
+  hi->reg = live_level_reg(fl_a, fl_b);
+  hi->ppb = live_level_ppb(n, fl_a, fl_b);
+  lo->reg = live_level_reg(ce_a, ce_b);
+  lo->ppb = live_level_ppb(n, ce_a, ce_b);
+  return ESP_OK;
+}
+
+/* Set the average TX MCLK to nominal * (1 + ppm / 1e6). Applies the nearer
+ * level at once; live_dither_step() then alternates per block. */
+static esp_err_t live_tune_write(int32_t ppm, uint32_t *mclk_hz_out) {
+  live_level_t lo, hi;
+  const esp_err_t err = live_bracket(ppm, &lo, &hi);
+  if (err != ESP_OK) return err;
+  const int64_t target_ppb = (int64_t)ppm * 1000LL;
+  s_dith_lo = lo;
+  s_dith_hi = hi;
+  s_dith_num = target_ppb - lo.ppb;
+  s_dith_den = hi.ppb - lo.ppb;
+  if (s_dith_num < 0) s_dith_num = 0;
+  if (s_dith_num > s_dith_den) s_dith_num = s_dith_den;
+  s_dith_acc = 0;
+  s_dith_reg = (s_dith_den == 0 || s_dith_num * 2 < s_dith_den) ? lo.reg : hi.reg;
+  I2S_LL_GET_HW(I2S_NUM_0)->tx_clkm_div_conf.val = s_dith_reg; /* one store */
   if (mclk_hz_out) {
-    /* MCLK = sclk / (n + b/a) = sclk * a / (n*a + b) */
-    *mclk_hz_out = (uint32_t)(((uint64_t)LIVE_SCLK_HZ * best_a + (n * best_a + best_b) / 2U) /
-                              (n * best_a + best_b));
+    *mclk_hz_out = (uint32_t)((int64_t)s_nominal_mclk_hz +
+                              ((int64_t)s_nominal_mclk_hz * ppm) / 1000000LL);
   }
   return ESP_OK;
+}
+
+/* One sigma-delta step per written DMA block (playout task only). */
+static void live_dither_step(void) {
+  if (s_live_div_int == 0U || s_dith_den == 0) return;
+  s_dith_acc += s_dith_num;
+  uint32_t reg = s_dith_lo.reg;
+  if (s_dith_acc >= s_dith_den) {
+    s_dith_acc -= s_dith_den;
+    reg = s_dith_hi.reg;
+  }
+  if (reg != s_dith_reg) {
+    s_dith_reg = reg;
+    I2S_LL_GET_HW(I2S_NUM_0)->tx_clkm_div_conf.val = reg;
+  }
 }
 
 bool audio_playout_tune_is_live(void) {

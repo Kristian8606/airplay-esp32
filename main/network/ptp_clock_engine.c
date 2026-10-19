@@ -25,8 +25,13 @@
  * fast. Crystal drift is < 100 us/s, so drift passes through unchanged while a
  * filter step is spread over seconds instead of hitting the I2S servo. */
 #define PTP_ENGINE_SLEW_NS_PER_S     250000LL
+/* Once the drift is known, the published offset follows the predicted drift
+ * plus only dt/tau of the remaining filter difference: the filter's 1/16
+ * steps would otherwise reach the I2S servo as slope noise (seen on the board
+ * as +/-40 ppm retunes every window). */
+#define PTP_ENGINE_OUTPUT_TAU_NS     15000000000LL
 /* Drift feed-forward window and bound (two crystals at +/-100 ppm). */
-#define PTP_ENGINE_DRIFT_WINDOW_NS   16000000000LL
+#define PTP_ENGINE_DRIFT_WINDOW_NS   30000000000LL
 #define PTP_ENGINE_DRIFT_MAX_NS_S    200000LL
 /* Real drift moves the filter ~10 us per Sync; a larger single move is a
  * filter step (a better sample, a clock step) and spoils that window. */
@@ -49,6 +54,7 @@ static void clear_filter_state(ptp_clock_engine_t *engine) {
   engine->neg_run = 0;
   engine->neg_run_max_ns = 0;
   engine->drift_ns_per_s = 0;
+  engine->drift_valid = false;
   engine->drift_window_start_ns = 0;
   engine->drift_window_start_offset_ns = 0;
 }
@@ -149,9 +155,11 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
        reception_time_ns < engine->last_accepted_time_ns)) {
     /* Same domain: the crystals did not change, keep the learned drift. */
     const int64_t drift = engine->drift_ns_per_s;
+    const bool drift_valid = engine->drift_valid;
     engine->epoch = next_epoch(engine->epoch);
     clear_filter_state(engine);
     engine->drift_ns_per_s = drift;
+    engine->drift_valid = drift_valid;
     result.restarted = true;
   }
 
@@ -222,10 +230,17 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
                        1000LL / (span_ns / 1000000LL);
     if (measured > PTP_ENGINE_DRIFT_MAX_NS_S) measured = PTP_ENGINE_DRIFT_MAX_NS_S;
     if (measured < -PTP_ENGINE_DRIFT_MAX_NS_S) measured = -PTP_ENGINE_DRIFT_MAX_NS_S;
-    int64_t change = (measured - engine->drift_ns_per_s) / 2;
-    if (change > PTP_ENGINE_DRIFT_MAX_CHANGE) change = PTP_ENGINE_DRIFT_MAX_CHANGE;
-    if (change < -PTP_ENGINE_DRIFT_MAX_CHANGE) change = -PTP_ENGINE_DRIFT_MAX_CHANGE;
-    engine->drift_ns_per_s += change;
+    if (!engine->drift_valid) {
+      /* First measurement: take it whole, so the smoothed output below never
+       * runs on an unknown drift. Later windows only refine it. */
+      engine->drift_ns_per_s = measured;
+      engine->drift_valid = true;
+    } else {
+      int64_t change = (measured - engine->drift_ns_per_s) / 2;
+      if (change > PTP_ENGINE_DRIFT_MAX_CHANGE) change = PTP_ENGINE_DRIFT_MAX_CHANGE;
+      if (change < -PTP_ENGINE_DRIFT_MAX_CHANGE) change = -PTP_ENGINE_DRIFT_MAX_CHANGE;
+      engine->drift_ns_per_s += change;
+    }
     engine->drift_window_start_ns = reception_time_ns;
     engine->drift_window_start_offset_ns = smoothed;
   }
@@ -233,11 +248,19 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
   if (result.reacquired || mastership_ns < PTP_ENGINE_READY_NS) {
     engine->output_offset_ns = smoothed;
   } else {
+    /* Follow the learned drift exactly, and only a fraction dt/tau of the
+     * remaining difference: the filter's 1/16 steps no longer reach audio as
+     * slope noise, while drift passes without lag. */
+    const int64_t predicted =
+        old_output + engine->drift_ns_per_s * dt_ns / 1000000000LL;
     const int64_t max_step = PTP_ENGINE_SLEW_NS_PER_S * dt_ns / 1000000000LL;
-    int64_t step = smoothed - old_output;
+    /* Until the drift is known, follow the filter (slew-limited only). */
+    int64_t step = engine->drift_valid
+        ? (smoothed - predicted) * dt_ns / PTP_ENGINE_OUTPUT_TAU_NS
+        : smoothed - predicted;
     if (step > max_step) step = max_step;
     if (step < -max_step) step = -max_step;
-    engine->output_offset_ns = old_output + step;
+    engine->output_offset_ns = predicted + step;
   }
 
   engine->raw_offset_ns = raw_offset_ns;

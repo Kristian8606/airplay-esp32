@@ -134,11 +134,11 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 #define AP2_PCM_CAPACITY_FRAMES    1024U
 
 #define AP2_PID_CALC_PERIOD_US    1000000LL  /* PID math at 1 Hz */
-#define AP2_PID_TUNE_PERIOD_US    5000000LL  /* physical I2S retune <= 0.2 Hz */
+#define AP2_PID_TUNE_PERIOD_US    1000000LL  /* live divider write: <= 1 Hz */
 #define AP2_PID_DEADBAND_US          1000    /* +/-1 ms is already good */
 #define AP2_PID_SOFTBAND_US          2000    /* 1..2 ms => gentler P action */
 #define AP2_PID_MAX_PPM               160
-#define AP2_PID_MIN_TUNE_PPM            5
+#define AP2_PID_MIN_TUNE_PPM            1  /* the divider is dithered: any ppm is exact */
 #define AP2_PID_MAX_JUMP_PPM            80
 
 /* Continuous-start alignment. A new generation enables I2S only once.
@@ -178,7 +178,7 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
  * that sync approaches 0 at <= AP2_CENTER_MAX_SLOPE_US_S and then stays flat.
  * 1 ppm of I2S rate change = 1 us/s of sync slope. */
 #define AP2_CENTER_WINDOW_US         15000000LL /* slope measurement window */
-#define AP2_CENTER_QUIET_US               200    /* |sync| below: aim for 0 slope */
+#define AP2_CENTER_QUIET_US                50    /* |sync| below: aim for 0 slope */
 #define AP2_CENTER_TIME_S                20.0   /* approach time constant */
 #define AP2_CENTER_MAX_SLOPE_US_S        40.0   /* max wanted approach speed */
 #define AP2_CENTER_MAX_STEP_PPM            40    /* max frequency step per window */
@@ -1729,6 +1729,39 @@ static pcm_store_result_t pcm_store_with_backpressure(
 /* Pure centring decision (host-tested). Returns the frequency step in ppm to
  * add to the current I2S correction, or 0. `slope_us_s` is the measured sync
  * slope over the last window while the clock was NOT being retuned. */
+/* Learned clock correction, remembered across sessions until reboot. The
+ * needed ppm is the ESP crystal error plus the sender's: keyed by the anchor
+ * clock (the sender's PTP identity); an unknown sender starts from the most
+ * recent value, which still carries the ESP crystal part. Playout task only. */
+#define AP2_LEARNED_CLOCKS 4U
+static struct {
+  uint64_t clock_id;
+  int32_t ppm;
+} s_learned[AP2_LEARNED_CLOCKS];
+static uint32_t s_learned_next;
+static int32_t s_learned_last;
+
+static void learned_ppm_store(uint64_t clock_id, int32_t ppm) {
+  s_learned_last = ppm;
+  if (clock_id == 0) return;
+  for (uint32_t i = 0; i < AP2_LEARNED_CLOCKS; ++i) {
+    if (s_learned[i].clock_id == clock_id) {
+      s_learned[i].ppm = ppm;
+      return;
+    }
+  }
+  s_learned[s_learned_next].clock_id = clock_id;
+  s_learned[s_learned_next].ppm = ppm;
+  s_learned_next = (s_learned_next + 1U) % AP2_LEARNED_CLOCKS;
+}
+
+static int32_t learned_ppm_lookup(uint64_t clock_id) {
+  for (uint32_t i = 0; clock_id != 0 && i < AP2_LEARNED_CLOCKS; ++i) {
+    if (s_learned[i].clock_id == clock_id) return s_learned[i].ppm;
+  }
+  return s_learned_last;
+}
+
 static int32_t servo_center_step(int32_t sync_us, double slope_us_s) {
   double wanted_slope = 0.0;
   if (sync_us > AP2_CENTER_QUIET_US || sync_us < -AP2_CENTER_QUIET_US) {
@@ -2817,6 +2850,7 @@ static void ap2_playout_task(void *arg) {
   double center_n = 0.0, center_st = 0.0, center_sy = 0.0;
   double center_stt = 0.0, center_sty = 0.0;
   uint32_t servo_generation = 0;
+  bool servo_seed_pending = true; /* start the next session from memory */
   double pid_integral_ms_s = 0.0;
   double pid_prev_error_ms = 0.0;
   double pid_d_filtered_ms_s = 0.0;
@@ -2850,6 +2884,7 @@ static void ap2_playout_task(void *arg) {
 
       servo_ppm = 0;
       servo_target_ppm = 0;
+      servo_seed_pending = true;
       idle_zeros = false;
       servo_generation = 0;
       center_active = false;
@@ -3028,6 +3063,22 @@ static void ap2_playout_task(void *arg) {
        * is handled above and explicitly returns both hardware tune and PID to 0. */
       pid_prev_valid = false;
       pid_d_filtered_ms_s = 0.0;
+      if (servo_seed_pending) {
+        /* First timeline of a session: start from the clock learned for this
+         * sender instead of nominal, so the first minutes are already in
+         * sync rather than spent re-learning the crystal error. */
+        servo_seed_pending = false;
+        const int32_t seed = learned_ppm_lookup(snap.anchor_clock_id);
+        if (seed != servo_ppm &&
+            audio_playout_tune_ppm(seed, NULL, NULL) == ESP_OK) {
+          aevt_post(AEVT_TUNE, NULL, servo_ppm, seed, 0, 0);
+          servo_ppm = seed;
+          const double i_lim = AP2_PID_I_TERM_LIMIT_PPM / AP2_PID_KI_PPM_PER_MS_S;
+          pid_integral_ms_s = (double)seed / AP2_PID_KI_PPM_PER_MS_S;
+          if (pid_integral_ms_s > i_lim) pid_integral_ms_s = i_lim;
+          if (pid_integral_ms_s < -i_lim) pid_integral_ms_s = -i_lim;
+        }
+      }
       servo_target_ppm = servo_ppm;
       center_active = false; /* new timeline: restart slope measurement */
       center_prev_valid = false;
@@ -3538,10 +3589,10 @@ static void ap2_playout_task(void *arg) {
      *   SYNC < 0 : ESP is late  -> positive ppm (speed I2S up)
      *   SYNC > 0 : ESP is early -> negative pressure on ppm
      *
-     * The PID math runs every 1 s, but i2s_channel_tune_rate() is allowed at
-     * most every 5 s and only for a useful >=5 ppm change.  This separation
-     * limits audible artifacts and unnecessary divider changes while keeping
-     * the live DMA/tag chronology intact.  +/-1 ms is deliberately treated as GOOD: once there and
+     * The PID math and the clock retune run every 1 s. A retune is a live
+     * write of the fractional divider, dithered per block so every integer
+     * ppm is exact on average; I2S and the DMA/tag chronology keep running.
+     * +/-1 ms is deliberately treated as GOOD: once there and
      * phase velocity is modest, the PID stops acting and a slow centring loop
      * (AP2_CENTER_*) steers towards 0 ms with at most one small step
      * per 15 s window, based on a least-squares slope of the measured sync.
@@ -3650,7 +3701,7 @@ static void ap2_playout_task(void *arg) {
         } else {
           next_target = servo_target_ppm;
           if (servo_target_ppm != servo_ppm) {
-            /* A step is still waiting for the 5 s retune slot: measure the
+            /* A step is still waiting for the retune slot: measure the
              * slope only once the clock really runs at the new rate. */
             restart_window = true;
           } else {
@@ -3701,6 +3752,10 @@ static void ap2_playout_task(void *arg) {
         center_prev_valid = true;
       }
       servo_target_ppm = next_target;
+      /* In the good zone with the clock held, the running ppm is the learned
+       * correction for this sender. */
+      if (center_active && in_deadband && servo_target_ppm == servo_ppm)
+        learned_ppm_store(snap.anchor_clock_id, servo_ppm);
       status_publish_sync(s.output_sync.us, robust_phase_center_us(&s.output_sync),
                           servo_ppm, snap.generation);
     }
