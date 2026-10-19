@@ -114,7 +114,10 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
  * record after 400 ms of mastership. There is no extra local lock or 1 s
  * initial-anchor gate. Reference rtp.c:1355-1356 at
  * 8c146e25183a354ae96f91fa069c2e7173f75a71. */
-#define AP2_PTP_MASTERSHIP_MIN_MS 400U
+#define AP2_PTP_MASTERSHIP_MIN_MS PTP_CLOCK_ENGINE_READY_MS
+/* A PTP estimate without a sample for this long must not create or refresh a
+ * local mapping; playback keeps the cached one (holdover) until PTP returns. */
+#define AP2_PTP_SAMPLE_STALE_MS   2000U
 /* Resync, Shairport "resync_threshold" semantics (default 0.050 s): if the
  * output stays out of sync by more than this for AP2_RESYNC_HOLD_US (about
  * Shairport's 40-sample sync history), late audio is dropped (the cursor
@@ -240,6 +243,7 @@ typedef struct {
 typedef struct {
   /* Physical tagged-DMA phase used directly by the clock servo. */
   int32_t us;
+  int64_t us_q4; /* EMA state in 1/16 us: no integer-division dead zone */
   uint32_t generation;
   bool valid;
 
@@ -677,6 +681,7 @@ static bool buffered_ptp_qualified(const ptp_clock_snapshot_t *ps,
   if (ps->grandmaster_clock_id == 0 ||
       ps->grandmaster_clock_id != anchor_clock_id)
     return false;
+  if (ps->sample_age_ms > AP2_PTP_SAMPLE_STALE_MS) return false;
   return ps->mastership_age_ms >= AP2_PTP_MASTERSHIP_MIN_MS;
 }
 
@@ -2447,13 +2452,16 @@ static void process_i2s_completions(const timing_snapshot_t *snap) {
     if (!s.output_sync.valid ||
         s.output_sync.generation != done.generation) {
       s.output_sync.us = sync_us;
+      s.output_sync.us_q4 = (int64_t)sync_us * 16;
       s.output_sync.generation = done.generation;
       s.output_sync.valid = true;
       s.output_sync.phase_count = 0;
       s.output_sync.phase_index = 0;
     } else {
-      /* Keep the existing EMA exactly as the PID input. */
-      s.output_sync.us += (sync_us - s.output_sync.us) / 8;
+      /* EMA (1/8 per DMA block) as the PID input. */
+      s.output_sync.us_q4 += ((int64_t)sync_us * 16 - s.output_sync.us_q4) / 8;
+      const int64_t q = s.output_sync.us_q4;
+      s.output_sync.us = (int32_t)((q >= 0 ? q + 8 : q - 8) / 16);
     }
 
     /* Passive robust phase history only. No controller reads these raw samples. */
@@ -3709,8 +3717,8 @@ static void ap2_playout_task(void *arg) {
         if (delta < -AP2_PID_MAX_JUMP_PPM) delta = -AP2_PID_MAX_JUMP_PPM;
         const int32_t next_ppm = servo_ppm + delta;
 
-        /* disable -> tune -> in-order reload -> enable, right after the
-         * next DMA write (see above). */
+        /* A single live divider write, right after the next DMA write
+         * (see above). */
         pid_last_tune_us = pid_now_us;
         retune_pending = true;
         retune_ppm = next_ppm;

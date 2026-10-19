@@ -46,25 +46,6 @@ static void amp_session_deactivate_once(rtsp_conn_t *conn) {
   amp_control_session_disconnected();
 }
 
-static void note_stream_pause_started(rtsp_conn_t *conn) {
-  if (!conn || conn->pause_started_us != 0) return;
-  conn->pause_started_us = esp_timer_get_time();
-}
-
-static void notify_timing_resume(rtsp_conn_t *conn) {
-  if (!conn || conn->pause_started_us == 0) return;
-
-  const int64_t now_us = esp_timer_get_time();
-  uint64_t pause_ms = 0;
-  if (now_us > conn->pause_started_us) {
-    pause_ms = (uint64_t)(now_us - conn->pause_started_us) / 1000ULL;
-  }
-  conn->pause_started_us = 0;
-
-  if (pause_ms > UINT32_MAX) pause_ms = UINT32_MAX;
-  ptp_clock_notify_resume((uint32_t)pause_ms);
-}
-
 // ============================================================================
 // Codec Registry
 // ============================================================================
@@ -259,11 +240,12 @@ static const rtsp_method_handler_t method_handlers[] = {
     {NULL, NULL}};
 
 // Parse a named header value from raw RTSP request data (case-insensitive).
-// Returns pointer to a static buffer with the trimmed value, or NULL.
+// Copies the trimmed value into the caller's buffer (two RTSP client tasks may
+// parse concurrently, so no shared static storage) and returns it, or NULL.
 static const char *parse_raw_header(const uint8_t *raw, size_t raw_len,
-                                    const char *name) {
-  static char value_buf[64];
-  if (!raw || !name) {
+                                    const char *name, char *value_buf,
+                                    size_t value_cap) {
+  if (!raw || !name || !value_buf || value_cap == 0) {
     return NULL;
   }
 
@@ -291,7 +273,7 @@ static const char *parse_raw_header(const uint8_t *raw, size_t raw_len,
       }
 
       size_t i = 0;
-      while (i < sizeof(value_buf) - 1 && hdr < line_end) {
+      while (i < value_cap - 1 && hdr < line_end) {
         value_buf[i] = *hdr;
         hdr++;
         i++;
@@ -312,7 +294,9 @@ static const char *parse_raw_header(const uint8_t *raw, size_t raw_len,
 static bool parse_rtp_info_rtptime(const uint8_t *raw, size_t raw_len,
                                     uint32_t *rtptime) {
   if (!rtptime) return false;
-  const char *info = parse_raw_header(raw, raw_len, "RTP-Info:");
+  char info_buf[64];
+  const char *info = parse_raw_header(raw, raw_len, "RTP-Info:", info_buf,
+                                      sizeof(info_buf));
   if (!info) return false;
   const char *p = strcasestr(info, "rtptime=");
   if (!p) return false;
@@ -1438,8 +1422,6 @@ static void handle_pause(int socket, rtsp_conn_t *conn,
 
   AP_LOGI(TAG, "PAUSE received");
 
-  note_stream_pause_started(conn);
-
   // Stop the audio consumer but leave the buffer filling.  The phone will
   // send a fresh SETRATEANCHORTIME (rate=1) anchor on resume that re-aligns
   // the buffered frames to the correct wall-clock position.
@@ -1590,7 +1572,6 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   // emit PAUSED (LED state) before the slower receiver/decoder teardown below
   // (audio_receiver_stop can block ~1 s waiting for the listener task).
   if (has_streams) {
-    note_stream_pause_started(conn);
     audio_receiver_set_playing(false);
     rtsp_events_emit(RTSP_EVENT_PAUSED);
   }
@@ -1687,7 +1668,6 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
      * processor immediately before closing the play gate. */
     if (have_rate && rate == 0.0) {
       AP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
-      note_stream_pause_started(conn);
       conn->stream_paused = true;
       audio_receiver_pause();
       rtsp_events_emit(RTSP_EVENT_PAUSED);
@@ -1763,7 +1743,6 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
   }
   AP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
            rate, conn->stream_paused);
-  if (conn->stream_paused) notify_timing_resume(conn);
   conn->stream_paused = false;
   audio_receiver_set_playing(true);
   rtsp_events_emit(RTSP_EVENT_PLAYING);

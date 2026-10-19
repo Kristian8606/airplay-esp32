@@ -7,6 +7,12 @@
 extern "C" {
 #endif
 
+/* A new mastership (first sample, GM change, restart after a gap) may drive
+ * audio after this much continuous history (Shairport/NQPTP: 400 ms). Until
+ * then the published offset follows the filter directly; afterwards it is
+ * slew-limited so the audio timeline never sees a step. */
+#define PTP_CLOCK_ENGINE_READY_MS 400U
+
 typedef struct {
   bool source_changed;
   bool gm_changed;
@@ -24,11 +30,12 @@ typedef struct {
 
 typedef struct {
   bool accepted;
-  bool outlier;
-  bool reacquired; /* outlier run too long: filter restarted on this sample */
-  int64_t reacquire_jump_ns; /* new raw offset minus the abandoned filter */
+  bool restarted;  /* sample gap too long: a new mastership starts here */
+  bool reacquired; /* sender clock stepped back: filter jumped to the run */
+  int64_t reacquire_jump_ns; /* new filter minus the abandoned filter */
   int64_t raw_offset_ns;
   int64_t filtered_offset_ns;
+  int64_t output_offset_ns;
   int64_t filtered_step_ns;
   int64_t raw_filter_delta_ns;
   uint32_t accepted_samples;
@@ -42,25 +49,26 @@ typedef struct {
   uint32_t epoch;
 
   int64_t raw_offset_ns;
-  int64_t filtered_offset_ns;
-  int64_t previous_offset_ns;
-  int64_t previous_sample_time_ns;
+  int64_t filtered_offset_ns; /* NQPTP-style minimum-delay estimate */
+  int64_t output_offset_ns;   /* what audio uses: filtered, slew-limited */
   int64_t mastership_start_time_ns;
   int64_t last_accepted_time_ns;
   uint32_t accepted_samples;
 
-  int64_t outlier_threshold_ns;
-  /* Consecutive rejected samples. A filter seeded from one bad sample (or a
-   * real step of the sender's clock) would otherwise reject everything
-   * forever; a long enough run restarts the estimator. */
-  uint32_t outlier_run;
-  int64_t outlier_run_start_ns;
-  int64_t outlier_run_level_ns; /* raw offset level of the current run */
-  uint32_t outlier_agree;       /* consecutive outliers at that level */
+  /* Drift feed-forward: the filter's own long-term slope (remote vs ESP
+   * crystal), so a drifting envelope is tracked without a drift-dependent
+   * lag. Measured over windows of filtered values. */
+  int64_t drift_ns_per_s;
+  int64_t drift_window_start_ns;
+  int64_t drift_window_start_offset_ns;
+
+  /* Consecutive samples far below the filter (a backward step of the
+   * sender's clock) and the best (largest) offset seen in that run. */
+  uint32_t neg_run;
+  int64_t neg_run_max_ns;
 } ptp_clock_engine_t;
 
-void ptp_clock_engine_init(ptp_clock_engine_t *engine,
-                           int64_t outlier_threshold_ns);
+void ptp_clock_engine_init(ptp_clock_engine_t *engine);
 
 /* Set the currently observed PTP source / grandmaster domain. A first domain
  * starts epoch 1; a later source or GM change increments the epoch and resets
@@ -77,11 +85,15 @@ void ptp_clock_engine_reset_filter(ptp_clock_engine_t *engine,
 
 /* NQPTP-derived passive one-way estimator:
  *  - first sample accepted directly;
- *  - positive jitter accepted fully during first second, then at 1/16;
- *  - negative jitter ignored during first second, then clamped to -2.5 ms and
+ *  - positive jitter (shorter network delay) accepted fully during startup,
+ *    then at 1/16;
+ *  - negative jitter ignored during startup, then clamped to -2.5 ms and
  *    applied at 1/256;
- *  - optional gross-outlier guard rejects a sample without updating freshness
- *    or accepted-sample count. */
+ *  - a long run of samples far below the filter is a backward clock step:
+ *    the filter jumps to the best sample of the run;
+ *  - a long gap without samples restarts the mastership (drift unknown);
+ *  - output_offset_ns follows the filter, slew-limited after the first
+ *    PTP_CLOCK_ENGINE_READY_MS of a mastership. */
 ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
     ptp_clock_engine_t *engine, int64_t raw_offset_ns,
     int64_t reception_time_ns);

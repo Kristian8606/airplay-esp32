@@ -35,7 +35,6 @@ struct rtsp_conn {
   // requests the RTSP connection itself to close after the 200 response.
   bool close_after_response;
   bool amp_session_active;
-  int64_t pause_started_us;
   /* Last committed AP2 setup; only the RTSP owner changes this snapshot. */
   bool setup_format_valid;
   audio_format_t setup_format;

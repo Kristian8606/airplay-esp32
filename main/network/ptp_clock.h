@@ -33,6 +33,8 @@ typedef struct {
   uint64_t grandmaster_clock_id;
   uint32_t epoch;
   int64_t raw_offset_ns;
+  /* The usable remote-local offset: minimum-delay filter, slew-limited once
+   * the mastership is ready, so audio never sees a step. */
   int64_t filtered_offset_ns;
   int64_t raw_filter_delta_ns;
   /* Age of the current mastership; buffered audio uses this to qualify a
@@ -47,22 +49,6 @@ typedef struct {
 
 /* Coherent status/diagnostic snapshot for either buffered or realtime mode. */
 void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot);
-
-/**
- * Notify the PTP clock that playback is resuming after a pause.
- *
- * If the pause lasted longer than PTP_LONG_PAUSE_THRESHOLD_MS, this
- * resets the asymmetric smoothing filter so the next received PTP sample is
- * accepted unconditionally — mirroring the nqptp "B" (begin) signal behaviour
- * described in nqptp-shm-structures.h.
- *
- * Without this, after a pause long enough for the local crystal to drift,
- * the 1/256-negative-jitter damping would take several minutes to re-converge,
- * causing audible multi-room sync loss on resume.
- *
- * @param pause_duration_ms  Wall-clock length of the pause in milliseconds.
- */
-void ptp_clock_notify_resume(uint32_t pause_duration_ms);
 
 /**
  * Stream SETUP equivalent of Shairport/NQPTP T <RTSP client IP>, then B.
@@ -97,25 +83,9 @@ typedef struct {
 
 /* Convert using one coherent clock snapshot. Both clock identity and readiness
  * belong to the same observation as the offset (including D7 admission). */
-static inline bool ptp_clock_realtime_snapshot_to_local(
+bool ptp_clock_realtime_snapshot_to_local(
     const ptp_realtime_snapshot_t *snapshot, uint64_t clock_id,
-    uint64_t remote_ns, uint64_t *local_ns) {
-  if (!snapshot || !local_ns || !snapshot->realtime_mode ||
-      !snapshot->master_ready || clock_id == 0 ||
-      clock_id != snapshot->master_clock_id || remote_ns > INT64_MAX)
-    return false;
-  const int64_t offset = snapshot->master_offset_ns;
-  if (offset >= 0) {
-    if (remote_ns < (uint64_t)offset) return false;
-    *local_ns = remote_ns - (uint64_t)offset;
-  } else {
-    const uint64_t magnitude = (uint64_t)(-(offset + 1)) + 1U;
-    if (magnitude > INT64_MAX || remote_ns > (uint64_t)INT64_MAX - magnitude)
-      return false;
-    *local_ns = remote_ns + magnitude;
-  }
-  return true;
-}
+    uint64_t remote_ns, uint64_t *local_ns);
 
 void ptp_clock_get_realtime_snapshot(ptp_realtime_snapshot_t *snapshot);
 

@@ -3,17 +3,35 @@
 #include <string.h>
 #include <limits.h>
 
-#define PTP_ENGINE_STARTUP_NS        1000000000LL
+/* Positive jitter is a shorter network delay, so it is always trusted. During
+ * the first seconds of a mastership it is taken in full: the session start is
+ * when Wi-Fi is busiest (buffered audio burst), and the estimate must reach
+ * the minimum-delay envelope before steady-state 1/16 tracking begins. */
+#define PTP_ENGINE_STARTUP_NS        2000000000LL
 #define PTP_ENGINE_POS_STEADY_DIV    16LL
 #define PTP_ENGINE_NEG_DIV           256LL
 #define PTP_ENGINE_NEG_CLAMP_NS      (-2500000LL)
-/* Restart after a run of consecutive outliers that agree with each other
- * (a real step of the sender's clock, seen at every iPhone session start), or
- * after a long run of any outliers. AirPlay senders send ~8 Sync/s. */
-#define PTP_ENGINE_REACQUIRE_COUNT     8U
-#define PTP_ENGINE_REACQUIRE_NS        1000000000LL
-#define PTP_ENGINE_STEP_COUNT          3U
-#define PTP_ENGINE_STEP_AGREE_NS       10000000LL /* 10 ms */
+#define PTP_ENGINE_READY_NS ((int64_t)PTP_CLOCK_ENGINE_READY_MS * 1000000LL)
+/* No accepted sample for this long (Sync stopped during a pause, Wi-Fi
+ * outage): the crystal drift since the last sample is unknown, start over. */
+#define PTP_ENGINE_GAP_NS            3000000000LL
+/* A backward step of the sender's clock (seen at iPhone session start) is
+ * tracked at only ~80 us/s by the 1/256 path. A shorter delay can only raise
+ * the offset, so a sustained run of samples all far BELOW the filter cannot be
+ * network jitter: 16 Syncs (~2 s) 3 ms or more below reacquire the filter. */
+#define PTP_ENGINE_STEP_NS           3000000LL
+#define PTP_ENGINE_STEP_COUNT        16U
+/* Once audio may use the estimate, its published value moves at most this
+ * fast. Crystal drift is < 100 us/s, so drift passes through unchanged while a
+ * filter step is spread over seconds instead of hitting the I2S servo. */
+#define PTP_ENGINE_SLEW_NS_PER_S     250000LL
+/* Drift feed-forward window and bound (two crystals at +/-100 ppm). */
+#define PTP_ENGINE_DRIFT_WINDOW_NS   16000000000LL
+#define PTP_ENGINE_DRIFT_MAX_NS_S    200000LL
+/* Real drift moves the filter ~10 us per Sync; a larger single move is a
+ * filter step (a better sample, a clock step) and spoils that window. */
+#define PTP_ENGINE_DRIFT_STEP_NS     500000LL
+#define PTP_ENGINE_DRIFT_MAX_CHANGE  50000LL /* per window, ns/s */
 
 static uint32_t next_epoch(uint32_t epoch) {
   epoch++;
@@ -24,22 +42,20 @@ static void clear_filter_state(ptp_clock_engine_t *engine) {
   engine->valid = false;
   engine->raw_offset_ns = 0;
   engine->filtered_offset_ns = 0;
-  engine->previous_offset_ns = 0;
-  engine->previous_sample_time_ns = 0;
+  engine->output_offset_ns = 0;
   engine->mastership_start_time_ns = 0;
   engine->last_accepted_time_ns = 0;
   engine->accepted_samples = 0;
-  engine->outlier_run = 0;
-  engine->outlier_run_start_ns = 0;
-  engine->outlier_run_level_ns = 0;
-  engine->outlier_agree = 0;
+  engine->neg_run = 0;
+  engine->neg_run_max_ns = 0;
+  engine->drift_ns_per_s = 0;
+  engine->drift_window_start_ns = 0;
+  engine->drift_window_start_offset_ns = 0;
 }
 
-void ptp_clock_engine_init(ptp_clock_engine_t *engine,
-                           int64_t outlier_threshold_ns) {
+void ptp_clock_engine_init(ptp_clock_engine_t *engine) {
   if (!engine) return;
   memset(engine, 0, sizeof(*engine));
-  engine->outlier_threshold_ns = outlier_threshold_ns;
 }
 
 bool ptp_clock_engine_set_domain(ptp_clock_engine_t *engine,
@@ -69,7 +85,7 @@ bool ptp_clock_engine_set_domain(ptp_clock_engine_t *engine,
   const uint64_t old_gm = engine->grandmaster_clock_id;
   const bool old_valid = engine->valid;
   const int64_t old_raw_offset_ns = engine->raw_offset_ns;
-  const int64_t old_filtered_offset_ns = engine->filtered_offset_ns;
+  const int64_t old_filtered_offset_ns = engine->output_offset_ns;
   const uint32_t old_accepted_samples = engine->accepted_samples;
 
   if (first_domain || source_changed || gm_changed) {
@@ -109,99 +125,128 @@ void ptp_clock_engine_reset_filter(ptp_clock_engine_t *engine,
   clear_filter_state(engine);
 }
 
+static void fill_result(const ptp_clock_engine_t *engine, int64_t old_output,
+                        ptp_clock_engine_sample_t *r) {
+  r->accepted = true;
+  r->raw_offset_ns = engine->raw_offset_ns;
+  r->filtered_offset_ns = engine->filtered_offset_ns;
+  r->output_offset_ns = engine->output_offset_ns;
+  r->filtered_step_ns =
+      engine->accepted_samples > 1 ? engine->output_offset_ns - old_output : 0;
+  r->raw_filter_delta_ns = engine->raw_offset_ns - engine->filtered_offset_ns;
+  r->accepted_samples = engine->accepted_samples;
+  r->epoch = engine->epoch;
+}
+
 ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
     ptp_clock_engine_t *engine, int64_t raw_offset_ns,
     int64_t reception_time_ns) {
   ptp_clock_engine_sample_t result = {0};
   if (!engine || reception_time_ns <= 0) return result;
 
-  result.raw_offset_ns = raw_offset_ns;
-  result.epoch = engine->epoch;
-
-  if (engine->valid && engine->outlier_threshold_ns > 0) {
-    int64_t diff = raw_offset_ns - engine->filtered_offset_ns;
-    if (diff < 0) diff = -diff;
-    if (diff > engine->outlier_threshold_ns) {
-      if (engine->outlier_run == 0) {
-        engine->outlier_run_start_ns = reception_time_ns;
-        engine->outlier_run_level_ns = raw_offset_ns;
-      }
-      engine->outlier_run++;
-      int64_t level_diff = raw_offset_ns - engine->outlier_run_level_ns;
-      if (level_diff < 0) level_diff = -level_diff;
-      if (engine->outlier_run == 1 || level_diff > PTP_ENGINE_STEP_AGREE_NS) {
-        engine->outlier_run_level_ns = raw_offset_ns;
-        engine->outlier_agree = 1;
-      } else {
-        engine->outlier_agree++;
-      }
-      const bool step = engine->outlier_agree >= PTP_ENGINE_STEP_COUNT;
-      const bool stuck = engine->outlier_run >= PTP_ENGINE_REACQUIRE_COUNT &&
-          reception_time_ns - engine->outlier_run_start_ns >= PTP_ENGINE_REACQUIRE_NS;
-      if (step || stuck) {
-        /* The estimator is the odd one out: start again from this sample. */
-        result.reacquired = true;
-        result.reacquire_jump_ns = raw_offset_ns - engine->filtered_offset_ns;
-        engine->epoch = next_epoch(engine->epoch);
-        clear_filter_state(engine);
-        result.epoch = engine->epoch;
-      } else {
-        result.outlier = true;
-        result.filtered_offset_ns = engine->filtered_offset_ns;
-        result.raw_filter_delta_ns = raw_offset_ns - engine->filtered_offset_ns;
-        result.accepted_samples = engine->accepted_samples;
-        return result;
-      }
-    }
+  if (engine->valid &&
+      (reception_time_ns - engine->last_accepted_time_ns > PTP_ENGINE_GAP_NS ||
+       reception_time_ns < engine->last_accepted_time_ns)) {
+    /* Same domain: the crystals did not change, keep the learned drift. */
+    const int64_t drift = engine->drift_ns_per_s;
+    engine->epoch = next_epoch(engine->epoch);
+    clear_filter_state(engine);
+    engine->drift_ns_per_s = drift;
+    result.restarted = true;
   }
-  engine->outlier_run = 0;
 
-  const int64_t old_filtered = engine->filtered_offset_ns;
-  int64_t smoothed = raw_offset_ns;
-
-  if (!engine->valid || engine->previous_sample_time_ns == 0) {
+  if (!engine->valid) {
+    engine->valid = true;
+    engine->raw_offset_ns = raw_offset_ns;
+    engine->filtered_offset_ns = raw_offset_ns;
+    engine->output_offset_ns = raw_offset_ns;
     engine->mastership_start_time_ns = reception_time_ns;
-  } else {
-    const int64_t jitter = raw_offset_ns - engine->previous_offset_ns;
-    int64_t mastership_ns = reception_time_ns - engine->mastership_start_time_ns;
-    if (mastership_ns < 0) mastership_ns = 0;
-
-    if (jitter < 0) {
-      smoothed = engine->previous_offset_ns;
-      if (mastership_ns > PTP_ENGINE_STARTUP_NS) {
-        int64_t clamped = jitter;
-        if (clamped < PTP_ENGINE_NEG_CLAMP_NS)
-          clamped = PTP_ENGINE_NEG_CLAMP_NS;
-        smoothed += clamped / PTP_ENGINE_NEG_DIV;
-      }
-    } else if (mastership_ns < PTP_ENGINE_STARTUP_NS) {
-      smoothed = engine->previous_offset_ns + jitter;
-    } else {
-      smoothed = engine->previous_offset_ns + jitter / PTP_ENGINE_POS_STEADY_DIV;
-    }
+    engine->last_accepted_time_ns = reception_time_ns;
+    engine->accepted_samples = 1;
+    fill_result(engine, raw_offset_ns, &result);
+    return result;
   }
 
-  engine->valid = true;
+  const int64_t mastership_ns =
+      reception_time_ns - engine->mastership_start_time_ns;
+  /* Predict the envelope at this sample from the learned drift. */
+  const int64_t dt_ns = reception_time_ns - engine->last_accepted_time_ns;
+  engine->filtered_offset_ns +=
+      engine->drift_ns_per_s * dt_ns / 1000000000LL;
+  const int64_t old_filtered = engine->filtered_offset_ns;
+  const int64_t old_output = engine->output_offset_ns;
+  const int64_t jitter = raw_offset_ns - old_filtered;
+  int64_t smoothed;
+
+  if (jitter < -PTP_ENGINE_STEP_NS) {
+    if (engine->neg_run == 0 || raw_offset_ns > engine->neg_run_max_ns)
+      engine->neg_run_max_ns = raw_offset_ns;
+    engine->neg_run++;
+  } else {
+    engine->neg_run = 0;
+  }
+
+  if (engine->neg_run >= PTP_ENGINE_STEP_COUNT) {
+    smoothed = engine->neg_run_max_ns;
+    engine->neg_run = 0;
+    engine->epoch = next_epoch(engine->epoch);
+    result.reacquired = true;
+    result.reacquire_jump_ns = smoothed - old_filtered;
+  } else if (jitter < 0) {
+    smoothed = old_filtered;
+    if (mastership_ns > PTP_ENGINE_STARTUP_NS) {
+      const int64_t clamped =
+          jitter < PTP_ENGINE_NEG_CLAMP_NS ? PTP_ENGINE_NEG_CLAMP_NS : jitter;
+      smoothed += clamped / PTP_ENGINE_NEG_DIV;
+    }
+  } else if (mastership_ns < PTP_ENGINE_STARTUP_NS) {
+    smoothed = raw_offset_ns;
+  } else {
+    smoothed = old_filtered + jitter / PTP_ENGINE_POS_STEADY_DIV;
+  }
+
+  /* Learn the drift from the filter's slope once startup has settled. A
+   * reacquire is a step, not drift: start a new window. */
+  const int64_t filter_move = smoothed - old_filtered;
+  if (result.reacquired || mastership_ns < PTP_ENGINE_STARTUP_NS ||
+      filter_move > PTP_ENGINE_DRIFT_STEP_NS ||
+      filter_move < -PTP_ENGINE_DRIFT_STEP_NS) {
+    engine->drift_window_start_ns = 0;
+  } else if (engine->drift_window_start_ns == 0) {
+    engine->drift_window_start_ns = reception_time_ns;
+    engine->drift_window_start_offset_ns = smoothed;
+  } else if (reception_time_ns - engine->drift_window_start_ns >=
+             PTP_ENGINE_DRIFT_WINDOW_NS) {
+    const int64_t span_ns = reception_time_ns - engine->drift_window_start_ns;
+    int64_t measured = (smoothed - engine->drift_window_start_offset_ns) *
+                       1000LL / (span_ns / 1000000LL);
+    if (measured > PTP_ENGINE_DRIFT_MAX_NS_S) measured = PTP_ENGINE_DRIFT_MAX_NS_S;
+    if (measured < -PTP_ENGINE_DRIFT_MAX_NS_S) measured = -PTP_ENGINE_DRIFT_MAX_NS_S;
+    int64_t change = (measured - engine->drift_ns_per_s) / 2;
+    if (change > PTP_ENGINE_DRIFT_MAX_CHANGE) change = PTP_ENGINE_DRIFT_MAX_CHANGE;
+    if (change < -PTP_ENGINE_DRIFT_MAX_CHANGE) change = -PTP_ENGINE_DRIFT_MAX_CHANGE;
+    engine->drift_ns_per_s += change;
+    engine->drift_window_start_ns = reception_time_ns;
+    engine->drift_window_start_offset_ns = smoothed;
+  }
+
+  if (result.reacquired || mastership_ns < PTP_ENGINE_READY_NS) {
+    engine->output_offset_ns = smoothed;
+  } else {
+    const int64_t max_step = PTP_ENGINE_SLEW_NS_PER_S * dt_ns / 1000000000LL;
+    int64_t step = smoothed - old_output;
+    if (step > max_step) step = max_step;
+    if (step < -max_step) step = -max_step;
+    engine->output_offset_ns = old_output + step;
+  }
+
   engine->raw_offset_ns = raw_offset_ns;
   engine->filtered_offset_ns = smoothed;
-  engine->previous_offset_ns = smoothed;
-  engine->previous_sample_time_ns = reception_time_ns;
   engine->last_accepted_time_ns = reception_time_ns;
   engine->accepted_samples++;
-
-  result.accepted = true;
-  result.raw_offset_ns = raw_offset_ns;
-  result.filtered_offset_ns = smoothed;
-  result.filtered_step_ns = engine->accepted_samples > 1
-                                ? smoothed - old_filtered
-                                : 0;
-  result.raw_filter_delta_ns = raw_offset_ns - smoothed;
-  result.accepted_samples = engine->accepted_samples;
-  result.epoch = engine->epoch;
+  fill_result(engine, old_output, &result);
   return result;
 }
-
-
 
 static bool add_signed_u64(uint64_t base, int64_t delta, uint64_t *out) {
   if (!out) return false;
