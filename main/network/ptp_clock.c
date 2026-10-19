@@ -51,6 +51,9 @@ static const char *TAG = "ptp_clock";
 #define RT_MIN_MASTER_SAMPLES 4U
 /* An estimate older than this must not create a new audio mapping. */
 #define PTP_SAMPLE_STALE_MS   2000U
+/* A stream SETUP keeps a settled estimate of the same sender (see
+ * ptp_clock_start_timing): at least this much continuous history. */
+#define PTP_KEEP_MIN_MASTERSHIP_MS 10000U
 
 #define PTP_TASK_PRIORITY_LEGACY   6U
 #define PTP_TASK_PRIORITY_REALTIME 8U
@@ -759,17 +762,39 @@ void ptp_clock_get_snapshot(ptp_clock_snapshot_t *snapshot) {
 
 void ptp_clock_start_timing(bool realtime, uint32_t timing_peer_ip) {
   SemaphoreHandle_t lifecycle = ptp_lifecycle_lock();
+  const int64_t now_ns = get_local_time_ns();
   taskENTER_CRITICAL(&ptp_state_mux);
+  /* NQPTP development handle_control_port_messages(T): clear the timing
+   * records, select the RTSP sender, then begin timing (B), even when the IP
+   * has not changed. Reference: 0a88cd7ca9325f023ca5d891714695167672bdb9.
+   * Exception: the same sender in the same mode, whose samples never stopped
+   * and whose estimate is settled. Some apps change tracks as TEARDOWN +
+   * SETUP ~60 ms apart; a reset there started every track on ~1 s of
+   * samples, 1-2 ms off, and the servo needed ~30 s to pull it back (seen on
+   * the board). A new sender, a mode change, a gap or a young estimate still
+   * start from scratch; GM changes and clock steps are handled by the
+   * engine itself. */
+  const ptp_clock_engine_t *e = &ptp.engine;
+  const uint32_t sample_age_ms = age_ms_since(now_ns, e->last_accepted_time_ns);
+  const uint32_t mastership_ms = age_ms_since(now_ns, e->mastership_start_time_ns);
+  const bool keep = e->valid && timing_peer_ip != 0 &&
+                    ptp.timing_peer_ip == timing_peer_ip &&
+                    ptp.realtime_mode == realtime &&
+                    sample_age_ms <= PTP_SAMPLE_STALE_MS &&
+                    mastership_ms != UINT32_MAX &&
+                    mastership_ms >= PTP_KEEP_MIN_MASTERSHIP_MS;
+  const uint32_t kept_samples = e->accepted_samples;
   ptp.realtime_mode = realtime;
   ptp.timing_peer_ip = timing_peer_ip;
-  /* NQPTP development handle_control_port_messages(T): clear the timing
-   * records, select the RTSP sender, then begin timing (B). Exactly one
-   * reset belongs to stream SETUP, even when the IP has not changed.
-   * Reference: 0a88cd7ca9325f023ca5d891714695167672bdb9. */
-  ptp_clear_estimators_locked();
+  if (!keep) ptp_clear_estimators_locked();
   TaskHandle_t task_handle =
       __atomic_load_n(&ptp.task_handle, __ATOMIC_ACQUIRE);
   taskEXIT_CRITICAL(&ptp_state_mux);
+  if (keep) {
+    AP_LOGI(TAG, "PTP: same sender, settled estimate kept at stream SETUP "
+                 "(%lu s, %lu samples)",
+            (unsigned long)(mastership_ms / 1000U), (unsigned long)kept_samples);
+  }
   if (task_handle && ptp_is_running()) {
     vTaskPrioritySet(task_handle, realtime ? PTP_TASK_PRIORITY_REALTIME
                                          : PTP_TASK_PRIORITY_LEGACY);
