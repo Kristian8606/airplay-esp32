@@ -206,6 +206,10 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
 #define AP2_RT_GM_REBASE_SETTLE_MS  1000U
 #define AP2_BUFFERED_STORE_REQUEST_BYTES AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES
 #define AP2_BUFFERED_LEAD_MS       (AP2_PCM_TARGET_MS + 100U)
+/* A re-sent stretch of timeline (AutoMix) replaces the PCM already published
+ * from its RTP on, if that point is still this far ahead of the audible frame.
+ * The playout task reads at most the DMA queue (~87 ms) ahead. */
+#define AP2_REPLACE_MIN_LEAD_MS     200U
 #define AP2_PHASE_HISTORY_SAMPLES        32U
 
 /* ALAC reorder release point. Missing PCM stays absent in the raw RTP ring
@@ -1726,6 +1730,41 @@ static pcm_store_result_t pcm_store_with_backpressure(
   return PCM_STORE_DROPPED;
 }
 
+/* AutoMix may send a stretch of timeline again (new sequence numbers, RTP
+ * going back by up to ~0.4 s) while the earlier version still waits in the
+ * PCM FIFO. Like the former RTP-addressed ring, the newer packets win: drop
+ * the published PCM from rtp on and let the processor append the new audio
+ * there. Shairport keeps the old blocks instead (its replacement path,
+ * get_revised_seqno + clear_buffers_from, is commented out). Returns false
+ * when rtp is too close to the playhead (or there is none): skip the packet
+ * as before. */
+static bool pcm_rewind_for_resend(uint32_t rtp, uint32_t pcm_generation,
+                                  uint32_t packet_seq, uint32_t stream_epoch) {
+  bool rewound = false;
+  xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
+  xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  uint32_t wanted = 0;
+  if (snap.stream_type == AUDIO_STREAM_BUFFERED &&
+      snap.pcm_generation == pcm_generation && !snap.timeline_reset_pending &&
+      ap2_buffered_fifo_epoch_is_current(s.transport, stream_epoch) &&
+      !buffered_control_packet_flushed_locked(packet_seq) && snap.playing &&
+      snap.anchor_valid && timing_clock_ready(&snap) &&
+      wanted_rtp_now(&snap, &wanted)) {
+    const int sr = snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100;
+    const int32_t min_lead =
+        (int32_t)(((int64_t)sr * AP2_REPLACE_MIN_LEAD_MS) / 1000LL);
+    if (rtp_delta(rtp, wanted) >= min_lead) {
+      pcm_fifo_truncate(s.pcm_fifo, rtp, pcm_generation);
+      rewound = true;
+    }
+  }
+  xSemaphoreGive(s.publish_mutex);
+  xSemaphoreGive(s_buffered_control.mutex);
+  return rewound;
+}
+
 /* Pure centring decision (host-tested). Returns the frequency step in ppm to
  * add to the current I2S correction, or 0. `slope_us_s` is the measured sync
  * slope over the last window while the clock was NOT being retuned. */
@@ -1819,6 +1858,7 @@ static void ap2_buffered_processor_task(void *arg) {
   uint32_t decrypt_failures = 0;
   uint32_t decode_failures = 0;
   uint32_t too_old_skipped = 0;
+  uint32_t resend_replaced = 0;
   uint32_t unsupported_skipped = 0;
 #if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
   /* Every packet in TCP order (before FLUSH decisions): a sequence jump means
@@ -2123,6 +2163,24 @@ static void ap2_buffered_processor_task(void *arg) {
                  (long)timestamp_difference);
       }
       if (timestamp_difference < 0 &&
+          (uint32_t)(-(int64_t)timestamp_difference) > frame_samples &&
+          pcm_rewind_for_resend(packet.rtp, snap.pcm_generation, packet.seq,
+                                packet.stream_epoch)) {
+        /* Re-sent timeline: this packet and the ones after it replace the
+         * PCM from packet.rtp on. The block is still muted (the decoder's
+         * history is from the other timeline); EQ history starts over. */
+        audio_eq_reset_state();
+        ++resend_replaced;
+#if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
+        ESP_LOGW(TAG, "AUTOMIX RESEND seq=%" PRIu32 " rtp=%" PRIu32
+                      " (%+" PRId32 " frames): replaces PCM from here (%" PRIu32
+                      " so far)",
+                 packet.seq, packet.rtp, timestamp_difference, resend_replaced);
+#else
+        AP_LOGI(TAG, "re-sent timeline at seq=%lu (%ld frames) replaces PCM",
+                (unsigned long)packet.seq, (long)timestamp_difference);
+#endif
+      } else if (timestamp_difference < 0 &&
           (uint32_t)(-(int64_t)timestamp_difference) > frame_samples) {
         (void)buffered_consume_head(&head, &decision, NULL);
 #if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
