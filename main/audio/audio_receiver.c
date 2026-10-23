@@ -4245,6 +4245,8 @@ void audio_receiver_set_format(const audio_format_t *f) {
   AP_LOGI(TAG, "FORMAT codec=%s sr=%d ch=%d bits=%d frame=%d",
            f->codec, f->sample_rate, f->channels, f->bits_per_sample,
            f->frame_size);
+  /* EQ runs on the playout task, which never logs or does one-off work. */
+  if (f->sample_rate > 0) audio_eq_prepare(f->sample_rate);
 }
 
 void audio_receiver_set_encryption(const audio_encrypt_t *e) {

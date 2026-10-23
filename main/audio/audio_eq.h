@@ -78,6 +78,10 @@ bool audio_eq_validate_config(const audio_eq_config_t *config);
  * Coefficients are calculated once per sample-rate change, never per sample. */
 void audio_eq_process(float *pcm, size_t frames, int channels,
                       int sample_rate);
+/* Calculate the coefficients for sample_rate now (stream SETUP), so the
+ * first audio_eq_process() on the playout task finds them ready and neither
+ * calculates nor logs there. */
+void audio_eq_prepare(int sample_rate);
 
 /* Clear biquad delay state only at a real output-chain boundary (new stream/
  * session or play stop). A normal AAC timestamp gap or codec-chain switch is

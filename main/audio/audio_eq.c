@@ -571,6 +571,12 @@ static inline void process_source_bypass(float *pcm, size_t frames,
   }
 }
 
+void audio_eq_prepare(int sample_rate) {
+  eq_lock();
+  (void)prepare_for_rate_unlocked(sample_rate);
+  eq_unlock();
+}
+
 void audio_eq_process(float *pcm, size_t frames, int channels,
                       int sample_rate) {
   if (!pcm || frames == 0 || channels != 2) return;
