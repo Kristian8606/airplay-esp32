@@ -15,12 +15,17 @@
 /* No accepted sample for this long (Sync stopped during a pause, Wi-Fi
  * outage): the crystal drift since the last sample is unknown, start over. */
 #define PTP_ENGINE_GAP_NS            3000000000LL
-/* A backward step of the sender's clock (seen at iPhone session start) is
- * tracked at only ~80 us/s by the 1/256 path. A shorter delay can only raise
- * the offset, so a sustained run of samples all far BELOW the filter cannot be
- * network jitter: 16 Syncs (~2 s) 3 ms or more below reacquire the filter. */
+/* A backward step of the sender's clock (~3 ms, seen every few minutes) is
+ * tracked at only ~80 us/s by the 1/256 path. 16 Syncs (~2 s) all 3 ms or more
+ * below the filter start a crawl toward the best of them. A run of delayed
+ * Syncs looks the same (seen on the board: 2 s of Syncs 15 ms to 1 s late),
+ * so the filter never jumps: it crawls at PTP_ENGINE_CRAWL_NS_PER_S, about
+ * what the I2S servo can follow anyway (160 ppm), and the first sample above
+ * the filter ends the crawl. The former jump moved the reference by 16 and
+ * 56 ms on such runs and put two receivers out of step for minutes. */
 #define PTP_ENGINE_STEP_NS           3000000LL
 #define PTP_ENGINE_STEP_COUNT        16U
+#define PTP_ENGINE_CRAWL_NS_PER_S    250000LL
 /* Once audio may use the estimate, its published value moves at most this
  * fast. Crystal drift is < 100 us/s, so drift passes through unchanged while a
  * filter step is spread over seconds instead of hitting the I2S servo. */
@@ -30,6 +35,12 @@
  * steps would otherwise reach the I2S servo as slope noise (seen on the board
  * as +/-40 ppm retunes every window). */
 #define PTP_ENGINE_OUTPUT_TAU_NS     15000000000LL
+/* A difference larger than this (a wrong drift) is followed at the slew rate
+ * instead of dt/tau, so the published offset never lags the filter by more
+ * than about this much for long. */
+#define PTP_ENGINE_OUTPUT_FAST_NS    1000000LL
+/* Catch-up after a crawl ends once the output is this close to the filter. */
+#define PTP_ENGINE_CATCHUP_DONE_NS   50000LL
 /* Drift feed-forward window and bound (two crystals at +/-100 ppm). */
 #define PTP_ENGINE_DRIFT_WINDOW_NS   30000000000LL
 #define PTP_ENGINE_DRIFT_MAX_NS_S    200000LL
@@ -53,6 +64,10 @@ static void clear_filter_state(ptp_clock_engine_t *engine) {
   engine->accepted_samples = 0;
   engine->neg_run = 0;
   engine->neg_run_max_ns = 0;
+  engine->crawl_active = false;
+  engine->crawl_target_ns = 0;
+  engine->crawl_start_filter_ns = 0;
+  engine->output_catchup = false;
   engine->drift_ns_per_s = 0;
   engine->drift_valid = false;
   engine->drift_window_start_ns = 0;
@@ -184,22 +199,50 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
   const int64_t old_filtered = engine->filtered_offset_ns;
   const int64_t old_output = engine->output_offset_ns;
   const int64_t jitter = raw_offset_ns - old_filtered;
+  const int64_t crawl_max_ns = PTP_ENGINE_CRAWL_NS_PER_S * dt_ns / 1000000000LL;
   int64_t smoothed;
 
-  if (jitter < -PTP_ENGINE_STEP_NS) {
+  if (engine->crawl_active) {
+    if (jitter > 0) {
+      /* The level is not that low after all: delayed Syncs, not a step. The
+       * positive path below takes this sample. */
+      engine->crawl_active = false;
+      result.crawl_ended = true;
+      result.crawl_aborted = true;
+      result.crawl_move_ns = old_filtered - engine->crawl_start_filter_ns;
+    } else if (raw_offset_ns > engine->crawl_target_ns) {
+      /* A less delayed sample: the new level is higher than the target. */
+      engine->crawl_target_ns = raw_offset_ns;
+    }
+  }
+
+  if (!engine->crawl_active && jitter < -PTP_ENGINE_STEP_NS) {
     if (engine->neg_run == 0 || raw_offset_ns > engine->neg_run_max_ns)
       engine->neg_run_max_ns = raw_offset_ns;
     engine->neg_run++;
   } else {
     engine->neg_run = 0;
   }
-
   if (engine->neg_run >= PTP_ENGINE_STEP_COUNT) {
-    smoothed = engine->neg_run_max_ns;
     engine->neg_run = 0;
-    engine->epoch = next_epoch(engine->epoch);
-    result.reacquired = true;
-    result.reacquire_jump_ns = smoothed - old_filtered;
+    engine->crawl_active = true;
+    engine->crawl_target_ns = engine->neg_run_max_ns;
+    engine->crawl_start_filter_ns = old_filtered;
+    engine->output_catchup = true;
+    result.crawl_started = true;
+    result.crawl_move_ns = engine->crawl_target_ns - old_filtered;
+  }
+
+  if (engine->crawl_active) {
+    const int64_t gap = old_filtered - engine->crawl_target_ns;
+    if (gap <= crawl_max_ns) {
+      smoothed = engine->crawl_target_ns;
+      engine->crawl_active = false;
+      result.crawl_ended = true;
+      result.crawl_move_ns = smoothed - engine->crawl_start_filter_ns;
+    } else {
+      smoothed = old_filtered - crawl_max_ns;
+    }
   } else if (jitter < 0) {
     smoothed = old_filtered;
     if (mastership_ns > PTP_ENGINE_STARTUP_NS) {
@@ -214,9 +257,12 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
   }
 
   /* Learn the drift from the filter's slope once startup has settled. A
-   * reacquire is a step, not drift: start a new window. */
+   * crawl, and the settling after it, follow a step, not drift: start a new
+   * window once the output has caught up. */
   const int64_t filter_move = smoothed - old_filtered;
-  if (result.reacquired || mastership_ns < PTP_ENGINE_STARTUP_NS ||
+  if (engine->crawl_active || engine->output_catchup ||
+      result.crawl_started || result.crawl_ended ||
+      mastership_ns < PTP_ENGINE_STARTUP_NS ||
       filter_move > PTP_ENGINE_DRIFT_STEP_NS ||
       filter_move < -PTP_ENGINE_DRIFT_STEP_NS) {
     engine->drift_window_start_ns = 0;
@@ -245,7 +291,7 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
     engine->drift_window_start_offset_ns = smoothed;
   }
 
-  if (result.reacquired || mastership_ns < PTP_ENGINE_READY_NS) {
+  if (mastership_ns < PTP_ENGINE_READY_NS) {
     engine->output_offset_ns = smoothed;
   } else {
     /* Follow the learned drift exactly, and only a fraction dt/tau of the
@@ -254,10 +300,17 @@ ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
     const int64_t predicted =
         old_output + engine->drift_ns_per_s * dt_ns / 1000000000LL;
     const int64_t max_step = PTP_ENGINE_SLEW_NS_PER_S * dt_ns / 1000000000LL;
-    /* Until the drift is known, follow the filter (slew-limited only). */
-    int64_t step = engine->drift_valid
-        ? (smoothed - predicted) * dt_ns / PTP_ENGINE_OUTPUT_TAU_NS
-        : smoothed - predicted;
+    const int64_t diff = smoothed - predicted;
+    if (engine->output_catchup && !engine->crawl_active &&
+        diff <= PTP_ENGINE_CATCHUP_DONE_NS && diff >= -PTP_ENGINE_CATCHUP_DONE_NS)
+      engine->output_catchup = false;
+    /* Until the drift is known, while catching up after a crawl, or while far
+     * apart (a wrong drift), follow the filter at the slew rate. */
+    int64_t step = engine->drift_valid && !engine->output_catchup &&
+                           diff <= PTP_ENGINE_OUTPUT_FAST_NS &&
+                           diff >= -PTP_ENGINE_OUTPUT_FAST_NS
+        ? diff * dt_ns / PTP_ENGINE_OUTPUT_TAU_NS
+        : diff;
     if (step > max_step) step = max_step;
     if (step < -max_step) step = -max_step;
     engine->output_offset_ns = predicted + step;

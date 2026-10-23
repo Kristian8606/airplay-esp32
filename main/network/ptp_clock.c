@@ -232,10 +232,9 @@ static void fill_step_log_locked(ptp_step_log_t *ev, const char *reason,
   ev->epoch = ptp.engine.epoch;
   ev->raw_offset_ns = r->raw_offset_ns;
   ev->filtered_offset_ns = r->output_offset_ns;
-  ev->raw_filter_delta_ns = r->reacquired ? r->reacquire_jump_ns
-                                          : r->raw_filter_delta_ns;
-  ev->filtered_step_ns = r->reacquired ? r->reacquire_jump_ns
-                                       : r->filtered_step_ns;
+  const bool crawl = r->crawl_started || r->crawl_ended;
+  ev->raw_filter_delta_ns = crawl ? r->crawl_move_ns : r->raw_filter_delta_ns;
+  ev->filtered_step_ns = crawl ? r->crawl_move_ns : r->filtered_step_ns;
   ev->rx_lag_ns = rx_lag_ns;
   ev->seq = seq;
 }
@@ -243,8 +242,8 @@ static void fill_step_log_locked(ptp_step_log_t *ev, const char *reason,
 /* Buffered lock qualification. Caller holds ptp_state_mux. */
 static void update_lock_locked(const ptp_clock_engine_sample_t *r,
                                int64_t reception_ns) {
-  if (r->restarted || r->reacquired) {
-    /* A new mastership or a clock step: lock must be earned again. */
+  if (r->restarted) {
+    /* A new mastership: lock must be earned again. */
     ptp.locked = false;
     ptp.lock_candidate_start_ms = 0;
   }
@@ -276,8 +275,15 @@ static void add_sample_locked(int64_t raw_offset_ns, int64_t reception_ns,
   ptp.last_sync_ms = (uint32_t)(reception_ns / 1000000LL);
   if (!ptp.realtime_mode) update_lock_locked(&r, reception_ns);
 
-  if (r.reacquired) {
-    fill_step_log_locked(step_ev, "clock-step-reacquire", &r, rx_lag_ns, seq);
+  if (r.crawl_started) {
+    /* dFilt = planned move toward the new level. */
+    fill_step_log_locked(step_ev, "clock-step-crawl", &r, rx_lag_ns, seq);
+    ptp.last_step_log_ns = reception_ns;
+  } else if (r.crawl_ended) {
+    /* dFilt = total move. Aborted: the samples came back above the filter,
+     * the run was delayed Syncs, not a step. */
+    fill_step_log_locked(step_ev, r.crawl_aborted ? "crawl-aborted" : "crawl-done",
+                         &r, rx_lag_ns, seq);
     ptp.last_step_log_ns = reception_ns;
   } else if (r.restarted) {
     fill_step_log_locked(step_ev, "gap-restart", &r, rx_lag_ns, seq);

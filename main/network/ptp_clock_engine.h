@@ -31,8 +31,12 @@ typedef struct {
 typedef struct {
   bool accepted;
   bool restarted;  /* sample gap too long: a new mastership starts here */
-  bool reacquired; /* sender clock stepped back: filter jumped to the run */
-  int64_t reacquire_jump_ns; /* new filter minus the abandoned filter */
+  /* Sender clock stepped back: the filter crawls to the new level instead of
+   * jumping (see ptp_clock_engine_add_sample). */
+  bool crawl_started;
+  bool crawl_ended;
+  bool crawl_aborted;   /* ended because samples came back above the filter */
+  int64_t crawl_move_ns; /* start: planned move; end: total move */
   int64_t raw_offset_ns;
   int64_t filtered_offset_ns;
   int64_t output_offset_ns;
@@ -67,6 +71,14 @@ typedef struct {
    * sender's clock) and the best (largest) offset seen in that run. */
   uint32_t neg_run;
   int64_t neg_run_max_ns;
+
+  /* Crawl to a lower level after such a run, at a bounded rate. */
+  bool crawl_active;
+  int64_t crawl_target_ns;
+  int64_t crawl_start_filter_ns;
+  /* After a crawl starts, the output follows the filter at the slew rate
+   * (not dt/tau) until it has caught up; no drift is learned meanwhile. */
+  bool output_catchup;
 } ptp_clock_engine_t;
 
 void ptp_clock_engine_init(ptp_clock_engine_t *engine);
@@ -90,11 +102,13 @@ void ptp_clock_engine_reset_filter(ptp_clock_engine_t *engine,
  *    then at 1/16;
  *  - negative jitter ignored during startup, then clamped to -2.5 ms and
  *    applied at 1/256;
- *  - a long run of samples far below the filter is a backward clock step:
- *    the filter jumps to the best sample of the run;
+ *  - a long run of samples far below the filter may be a backward clock
+ *    step: the filter crawls toward the best sample of the run at a bounded
+ *    rate, and stops as soon as a sample shows the level was higher (a run
+ *    of delayed Syncs, not a step);
  *  - a long gap without samples restarts the mastership (drift unknown);
  *  - output_offset_ns follows the filter, slew-limited after the first
- *    PTP_CLOCK_ENGINE_READY_MS of a mastership. */
+ *    PTP_CLOCK_ENGINE_READY_MS of a mastership: never a step. */
 ptp_clock_engine_sample_t ptp_clock_engine_add_sample(
     ptp_clock_engine_t *engine, int64_t raw_offset_ns,
     int64_t reception_time_ns);
