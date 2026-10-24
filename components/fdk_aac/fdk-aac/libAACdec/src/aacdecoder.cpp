@@ -3356,10 +3356,11 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
           offset = outputChannel * timeDataChannelOffset;
         }
 
-        /* airplay-esp32 patch: channels outside synthChannelMask were parsed
-         * above but get no concealment/DRC/filterbank, only silence. */
-        if (self->synthChannelMask != 0 &&
-            !(self->synthChannelMask & (1U << outputChannel))) {
+        /* airplay-esp32 patch: channels other than synthType/synthIndex were
+         * parsed above but get no concealment/DRC/filterbank, only silence. */
+        if (self->synthType != ACT_NONE && self->planeLabelsValid &&
+            !(self->planeType[outputChannel] == self->synthType &&
+              self->planeIndex[outputChannel] == self->synthIndex)) {
           if (timeDataSize >= timeDataChannelOffset * self->aacChannels) {
             FDKmemclear(pTimeData + offset,
                         sizeof(PCM_DEC) * self->streamInfo.aacSamplesPerFrame);
@@ -3579,6 +3580,12 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
       self->channelType[mapValue] = types[c];
       self->channelIndices[mapValue] = idx[c];
     }
+    /* airplay-esp32 patch: remember the label of each time-buffer plane
+     * (before pcmDmx reorders planes into output channels) for the
+     * synthType/synthIndex test of the next frame. */
+    FDKmemcpy(self->planeType, self->channelType, sizeof(self->planeType));
+    FDKmemcpy(self->planeIndex, self->channelIndices, sizeof(self->planeIndex));
+    self->planeLabelsValid = 1;
   }
 
   self->blockNumber++;

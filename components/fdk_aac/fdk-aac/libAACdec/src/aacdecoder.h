@@ -354,10 +354,17 @@ This structure is allocated once for each CPE. */
                                         for eSBR delay of DMX signal in case of
                                         stereoConfigIndex==2. */
 
-  /* airplay-esp32 patch: bit n set = synthesize output channel n (index as in
-   * CStreamInfo::pChannelType). 0 = all channels (stock behaviour). See
-   * aacDecoder_SetSynthChannelMask(). */
-  UINT synthChannelMask;
+  /* airplay-esp32 patch: synthesize only the channel labelled
+   * synthType/synthIndex (ACT_NONE = all, stock behaviour). See
+   * aacDecoder_SetSynthChannel(). The label of each time-buffer plane is
+   * taken from the previous frame (planeType/planeIndex): planes are later
+   * reordered by pcmDmx, so a plane number is not an output channel number,
+   * but the label travels with the data. */
+  AUDIO_CHANNEL_TYPE synthType;
+  UCHAR synthIndex;
+  UCHAR planeLabelsValid;
+  AUDIO_CHANNEL_TYPE planeType[(8)];
+  UCHAR planeIndex[(8)];
 };
 
 #define AAC_DEBUG_EXTHLP \

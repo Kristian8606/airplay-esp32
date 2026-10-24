@@ -44,8 +44,17 @@ struct aac_decoder {
   HANDLE_AACDECODER fdk;
   int16_t *mc_pcm;
   uint32_t mc_decodes;
-  bool mc_layout_logged;
+  bool mc_layout_known;
   int mc_lfe_index; /* -1 if the stream has no LFE */
+  int mc_channels;
+  /* Decoded channel index of each aac_speaker_t (-1 = not in the stream),
+   * and FDK's label of each decoded channel. */
+  int8_t mc_speaker_channel[AAC_SPEAKER_COUNT];
+  AUDIO_CHANNEL_TYPE mc_type[MC_MAX_CHANNELS];
+  UCHAR mc_index[MC_MAX_CHANNELS];
+  char mc_label[MC_MAX_CHANNELS][16];
+  int mc_applied_speaker; /* speaker the synth mask is set for; -2 = none */
+  int mc_play_channel;    /* decoded channel played, -1 = mono mix */
   int64_t mc_time_sum_us;
   int64_t mc_time_max_us;
   uint32_t mc_time_frames;
@@ -134,6 +143,32 @@ static inline void mc_trace(uint32_t stage, uint32_t frames) {
   s_mc_trace_magic = MC_TRACE_MAGIC;
 }
 
+/* Selected speaker (aac_speaker_t), written by the web UI / boot code and
+ * read by the decode task once per frame. */
+static int s_mc_speaker =
+#ifdef CONFIG_AIRPLAY_MULTICHANNEL_DEFAULT_SPEAKER
+    CONFIG_AIRPLAY_MULTICHANNEL_DEFAULT_SPEAKER;
+#else
+    AAC_SPEAKER_MIX;
+#endif
+
+/* What the running decoder plays, for the web UI. */
+static portMUX_TYPE s_mc_status_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_mc_status_active;
+static int s_mc_status_channel;
+static int s_mc_status_channels;
+static char s_mc_status_label[16];
+
+static void mc_publish_status(bool active, int channel, int channels,
+                              const char *label) {
+  taskENTER_CRITICAL(&s_mc_status_mux);
+  s_mc_status_active = active;
+  s_mc_status_channel = channel;
+  s_mc_status_channels = channels;
+  strlcpy(s_mc_status_label, label ? label : "", sizeof(s_mc_status_label));
+  taskEXIT_CRITICAL(&s_mc_status_mux);
+}
+
 static bool open_fdk_decoder(aac_decoder_t *d) {
   mc_trace(MC_STAGE_OPEN, 0);
   d->fdk = aacDecoder_Open(TT_MP4_ADTS, 1);
@@ -151,18 +186,13 @@ static bool open_fdk_decoder(aac_decoder_t *d) {
       aacDecoder_SetParam(d->fdk, AAC_PCM_OUTPUT_CHANNEL_MAPPING, 1);
   const AAC_DECODER_ERROR e3 =
       aacDecoder_SetParam(d->fdk, AAC_PCM_LIMITER_ENABLE, 0);
-  /* Playing one channel: let FDK skip the filterbank of all the others
-   * (local fdk-aac patch). 8-channel synthesis does not fit one frame. */
-  const UINT synth_mask =
-      (d->config.pick_channel >= 0 && d->config.pick_channel < MC_MAX_CHANNELS)
-          ? (1U << d->config.pick_channel)
-          : 0U;
-  const AAC_DECODER_ERROR e4 = aacDecoder_SetSynthChannelMask(d->fdk, synth_mask);
-  ESP_LOGW(TAG, "MC: FDK AAC decoder for %d Hz / %d ch (params 0x%x/0x%x/0x%x/0x%x); "
-                "output: %s %d, synth mask 0x%02x",
-           d->config.sample_rate, d->config.channels, e1, e2, e3, e4,
-           d->config.pick_channel >= 0 ? "channel" : "mono downmix",
-           d->config.pick_channel, (unsigned)synth_mask);
+  /* The first frame synthesizes every channel; once the layout is known the
+   * synth mask is narrowed to the selected speaker (mc_apply_speaker). */
+  d->mc_applied_speaker = -2;
+  d->mc_play_channel = -1;
+  d->mc_lfe_index = -1;
+  ESP_LOGW(TAG, "MC: FDK AAC decoder for %d Hz / %d ch (params 0x%x/0x%x/0x%x)",
+           d->config.sample_rate, d->config.channels, e1, e2, e3);
   mc_trace(MC_STAGE_IDLE, 0);
   return true;
 }
@@ -209,23 +239,118 @@ static const char *mc_channel_type_name(AUDIO_CHANNEL_TYPE t) {
   }
 }
 
-/* Once per decoder: which output index is which speaker, so the Kconfig
- * channel index can be chosen from the log. */
-static void mc_log_layout(aac_decoder_t *d, const CStreamInfo *si) {
-  d->mc_lfe_index = -1;
+static int mc_find(const CStreamInfo *si, AUDIO_CHANNEL_TYPE type, int index) {
   for (int c = 0; c < si->numChannels && c < MC_MAX_CHANNELS; ++c) {
-    const AUDIO_CHANNEL_TYPE t =
-        si->pChannelType ? si->pChannelType[c] : ACT_NONE;
-    if (t == ACT_LFE) d->mc_lfe_index = c;
-    ESP_LOGW(TAG, "MC: output channel %d = %s #%u%s", c,
-             mc_channel_type_name(t),
-             si->pChannelIndices ? si->pChannelIndices[c] : 0,
-             c == d->config.pick_channel ? "  <- played" : "");
+    if (si->pChannelType[c] == type && si->pChannelIndices[c] == index) return c;
+  }
+  return -1;
+}
+
+static int mc_count(const CStreamInfo *si, AUDIO_CHANNEL_TYPE type) {
+  int n = 0;
+  for (int c = 0; c < si->numChannels && c < MC_MAX_CHANNELS; ++c) {
+    if (si->pChannelType[c] == type) ++n;
+  }
+  return n;
+}
+
+/* Once per decoder: map every speaker name to a decoded channel.
+ *
+ * FDK labels channels by MPEG position (front #0..n, side, back, lfe). 5.1
+ * (configuration 6) is unambiguous: front C/L/R, back = surround pair. For
+ * 7.1, Apple TV sends configuration 7, which FDK (following ISO) reports as
+ * five fronts + two backs: front #0 = C, #1/#2 and #3/#4 = two pairs. ISO
+ * calls #1/#2 "left/right centre" and #3/#4 L/R; Apple's 7.1 order (C L R
+ * Ls Rs Lrs Rrs LFE) makes #1/#2 L/R, #3/#4 the side pair and the backs the
+ * rear pair. We follow Apple: in the first test the #1/#2 pair carried the
+ * most energy of an upmixed stereo song, as main L/R should. */
+static void mc_build_speaker_map(aac_decoder_t *d, const CStreamInfo *si) {
+  int8_t *m = d->mc_speaker_channel;
+  for (int s = 0; s < AAC_SPEAKER_COUNT; ++s) m[s] = -1;
+  if (!si->pChannelType || !si->pChannelIndices) {
+    d->mc_layout_known = true;
+    return;
+  }
+  const int fronts = mc_count(si, ACT_FRONT);
+  const int sides = mc_count(si, ACT_SIDE);
+  const int backs = mc_count(si, ACT_BACK);
+  const int lr = (fronts & 1) ? 1 : 0; /* odd count: front #0 is the centre */
+
+  if (fronts & 1) m[AAC_SPEAKER_C] = (int8_t)mc_find(si, ACT_FRONT, 0);
+  m[AAC_SPEAKER_L] = (int8_t)mc_find(si, ACT_FRONT, lr);
+  m[AAC_SPEAKER_R] = (int8_t)mc_find(si, ACT_FRONT, lr + 1);
+  m[AAC_SPEAKER_LFE] = (int8_t)mc_find(si, ACT_LFE, 0);
+  bool rear_pair = false;
+  if (sides >= 2) {
+    m[AAC_SPEAKER_LS] = (int8_t)mc_find(si, ACT_SIDE, 0);
+    m[AAC_SPEAKER_RS] = (int8_t)mc_find(si, ACT_SIDE, 1);
+    rear_pair = backs >= 2;
+  } else if (fronts >= lr + 4) { /* Apple 7.1 in configuration 7 */
+    m[AAC_SPEAKER_LS] = (int8_t)mc_find(si, ACT_FRONT, lr + 2);
+    m[AAC_SPEAKER_RS] = (int8_t)mc_find(si, ACT_FRONT, lr + 3);
+    rear_pair = backs >= 2;
+  } else if (backs >= 2) { /* 5.1: the backs are the surround pair */
+    m[AAC_SPEAKER_LS] = (int8_t)mc_find(si, ACT_BACK, 0);
+    m[AAC_SPEAKER_RS] = (int8_t)mc_find(si, ACT_BACK, 1);
+  }
+  if (rear_pair) {
+    m[AAC_SPEAKER_LRS] = (int8_t)mc_find(si, ACT_BACK, 0);
+    m[AAC_SPEAKER_RRS] = (int8_t)mc_find(si, ACT_BACK, 1);
+  } else {
+    m[AAC_SPEAKER_LRS] = m[AAC_SPEAKER_LS];
+    m[AAC_SPEAKER_RRS] = m[AAC_SPEAKER_RS];
+  }
+  d->mc_lfe_index = m[AAC_SPEAKER_LFE];
+  d->mc_channels = si->numChannels;
+
+  for (int c = 0; c < si->numChannels && c < MC_MAX_CHANNELS; ++c) {
+    d->mc_type[c] = si->pChannelType[c];
+    d->mc_index[c] = si->pChannelIndices[c];
+    snprintf(d->mc_label[c], sizeof(d->mc_label[c]), "%s #%u",
+             mc_channel_type_name(si->pChannelType[c]),
+             si->pChannelIndices[c]);
+    const char *speaker = "-";
+    for (int s = 0; s < AAC_SPEAKER_COUNT; ++s) {
+      /* First match wins, so a 5.1 side pair is named Side, not Rear. */
+      if (m[s] == c) {
+        speaker = aac_speaker_name(s);
+        break;
+      }
+    }
+    ESP_LOGW(TAG, "MC: decoded channel %d = %s -> %s", c, d->mc_label[c],
+             speaker);
   }
   ESP_LOGW(TAG, "MC: stream sr=%d ch=%d frame=%d channelConfig=%d aacCh=%d",
            si->sampleRate, si->numChannels, si->frameSize, si->channelConfig,
            si->aacNumChannels);
-  d->mc_layout_logged = true;
+  d->mc_layout_known = true;
+}
+
+/* Point FDK's synthesis (local fdk-aac patch) at the selected speaker, so it
+ * runs the filterbank for that channel only: all eight do not fit one frame.
+ * The channel is named by its label (type + index), not its number: FDK
+ * reorders channels after synthesis, and only the label follows the data.
+ * Called before every decode; acts only when the selection changed. A
+ * channel switched on mid-stream has stale overlap for one frame. */
+static void mc_apply_speaker(aac_decoder_t *d) {
+  if (!d->mc_layout_known) return;
+  const int speaker = __atomic_load_n(&s_mc_speaker, __ATOMIC_RELAXED);
+  if (speaker == d->mc_applied_speaker) return;
+  const int channel =
+      (speaker >= 0 && speaker < AAC_SPEAKER_COUNT) ? d->mc_speaker_channel[speaker] : -1;
+  if (channel >= 0) {
+    aacDecoder_SetSynthChannel(d->fdk, d->mc_type[channel], d->mc_index[channel]);
+  } else {
+    aacDecoder_SetSynthChannel(d->fdk, ACT_NONE, 0);
+  }
+  d->mc_applied_speaker = speaker;
+  d->mc_play_channel = channel;
+  ESP_LOGW(TAG, "MC: playing %s = decoded channel %d (%s)%s",
+           aac_speaker_name(speaker), channel,
+           channel >= 0 ? d->mc_label[channel] : "all",
+           (speaker >= 0 && channel < 0) ? " - not in this stream, mono mix" : "");
+  mc_publish_status(true, channel, d->mc_channels,
+                    channel >= 0 ? d->mc_label[channel] : "mix");
 }
 
 static void mc_log_peaks(aac_decoder_t *d, int ch, size_t frames) {
@@ -234,6 +359,7 @@ static void mc_log_peaks(aac_decoder_t *d, int ch, size_t frames) {
   char peaks[96];
   size_t pos = 0;
   peaks[0] = '\0';
+  int played_peak = 0, other_peak = 0, other_channel = -1;
   for (int c = 0; c < ch && c < MC_MAX_CHANNELS; ++c) {
     int peak = 0;
     for (size_t f = 0; f < frames; ++f) {
@@ -241,12 +367,23 @@ static void mc_log_peaks(aac_decoder_t *d, int ch, size_t frames) {
       if (v < 0) v = -v;
       if (v > peak) peak = v;
     }
-    pos += (size_t)snprintf(peaks + pos, sizeof(peaks) - pos, "%s%d",
-                            c ? "," : "", peak);
-    if (pos >= sizeof(peaks)) break;
+    if (c == d->mc_play_channel) {
+      played_peak = peak;
+    } else if (peak > other_peak) {
+      other_peak = peak;
+      other_channel = c;
+    }
+    if (pos < sizeof(peaks))
+      pos += (size_t)snprintf(peaks + pos, sizeof(peaks) - pos, "%s%d",
+                              c ? "," : "", peak);
   }
   ESP_LOGW(TAG, "MC #%lu: %u frames x %d ch, peaks[%s]", (unsigned long)n,
            (unsigned)frames, ch, peaks);
+  /* With one channel synthesized, every other channel must be silent. */
+  if (d->mc_play_channel >= 0 && played_peak == 0 && other_peak > 0)
+    ESP_LOGE(TAG, "MC: played channel %d is silent but channel %d has signal: "
+                  "synthesis hit the wrong channel", d->mc_play_channel,
+             other_channel);
 }
 
 static void mc_account_time(aac_decoder_t *d, int64_t us, int frame_size,
@@ -276,6 +413,7 @@ static int mc_decode(aac_decoder_t *d, const uint8_t *data, size_t len,
   UINT in_size = (UINT)len;
   UINT valid = (UINT)len;
 
+  mc_apply_speaker(d);
   const int64_t t0 = esp_timer_get_time();
   mc_trace(MC_STAGE_FILL, d->mc_decodes);
   AAC_DECODER_ERROR err = aacDecoder_Fill(d->fdk, &in, &in_size, &valid);
@@ -300,7 +438,10 @@ static int mc_decode(aac_decoder_t *d, const uint8_t *data, size_t len,
       si->frameSize <= 0) {
     return -1;
   }
-  if (!d->mc_layout_logged) mc_log_layout(d, si);
+  if (!d->mc_layout_known) {
+    mc_build_speaker_map(d, si);
+    mc_apply_speaker(d); /* narrows the mask from the next frame on */
+  }
   ++d->mc_decodes;
   mc_trace(MC_STAGE_IDLE, d->mc_decodes);
   mc_account_time(d, t1 - t0, si->frameSize, si->sampleRate);
@@ -310,7 +451,7 @@ static int mc_decode(aac_decoder_t *d, const uint8_t *data, size_t len,
   mc_log_peaks(d, ch, frames);
   if (frames > output_capacity_frames) frames = output_capacity_frames;
 
-  const int pick = d->config.pick_channel;
+  const int pick = d->mc_play_channel;
   if (ch >= 3 && pick >= 0 && pick < ch) {
     mc_pick_channel(d->mc_pcm, ch, pick, frames, output);
   } else if (ch >= 3) {
@@ -344,6 +485,51 @@ void aac_decoder_report_last_run(void) {
     ESP_LOGW(TAG, "MC: last reset reason %d; no FDK trace", (int)why);
   }
   mc_trace(MC_STAGE_IDLE, 0);
+#endif
+}
+
+const char *aac_speaker_name(int speaker) {
+  static const char *const names[AAC_SPEAKER_COUNT] = {
+      "Front Left (L)",  "Front Right (R)", "Centre (C)",
+      "Subwoofer (LFE)", "Side Left (Ls)",  "Side Right (Rs)",
+      "Rear Left (Lrs)", "Rear Right (Rrs)"};
+  return (speaker >= 0 && speaker < AAC_SPEAKER_COUNT) ? names[speaker]
+                                                       : "Mono mix";
+}
+
+void aac_decoder_set_speaker(int speaker) {
+  if (speaker < AAC_SPEAKER_MIX || speaker >= AAC_SPEAKER_COUNT)
+    speaker = AAC_SPEAKER_MIX;
+#if AAC_MULTICHANNEL
+  __atomic_store_n(&s_mc_speaker, speaker, __ATOMIC_RELAXED);
+#else
+  (void)speaker;
+#endif
+}
+
+int aac_decoder_get_speaker(void) {
+#if AAC_MULTICHANNEL
+  return __atomic_load_n(&s_mc_speaker, __ATOMIC_RELAXED);
+#else
+  return AAC_SPEAKER_MIX;
+#endif
+}
+
+bool aac_decoder_get_mc_status(int *output_channel, int *stream_channels,
+                               char *label, size_t label_len) {
+#if AAC_MULTICHANNEL
+  taskENTER_CRITICAL(&s_mc_status_mux);
+  const bool active = s_mc_status_active;
+  if (output_channel) *output_channel = s_mc_status_channel;
+  if (stream_channels) *stream_channels = s_mc_status_channels;
+  if (label && label_len) strlcpy(label, s_mc_status_label, label_len);
+  taskEXIT_CRITICAL(&s_mc_status_mux);
+  return active;
+#else
+  (void)output_channel;
+  (void)stream_channels;
+  if (label && label_len) label[0] = '\0';
+  return false;
 #endif
 }
 
@@ -399,6 +585,7 @@ void aac_decoder_destroy(aac_decoder_t *d) {
 #if AAC_MULTICHANNEL
   if (d->fdk) {
     aacDecoder_Close(d->fdk);
+    mc_publish_status(false, -1, 0, NULL);
   }
   free(d->mc_pcm);
 #endif

@@ -85,19 +85,90 @@ menu "Multichannel Experiment"
             44.1 kHz buffered audio is no longer offered, and realtime
             (type 96) ALAC 44.1 kHz will not play correctly in this mode.
 
-    config AIRPLAY_MULTICHANNEL_OUT_CHANNEL
-        int "Channel to play (index in decoder output, -1 = downmix)"
+    choice AIRPLAY_MULTICHANNEL_SPEAKER
+        prompt "Default speaker this receiver plays"
         depends on AIRPLAY_MULTICHANNEL
-        range -1 7
-        default 0
+        default AIRPLAY_MC_SPEAKER_L
         help
-            Index of the decoded channel sent to I2S, in the FDK AAC
-            decoder's WAV order (usually FL, FR, FC, LFE, then the
-            surrounds). At the start of a stream the log prints
-            "MC: output channel N = <speaker>" for every index, and the
-            "MC #" lines show each channel's peak. -1 folds all channels
-            except LFE into mono. A 5.1 stream (6 channels) falls back to
-            downmix for an index of 6 or 7.
+            Which speaker of the 5.1/7.1 stream goes to this receiver's
+            output (the same signal on both I2S slots, L = R). This is only
+            the default: the Audio EQ page (/eq, card "Source") changes it
+            live and remembers the choice across reboots.
+
+            The speaker is found by name, not by a fixed channel number, so
+            the same setting works for 5.1 and 7.1. For 7.1, Apple TV sends
+            AAC channel configuration 7: C, pair, pair, pair, LFE. The names
+            below follow Apple's 7.1 order (C L R Ls Rs Lrs Rrs LFE); the
+            ISO reading of configuration 7 would instead call the first pair
+            "front centre" and the second pair L/R. Check with a 7.1 speaker
+            test; if Front L/R and Side L/R come out swapped, that is why.
+
+            Typical 7.1 placement (listener in the middle, facing the TV):
+              Front L/R  ~ 30 deg left/right of the screen
+              Centre     under/over the screen
+              Side L/R   ~ 90-110 deg, beside the listener
+              Rear L/R   ~ 135-150 deg, behind the listener
+              LFE        subwoofer (low-frequency effects, < ~120 Hz)
+            With 5.1 there are no rear speakers: Rear L/R play Side L/R.
+
+        config AIRPLAY_MC_SPEAKER_L
+            bool "Front Left (L)"
+            help
+                Main left speaker, ~30 deg left of the screen. In a 7.1
+                stream from Apple TV: the first channel pair, left.
+        config AIRPLAY_MC_SPEAKER_R
+            bool "Front Right (R)"
+            help
+                Main right speaker, ~30 deg right of the screen.
+        config AIRPLAY_MC_SPEAKER_C
+            bool "Centre (C)"
+            help
+                Centre speaker under or over the screen; carries most
+                dialogue.
+        config AIRPLAY_MC_SPEAKER_LFE
+            bool "Subwoofer (LFE)"
+            help
+                Low-frequency effects channel for a subwoofer. It contains
+                only the extra bass effects, not the bass of the other
+                speakers.
+        config AIRPLAY_MC_SPEAKER_LS
+            bool "Side Left (Ls)"
+            help
+                Left surround, beside the listener (~90-110 deg). In 5.1
+                this is the (only) left surround speaker.
+        config AIRPLAY_MC_SPEAKER_RS
+            bool "Side Right (Rs)"
+            help
+                Right surround, beside the listener (~90-110 deg).
+        config AIRPLAY_MC_SPEAKER_LRS
+            bool "Rear Left (Lrs)"
+            help
+                Left rear surround, behind the listener (~135-150 deg).
+                7.1 only; a 5.1 stream plays Side Left here.
+        config AIRPLAY_MC_SPEAKER_RRS
+            bool "Rear Right (Rrs)"
+            help
+                Right rear surround, behind the listener (~135-150 deg).
+                7.1 only; a 5.1 stream plays Side Right here.
+        config AIRPLAY_MC_SPEAKER_MIX
+            bool "Mono mix of all speakers (no LFE)"
+            help
+                Every channel except LFE folded into one mono signal. Costs
+                the most CPU: all channels must be fully decoded.
+    endchoice
+
+    config AIRPLAY_MULTICHANNEL_DEFAULT_SPEAKER
+        int
+        depends on AIRPLAY_MULTICHANNEL
+        default 0 if AIRPLAY_MC_SPEAKER_L
+        default 1 if AIRPLAY_MC_SPEAKER_R
+        default 2 if AIRPLAY_MC_SPEAKER_C
+        default 3 if AIRPLAY_MC_SPEAKER_LFE
+        default 4 if AIRPLAY_MC_SPEAKER_LS
+        default 5 if AIRPLAY_MC_SPEAKER_RS
+        default 6 if AIRPLAY_MC_SPEAKER_LRS
+        default 7 if AIRPLAY_MC_SPEAKER_RRS
+        default -1
 
 endmenu
 

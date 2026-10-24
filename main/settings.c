@@ -350,6 +350,29 @@ esp_err_t settings_set_loudness(bool enabled, int32_t reference_db) {
   nvs_close(h);
   return e;
 }
+esp_err_t settings_get_mc_speaker(int32_t *speaker) {
+  if (!speaker) return ESP_ERR_INVALID_ARG;
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+  *speaker = CONFIG_AIRPLAY_MULTICHANNEL_DEFAULT_SPEAKER;
+#else
+  *speaker = -1;
+#endif
+  nvs_handle_t h;
+  if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return ESP_OK;
+  int32_t v = 0;
+  if (nvs_get_i32(h, "mc_speaker", &v) == ESP_OK) *speaker = v;
+  nvs_close(h);
+  return ESP_OK;
+}
+esp_err_t settings_set_mc_speaker(int32_t speaker) {
+  nvs_handle_t h;
+  esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
+  if (e != ESP_OK) return e;
+  e = nvs_set_i32(h, "mc_speaker", speaker);
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  return e;
+}
 esp_err_t settings_persist_volume(void) {
   /* Called whenever playback stops: write only a changed volume, so pauses
    * do not wear the flash. */

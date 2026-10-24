@@ -672,11 +672,13 @@ bail:
 
 /* airplay-esp32 patch: see aacdecoder_lib.h. */
 LINKSPEC_CPP AAC_DECODER_ERROR
-aacDecoder_SetSynthChannelMask(const HANDLE_AACDECODER self, const UINT mask) {
+aacDecoder_SetSynthChannel(const HANDLE_AACDECODER self,
+                           const AUDIO_CHANNEL_TYPE type, const UCHAR index) {
   if (self == NULL) {
     return AAC_DEC_INVALID_HANDLE;
   }
-  self->synthChannelMask = mask;
+  self->synthType = type;
+  self->synthIndex = index;
   return AAC_DEC_OK;
 }
 

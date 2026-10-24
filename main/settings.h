@@ -37,3 +37,8 @@ esp_err_t settings_clear_output_latency(void);
  * nothing was saved). */
 esp_err_t settings_get_loudness(bool *enabled, int32_t *reference_db);
 esp_err_t settings_set_loudness(bool enabled, int32_t reference_db);
+/* Multichannel experiment: which 5.1/7.1 speaker this receiver plays
+ * (aac_speaker_t, -1 = mono mix). Returns the Kconfig default
+ * CONFIG_AIRPLAY_MULTICHANNEL_DEFAULT_SPEAKER when nothing was saved. */
+esp_err_t settings_get_mc_speaker(int32_t *speaker);
+esp_err_t settings_set_mc_speaker(int32_t speaker);

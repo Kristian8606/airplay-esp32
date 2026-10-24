@@ -13,6 +13,23 @@
 </div>
 <p class='hint'>Each physical output always has its own independent filters. In Mono, Left and Right receive the same mono source but are processed separately, so one output can be low-pass and the other high-pass.</p>
 </div>
+<div class='card' id='spk-card' style='display:none'>
+<h2>Surround speaker (5.1 / 7.1)</h2>
+<p class='hint' style='margin-bottom:14px'>A surround stream (e.g. Apple TV) carries 6 or 8 speakers. This receiver plays one of them on both outputs (L = R), so several receivers can make up a surround system. Changes apply instantly and are remembered.</p>
+<div class='form-group'><label for='spk-select'>This receiver plays</label><select id='spk-select' onchange='postSpeaker()'></select></div>
+<p class='loud-now' id='spk-now'>Loading...</p>
+<table style='width:100%;border-collapse:collapse;margin-top:12px;font-size:13px;color:#cfd3dc'>
+<tr><td style='padding:4px 8px 4px 0;white-space:nowrap'><b>Front L / R</b></td><td>Main speakers, ~30&deg; left/right of the screen.</td></tr>
+<tr><td style='padding:4px 8px 4px 0'><b>Centre</b></td><td>Under/over the screen; most of the dialogue.</td></tr>
+<tr><td style='padding:4px 8px 4px 0'><b>Subwoofer</b></td><td>LFE: only the extra bass effects (&lt; ~120 Hz), not the bass of the other speakers.</td></tr>
+<tr><td style='padding:4px 8px 4px 0'><b>Side L / R</b></td><td>Beside the listener, ~90&ndash;110&deg;. In 5.1 these are the surround speakers.</td></tr>
+<tr><td style='padding:4px 8px 4px 0'><b>Rear L / R</b></td><td>Behind the listener, ~135&ndash;150&deg;. 7.1 only; a 5.1 stream plays Side L / R here.</td></tr>
+<tr><td style='padding:4px 8px 4px 0'><b>Mono mix</b></td><td>All speakers except the subwoofer in one signal (uses the most CPU).</td></tr>
+</table>
+<p class='hint' style='margin-top:10px'>With a surround stream both EQ inputs carry this one speaker, so every <b>Source mode</b> above gives the same signal; the output filters and preamp still apply (e.g. a low-pass for the subwoofer).</p>
+<p class='hint' style='margin-top:6px'>Names follow Apple's 7.1 order. If a 7.1 speaker test plays Front where you expect Side (or the reverse), the stream uses the ISO order instead; tell the firmware author.</p>
+<div id='spk-msg'></div>
+</div>
 <div class='card' id='loud-card'>
 <h2>Loudness</h2>
 <p class='hint' style='margin-bottom:14px'>Keeps the sound full when you turn it down. At low volume the ear hears less bass and a little less treble; this puts them back, the more the quieter you listen, following the ISO 226 equal-loudness standard. Works with or without the EQ and follows the volume instantly.</p>
@@ -82,5 +99,10 @@ async function postLoudness(){loudBusy=true;lmsg('','');try{const r=await fetch(
 function useCurrentVolume(){if(!loud||loud.output_db===null){lmsg('Start playback and set your usual loud level first.','info');return;}const ref=Math.min(Number(document.getElementById('loud-ref').max),Math.max(0,Math.round(-loud.output_db)));document.getElementById('loud-ref').value=ref;document.getElementById('loud-ref-val').textContent=ref;postLoudness();}
 setInterval(()=>{if(document.visibilityState==='visible')loadLoudness(false);},1000);
 window.addEventListener('resize',drawLoudness);
-window.onload=()=>{loadEq();loadLoudness(true);};
+let spkBusy=false;
+function smsg(txt,type){document.getElementById('spk-msg').innerHTML=txt?'<div class="msg '+type+'">'+txt+'</div>':'';}
+function showSpeaker(d,fill){const card=document.getElementById('spk-card');if(!d.available){card.style.display='none';return;}card.style.display='';const sel=document.getElementById('spk-select');if(fill||!sel.options.length){sel.innerHTML='';(d.speakers||[]).filter(s=>s.id>=0).concat((d.speakers||[]).filter(s=>s.id<0)).forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent=s.name;sel.appendChild(o);});}if(!spkBusy)sel.value=String(d.speaker);const now=document.getElementById('spk-now');if(d.active){now.textContent='Now playing: '+(d.channel>=0?'decoded channel '+d.channel+' of '+d.channels+' ('+d.label+')':'mono mix of all '+d.channels+' channels');}else{now.textContent='No 5.1/7.1 stream playing right now; the choice applies to the next one.';}}
+async function loadSpeaker(fill){try{const r=await fetch('/api/audio/speaker');if(!r.ok)throw new Error('HTTP '+r.status);showSpeaker(await r.json(),fill);}catch(e){}}
+async function postSpeaker(){spkBusy=true;smsg('','');try{const r=await fetch('/api/audio/speaker',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({speaker:Number(document.getElementById('spk-select').value)})});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();if(!d.success)throw new Error(d.error||'Request failed');spkBusy=false;showSpeaker(d,false);smsg('Saved. Applied on the next decoded frame.','ok');setTimeout(()=>loadSpeaker(false),400);}catch(e){spkBusy=false;smsg('Speaker: '+esc(e.message),'err');loadSpeaker(false);}}
+window.onload=()=>{loadEq();loadLoudness(true);loadSpeaker(true);setInterval(()=>{if(document.getElementById('spk-card').style.display!=='none')loadSpeaker(false);},3000);};
 </script></body></html>

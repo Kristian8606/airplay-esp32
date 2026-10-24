@@ -65,6 +65,12 @@ void app_main(void) {
   (void)audio_loudness_init();
   ESP_ERROR_CHECK(log_stream_init());
   aac_decoder_report_last_run();
+  {
+    int32_t speaker = AAC_SPEAKER_MIX;
+    if (settings_get_mc_speaker(&speaker) == ESP_OK) {
+      aac_decoder_set_speaker((int)speaker);
+    }
+  }
 
   const bool provisioning_only = !settings_has_wifi_credentials();
 

@@ -2271,11 +2271,6 @@ static void ap2_buffered_processor_task(void *arg) {
           .sample_rate = snap.format.sample_rate,
           .channels = ap2_ssrc_aac_channels(current_ssrc),
           .bits_per_sample = snap.format.bits_per_sample,
-#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
-          .pick_channel = CONFIG_AIRPLAY_MULTICHANNEL_OUT_CHANNEL,
-#else
-          .pick_channel = -1,
-#endif
       };
       decoder = aac_decoder_create(&cfg);
       if (!decoder) {
