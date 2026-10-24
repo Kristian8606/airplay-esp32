@@ -33,7 +33,13 @@ static const char *TAG = "rgb_vu";
 #define LED_PCM_MAX_FRAMES 256U
 #define LED_TASK_STACK 4096U
 #define LED_TASK_PRIO 1U
+/* Multichannel: FDK keeps Core0 ~90% busy at a higher priority; Core1 has
+ * idle time for the VU animation. */
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+#define LED_TASK_CORE 1
+#else
 #define LED_TASK_CORE 0
+#endif
 
 typedef enum {
   LED_STATE_STANDBY,

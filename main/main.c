@@ -44,6 +44,9 @@ static void print_firmware_banner(void) {
   ESP_LOGI(TAG, "VERSION: %s", app ? app->version : "unknown");
   ESP_LOGI(TAG, "BUILD: %s %s", __DATE__, __TIME__);
   ESP_LOGI(TAG, "IDF: %s", app ? app->idf_ver : "unknown");
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+  ESP_LOGI(TAG, "CORE PLAN: multichannel: Core0=FDK AAC decode + RTSP/PTP; Core1=WiFi/LwIP + AAC TCP reader + I2S playout + status/LED/log");
+#endif
   ESP_LOGI(TAG, "CORE PLAN: Core0=WiFi/RTSP/PTP + AAC decode/EQ + ALAC UDP/decrypt/decode");
   ESP_LOGI(TAG, "CORE PLAN: Core1=I2S playout + ALAC ordered staging/EQ + AAC TCP reader");
   ESP_LOGI(TAG, "============================================================");

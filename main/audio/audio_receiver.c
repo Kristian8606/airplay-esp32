@@ -56,6 +56,9 @@
 #define AP2_STATUS_STACK             6144U
 #define AP2_AAC_RX_CORE            1  /* buffered TCP reader */
 #define AP2_PLAYOUT_CORE           1  /* I2S playout + ALAC staging */
+/* Multichannel: FDK stays on Core0 too. On Core1 the I2S playout task (prio
+ * 8, EQ/loudness per block) preempted it so often that it fell behind: the
+ * PCM lead dropped from ~850 ms to 0-200 ms and playback crackled. */
 #define AP2_BUFFERED_PROCESSOR_CORE 0 /* AAC decrypt/decode/EQ */
 #define AP2_RX_PRIORITY            4  /* raw TCP reader (Core1, below playout and ALAC staging) */
 #define AP2_DECODE_PRIORITY        4  /* AAC processor; RTSP control (prio 17, same core) preempts it */
@@ -132,7 +135,13 @@ static int ap2_ssrc_aac_channels(uint32_t ssrc) {
 #define AP2_PLAYOUT_PRIORITY       8
 #define AP2_RT_STAGE_PRIORITY      7
 #define AP2_STATUS_PRIORITY          1
+/* Multichannel: FDK keeps Core0 ~90% busy at priority 4, which starved this
+ * priority-1 task there (no audio_status for minutes); Core1 has idle time. */
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+#define AP2_STATUS_CORE              1
+#else
 #define AP2_STATUS_CORE              0
+#endif
 #define AP2_STATUS_PERIOD_MS      2000U
 /* Shairport development get_ptp_anchor_local_time_info accepts a timing
  * record after 400 ms of mastership. There is no extra local lock or 1 s

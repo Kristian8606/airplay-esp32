@@ -83,3 +83,9 @@ CONFIG_AIRPLAY_AMP_OFF_DELAY_SEC=300
 CONFIG_AIRPLAY_DIAG_PLAYOUT=n
 CONFIG_AIRPLAY_DIAG_LIFECYCLE=n
 CONFIG_AIRPLAY_DIAG_AUTOMIX=n
+# Multichannel experiment (this branch): FDK AAC decoding keeps Core0 ~90%
+# busy, so the WiFi driver and the LwIP tcpip task run on Core1, next to the
+# AAC TCP reader. Core1 also runs I2S playout, whose 80 ms of DMA rides out
+# WiFi bursts. Revert these two lines when merging without multichannel.
+CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU1=y

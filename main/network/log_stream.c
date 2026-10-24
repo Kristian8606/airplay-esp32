@@ -21,6 +21,15 @@
 #include <stdio.h>
 #include <string.h>
 #include "airplay_log.h"
+#include "sdkconfig.h"
+
+/* Multichannel experiment: FDK AAC keeps Core0 busy at a higher priority;
+ * the log broadcaster runs on Core1 (next to WiFi/LwIP) instead. */
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+#define LOG_WS_CORE 1
+#else
+#define LOG_WS_CORE 0
+#endif
 
 /* Ring buffer size — must be power of two for masking. */
 #define LOG_RING_SIZE 8192
@@ -358,7 +367,7 @@ esp_err_t log_stream_register(httpd_handle_t server) {
     /* Only the stack is external; the WithCaps API keeps the TCB internal. */
     if (xTaskCreatePinnedToCoreWithCaps(
             broadcast_task, "log_ws", BROADCAST_TASK_STACK, NULL,
-            BROADCAST_TASK_PRIORITY, &s_broadcast_task, 0,
+            BROADCAST_TASK_PRIORITY, &s_broadcast_task, LOG_WS_CORE,
             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
       httpd_unregister_uri_handler(server, "/ws/logs", HTTP_GET);
       err = ESP_ERR_NO_MEM;
