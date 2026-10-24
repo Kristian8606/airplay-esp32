@@ -102,7 +102,10 @@ static bool ap2_audio_format_supported(int64_t stream_type, int64_t codec_type,
            samples_per_frame == 352;
   }
   if (stream_type == AUDIO_STREAM_BUFFERED) {
-    return codec_type == 4 && sample_rate == AUDIO_PIPELINE_RATE_HZ &&
+    /* 44.1 kHz stereo AAC everywhere; the multichannel build also plays
+     * 48 kHz (5.1/7.1), switching I2S per stream. */
+    return codec_type == 4 &&
+           (sample_rate == 44100 || sample_rate == AUDIO_PIPELINE_RATE_HZ) &&
            samples_per_frame == 1024;
   }
   return false;
@@ -914,7 +917,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       ESP_LOGE(TAG,
                "SETUP: unsupported AP2 audio format type=%lld ct=%lld "
                "sr=%lld spf=%lld (supported: 96/ALAC/44100/352, "
-               "103/AAC/%u/1024)",
+               "103/AAC/44100 or %u/1024)",
                (long long)stream_type, (long long)codec_type,
                (long long)sample_rate, (long long)samples_per_frame,
                (unsigned)AUDIO_PIPELINE_RATE_HZ);

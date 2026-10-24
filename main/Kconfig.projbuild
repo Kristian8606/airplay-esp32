@@ -79,11 +79,12 @@ menu "Multichannel Experiment"
         bool "Receive 5.1/7.1 AAC and play one channel"
         default y
         help
-            EXPERIMENT. Advertise only AAC-LC 48 kHz 5.1 and 7.1 for buffered
-            audio, run the I2S output and the audio pipeline at 48 kHz, and
-            play a single channel of the stream on both I2S slots. Stereo
-            44.1 kHz buffered audio is no longer offered, and realtime
-            (type 96) ALAC 44.1 kHz will not play correctly in this mode.
+            EXPERIMENT. Also advertise AAC-LC 48 kHz 5.1 and 7.1 for buffered
+            audio and play a single channel of such a stream on both I2S
+            slots (decoded with Fraunhofer FDK AAC). Stereo AAC and realtime
+            (type 96) ALAC still play normally: I2S switches its rate per
+            stream, 44.1 kHz for those and 48 kHz for 5.1/7.1, with a short
+            silence at each switch.
 
     choice AIRPLAY_MULTICHANNEL_SPEAKER
         prompt "Default speaker this receiver plays"

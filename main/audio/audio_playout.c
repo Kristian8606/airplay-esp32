@@ -39,7 +39,11 @@ static void live_dither_step(void);
 
 #define I2S_DMA_DESC_NUM  AUDIO_PLAYOUT_DMA_BLOCKS
 #define I2S_DMA_FRAME_NUM AUDIO_PLAYOUT_FRAMES
+/* Rate the channel is created with. In the multichannel build the playout
+ * task switches it per stream (44.1 kHz realtime ALAC / stereo AAC, 48 kHz
+ * 5.1/7.1 AAC) with audio_playout_set_rate(); s_rate_hz is the current one. */
 #define I2S_RATE_HZ       AUDIO_PIPELINE_RATE_HZ
+#define I2S_MIN_RATE_HZ   44100U
 /* Every descriptor holds one tagged block, plus the batch being written. */
 #define TX_TAG_Q_CAP      16U
 #define TX_DONE_Q_CAP     16U
@@ -54,7 +58,7 @@ _Static_assert(I2S_DMA_FRAME_NUM * 8U <= 4092U,
  * i2s_channel_write() takes milliseconds (it converts to ticks itself): pass
  * this value as it is, never through pdMS_TO_TICKS(). */
 #define I2S_WRITE_TIMEOUT_MS 200U
-_Static_assert(I2S_WRITE_TIMEOUT_MS * I2S_RATE_HZ >
+_Static_assert(I2S_WRITE_TIMEOUT_MS * I2S_MIN_RATE_HZ >
                    2U * 1000U * I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM,
                "write timeout must exceed twice the whole DMA queue");
 
@@ -85,6 +89,7 @@ static bool s_enabled;
 static bool s_preload_pending;
 static uint32_t s_nominal_mclk_hz;
 static int32_t s_tune_ppm;
+static uint32_t s_rate_hz = I2S_RATE_HZ;
 
 /* SPSC queues: playout task -> TX ISR for tags; TX ISR -> playout task for
  * completions. Capacity is intentionally larger than the two DMA descriptors
@@ -320,7 +325,7 @@ static esp_err_t audio_playout_init_current_core(void) {
   if (err == ESP_OK) {
     s_nominal_mclk_hz = initial_tune.curr_mclk_hz;
   } else {
-    s_nominal_mclk_hz = I2S_RATE_HZ * 256U;
+    s_nominal_mclk_hz = s_rate_hz * 256U;
     ESP_LOGW(TAG, "initial tune query failed: %s; assuming MCLK=%" PRIu32,
              esp_err_to_name(err), s_nominal_mclk_hz);
   }
@@ -341,7 +346,7 @@ static esp_err_t audio_playout_init_current_core(void) {
   );
   s_tx = tx; /* Publish only a fully initialised channel. */
   ESP_LOGI(TAG, "I2S TX 32-bit data in 32-bit slots, %u Hz, MCLK=%" PRIu32 " Hz",
-           (unsigned)I2S_RATE_HZ, s_nominal_mclk_hz);
+           (unsigned)s_rate_hz, s_nominal_mclk_hz);
   return ESP_OK;
 
 fail:
@@ -564,7 +569,7 @@ bool audio_playout_wait_free(uint32_t blocks, uint32_t timeout_ticks) {
 /* Do not touch a descriptor the DMA starts reading within this time. */
 #define FADE_GUARD_US 2000LL
 #define DMA_BLOCK_US \
-  ((int64_t)I2S_DMA_FRAME_NUM * 1000000LL / (int64_t)I2S_RATE_HZ)
+  ((int64_t)I2S_DMA_FRAME_NUM * 1000000LL / (int64_t)s_rate_hz)
 
 static inline void sync_dma_buf(void *buf) {
 #if SOC_CACHE_INTERNAL_MEM_VIA_L1CACHE
@@ -784,6 +789,43 @@ static void live_dither_step(void) {
     s_dith_reg = reg;
     I2S_LL_GET_HW(I2S_NUM_0)->tx_clkm_div_conf.val = reg;
   }
+}
+
+uint32_t audio_playout_get_rate(void) { return s_rate_hz; }
+
+esp_err_t audio_playout_set_rate(uint32_t rate_hz) {
+  if (!s_tx || rate_hz == 0U) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (rate_hz == s_rate_hz) {
+    return ESP_OK;
+  }
+  /* The clock can only be reprogrammed in READY: stop and drop the queue. */
+  esp_err_t err = audio_playout_flush();
+  if (err != ESP_OK) {
+    return err;
+  }
+  const i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(rate_hz);
+  err = i2s_channel_reconfig_std_clock(s_tx, &clk);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "I2S rate %u Hz rejected: %s", (unsigned)rate_hz,
+             esp_err_to_name(err));
+    return err;
+  }
+  s_rate_hz = rate_hz;
+  /* The servo's ppm corrections are relative to the nominal MCLK of the new
+   * rate: measure it again and rebuild the live divider levels. */
+  s_tune_ppm = 0;
+  i2s_tuning_info_t tune = {0};
+  if (i2s_channel_tune_rate(s_tx, NULL, &tune) == ESP_OK) {
+    s_nominal_mclk_hz = tune.curr_mclk_hz;
+  } else {
+    s_nominal_mclk_hz = rate_hz * 256U;
+  }
+  live_tune_init();
+  ESP_LOGW(TAG, "I2S rate now %u Hz, MCLK=%" PRIu32 " Hz", (unsigned)rate_hz,
+           s_nominal_mclk_hz);
+  return ESP_OK;
 }
 
 bool audio_playout_tune_is_live(void) {

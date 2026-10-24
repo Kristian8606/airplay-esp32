@@ -188,6 +188,9 @@ static bool loudness_prepare(int32_t gain_q15) {
 
 void audio_loudness_reset(void) {
   memset(s_state, 0, sizeof(s_state));
+  /* Rebuild the coefficients on the next block: the I2S rate may have
+   * changed with the stream. */
+  s_coeff_att_db = -1.0f;
 }
 
 /* Float PCM in place (1.0 = full scale), after the output volume. No

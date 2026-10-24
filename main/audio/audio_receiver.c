@@ -107,11 +107,12 @@ static bool ap2_ssrc_recognised(uint32_t ssrc) {
 }
 
 /* true for formats we know we cannot decode on this device. The
- * multichannel experiment runs the pipeline at 48 kHz, so there the 5.1/7.1
- * streams are the playable ones and 44.1 kHz stereo is not. */
+ * multichannel experiment adds 48 kHz 5.1/7.1 (I2S switches rate per stream)
+ * to the 44.1 kHz stereo AAC every build plays. */
 static bool ap2_ssrc_unsupported(uint32_t ssrc) {
   switch (ssrc) {
 #if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+    case AP2_SSRC_AAC_44100_F24_2:
     case AP2_SSRC_AAC_48000_F24_5P1:
     case AP2_SSRC_AAC_48000_F24_7P1:
       return false;
@@ -189,7 +190,7 @@ static int ap2_ssrc_aac_channels(uint32_t ssrc) {
  * queued descriptors; allow two more blocks. */
 #define AP2_START_ALIGN_TIMEOUT_US \
   ((int64_t)(AUDIO_PLAYOUT_DMA_BLOCKS + 2U) * AUDIO_PLAYOUT_FRAMES * \
-   1000000LL / (int64_t)AUDIO_PIPELINE_RATE_HZ + 10000LL)
+   1000000LL / 44100LL + 10000LL) /* slowest I2S rate: longest wait */
 #define AP2_START_PRIME_GUARD_BLOCKS        4U
 
 /* PID servo around tagged DMA-EOF phase.
@@ -364,6 +365,10 @@ typedef struct {
    * session after ALAC was active. */
   volatile bool i2s_flush_requested;
   volatile bool playout_servo_reset_requested;
+  /* Multichannel build: I2S rate the current stream needs (44.1 kHz for
+   * realtime ALAC and stereo AAC, 48 kHz for 5.1/7.1 AAC). Set by
+   * audio_receiver_set_format(), applied by the playout task. */
+  volatile uint32_t i2s_rate_wanted;
   /* Hard stream/session boundaries are requested by the RTSP/control core but
    * executed by the single-owner playout task. The sequence pair provides a
    * bounded acknowledgement so the next codec SETUP cannot race ahead of an
@@ -2878,7 +2883,7 @@ static audio_out_sample_t s_silence_block[AUDIO_PLAYOUT_FRAMES * 2U];
 #define CAL_BURST_EVERY     20U   /* ~218 ms between chirps */
 #define CAL_TAIL_BLOCKS     20U   /* covers up to ~218 ms of chain latency */
 #define CAL_TOTAL_BLOCKS    (CAL_LEAD_BLOCKS + LATENCY_CAL_BURSTS * CAL_BURST_EVERY + CAL_TAIL_BLOCKS)
-#define CAL_I2S_RATE_HZ     AUDIO_PIPELINE_RATE_HZ
+#define CAL_I2S_RATE_HZ     audio_playout_get_rate()
 
 static struct {
   int64_t emit_us[LATENCY_CAL_BURSTS];
@@ -3093,6 +3098,42 @@ static void ap2_playout_task(void *arg) {
       status_invalidate_sync();
       state = PLAYOUT_STOPPED;
     }
+
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+    {
+      /* A new stream needs another I2S rate (realtime ALAC / stereo AAC at
+       * 44.1 kHz, 5.1/7.1 at 48 kHz): stop, reprogram the clock and start
+       * the next stream from a clean servo, before any of its audio is
+       * primed. The learned crystal ppm is kept (servo_seed_pending). */
+      const uint32_t want_rate =
+          __atomic_load_n(&s.i2s_rate_wanted, __ATOMIC_ACQUIRE);
+      if (want_rate != 0U && want_rate != audio_playout_get_rate()) {
+        if (!playout_flush_checked("I2S rate change")) {
+          vTaskDelay(1);
+          continue;
+        }
+        if (audio_playout_set_rate(want_rate) != ESP_OK) {
+          vTaskDelay(pdMS_TO_TICKS(10));
+          continue;
+        }
+        servo_ppm = 0;
+        servo_target_ppm = 0;
+        servo_seed_pending = true;
+        idle_zeros = false;
+        servo_generation = 0;
+        center_active = false;
+        pid_integral_ms_s = 0.0;
+        pid_prev_error_ms = 0.0;
+        pid_d_filtered_ms_s = 0.0;
+        pid_prev_valid = false;
+        pid_last_calc_us = esp_timer_get_time();
+        pid_last_tune_us = pid_last_calc_us;
+        s.output_sync.valid = false;
+        status_invalidate_sync();
+        state = PLAYOUT_STOPPED;
+      }
+    }
+#endif
 
     const bool flush_requested =
         __atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL);
@@ -4284,6 +4325,14 @@ void audio_receiver_set_format(const audio_format_t *f) {
            f->frame_size);
   /* EQ runs on the playout task, which never logs or does one-off work. */
   if (f->sample_rate > 0) audio_eq_prepare(f->sample_rate);
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+  /* The playout task switches I2S to this stream's rate before playing it. */
+  if (f->sample_rate == 44100 || f->sample_rate == 48000) {
+    __atomic_store_n(&s.i2s_rate_wanted, (uint32_t)f->sample_rate,
+                     __ATOMIC_RELEASE);
+    media_control_wake();
+  }
+#endif
 }
 
 void audio_receiver_set_encryption(const audio_encrypt_t *e) {
@@ -4309,7 +4358,8 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
   timing_snapshot_t fmt_snap;
   snapshot_state(&fmt_snap);
   if (strcmp(fmt_snap.format.codec, "AAC") != 0 ||
-      fmt_snap.format.sample_rate != (int)AUDIO_PIPELINE_RATE_HZ ||
+      !(fmt_snap.format.sample_rate == 44100 ||
+        fmt_snap.format.sample_rate == (int)AUDIO_PIPELINE_RATE_HZ) ||
       fmt_snap.format.channels != 2 ||
       fmt_snap.format.bits_per_sample != 16 || fmt_snap.format.frame_size != 1024) {
     ESP_LOGE(TAG,
