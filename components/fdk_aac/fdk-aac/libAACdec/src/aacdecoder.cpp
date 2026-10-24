@@ -100,6 +100,13 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-24 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
+ * synthesis and output for 5.1/7.1 streams, and synthesis timestamps.
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 /*!
   \page default General Overview of the AAC Decoder Implementation
 
