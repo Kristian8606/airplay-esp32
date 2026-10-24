@@ -12,6 +12,10 @@ typedef struct {
   int sample_rate;
   int channels;
   int bits_per_sample;
+  /* For a multichannel (> 2) stream: index of the decoded channel to output
+   * on both stereo slots, or -1 to fold all non-LFE channels into mono.
+   * Output is always stereo. Ignored for mono/stereo streams. */
+  int pick_channel;
 } aac_decoder_config_t;
 
 typedef struct {
@@ -27,3 +31,8 @@ int aac_decoder_decode(aac_decoder_t *decoder, uint8_t *input,
                        size_t input_len, int16_t *output,
                        size_t output_capacity_frames,
                        aac_decode_info_t *info);
+
+/* EXPERIMENT (multichannel): log the reset reason and, after a crash, the
+ * FDK decoder step that was running (kept in RTC memory across the reboot).
+ * Call once at boot after logging is up. No-op in normal builds. */
+void aac_decoder_report_last_run(void);

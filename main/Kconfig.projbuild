@@ -73,6 +73,34 @@ menu "AirPlay Receiver"
     endmenu
 endmenu
 
+menu "Multichannel Experiment"
+
+    config AIRPLAY_MULTICHANNEL
+        bool "Receive 5.1/7.1 AAC and play one channel"
+        default y
+        help
+            EXPERIMENT. Advertise only AAC-LC 48 kHz 5.1 and 7.1 for buffered
+            audio, run the I2S output and the audio pipeline at 48 kHz, and
+            play a single channel of the stream on both I2S slots. Stereo
+            44.1 kHz buffered audio is no longer offered, and realtime
+            (type 96) ALAC 44.1 kHz will not play correctly in this mode.
+
+    config AIRPLAY_MULTICHANNEL_OUT_CHANNEL
+        int "Channel to play (index in decoder output, -1 = downmix)"
+        depends on AIRPLAY_MULTICHANNEL
+        range -1 7
+        default 0
+        help
+            Index of the decoded channel sent to I2S, in the FDK AAC
+            decoder's WAV order (usually FL, FR, FC, LFE, then the
+            surrounds). At the start of a stream the log prints
+            "MC: output channel N = <speaker>" for every index, and the
+            "MC #" lines show each channel's peak. -1 folds all channels
+            except LFE into mono. A 5.1 stream (6 channels) falls back to
+            downmix for an index of 6 or 7.
+
+endmenu
+
 menu "Amplifier Power Control"
     config AIRPLAY_AMP_CONTROL
         bool "Enable amplifier power control GPIO"

@@ -1,4 +1,5 @@
 #include "audio_receiver.h"
+#include "aac_decoder.h"
 #include "audio_diag.h"
 #include "amp_control.h"
 #include "audio_eq.h"
@@ -63,6 +64,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(audio_eq_init());
   (void)audio_loudness_init();
   ESP_ERROR_CHECK(log_stream_init());
+  aac_decoder_report_last_run();
 
   const bool provisioning_only = !settings_has_wifi_credentials();
 

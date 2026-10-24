@@ -78,6 +78,7 @@ idf_component_register(
         esp_app_format
         mbedtls
         esp_adc
+        fdk_aac
 )
 
 # Embed the UI into the OTA application image. File changes automatically

@@ -353,6 +353,11 @@ This structure is allocated once for each CPE. */
   FDK_SignalDelay usacResidualDelay; /*!< Delay residual signal to compensate
                                         for eSBR delay of DMX signal in case of
                                         stereoConfigIndex==2. */
+
+  /* airplay-esp32 patch: bit n set = synthesize output channel n (index as in
+   * CStreamInfo::pChannelType). 0 = all channels (stock behaviour). See
+   * aacDecoder_SetSynthChannelMask(). */
+  UINT synthChannelMask;
 };
 
 #define AAC_DEBUG_EXTHLP \

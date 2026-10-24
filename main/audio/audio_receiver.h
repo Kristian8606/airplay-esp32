@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "sdkconfig.h"
 
 /* Raw AirPlay-2 buffered TCP FIFO. The receiver stores bytes exactly in TCP
  * order; packet framing and FLUSH interpretation happen only in the single
@@ -23,6 +24,15 @@ typedef struct {
   int bits_per_sample;
   int frame_size; /* observed AP2 AAC path: 1024 PCM frames/AU */
 } audio_format_t;
+
+/* Rate of the buffered pipeline and the I2S output. The multichannel
+ * experiment (5.1/7.1 AAC is only sent at 48 kHz) runs everything at 48 kHz;
+ * the decoder reduces the stream to stereo before the pipeline. */
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+#define AUDIO_PIPELINE_RATE_HZ 48000U
+#else
+#define AUDIO_PIPELINE_RATE_HZ 44100U
+#endif
 
 typedef enum {
   AUDIO_ENCRYPT_NONE = 0,

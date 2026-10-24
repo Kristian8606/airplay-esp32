@@ -1,21 +1,55 @@
 #include "aac_decoder.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "decoder/impl/esp_aac_dec.h"
 #include "esp_audio_dec.h"
+#include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "airplay_log.h"
+#include "sdkconfig.h"
+
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+#include "aacdecoder_lib.h"
+#define AAC_MULTICHANNEL 1
+#else
+#define AAC_MULTICHANNEL 0
+#endif
 
 #define ADTS_HEADER_LEN AAC_DECODER_INPUT_HEADROOM
 #define AAC_INPUT_MAX   8192U
+/* EXPERIMENT (multichannel): scratch for one 7.1 AAC-LC access unit (2048
+ * leaves room in case the decoder hands out more than 1024 frames). */
+#define MC_MAX_CHANNELS 8
+#define MC_MAX_FRAMES   2048U
+/* CPU-time statistics are logged once per this many decoded frames
+ * (~10.7 s at 48 kHz / 1024). */
+#define MC_TIMING_EVERY 500U
 
 struct aac_decoder {
   aac_decoder_config_t config;
-  void *handle;
+  void *handle; /* esp_aac_dec (PacketVideo): mono/stereo only */
   uint32_t decode_errors;
+#if AAC_MULTICHANNEL
+  /* channels > 2: Fraunhofer FDK decodes into mc_pcm, which is then reduced
+   * to the stereo output the pipeline expects. */
+  HANDLE_AACDECODER fdk;
+  int16_t *mc_pcm;
+  uint32_t mc_decodes;
+  bool mc_layout_logged;
+  int mc_lfe_index; /* -1 if the stream has no LFE */
+  int64_t mc_time_sum_us;
+  int64_t mc_time_max_us;
+  uint32_t mc_time_frames;
+#endif
 };
 
 static const char *TAG = "aac_dec_v1";
@@ -39,7 +73,9 @@ static void make_adts(uint8_t *h, size_t payload_len, int sample_rate,
                       int channels) {
   const int profile = 2; // AAC LC
   const int freq_idx = adts_frequency_index(sample_rate);
-  const int chan_cfg = channels > 0 ? channels : 2;
+  /* ADTS channel_configuration: 1..6 = that many channels (6 = 5.1),
+   * 7 = 8 channels (7.1). */
+  const int chan_cfg = channels == 8 ? 7 : (channels > 0 ? channels : 2);
   const int packet_len = (int)(payload_len + ADTS_HEADER_LEN);
 
   h[0] = 0xff;
@@ -73,16 +109,279 @@ static bool open_decoder(aac_decoder_t *d) {
   return true;
 }
 
+#if AAC_MULTICHANNEL
+
+/* Crash breadcrumbs: the last FDK step and frame count survive a panic
+ * reboot in RTC memory, so the next boot can say where it died even when
+ * only the web log (not the UART panic dump) is visible. */
+enum {
+  MC_STAGE_IDLE = 0,
+  MC_STAGE_ALLOC,
+  MC_STAGE_OPEN,
+  MC_STAGE_SETPARAM,
+  MC_STAGE_FILL,
+  MC_STAGE_DECODE,
+  MC_STAGE_POST,
+};
+#define MC_TRACE_MAGIC 0x4D43A0A0U
+static RTC_NOINIT_ATTR uint32_t s_mc_trace_magic;
+static RTC_NOINIT_ATTR uint32_t s_mc_trace_stage;
+static RTC_NOINIT_ATTR uint32_t s_mc_trace_frames;
+
+static inline void mc_trace(uint32_t stage, uint32_t frames) {
+  s_mc_trace_stage = stage;
+  s_mc_trace_frames = frames;
+  s_mc_trace_magic = MC_TRACE_MAGIC;
+}
+
+static bool open_fdk_decoder(aac_decoder_t *d) {
+  mc_trace(MC_STAGE_OPEN, 0);
+  d->fdk = aacDecoder_Open(TT_MP4_ADTS, 1);
+  if (!d->fdk) {
+    ESP_LOGE(TAG, "MC: aacDecoder_Open failed");
+    return false;
+  }
+  /* Keep every encoded channel (no FDK downmix) in WAV order, and no
+   * limiter: it adds look-ahead delay and CPU, and one channel of a mix
+   * cannot clip anyway. */
+  mc_trace(MC_STAGE_SETPARAM, 0);
+  const AAC_DECODER_ERROR e1 =
+      aacDecoder_SetParam(d->fdk, AAC_PCM_MAX_OUTPUT_CHANNELS, MC_MAX_CHANNELS);
+  const AAC_DECODER_ERROR e2 =
+      aacDecoder_SetParam(d->fdk, AAC_PCM_OUTPUT_CHANNEL_MAPPING, 1);
+  const AAC_DECODER_ERROR e3 =
+      aacDecoder_SetParam(d->fdk, AAC_PCM_LIMITER_ENABLE, 0);
+  /* Playing one channel: let FDK skip the filterbank of all the others
+   * (local fdk-aac patch). 8-channel synthesis does not fit one frame. */
+  const UINT synth_mask =
+      (d->config.pick_channel >= 0 && d->config.pick_channel < MC_MAX_CHANNELS)
+          ? (1U << d->config.pick_channel)
+          : 0U;
+  const AAC_DECODER_ERROR e4 = aacDecoder_SetSynthChannelMask(d->fdk, synth_mask);
+  ESP_LOGW(TAG, "MC: FDK AAC decoder for %d Hz / %d ch (params 0x%x/0x%x/0x%x/0x%x); "
+                "output: %s %d, synth mask 0x%02x",
+           d->config.sample_rate, d->config.channels, e1, e2, e3, e4,
+           d->config.pick_channel >= 0 ? "channel" : "mono downmix",
+           d->config.pick_channel, (unsigned)synth_mask);
+  mc_trace(MC_STAGE_IDLE, 0);
+  return true;
+}
+
+/* EXPERIMENT: one decoded channel on both stereo slots. */
+static void mc_pick_channel(const int16_t *in, int channels, int pick,
+                            size_t frames, int16_t *out) {
+  for (size_t f = 0; f < frames; ++f) {
+    const int16_t v = in[f * (size_t)channels + (size_t)pick];
+    out[2 * f] = v;
+    out[2 * f + 1] = v;
+  }
+}
+
+/* EXPERIMENT: fold every channel except LFE into mono on both slots. */
+static void mc_downmix_to_mono(const int16_t *in, int channels, int lfe,
+                               size_t frames, int16_t *out) {
+  const int used = lfe >= 0 ? channels - 1 : channels;
+  const float gain = 1.0f / (float)used;
+  for (size_t f = 0; f < frames; ++f) {
+    const int16_t *s = in + f * (size_t)channels;
+    float m = 0.0f;
+    for (int c = 0; c < channels; ++c) {
+      if (c != lfe) m += s[c];
+    }
+    m *= gain;
+    const int16_t v =
+        (int16_t)(m > 32767.f ? 32767 : (m < -32768.f ? -32768 : m));
+    out[2 * f] = v;
+    out[2 * f + 1] = v;
+  }
+}
+
+static const char *mc_channel_type_name(AUDIO_CHANNEL_TYPE t) {
+  switch (t) {
+    case ACT_FRONT: return "front";
+    case ACT_SIDE: return "side";
+    case ACT_BACK: return "back";
+    case ACT_LFE: return "lfe";
+    case ACT_FRONT_TOP: return "front-top";
+    case ACT_SIDE_TOP: return "side-top";
+    case ACT_BACK_TOP: return "back-top";
+    default: return "none";
+  }
+}
+
+/* Once per decoder: which output index is which speaker, so the Kconfig
+ * channel index can be chosen from the log. */
+static void mc_log_layout(aac_decoder_t *d, const CStreamInfo *si) {
+  d->mc_lfe_index = -1;
+  for (int c = 0; c < si->numChannels && c < MC_MAX_CHANNELS; ++c) {
+    const AUDIO_CHANNEL_TYPE t =
+        si->pChannelType ? si->pChannelType[c] : ACT_NONE;
+    if (t == ACT_LFE) d->mc_lfe_index = c;
+    ESP_LOGW(TAG, "MC: output channel %d = %s #%u%s", c,
+             mc_channel_type_name(t),
+             si->pChannelIndices ? si->pChannelIndices[c] : 0,
+             c == d->config.pick_channel ? "  <- played" : "");
+  }
+  ESP_LOGW(TAG, "MC: stream sr=%d ch=%d frame=%d channelConfig=%d aacCh=%d",
+           si->sampleRate, si->numChannels, si->frameSize, si->channelConfig,
+           si->aacNumChannels);
+  d->mc_layout_logged = true;
+}
+
+static void mc_log_peaks(aac_decoder_t *d, int ch, size_t frames) {
+  const uint32_t n = d->mc_decodes;
+  if (n > 5 && (n % MC_TIMING_EVERY) != 0) return;
+  char peaks[96];
+  size_t pos = 0;
+  peaks[0] = '\0';
+  for (int c = 0; c < ch && c < MC_MAX_CHANNELS; ++c) {
+    int peak = 0;
+    for (size_t f = 0; f < frames; ++f) {
+      int v = d->mc_pcm[f * (size_t)ch + (size_t)c];
+      if (v < 0) v = -v;
+      if (v > peak) peak = v;
+    }
+    pos += (size_t)snprintf(peaks + pos, sizeof(peaks) - pos, "%s%d",
+                            c ? "," : "", peak);
+    if (pos >= sizeof(peaks)) break;
+  }
+  ESP_LOGW(TAG, "MC #%lu: %u frames x %d ch, peaks[%s]", (unsigned long)n,
+           (unsigned)frames, ch, peaks);
+}
+
+static void mc_account_time(aac_decoder_t *d, int64_t us, int frame_size,
+                            int sample_rate) {
+  d->mc_time_sum_us += us;
+  if (us > d->mc_time_max_us) d->mc_time_max_us = us;
+  if (++d->mc_time_frames < MC_TIMING_EVERY) return;
+  const int64_t budget_us =
+      sample_rate > 0 ? (int64_t)frame_size * 1000000LL / sample_rate : 0;
+  const int64_t avg_us = d->mc_time_sum_us / (int64_t)d->mc_time_frames;
+  ESP_LOGW(TAG, "MC CPU: FDK decode avg %lld us, max %lld us per frame over %lu "
+                "frames; frame budget %lld us -> avg %lld%% of one core; "
+                "decode task stack never below %u B free",
+           (long long)avg_us, (long long)d->mc_time_max_us,
+           (unsigned long)d->mc_time_frames, (long long)budget_us,
+           budget_us > 0 ? (long long)(avg_us * 100 / budget_us) : -1LL,
+           (unsigned)uxTaskGetStackHighWaterMark(NULL));
+  d->mc_time_sum_us = 0;
+  d->mc_time_max_us = 0;
+  d->mc_time_frames = 0;
+}
+
+static int mc_decode(aac_decoder_t *d, const uint8_t *data, size_t len,
+                     int16_t *output, size_t output_capacity_frames,
+                     aac_decode_info_t *info) {
+  UCHAR *in = (UCHAR *)data;
+  UINT in_size = (UINT)len;
+  UINT valid = (UINT)len;
+
+  const int64_t t0 = esp_timer_get_time();
+  mc_trace(MC_STAGE_FILL, d->mc_decodes);
+  AAC_DECODER_ERROR err = aacDecoder_Fill(d->fdk, &in, &in_size, &valid);
+  if (err == AAC_DEC_OK) {
+    mc_trace(MC_STAGE_DECODE, d->mc_decodes);
+    err = aacDecoder_DecodeFrame(d->fdk, (INT_PCM *)d->mc_pcm,
+                                 (INT)(MC_MAX_FRAMES * MC_MAX_CHANNELS), 0);
+  }
+  const int64_t t1 = esp_timer_get_time();
+  mc_trace(MC_STAGE_POST, d->mc_decodes);
+
+  if (err != AAC_DEC_OK) {
+    if ((++d->decode_errors & 63U) == 1U || d->decode_errors <= 8U)
+      ESP_LOGW(TAG, "MC: FDK decode error 0x%x (in %u B, %u left; %lu total)",
+               err, (unsigned)len, (unsigned)valid,
+               (unsigned long)d->decode_errors);
+    return -1;
+  }
+
+  const CStreamInfo *si = aacDecoder_GetStreamInfo(d->fdk);
+  if (!si || si->numChannels <= 0 || si->numChannels > MC_MAX_CHANNELS ||
+      si->frameSize <= 0) {
+    return -1;
+  }
+  if (!d->mc_layout_logged) mc_log_layout(d, si);
+  ++d->mc_decodes;
+  mc_trace(MC_STAGE_IDLE, d->mc_decodes);
+  mc_account_time(d, t1 - t0, si->frameSize, si->sampleRate);
+
+  const int ch = si->numChannels;
+  size_t frames = (size_t)si->frameSize;
+  mc_log_peaks(d, ch, frames);
+  if (frames > output_capacity_frames) frames = output_capacity_frames;
+
+  const int pick = d->config.pick_channel;
+  if (ch >= 3 && pick >= 0 && pick < ch) {
+    mc_pick_channel(d->mc_pcm, ch, pick, frames, output);
+  } else if (ch >= 3) {
+    mc_downmix_to_mono(d->mc_pcm, ch, d->mc_lfe_index, frames, output);
+  } else if (ch == 2) {
+    memcpy(output, d->mc_pcm, frames * 2U * sizeof(int16_t));
+  } else {
+    mc_pick_channel(d->mc_pcm, 1, 0, frames, output);
+  }
+  if (info) info->channels = 2;
+  return (int)frames;
+}
+
+#endif /* AAC_MULTICHANNEL */
+
+void aac_decoder_report_last_run(void) {
+#if AAC_MULTICHANNEL
+  static const char *const stages[] = {"idle", "scratch alloc",
+                                       "aacDecoder_Open", "aacDecoder_SetParam",
+                                       "aacDecoder_Fill", "aacDecoder_DecodeFrame",
+                                       "after decode"};
+  const esp_reset_reason_t why = esp_reset_reason();
+  if (s_mc_trace_magic == MC_TRACE_MAGIC && why != ESP_RST_POWERON) {
+    const uint32_t st = s_mc_trace_stage;
+    ESP_LOGW(TAG, "MC: last reset reason %d; FDK step at reset: %s, after %lu "
+                  "decoded frames",
+             (int)why,
+             st < sizeof(stages) / sizeof(stages[0]) ? stages[st] : "?",
+             (unsigned long)s_mc_trace_frames);
+  } else {
+    ESP_LOGW(TAG, "MC: last reset reason %d; no FDK trace", (int)why);
+  }
+  mc_trace(MC_STAGE_IDLE, 0);
+#endif
+}
+
 aac_decoder_t *aac_decoder_create(const aac_decoder_config_t *config) {
   if (!config || config->sample_rate <= 0 || config->channels <= 0) {
     return NULL;
   }
+#if !AAC_MULTICHANNEL
+  if (config->channels > 2) {
+    ESP_LOGE(TAG, "%d-channel AAC needs CONFIG_AIRPLAY_MULTICHANNEL",
+             config->channels);
+    return NULL;
+  }
+#endif
 
   aac_decoder_t *d = calloc(1, sizeof(*d));
   if (!d) {
     return NULL;
   }
   d->config = *config;
+#if AAC_MULTICHANNEL
+  if (config->channels > 2) {
+    if (config->channels > MC_MAX_CHANNELS) {
+      aac_decoder_destroy(d);
+      return NULL;
+    }
+    const size_t bytes = MC_MAX_FRAMES * MC_MAX_CHANNELS * sizeof(int16_t);
+    mc_trace(MC_STAGE_ALLOC, 0);
+    d->mc_pcm = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!d->mc_pcm) d->mc_pcm = malloc(bytes);
+    if (!d->mc_pcm || !open_fdk_decoder(d)) {
+      ESP_LOGE(TAG, "MC: cannot create the multichannel decoder");
+      aac_decoder_destroy(d);
+      return NULL;
+    }
+    return d;
+  }
+#endif
   if (!open_decoder(d)) {
     aac_decoder_destroy(d);
     return NULL;
@@ -97,6 +396,12 @@ void aac_decoder_destroy(aac_decoder_t *d) {
   if (d->handle) {
     esp_aac_dec_close(d->handle);
   }
+#if AAC_MULTICHANNEL
+  if (d->fdk) {
+    aacDecoder_Close(d->fdk);
+  }
+  free(d->mc_pcm);
+#endif
   free(d);
 }
 
@@ -104,7 +409,11 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
                        size_t input_len, int16_t *output,
                        size_t output_capacity_frames,
                        aac_decode_info_t *info) {
-  if (!d || !d->handle || !input || input_len == 0 || !output ||
+  bool ready = d && d->handle;
+#if AAC_MULTICHANNEL
+  ready = ready || (d && d->fdk);
+#endif
+  if (!ready || !input || input_len == 0 || !output ||
       output_capacity_frames == 0) {
     return -1;
   }
@@ -120,6 +429,13 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
     decode_data = input - ADTS_HEADER_LEN;
     decode_len = input_len + ADTS_HEADER_LEN;
   }
+
+#if AAC_MULTICHANNEL
+  if (d->fdk) {
+    return mc_decode(d, decode_data, decode_len, output,
+                     output_capacity_frames, info);
+  }
+#endif
 
   const int channels = d->config.channels > 0 ? d->config.channels : 2;
   esp_audio_dec_in_raw_t raw = {

@@ -40,7 +40,17 @@
 
 #define AP2_PACKET_MAX             8192U
 #define AP2_RX_STACK               4096U
+/* The multichannel experiment decodes with FDK AAC on this task. FDK keeps
+ * a dummy channel and work buffers on the stack: CAacDecoder_DecodeFrame alone
+ * has a 35.6 KiB frame (-fstack-usage), ~45 KiB at the deepest call. That
+ * stack lives in PSRAM so internal RAM is not spent on it. */
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+#define AP2_PROCESS_STACK          65536U
+#define AP2_PROCESS_STACK_PSRAM    1
+#else
+#define AP2_PROCESS_STACK_PSRAM    0
 #define AP2_PROCESS_STACK          6144U
+#endif
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
 #define AP2_STATUS_STACK             6144U
@@ -54,8 +64,9 @@
 
 /* Payload format announced in the RTP SSRC, as Shairport Sync reads
  * it (ap2_buffered_audio_processor.c / player.h). We can only play AAC-LC
- * 44100 stereo; the others are skipped with a clear message instead of being
- * fed to the decoder as noise. Unknown SSRC values are consumed without
+ * 44100 stereo (48 kHz 5.1/7.1 in the multichannel experiment); the others
+ * are skipped with a clear message instead of being fed to the decoder as
+ * noise. Unknown SSRC values are consumed without
  * decoding, matching Shairport's ssrc_is_recognised() gate. */
 #define AP2_SSRC_ALAC_44100_S16_2   0x0000FACEU
 #define AP2_SSRC_ALAC_48000_S24_2   0x15000000U
@@ -92,17 +103,30 @@ static bool ap2_ssrc_recognised(uint32_t ssrc) {
   }
 }
 
-/* true for formats we know we cannot decode on this device */
+/* true for formats we know we cannot decode on this device. The
+ * multichannel experiment runs the pipeline at 48 kHz, so there the 5.1/7.1
+ * streams are the playable ones and 44.1 kHz stereo is not. */
 static bool ap2_ssrc_unsupported(uint32_t ssrc) {
   switch (ssrc) {
-    case AP2_SSRC_ALAC_44100_S16_2:
-    case AP2_SSRC_ALAC_48000_S24_2:
-    case AP2_SSRC_AAC_48000_F24_2:
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
     case AP2_SSRC_AAC_48000_F24_5P1:
     case AP2_SSRC_AAC_48000_F24_7P1:
-      return true;
-    default:
       return false;
+#else
+    case AP2_SSRC_AAC_44100_F24_2:
+      return false;
+#endif
+    default:
+      return true;
+  }
+}
+
+/* Channel count the AAC decoder must be opened with for a playable SSRC. */
+static int ap2_ssrc_aac_channels(uint32_t ssrc) {
+  switch (ssrc) {
+    case AP2_SSRC_AAC_48000_F24_5P1: return 6;
+    case AP2_SSRC_AAC_48000_F24_7P1: return 8;
+    default: return 2;
   }
 }
 #define AP2_PLAYOUT_PRIORITY       8
@@ -156,7 +180,7 @@ static bool ap2_ssrc_unsupported(uint32_t ssrc) {
  * queued descriptors; allow two more blocks. */
 #define AP2_START_ALIGN_TIMEOUT_US \
   ((int64_t)(AUDIO_PLAYOUT_DMA_BLOCKS + 2U) * AUDIO_PLAYOUT_FRAMES * \
-   1000000LL / 44100LL + 10000LL)
+   1000000LL / (int64_t)AUDIO_PIPELINE_RATE_HZ + 10000LL)
 #define AP2_START_PRIME_GUARD_BLOCKS        4U
 
 /* PID servo around tagged DMA-EOF phase.
@@ -2038,7 +2062,7 @@ static void ap2_buffered_processor_task(void *arg) {
       (void)buffered_consume_head(&head, &decision, NULL);
       early_hold_since_us = 0;
       if ((++unrecognised_ssrc_skipped & 0xFFU) == 1U)
-        AP_LOGI(TAG,
+        ESP_LOGW(TAG,
                  "block seq=%lu with unrecognised SSRC 0x%08lx skipped (%lu so far)",
                  (unsigned long)packet.seq, (unsigned long)packet.ssrc,
                  (unsigned long)unrecognised_ssrc_skipped);
@@ -2046,7 +2070,7 @@ static void ap2_buffered_processor_task(void *arg) {
     }
 
     if (packet.ssrc != current_ssrc) {
-      AP_LOGI(TAG, "incoming audio format%s \"%s\" (ssrc=0x%08lx) at seq=%lu",
+      ESP_LOGW(TAG, "incoming audio format%s \"%s\" (ssrc=0x%08lx) at seq=%lu",
                current_ssrc == 0 ? "" : " switching to",
                ap2_ssrc_name(packet.ssrc), (unsigned long)packet.ssrc,
                (unsigned long)packet.seq);
@@ -2067,7 +2091,7 @@ static void ap2_buffered_processor_task(void *arg) {
       (void)buffered_consume_head(&head, &decision, NULL);
       early_hold_since_us = 0;
       if ((++unsupported_skipped & 0xFFU) == 1U)
-        AP_LOGW(TAG, "unsupported payload format \"%s\"; skipping (%lu blocks)",
+        ESP_LOGW(TAG, "unsupported payload format \"%s\"; skipping (%lu blocks)",
                  ap2_ssrc_name(current_ssrc),
                  (unsigned long)unsupported_skipped);
       continue;
@@ -2245,8 +2269,13 @@ static void ap2_buffered_processor_task(void *arg) {
       decoder = NULL;
       aac_decoder_config_t cfg = {
           .sample_rate = snap.format.sample_rate,
-          .channels = snap.format.channels,
+          .channels = ap2_ssrc_aac_channels(current_ssrc),
           .bits_per_sample = snap.format.bits_per_sample,
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+          .pick_channel = CONFIG_AIRPLAY_MULTICHANNEL_OUT_CHANNEL,
+#else
+          .pick_channel = -1,
+#endif
       };
       decoder = aac_decoder_create(&cfg);
       if (!decoder) {
@@ -2362,7 +2391,11 @@ static void ap2_buffered_processor_task(void *arg) {
 
   if (decoder) aac_decoder_destroy(decoder);
   s.processor_task = NULL;
+#if AP2_PROCESS_STACK_PSRAM
+  vTaskDeleteWithCaps(NULL);
+#else
   vTaskDelete(NULL);
+#endif
 }
 
 static bool frame_is_fully_stale(uint32_t rtp, const timing_snapshot_t *snap,
@@ -2841,7 +2874,7 @@ static audio_out_sample_t s_silence_block[AUDIO_PLAYOUT_FRAMES * 2U];
 #define CAL_BURST_EVERY     20U   /* ~218 ms between chirps */
 #define CAL_TAIL_BLOCKS     20U   /* covers up to ~218 ms of chain latency */
 #define CAL_TOTAL_BLOCKS    (CAL_LEAD_BLOCKS + LATENCY_CAL_BURSTS * CAL_BURST_EVERY + CAL_TAIL_BLOCKS)
-#define CAL_I2S_RATE_HZ     44100U
+#define CAL_I2S_RATE_HZ     AUDIO_PIPELINE_RATE_HZ
 
 static struct {
   int64_t emit_us[LATENCY_CAL_BURSTS];
@@ -4272,7 +4305,8 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
   timing_snapshot_t fmt_snap;
   snapshot_state(&fmt_snap);
   if (strcmp(fmt_snap.format.codec, "AAC") != 0 ||
-      fmt_snap.format.sample_rate != 44100 || fmt_snap.format.channels != 2 ||
+      fmt_snap.format.sample_rate != (int)AUDIO_PIPELINE_RATE_HZ ||
+      fmt_snap.format.channels != 2 ||
       fmt_snap.format.bits_per_sample != 16 || fmt_snap.format.frame_size != 1024) {
     ESP_LOGE(TAG,
              "Buffered format rejected codec=%s sr=%d ch=%d bits=%d frame=%d",
@@ -4303,9 +4337,16 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
                       TAG, "buffered FIFO start failed");
   s.port = bound;
   __atomic_store_n(&s.rx_running, true, __ATOMIC_RELEASE);
+#if AP2_PROCESS_STACK_PSRAM
+  if (xTaskCreatePinnedToCoreWithCaps(ap2_buffered_processor_task, "ap2_buf_proc",
+                                      AP2_PROCESS_STACK, NULL, AP2_DECODE_PRIORITY,
+                                      &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+#else
   if (xTaskCreatePinnedToCore(ap2_buffered_processor_task, "ap2_buf_proc",
                               AP2_PROCESS_STACK, NULL, AP2_DECODE_PRIORITY,
                               &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE) != pdPASS) {
+#endif
     __atomic_store_n(&s.rx_running, false, __ATOMIC_RELEASE);
     ap2_buffered_fifo_notify(s.transport);
     ap2_buffered_fifo_stop(s.transport);

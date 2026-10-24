@@ -24,6 +24,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "audio_receiver.h" /* AUDIO_PIPELINE_RATE_HZ */
 
 #define AUDIO_LOUDNESS_REF_MAX_DB 20
 #define AUDIO_LOUDNESS_MAX_ATT_DB 40.0f
@@ -33,7 +34,7 @@
 #define AUDIO_LOUDNESS_HIGH_HZ 10500.0f
 #define AUDIO_LOUDNESS_HIGH_SLOPE 1.0f
 #define AUDIO_LOUDNESS_HIGH_DB_PER_DB 0.15f
-#define AUDIO_LOUDNESS_SAMPLE_RATE 44100.0f
+#define AUDIO_LOUDNESS_SAMPLE_RATE ((float)AUDIO_PIPELINE_RATE_HZ)
 
 typedef struct {
   bool enabled;

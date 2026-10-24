@@ -3347,13 +3347,24 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
             self->pAacDecoderStaticChannelInfo[c];
 
         /* Setup offset for time buffer traversal. */
+        int outputChannel;
         {
           pAacDecoderStaticChannelInfo =
               self->pAacDecoderStaticChannelInfo[Reverse_chMapping[c]];
-          offset =
-              FDK_chMapDescr_getMapValue(
-                  &self->mapDescr, Reverse_chMapping[cIdx], self->chMapIndex) *
-              timeDataChannelOffset;
+          outputChannel = FDK_chMapDescr_getMapValue(
+              &self->mapDescr, Reverse_chMapping[cIdx], self->chMapIndex);
+          offset = outputChannel * timeDataChannelOffset;
+        }
+
+        /* airplay-esp32 patch: channels outside synthChannelMask were parsed
+         * above but get no concealment/DRC/filterbank, only silence. */
+        if (self->synthChannelMask != 0 &&
+            !(self->synthChannelMask & (1U << outputChannel))) {
+          if (timeDataSize >= timeDataChannelOffset * self->aacChannels) {
+            FDKmemclear(pTimeData + offset,
+                        sizeof(PCM_DEC) * self->streamInfo.aacSamplesPerFrame);
+          }
+          continue;
         }
 
         if (flags & AACDEC_FLUSH) {

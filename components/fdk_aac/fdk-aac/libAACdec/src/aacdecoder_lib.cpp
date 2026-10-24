@@ -670,6 +670,16 @@ bail:
   return errorStatus;
 }
 
+/* airplay-esp32 patch: see aacdecoder_lib.h. */
+LINKSPEC_CPP AAC_DECODER_ERROR
+aacDecoder_SetSynthChannelMask(const HANDLE_AACDECODER self, const UINT mask) {
+  if (self == NULL) {
+    return AAC_DEC_INVALID_HANDLE;
+  }
+  self->synthChannelMask = mask;
+  return AAC_DEC_OK;
+}
+
 LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_SetParam(
     const HANDLE_AACDECODER self, /*!< Handle of the decoder instance */
     const AACDEC_PARAM param,     /*!< Parameter to set               */

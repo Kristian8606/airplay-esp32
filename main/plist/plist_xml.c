@@ -100,6 +100,15 @@ void plist_dict_array_begin(plist_t *p, const char *key) {
   }
 }
 
+void plist_dict_dict_begin(plist_t *p, const char *key) {
+  size_t remaining = p->capacity - p->size;
+  int len =
+      snprintf(p->buffer + p->size, remaining, "<key>%s</key>\n<dict>\n", key);
+  if (len > 0 && (size_t)len < remaining) {
+    p->size += (size_t)len;
+  }
+}
+
 void plist_array_end(plist_t *p) {
   plist_append(p, "</array>\n");
 }

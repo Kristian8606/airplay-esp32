@@ -933,6 +933,18 @@ LINKSPEC_H AAC_DECODER_ERROR aacDecoder_SetParam(const HANDLE_AACDECODER self,
                                                  const INT value);
 
 /**
+ * \brief airplay-esp32 patch (not in upstream fdk-aac): synthesize only some
+ *        output channels. Bit n set = output channel n (index as in
+ *        CStreamInfo::pChannelType) gets concealment, DRC, IMDCT and fading
+ *        as usual; every other channel is still parsed (so the bitstream and
+ *        stereo pairs stay intact) but its PCM is zero and its filterbank is
+ *        not run. 0 = all channels (default). Used to play one channel of a
+ *        7.1 stream on a CPU that cannot synthesize all eight in real time.
+ */
+LINKSPEC_H AAC_DECODER_ERROR
+aacDecoder_SetSynthChannelMask(const HANDLE_AACDECODER self, const UINT mask);
+
+/**
  * \brief              Get free bytes inside decoder internal buffer.
  * \param self         Handle of AAC decoder instance.
  * \param pFreeBytes   Pointer to variable receiving amount of free bytes inside

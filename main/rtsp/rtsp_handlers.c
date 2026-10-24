@@ -102,7 +102,7 @@ static bool ap2_audio_format_supported(int64_t stream_type, int64_t codec_type,
            samples_per_frame == 352;
   }
   if (stream_type == AUDIO_STREAM_BUFFERED) {
-    return codec_type == 4 && sample_rate == 44100 &&
+    return codec_type == 4 && sample_rate == AUDIO_PIPELINE_RATE_HZ &&
            samples_per_frame == 1024;
   }
   return false;
@@ -543,6 +543,11 @@ static void handle_get(int socket, rtsp_conn_t *conn, const rtsp_request_t *req,
     plist_dict_end(&p);
     plist_array_end(&p);
 
+    plist_dict_dict_begin(&p, "supportedFormats");
+    plist_dict_uint(&p, "audioStream", AIRPLAY_SUPPORTED_AUDIO_STREAM);
+    plist_dict_uint(&p, "bufferStream", AIRPLAY_SUPPORTED_BUFFER_STREAM);
+    plist_dict_end(&p);
+
     plist_dict_end(&p);
     size_t body_len = plist_end(&p);
 
@@ -746,13 +751,14 @@ static void handle_post(int socket, rtsp_conn_t *conn,
     if (conn->stream_type == 103) {
       uint8_t response[128];
       size_t response_len = bplist_build_feedback_response(
-          response, sizeof(response), conn->stream_type, 44100.0);
+          response, sizeof(response), conn->stream_type,
+          (double)AUDIO_PIPELINE_RATE_HZ);
 
       if (response_len > 0) {
         AP_LOGD(
             TAG,
-            "/feedback responding with stream status (type=%lld, sr=44100)",
-            (long long)conn->stream_type);
+            "/feedback responding with stream status (type=%lld, sr=%u)",
+            (long long)conn->stream_type, (unsigned)AUDIO_PIPELINE_RATE_HZ);
         rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                            "Content-Type: application/x-apple-binary-plist\r\n",
                            (const char *)response, response_len);
@@ -821,7 +827,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       return;
     }
 
-    bplist_kv_info_t kv[16];
+    /* 24, not 16: a full stream dict has ~20 keys and "audioFormat" must not
+     * be cut off for the multichannel experiment log below. */
+    bplist_kv_info_t kv[24];
     size_t kv_count = 0;
     int64_t codec_type = -1;
     int64_t latency_min = 0;
@@ -832,11 +840,41 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     int64_t samples_per_frame =
         stream_type == AUDIO_STREAM_BUFFERED ? 1024 :
         (stream_type == AUDIO_STREAM_REALTIME ? 352 : -1);
-    if (!bplist_get_stream_kv_info(body, body_len, 0, kv, 16, &kv_count)) {
+    if (!bplist_get_stream_kv_info(body, body_len, 0, kv,
+                                   sizeof(kv) / sizeof(kv[0]), &kv_count)) {
       ESP_LOGE(TAG, "SETUP: missing AirPlay 2 audio format dictionary");
       rtsp_send_response(socket, conn, 400, "Bad Request", req->cseq, NULL,
                          NULL, 0);
       return;
+    }
+
+    /* EXPERIMENT: dump the whole stream dict so we can see which format the
+     * sender picked from supportedFormats (audioFormat bit 39 = 5.1,
+     * bit 40 = 7.1) and any channel-related keys it adds. */
+    for (size_t k = 0; k < kv_count; k++) {
+      if (kv[k].value_type == BPLIST_VALUE_INT) {
+        ESP_LOGW(TAG, "SETUP stream[0] %s = %lld (0x%llx)", kv[k].key,
+                 (long long)kv[k].int_value,
+                 (unsigned long long)kv[k].int_value);
+      } else {
+        ESP_LOGW(TAG, "SETUP stream[0] %s : type=%u len=%zu", kv[k].key,
+                 kv[k].value_type, kv[k].value_len);
+      }
+    }
+    bool multichannel = false;
+    for (size_t k = 0; k < kv_count; k++) {
+      if (kv[k].value_type == BPLIST_VALUE_INT &&
+          strcmp(kv[k].key, "audioFormat") == 0) {
+        const uint64_t af = (uint64_t)kv[k].int_value;
+        multichannel = af == AIRPLAY_FMT_AAC_LC_48000_5_1 ||
+                       af == AIRPLAY_FMT_AAC_LC_48000_7_1;
+        ESP_LOGW(TAG, "SETUP audioFormat 0x%llx -> %s", (unsigned long long)af,
+                 af == AIRPLAY_FMT_AAC_LC_48000_7_1   ? "AAC-LC 48k 7.1 !!!"
+                 : af == AIRPLAY_FMT_AAC_LC_48000_5_1 ? "AAC-LC 48k 5.1 !!!"
+                 : af == AIRPLAY_FMT_AAC_LC_44100_2   ? "AAC-LC 44.1k stereo"
+                 : af == AIRPLAY_FMT_ALAC_44100_S16_2 ? "ALAC 44.1k stereo"
+                                                      : "other");
+      }
     }
 
     for (size_t k = 0; k < kv_count; k++) {
@@ -860,6 +898,13 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       }
     }
 
+    /* 5.1/7.1 AAC is always 48 kHz, but Apple TV omits "sr" for it, which
+     * leaves the 44100 default above. The decoder learns the channel count
+     * from each packet's SSRC; the pipeline format stays stereo. */
+    if (multichannel && stream_type == AUDIO_STREAM_BUFFERED) {
+      sample_rate = 48000;
+    }
+
     audio_format_t format = {0};
     const bool known_codec = rtsp_codec_configure(
         codec_type, &format, sample_rate, samples_per_frame);
@@ -869,9 +914,10 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       ESP_LOGE(TAG,
                "SETUP: unsupported AP2 audio format type=%lld ct=%lld "
                "sr=%lld spf=%lld (supported: 96/ALAC/44100/352, "
-               "103/AAC/44100/1024)",
+               "103/AAC/%u/1024)",
                (long long)stream_type, (long long)codec_type,
-               (long long)sample_rate, (long long)samples_per_frame);
+               (long long)sample_rate, (long long)samples_per_frame,
+               (unsigned)AUDIO_PIPELINE_RATE_HZ);
       /* Reject only this SETUP dictionary.  A malformed/unsupported request
        * must not clobber a stream that is already owned by the control
        * session; the sender may retry with a supported stream immediately. */

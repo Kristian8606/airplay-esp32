@@ -2,6 +2,8 @@
 
 #include <stddef.h>
 
+#include "sdkconfig.h"
+
 /* How this receiver presents itself to AirPlay 2 senders. Used by mDNS
  * (_airplay/_raop TXT records), GET /info and the RTSP "Server" header, so
  * all of them always agree. */
@@ -23,6 +25,23 @@
  *   Bit 48: SupportsTransientPairing */
 #define AIRPLAY_FEATURES_HI 0x1C340
 #define AIRPLAY_FEATURES_LO 0x401C4A00 /* bit 22 off, as Shairport Sync */
+
+/* GET /info "supportedFormats": bit N = AirPlay audio format N, as in
+ * Shairport Sync generateInfoPlist(). The sender echoes its pick back as
+ * "audioFormat" in the SETUP stream dict.
+ * EXPERIMENT (CONFIG_AIRPLAY_MULTICHANNEL): only 5.1/7.1 are offered for
+ * buffered audio, because the pipeline then runs at 48 kHz. */
+#define AIRPLAY_FMT_ALAC_44100_S16_2 (1ULL << 18) /* 0x40000 */
+#define AIRPLAY_FMT_AAC_LC_44100_2   (1ULL << 22)
+#define AIRPLAY_FMT_AAC_LC_48000_5_1 (1ULL << 39)
+#define AIRPLAY_FMT_AAC_LC_48000_7_1 (1ULL << 40)
+#define AIRPLAY_SUPPORTED_AUDIO_STREAM AIRPLAY_FMT_ALAC_44100_S16_2
+#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
+#define AIRPLAY_SUPPORTED_BUFFER_STREAM \
+  (AIRPLAY_FMT_AAC_LC_48000_5_1 | AIRPLAY_FMT_AAC_LC_48000_7_1)
+#else
+#define AIRPLAY_SUPPORTED_BUFFER_STREAM AIRPLAY_FMT_AAC_LC_44100_2
+#endif
 
 /* Pairing identity UUID ("pi" in mDNS and GET /info), lowercase
  * 8-4-4-4-12 form. Derived from the Wi-Fi MAC, so it is stable across

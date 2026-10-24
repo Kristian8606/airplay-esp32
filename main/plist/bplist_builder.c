@@ -456,7 +456,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
   }
 
   size_t pos = 0;
-  size_t offsets[41];
+  size_t offsets[47];
   size_t obj = 0;
 
 #define ADD_OFFSET()                                   \
@@ -659,11 +659,39 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
     union { double value; uint64_t bits; } real = {.value = initial_volume};
     if (!bplist_write_u64(out, capacity, &pos, real.bits)) return 0;
   }
-  ADD_OFFSET(); // 40: top-level info dict
+  ADD_OFFSET(); // 40: "supportedFormats"
+  if (!bplist_write_ascii_string(out, capacity, &pos, "supportedFormats")) {
+    return 0;
+  }
+  ADD_OFFSET(); // 41: "audioStream"
+  if (!bplist_write_ascii_string(out, capacity, &pos, "audioStream")) {
+    return 0;
+  }
+  ADD_OFFSET(); // 42: realtime format mask
+  if (!bplist_write_int(out, capacity, &pos, AIRPLAY_SUPPORTED_AUDIO_STREAM)) {
+    return 0;
+  }
+  ADD_OFFSET(); // 43: "bufferStream"
+  if (!bplist_write_ascii_string(out, capacity, &pos, "bufferStream")) {
+    return 0;
+  }
+  ADD_OFFSET(); // 44: buffered format mask
+  if (!bplist_write_int(out, capacity, &pos, AIRPLAY_SUPPORTED_BUFFER_STREAM)) {
+    return 0;
+  }
+  ADD_OFFSET(); // 45: supportedFormats dict
   {
-    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 38};
-    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 39};
-    if (!bplist_write_dict(out, capacity, &pos, keys, values, 13)) {
+    const uint8_t keys[] = {41, 43};
+    const uint8_t values[] = {42, 44};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 2)) {
+      return 0;
+    }
+  }
+  ADD_OFFSET(); // 46: top-level info dict
+  {
+    const uint8_t keys[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 28, 38, 40};
+    const uint8_t values[] = {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 27, 37, 39, 45};
+    if (!bplist_write_dict(out, capacity, &pos, keys, values, 14)) {
       return 0;
     }
   }
@@ -671,7 +699,7 @@ size_t bplist_build_info_response(uint8_t *out, size_t capacity,
 #undef ADD_OFFSET
 
   if (obj != sizeof(offsets) / sizeof(offsets[0]) ||
-      !bplist_finish(out, capacity, &pos, offsets, obj, 40)) {
+      !bplist_finish(out, capacity, &pos, offsets, obj, 46)) {
     return 0;
   }
 
