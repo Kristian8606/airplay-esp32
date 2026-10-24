@@ -8,26 +8,23 @@
 #include "sdkconfig.h"
 
 /* Raw AirPlay-2 buffered TCP FIFO. The receiver stores bytes exactly in TCP
- * order; packet framing and FLUSH interpretation happen only in the single
- * sequential AAC consumer, following Shairport Sync's buffered path. */
+ * order; framing and FLUSH interpretation belong to the sequential consumer. */
 #define AP2_BUFFERED_AUDIO_BUFFER_REQUEST_BYTES (6U * 1024U * 1024U)
 
 /* AirPlay type-103 capacity advertised to the sender. Keep this equal to the
  * physical 6 MiB raw FIFO so normal TCP backpressure bounds sender preload. */
 #define AP2_BUFFERED_AUDIO_ADVERTISED_BYTES (6U * 1024U * 1024U)
 
-/* AirPlay 2 audio receiver: buffered AAC plus realtime ALAC. */
+/* AirPlay 2 audio receiver: buffered AAC/ALAC plus realtime ALAC. */
 typedef struct {
   char codec[32];
   int sample_rate;
   int channels;
   int bits_per_sample;
-  int frame_size; /* observed AP2 AAC path: 1024 PCM frames/AU */
+  int frame_size;
 } audio_format_t;
 
-/* Rate of the buffered pipeline and the I2S output. The multichannel
- * experiment (5.1/7.1 AAC is only sent at 48 kHz) runs everything at 48 kHz;
- * the decoder reduces the stream to stereo before the pipeline. */
+/* Initial I2S rate; the playout task switches to the active stream's rate. */
 #if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
 #define AUDIO_PIPELINE_RATE_HZ 48000U
 #else
@@ -63,6 +60,7 @@ bool audio_receiver_is_idle(void);
  * engine. Call only after the RTSP server has stopped accepting clients. */
 esp_err_t audio_receiver_release_for_wifi_scan(void);
 void audio_receiver_set_format(const audio_format_t *format);
+uint32_t audio_receiver_get_sample_rate(void);
 void audio_receiver_set_encryption(const audio_encrypt_t *encrypt);
 void audio_receiver_set_stream_type(audio_stream_type_t type);
 

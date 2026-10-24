@@ -1,4 +1,6 @@
 #include <inttypes.h>
+#include <limits.h>
+#include <math.h>
 #include <string.h>
 
 #include "plist.h"
@@ -1285,6 +1287,7 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
       const uint8_t *stream_val_refs =
           plist + stream_pos + stream_dict_size * ref_size;
 
+      if (stream_dict_size > out_capacity) return false;
       for (size_t j = 0; j < stream_dict_size && *out_count < out_capacity;
            j++) {
         uint64_t stream_key_idx =
@@ -1317,6 +1320,13 @@ bool bplist_get_stream_kv_info(const uint8_t *plist, size_t plist_len,
           if (bplist_read_int(plist, plist_len, stream_val_offset, &int_val)) {
             info->int_value = int_val;
           }
+        } else if (stream_val_type == BPLIST_REAL && strcmp(stream_key, "sr") == 0) {
+          double rate = 0;
+          if (!bplist_read_real(plist, plist_len, stream_val_offset, &rate) ||
+              !isfinite(rate) || rate <= 0 || rate > INT32_MAX ||
+              rate != (double)(int64_t)rate) return false;
+          info->value_type = BPLIST_VALUE_INT;
+          info->int_value = (int64_t)rate;
         } else if (stream_val_type == BPLIST_DATA) {
           info->value_type = BPLIST_VALUE_DATA;
           size_t len = 0;

@@ -1,4 +1,5 @@
 #include "aac_decoder.h"
+#include "audio_format_log.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -355,10 +356,11 @@ static void mc_apply_speaker(aac_decoder_t *d) {
   }
   d->mc_applied_speaker = speaker;
   d->mc_play_channel = channel;
-  ESP_LOGW(TAG, "MC: playing %s = decoded channel %d (%s)%s",
-           aac_speaker_name(speaker), channel,
-           channel >= 0 ? d->mc_label[channel] : "all",
-           (speaker >= 0 && channel < 0) ? " - not in this stream, mono mix" : "");
+  if (d->mc_channels > 2)
+    audio_log_surround_playback(TAG, d->config.sample_rate, d->mc_channels,
+                                aac_speaker_name(speaker), channel);
+  else
+    audio_log_stereo_playback(TAG, "AAC", d->config.sample_rate, 16, "buffered");
   mc_publish_status(true, channel, d->mc_channels,
                     channel >= 0 ? d->mc_label[channel] : "mix");
 }

@@ -81,6 +81,7 @@ CONFIG_AIRPLAY_AMP_OFF_DELAY_SEC=300
 
 # AirPlay diagnostics (menuconfig "AirPlay Logs and Diagnostics")
 CONFIG_AIRPLAY_DIAG_PLAYOUT=n
+CONFIG_AIRPLAY_LOG_RTSP_REQUESTS=n
 CONFIG_AIRPLAY_DIAG_LIFECYCLE=n
 CONFIG_AIRPLAY_DIAG_AUTOMIX=n
 # Multichannel experiment (this branch): FDK AAC decoding keeps Core0 ~90%

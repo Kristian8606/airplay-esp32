@@ -11,6 +11,9 @@
 #include <unistd.h>
 
 #include "aac_decoder.h"
+#include "audio_format_log.h"
+#include "alac_decoder.h"
+#include "airplay_audio_formats.h"
 #include "audio_eq.h"
 #include "audio_fade.h"
 #include "audio_loudness.h"
@@ -65,74 +68,6 @@
 #define AP2_NO_TIMING_WAIT_MS      20U /* Shairport: wait ~20 ms without valid timing */
 #define AP2_MAX_DEFERRED_FLUSH      10U /* Shairport MAX_DEFERRED_FLUSH_REQUESTS */
 
-/* Payload format announced in the RTP SSRC, as Shairport Sync reads
- * it (ap2_buffered_audio_processor.c / player.h). We can only play AAC-LC
- * 44100 stereo (48 kHz 5.1/7.1 in the multichannel experiment); the others
- * are skipped with a clear message instead of being fed to the decoder as
- * noise. Unknown SSRC values are consumed without
- * decoding, matching Shairport's ssrc_is_recognised() gate. */
-#define AP2_SSRC_ALAC_44100_S16_2   0x0000FACEU
-#define AP2_SSRC_ALAC_48000_S24_2   0x15000000U
-#define AP2_SSRC_AAC_44100_F24_2    0x16000000U
-#define AP2_SSRC_AAC_48000_F24_2    0x17000000U
-#define AP2_SSRC_AAC_48000_F24_5P1  0x27000000U
-#define AP2_SSRC_AAC_48000_F24_7P1  0x28000000U
-
-static const char *ap2_ssrc_name(uint32_t ssrc) {
-  switch (ssrc) {
-    case AP2_SSRC_ALAC_44100_S16_2:  return "ALAC 44100/16 stereo";
-    case AP2_SSRC_ALAC_48000_S24_2:  return "ALAC 48000/24 stereo";
-    case AP2_SSRC_AAC_44100_F24_2:   return "AAC-LC 44100 stereo";
-    case AP2_SSRC_AAC_48000_F24_2:   return "AAC 48000 stereo";
-    case AP2_SSRC_AAC_48000_F24_5P1: return "AAC 48000 5.1";
-    case AP2_SSRC_AAC_48000_F24_7P1: return "AAC 48000 7.1";
-    default: return "unknown";
-  }
-}
-
-/* Shairport ssrc_is_recognised(): the known formats; anything else,
- * including 0 (SSRC_NONE), is never decoded. */
-static bool ap2_ssrc_recognised(uint32_t ssrc) {
-  switch (ssrc) {
-    case AP2_SSRC_ALAC_44100_S16_2:
-    case AP2_SSRC_ALAC_48000_S24_2:
-    case AP2_SSRC_AAC_44100_F24_2:
-    case AP2_SSRC_AAC_48000_F24_2:
-    case AP2_SSRC_AAC_48000_F24_5P1:
-    case AP2_SSRC_AAC_48000_F24_7P1:
-      return true;
-    default:
-      return false;
-  }
-}
-
-/* true for formats we know we cannot decode on this device. The
- * multichannel experiment adds 48 kHz 5.1/7.1 (I2S switches rate per stream)
- * to the 44.1 kHz stereo AAC every build plays. */
-static bool ap2_ssrc_unsupported(uint32_t ssrc) {
-  switch (ssrc) {
-#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
-    case AP2_SSRC_AAC_44100_F24_2:
-    case AP2_SSRC_AAC_48000_F24_5P1:
-    case AP2_SSRC_AAC_48000_F24_7P1:
-      return false;
-#else
-    case AP2_SSRC_AAC_44100_F24_2:
-      return false;
-#endif
-    default:
-      return true;
-  }
-}
-
-/* Channel count the AAC decoder must be opened with for a playable SSRC. */
-static int ap2_ssrc_aac_channels(uint32_t ssrc) {
-  switch (ssrc) {
-    case AP2_SSRC_AAC_48000_F24_5P1: return 6;
-    case AP2_SSRC_AAC_48000_F24_7P1: return 8;
-    default: return 2;
-  }
-}
 #define AP2_PLAYOUT_PRIORITY       8
 #define AP2_RT_STAGE_PRIORITY      7
 #define AP2_STATUS_PRIORITY          1
@@ -349,6 +284,10 @@ typedef struct {
   uint32_t rt_media_rebase_epoch;
   int64_t rt_media_rebase_bias_ns;
   int64_t rt_media_rebase_start_us;
+  bool buffered_sender_anchor_valid;
+  uint64_t buffered_sender_anchor_clock_id;
+  uint64_t buffered_sender_anchor_ptp_ns;
+  uint32_t buffered_sender_anchor_rtp;
   uint32_t generation;          /* timing/playout epoch */
   uint32_t media_revision;      /* changes on every buffered anchor update */
   uint32_t buffered_pcm_generation; /* survives buffered seek/anchor changes */
@@ -365,9 +304,6 @@ typedef struct {
    * session after ALAC was active. */
   volatile bool i2s_flush_requested;
   volatile bool playout_servo_reset_requested;
-  /* Multichannel build: I2S rate the current stream needs (44.1 kHz for
-   * realtime ALAC and stereo AAC, 48 kHz for 5.1/7.1 AAC). Set by
-   * audio_receiver_set_format(), applied by the playout task. */
   volatile uint32_t i2s_rate_wanted;
   /* Hard stream/session boundaries are requested by the RTSP/control core but
    * executed by the single-owner playout task. The sequence pair provides a
@@ -1385,8 +1321,9 @@ static void audio_status_task(void *arg) {
 
       if (sync_valid && ps.valid) {
         ESP_LOGI(STATUS_TAG,
-                 "AAC | sync=%+.2fms | i2s=%+ldppm | ptpD=%+.2fms | "
+                 "%s | %d Hz | %d-bit PCM | sync=%+.2fms | i2s=%+ldppm | ptpD=%+.2fms | "
                  "gm=%08lx%s | fifo=%u/%uKiB rx=%luKB/s | pcm=%.0fms",
+                 snap.format.codec, sr, snap.format.bits_per_sample,
                  (double)sync_us / 1000.0, (long)correction_ppm,
                  ptp_delta_ms, (unsigned long)gm_short, control_suffix,
                  (unsigned)(usage.used_bytes / 1024U),
@@ -1394,8 +1331,9 @@ static void audio_status_task(void *arg) {
                  status_frames_to_ms(pcm_frames, sr));
       } else {
         ESP_LOGI(STATUS_TAG,
-                 "AAC | sync=%s | i2s=%+ldppm | ptpD=%s | "
+                 "%s | %d Hz | %d-bit PCM | sync=%s | i2s=%+ldppm | ptpD=%s | "
                  "gm=%08lx%s | fifo=%u/%uKiB rx=%luKB/s | pcm=%.0fms",
+                 snap.format.codec, sr, snap.format.bits_per_sample,
                  sync_valid ? "valid" : "n/a", (long)correction_ppm,
                  ps.valid ? "valid" : "n/a", (unsigned long)gm_short,
                  control_suffix, (unsigned)(usage.used_bytes / 1024U),
@@ -1618,7 +1556,8 @@ static void status_print_audio_events(void) {
       case AEVT_SILENCE_END:
         ESP_LOGW(TAG, "AUDIO EVT %lu ms: SILENCE ends at rtp=%lu after %ld blocks (%.1f ms)",
                  ms, (unsigned long)(uint32_t)e.a, (long)e.b,
-                 (double)e.b * (double)AUDIO_PLAYOUT_FRAMES * 1000.0 / 44100.0);
+                 (double)e.b * (double)AUDIO_PLAYOUT_FRAMES * 1000.0 /
+                     (e.c > 0 ? e.c : 44100));
         break;
       case AEVT_CONCEAL:
         ESP_LOGW(TAG, "AUDIO EVT %lu ms: HOLE in block rtp=%lu, %ld frames played as silence",
@@ -1922,12 +1861,84 @@ static esp_err_t buffered_consume_head(const ap2_buffered_fifo_head_t *head,
   return err;
 }
 
+static bool buffered_select_format(
+    const airplay_audio_format_t *format,
+    const ap2_buffered_fifo_head_t *head,
+    const buffered_packet_decision_t *decision, uint32_t packet_rtp,
+    bool old_sequence, uint32_t pcm_generation) {
+  xSemaphoreTake(s_buffered_control.mutex, portMAX_DELAY);
+  xSemaphoreTake(s.publish_mutex, portMAX_DELAY);
+  timing_snapshot_t snap;
+  snapshot_state(&snap);
+  bool valid = s_buffered_control.revision == decision->revision &&
+      snap.stream_type == AUDIO_STREAM_BUFFERED &&
+      snap.pcm_generation == pcm_generation &&
+      __atomic_load_n(&s.rx_running, __ATOMIC_ACQUIRE) &&
+      ap2_buffered_fifo_epoch_is_current(s.transport, head->stream_epoch);
+  const bool rate_changed = snap.format.sample_rate != format->sample_rate;
+  const bool rebase = rate_changed && old_sequence && snap.anchor_valid &&
+      !snap.timeline_reset_pending;
+  if (valid && rate_changed && old_sequence && snap.playing &&
+      snap.anchor_valid && !snap.timeline_reset_pending) {
+    timing_snapshot_t boundary = snap;
+    if (!rebase) boundary.format.sample_rate = format->sample_rate;
+    uint64_t presentation_ns = 0;
+    if (!rtp_to_presentation_ns(&boundary, packet_rtp, &presentation_ns) ||
+        (int64_t)presentation_ns - esp_timer_get_time() * 1000LL > 20000000LL)
+      valid = false;
+  }
+  if (valid) {
+    if (rebase) {
+      const int64_t delta_ns =
+          (int64_t)rtp_delta(packet_rtp, snap.anchor_rtp) * 1000000000LL /
+          snap.format.sample_rate;
+      const int64_t remote_ns = (int64_t)snap.anchor_ptp_ns + delta_ns;
+      const int64_t local_ns = (int64_t)snap.anchor_local_ns + delta_ns;
+      if (remote_ns < 0 || (snap.anchor_local_valid && local_ns < 0)) {
+        valid = false;
+      } else {
+        taskENTER_CRITICAL(&s.state_mux);
+        s.anchor_rtp = packet_rtp;
+        s.anchor_ptp_ns = (uint64_t)remote_ns;
+        if (s.anchor_local_valid) s.anchor_local_ns = (uint64_t)local_ns;
+        s.media_revision = next_generation(s.media_revision);
+        taskEXIT_CRITICAL(&s.state_mux);
+      }
+    }
+  }
+  if (valid) {
+    if (rate_changed) {
+      __atomic_store_n(&s.i2s_flush_requested, true, __ATOMIC_RELEASE);
+      (void)reset_buffered_pcm_store();
+    }
+    audio_format_t next = {
+        .sample_rate = format->sample_rate,
+        .channels = 2,
+        .bits_per_sample = format->bits_per_sample,
+        .frame_size = format->frame_size,
+    };
+    strlcpy(next.codec, format->codec, sizeof(next.codec));
+    audio_receiver_set_format(&next);
+  }
+  xSemaphoreGive(s.publish_mutex);
+  xSemaphoreGive(s_buffered_control.mutex);
+  if (valid && rebase)
+    ESP_LOGI(TAG, "AUDIO RATE ANCHOR %d -> %d Hz, rebased at RTP=%" PRIu32,
+             snap.format.sample_rate, format->sample_rate, packet_rtp);
+  return valid;
+}
+
 static void ap2_buffered_processor_task(void *arg) {
   (void)arg;
   aac_decoder_t *decoder = NULL;
+  alac_decoder_t *alac = NULL;
   uint32_t decoder_format_generation = 0;
   uint32_t current_ssrc = 0;
+  bool playback_announced = false;
   uint32_t seen_stream_epoch = 0;
+  bool authenticated_valid = false;
+  ap2_buffered_fifo_head_t authenticated_head = {0};
+  int authenticated_len = 0;
 
   /* Shairport's packets_played_in_this_sequence / expected_timestamp. A play
    * stop starts a new sequence; deferred FLUSH does not reset it, so the first
@@ -2020,8 +2031,10 @@ static void ap2_buffered_processor_task(void *arg) {
 
     if (seen_stream_epoch != 0 && packet.stream_epoch != seen_stream_epoch) {
       if (decoder) { aac_decoder_destroy(decoder); decoder = NULL; }
+      if (alac) { alac_decoder_destroy(alac); alac = NULL; }
       decoder_format_generation = 0;
       current_ssrc = 0;
+      playback_announced = false;
       packets_played_in_sequence = 0;
       expected_timestamp = 0;
 #if defined(CONFIG_AIRPLAY_LOG_AUDIO_EVENTS) && CONFIG_AIRPLAY_LOG_AUDIO_EVENTS
@@ -2072,7 +2085,9 @@ static void ap2_buffered_processor_task(void *arg) {
     /* Shairport never gives an unrecognised SSRC to the timing/decoder path;
      * such a block is simply consumed. ESP32 additionally skips recognised
      * encodings for which this build has no decoder. */
-    if (!ap2_ssrc_recognised(packet.ssrc)) {
+    const airplay_audio_format_t *payload_format =
+        airplay_audio_format_by_ssrc(packet.ssrc);
+    if (!payload_format) {
       (void)buffered_consume_head(&head, &decision, NULL);
       early_hold_since_us = 0;
       if ((++unrecognised_ssrc_skipped & 0xFFU) == 1U)
@@ -2083,32 +2098,55 @@ static void ap2_buffered_processor_task(void *arg) {
       continue;
     }
 
-    if (packet.ssrc != current_ssrc) {
-      ESP_LOGW(TAG, "incoming audio format%s \"%s\" (ssrc=0x%08lx) at seq=%lu",
-               current_ssrc == 0 ? "" : " switching to",
-               ap2_ssrc_name(packet.ssrc), (unsigned long)packet.ssrc,
-               (unsigned long)packet.seq);
-      current_ssrc = packet.ssrc;
-      unsupported_skipped = 0;
-      /* Shairport prepare_decoding_chain(): a recognised SSRC change rebuilds
-       * only the codec chain. It does not start a new play sequence or clear
-       * downstream filter history; RTP continuity still decides whether the
-       * first block after the format switch is muted. */
-      if (decoder) {
-        aac_decoder_destroy(decoder);
-        decoder = NULL;
-      }
-      decoder_format_generation = 0;
-    }
-
-    if (ap2_ssrc_unsupported(current_ssrc)) {
+    if (!airplay_audio_format_supported(payload_format, AUDIO_STREAM_BUFFERED)) {
       (void)buffered_consume_head(&head, &decision, NULL);
       early_hold_since_us = 0;
       if ((++unsupported_skipped & 0xFFU) == 1U)
         ESP_LOGW(TAG, "unsupported payload format \"%s\"; skipping (%lu blocks)",
-                 ap2_ssrc_name(current_ssrc),
+                 payload_format->name,
                  (unsigned long)unsupported_skipped);
       continue;
+    }
+
+    if (packet.ssrc != current_ssrc) {
+      if (!authenticated_valid ||
+          authenticated_head.read_serial != head.read_serial ||
+          authenticated_head.stream_epoch != head.stream_epoch) {
+        if (ap2_buffered_fifo_copy_head(s.transport, &head, s.buffered_packet,
+                                         AP2_PACKET_MAX) != ESP_OK) continue;
+        authenticated_len = audio_crypto_decrypt_buffered(
+            &session_encrypt, s.buffered_packet, packet.len,
+            s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
+        authenticated_head = head;
+        authenticated_valid = authenticated_len > 0;
+        if (!authenticated_valid) {
+          (void)buffered_consume_head(&head, &decision, NULL);
+          if (authenticated_len < 0 && (++decrypt_failures & 0x3fU) == 1U)
+            ESP_LOGW(TAG, "AUDIO FORMAT rejected: unauthenticated %s SSRC "
+                          "0x%08" PRIx32 " at seq=%" PRIu32,
+                     payload_format->name, packet.ssrc, packet.seq);
+          continue;
+        }
+      }
+      if (!buffered_select_format(payload_format, &head, &decision, packet.rtp,
+                                    packets_played_in_sequence != 0,
+                                    seen_pcm_generation)) {
+        ap2_buffered_fifo_wait(s.transport, AP2_NO_TIMING_WAIT_MS);
+        continue;
+      }
+      const airplay_audio_format_t *previous =
+          airplay_audio_format_by_ssrc(current_ssrc);
+      ESP_LOGI(TAG, "AUDIO FORMAT %s -> %s; SSRC 0x%08" PRIx32
+                    " -> 0x%08" PRIx32 ", seq=%" PRIu32 ", block=%d frames",
+               previous ? previous->name : "SETUP/initial",
+               payload_format->name, current_ssrc, packet.ssrc,
+               packet.seq, payload_format->frame_size);
+      current_ssrc = packet.ssrc;
+      playback_announced = false;
+      unsupported_skipped = 0;
+      if (decoder) { aac_decoder_destroy(decoder); decoder = NULL; }
+      if (alac) { alac_decoder_destroy(alac); alac = NULL; }
+      decoder_format_generation = 0;
     }
 
     snapshot_state(&snap);
@@ -2211,11 +2249,12 @@ static void ap2_buffered_processor_task(void *arg) {
      * A sequence-number gap alone is diagnostic; it does not rebuild or reset
      * the AAC decoder. */
     int32_t timestamp_difference = 0;
-    bool mute = packets_played_in_sequence == 0;
+    const bool is_aac = payload_format->codec_type == 4;
+    bool mute = is_aac && packets_played_in_sequence == 0;
     if (packets_played_in_sequence != 0) {
       timestamp_difference = rtp_delta(packet.rtp, expected_timestamp);
       if (timestamp_difference != 0) {
-        mute = true;
+        mute = is_aac;
 #if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
         {
           buffered_control_snapshot_t fc = {0};
@@ -2228,12 +2267,12 @@ static void ap2_buffered_processor_task(void *arg) {
                         " | lead %ld ms | flush imm=%d deferred=%" PRIu32
                         " | too old so far %" PRIu32 ", late dropped %" PRIu32,
                    timestamp_difference,
-                   (double)timestamp_difference * 1000.0 / 44100.0,
+                   (double)timestamp_difference * 1000.0 / sr,
                    am_last_published_seq, packet.seq,
                    seq23_delta(packet.seq, am_last_published_seq),
                    expected_timestamp, packet.rtp,
                    now_valid ? (long)((int64_t)rtp_delta(packet.rtp, now_rtp) *
-                                      1000LL / 44100LL) : -1L,
+                                      1000LL / sr) : -1L,
                    fc.immediate_active ? 1 : 0, (uint32_t)fc.deferred_requests,
                    too_old_skipped, am_late_dropped);
         }
@@ -2278,16 +2317,29 @@ static void ap2_buffered_processor_task(void *arg) {
       }
     }
 
-    if (!decoder || decoder_format_generation != snap.format_generation) {
+    if ((!decoder && !alac) ||
+        decoder_format_generation != snap.format_generation) {
       if (decoder) aac_decoder_destroy(decoder);
+      if (alac) alac_decoder_destroy(alac);
       decoder = NULL;
-      aac_decoder_config_t cfg = {
-          .sample_rate = snap.format.sample_rate,
-          .channels = ap2_ssrc_aac_channels(current_ssrc),
-          .bits_per_sample = snap.format.bits_per_sample,
-      };
-      decoder = aac_decoder_create(&cfg);
-      if (!decoder) {
+      alac = NULL;
+      if (is_aac) {
+        aac_decoder_config_t cfg = {
+            .sample_rate = payload_format->sample_rate,
+            .channels = payload_format->channels,
+            .bits_per_sample = 16,
+        };
+        decoder = aac_decoder_create(&cfg);
+      } else {
+        alac_decoder_config_t cfg = {
+            .sample_rate = payload_format->sample_rate,
+            .channels = payload_format->channels,
+            .bits_per_sample = payload_format->bits_per_sample,
+            .frame_size = payload_format->frame_size,
+        };
+        alac = alac_decoder_create(&cfg);
+      }
+      if (!decoder && !alac) {
         vTaskDelay(1);
         continue; /* keep the FIFO head and retry */
       }
@@ -2297,37 +2349,54 @@ static void ap2_buffered_processor_task(void *arg) {
     if (buffered_consume_head(&head, &decision, s.buffered_packet) != ESP_OK)
       continue; /* new control command or transport epoch: inspect again */
 
-    const int dec_len = audio_crypto_decrypt_buffered(
-        &session_encrypt, s.buffered_packet, packet.len,
-        s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
+    const bool already_authenticated = authenticated_valid &&
+        authenticated_head.read_serial == head.read_serial &&
+        authenticated_head.stream_epoch == head.stream_epoch;
+    const int dec_len = already_authenticated ? authenticated_len :
+        audio_crypto_decrypt_buffered(
+            &session_encrypt, s.buffered_packet, packet.len,
+            s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM, AP2_PACKET_MAX);
+    authenticated_valid = false;
     if (dec_len == 0) {
       if ((++empty_blocks & 0x3FU) == 1U)
-        AP_LOGI(TAG, "AAC empty block seq=%lu len=%u (skipped, total %lu)",
-                 (unsigned long)packet.seq, (unsigned)packet.len,
+        AP_LOGI(TAG, "%s empty block seq=%lu len=%u (skipped, total %lu)",
+                 payload_format->codec, (unsigned long)packet.seq, (unsigned)packet.len,
                  (unsigned long)empty_blocks);
       continue;
     }
     if (dec_len < 0) {
       aevt_post(AEVT_AAC_LOST, "decrypt-error", (int32_t)packet.seq, 0, 0, 0);
       if ((++decrypt_failures & 0x3FU) == 1U)
-        AP_LOGW(TAG, "AAC decrypt/auth failed seq=%lu rtp=%lu len=%u (%lu total)",
-                 (unsigned long)packet.seq, (unsigned long)packet.rtp,
+        AP_LOGW(TAG, "%s decrypt/auth failed seq=%lu rtp=%lu len=%u (%lu total)",
+                 payload_format->codec, (unsigned long)packet.seq, (unsigned long)packet.rtp,
                  (unsigned)packet.len, (unsigned long)decrypt_failures);
       continue;
     }
 
-    aac_decode_info_t info = {0};
-    const int frames = aac_decoder_decode(
-        decoder, s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM,
-        (size_t)dec_len, s.decode_pcm, AP2_PCM_CAPACITY_FRAMES, &info);
-    if (frames <= 0) {
-      /* Shairport keeps the FFmpeg decoder chain after a bad AAC packet. The
-       * missing timestamp is enough to mute the first packet that decodes
-       * successfully afterwards. */
+    int channels = 2;
+    int frames;
+    if (is_aac) {
+      aac_decode_info_t info = {0};
+      frames = aac_decoder_decode(
+          decoder, s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM,
+          (size_t)dec_len, s.decode_pcm, AP2_PCM_CAPACITY_FRAMES, &info);
+      channels = info.channels;
+      if (frames > 0 && channels == 2)
+        audio_pcm16_to_float_block(s.decode_pcm, s.pcm_f32,
+                                   (size_t)frames * 2U);
+    } else {
+      alac_decode_info_t info = {0};
+      frames = alac_decoder_decode_float(
+          alac, s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM,
+          (size_t)dec_len, s.pcm_f32, AP2_PCM_CAPACITY_FRAMES, &info);
+      channels = info.channels;
+    }
+    if (frames <= 0 || frames > payload_format->frame_size || channels != 2) {
       aevt_post(AEVT_AAC_LOST, "decode-error", (int32_t)packet.seq, 0, 0, 0);
       if ((++decode_failures & 0x3FU) == 1U)
-        AP_LOGW(TAG, "AAC decode failed at seq=%lu (%lu total); decoder kept",
-                 (unsigned long)packet.seq, (unsigned long)decode_failures);
+        AP_LOGW(TAG, "%s decode failed at seq=%lu (%lu total); packet dropped",
+                 payload_format->codec, (unsigned long)packet.seq,
+                 (unsigned long)decode_failures);
       continue;
     }
 
@@ -2355,16 +2424,19 @@ static void ap2_buffered_processor_task(void *arg) {
                   timestamp_difference, lead_ms);
       }
       memset(s.pcm_f32, 0,
-             (size_t)frames * (size_t)info.channels * sizeof(float));
-    } else {
-      /* 16-bit decoder output -> float; from here to DMA it stays float. */
-      audio_pcm16_to_float_block(s.decode_pcm, s.pcm_f32,
-                                 (size_t)frames * (size_t)info.channels);
+             (size_t)frames * (size_t)channels * sizeof(float));
     }
     const pcm_store_result_t stored = pcm_store_with_backpressure(
-        packet.rtp, s.pcm_f32, (size_t)frames, info.channels,
+        packet.rtp, s.pcm_f32, (size_t)frames, channels,
         snap.pcm_generation, packet.seq, packet.stream_epoch);
     if (stored == PCM_STORE_PUBLISHED) {
+      if (!playback_announced) {
+        if (payload_format->channels == 2)
+          audio_log_stereo_playback(TAG, payload_format->codec,
+                                    payload_format->sample_rate,
+                                    payload_format->bits_per_sample, "buffered");
+        playback_announced = true;
+      }
       expected_timestamp = packet.rtp + (uint32_t)frames;
       packets_played_in_sequence++;
 #if defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
@@ -2383,7 +2455,7 @@ static void ap2_buffered_processor_task(void *arg) {
                       "pcm_gen %s)",
                  packet.seq, packet.rtp,
                  now_valid ? (long)((int64_t)rtp_delta(packet.rtp, now_rtp) *
-                                    1000LL / 44100LL) : -1L,
+                                    1000LL / sr) : -1L,
                  ds.playing ? 1 : 0, ds.anchor_valid ? 1 : 0,
                  ds.pcm_generation == snap.pcm_generation ? "same" : "changed");
       }
@@ -2399,6 +2471,7 @@ static void ap2_buffered_processor_task(void *arg) {
   }
 
   if (decoder) aac_decoder_destroy(decoder);
+  if (alac) alac_decoder_destroy(alac);
   s.processor_task = NULL;
 #if AP2_PROCESS_STACK_PSRAM
   vTaskDeleteWithCaps(NULL);
@@ -2851,7 +2924,8 @@ static bool playout_keep_running_stop(const char *reason, bool *idle_zeros) {
   if (!*idle_zeros) {
     aevt_post(AEVT_I2S_IDLE, reason ? reason : "unknown",
               (int32_t)__atomic_load_n(&s.generation, __ATOMIC_RELAXED),
-              (int32_t)(((uint64_t)faded_frames * 1000ULL) / 44100ULL), 0, 0);
+              (int32_t)(((uint64_t)faded_frames * 1000ULL) /
+                        audio_playout_get_rate()), 0, 0);
     *idle_zeros = true;
   }
   return true;
@@ -3099,12 +3173,7 @@ static void ap2_playout_task(void *arg) {
       state = PLAYOUT_STOPPED;
     }
 
-#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
     {
-      /* A new stream needs another I2S rate (realtime ALAC / stereo AAC at
-       * 44.1 kHz, 5.1/7.1 at 48 kHz): stop, reprogram the clock and start
-       * the next stream from a clean servo, before any of its audio is
-       * primed. The learned crystal ppm is kept (servo_seed_pending). */
       const uint32_t want_rate =
           __atomic_load_n(&s.i2s_rate_wanted, __ATOMIC_ACQUIRE);
       if (want_rate != 0U && want_rate != audio_playout_get_rate()) {
@@ -3133,7 +3202,6 @@ static void ap2_playout_task(void *arg) {
         state = PLAYOUT_STOPPED;
       }
     }
-#endif
 
     const bool flush_requested =
         __atomic_exchange_n(&s.i2s_flush_requested, false, __ATOMIC_ACQ_REL);
@@ -3184,6 +3252,8 @@ static void ap2_playout_task(void *arg) {
 
     timing_snapshot_t snap;
     refresh_timing_snapshot(&snap);
+    if (snap.format.sample_rate > 0 &&
+        (uint32_t)snap.format.sample_rate != audio_playout_get_rate()) continue;
     process_i2s_completions(&snap);
 
     uint32_t desired_rtp = 0;
@@ -3751,9 +3821,13 @@ static void ap2_playout_task(void *arg) {
         aevt_post(AEVT_SILENCE_BEGIN, NULL, (int32_t)cursor_rtp, 0, 0, 0);
     } else if (zero_blocks != 0U) {
       aevt_post(AEVT_SILENCE_END, NULL, (int32_t)cursor_rtp,
-                (int32_t)zero_blocks, 0, 0);
+                (int32_t)zero_blocks, snap.format.sample_rate, 0);
       zero_blocks = 0;
     }
+    timing_snapshot_t current;
+    snapshot_state(&current);
+    if (current.generation != snap.generation ||
+        current.format_generation != snap.format_generation) continue;
     const audio_out_sample_t *out_block =
         output_stage(block, AUDIO_PLAYOUT_FRAMES, snap.format.sample_rate,
                      volume_current_q15);
@@ -4313,26 +4387,38 @@ void audio_receiver_set_format(const audio_format_t *f) {
   if (!f) {
     return;
   }
+  if (f->sample_rate > 0) audio_eq_prepare(f->sample_rate);
   taskENTER_CRITICAL(&s.state_mux);
+  const audio_format_t previous = s.format;
   s.format = *f;
   s.format_generation++;
   if (s.format_generation == 0) {
     s.format_generation = 1;
   }
-  taskEXIT_CRITICAL(&s.state_mux);
-  AP_LOGI(TAG, "FORMAT codec=%s sr=%d ch=%d bits=%d frame=%d",
-           f->codec, f->sample_rate, f->channels, f->bits_per_sample,
-           f->frame_size);
-  /* EQ runs on the playout task, which never logs or does one-off work. */
-  if (f->sample_rate > 0) audio_eq_prepare(f->sample_rate);
-#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
-  /* The playout task switches I2S to this stream's rate before playing it. */
   if (f->sample_rate == 44100 || f->sample_rate == 48000) {
     __atomic_store_n(&s.i2s_rate_wanted, (uint32_t)f->sample_rate,
                      __ATOMIC_RELEASE);
-    media_control_wake();
   }
-#endif
+  taskEXIT_CRITICAL(&s.state_mux);
+  if (strcmp(previous.codec, f->codec) != 0 ||
+      previous.sample_rate != f->sample_rate ||
+      previous.bits_per_sample != f->bits_per_sample ||
+      previous.channels != f->channels || previous.frame_size != f->frame_size)
+    ESP_LOGI(TAG, "AUDIO PIPELINE %s/%d Hz/%d-bit/%d ch/%d frames -> "
+                  "%s/%d Hz/%d-bit/%d ch/%d frames",
+             previous.codec[0] ? previous.codec : "none", previous.sample_rate,
+             previous.bits_per_sample, previous.channels, previous.frame_size,
+             f->codec, f->sample_rate, f->bits_per_sample, f->channels,
+             f->frame_size);
+  media_control_wake();
+  audio_status_notify();
+}
+
+uint32_t audio_receiver_get_sample_rate(void) {
+  taskENTER_CRITICAL(&s.state_mux);
+  const int rate = s.format.sample_rate;
+  taskEXIT_CRITICAL(&s.state_mux);
+  return rate > 0 ? (uint32_t)rate : AUDIO_PIPELINE_RATE_HZ;
 }
 
 void audio_receiver_set_encryption(const audio_encrypt_t *e) {
@@ -4357,11 +4443,13 @@ void audio_receiver_set_stream_type(audio_stream_type_t t) {
 esp_err_t audio_receiver_start_buffered(uint16_t port) {
   timing_snapshot_t fmt_snap;
   snapshot_state(&fmt_snap);
-  if (strcmp(fmt_snap.format.codec, "AAC") != 0 ||
-      !(fmt_snap.format.sample_rate == 44100 ||
-        fmt_snap.format.sample_rate == (int)AUDIO_PIPELINE_RATE_HZ) ||
-      fmt_snap.format.channels != 2 ||
-      fmt_snap.format.bits_per_sample != 16 || fmt_snap.format.frame_size != 1024) {
+  const int codec_type = strcmp(fmt_snap.format.codec, "AAC") == 0 ? 4 :
+      strcmp(fmt_snap.format.codec, "ALAC") == 0 ? 2 : -1;
+  if (!airplay_audio_format_resolve(AUDIO_STREAM_BUFFERED, 0, codec_type,
+                                    fmt_snap.format.sample_rate,
+                                    fmt_snap.format.frame_size,
+                                    fmt_snap.format.bits_per_sample,
+                                    fmt_snap.format.channels)) {
     ESP_LOGE(TAG,
              "Buffered format rejected codec=%s sr=%d ch=%d bits=%d frame=%d",
              fmt_snap.format.codec, fmt_snap.format.sample_rate,
@@ -4907,6 +4995,16 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   uint32_t gen;
   bool committed;
   taskENTER_CRITICAL(&s.state_mux);
+  if (s.stream_type == AUDIO_STREAM_BUFFERED && s.anchor_valid &&
+      !s.timeline_reset_pending && s.buffered_sender_anchor_valid &&
+      s.buffered_sender_anchor_clock_id == clock_id &&
+      s.buffered_sender_anchor_ptp_ns == ptp_ns &&
+      s.buffered_sender_anchor_rtp == rtp) {
+    taskEXIT_CRITICAL(&s.state_mux);
+    xSemaphoreGive(s.publish_mutex);
+    xSemaphoreGive(s_buffered_control.mutex);
+    return;
+  }
   committed = s.timeline_reset_pending;
   gen = commit_anchor_epoch_locked();
   s.media_revision = next_generation(s.media_revision);
@@ -4918,6 +5016,12 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t ptp_ns,
   s.anchor_local_update_us = local_update_us;
   s.anchor_local_valid = local_valid;
   s.anchor_rtp = rtp;
+  if (s.stream_type == AUDIO_STREAM_BUFFERED) {
+    s.buffered_sender_anchor_valid = true;
+    s.buffered_sender_anchor_clock_id = clock_id;
+    s.buffered_sender_anchor_ptp_ns = ptp_ns;
+    s.buffered_sender_anchor_rtp = rtp;
+  }
   s.rt_media_rebase_valid = false;
   s.rt_media_rebase_clock_id = 0;
   s.rt_media_rebase_epoch = 0;

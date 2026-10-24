@@ -112,7 +112,7 @@ void mdns_airplay_init(void) {
   // ========================================
   mdns_txt_item_t raop_txt[] = {
       {"am", AIRPLAY_MODEL},
-      {"cn", "0,1,2,3"},              // Audio codecs: PCM, ALAC, AAC, AAC-ELD
+      {"cn", "1,2"},
       {"da", "true"},                 // Digest auth
       {"et", "0,3,5"},                // Encryption types: none, FairPlay, MFi-SAP
       {"ft", features_str},           // Features (same as airplay)

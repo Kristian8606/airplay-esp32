@@ -29,20 +29,23 @@
 /* GET /info "supportedFormats": bit N = AirPlay audio format N, as in
  * Shairport Sync generateInfoPlist(). The sender echoes its pick back as
  * "audioFormat" in the SETUP stream dict.
- * EXPERIMENT (CONFIG_AIRPLAY_MULTICHANNEL): 48 kHz 5.1/7.1 is offered next to
- * 44.1 kHz stereo; I2S switches rate per stream (44.1 kHz also for realtime
- * ALAC). */
+ */
 #define AIRPLAY_FMT_ALAC_44100_S16_2 (1ULL << 18) /* 0x40000 */
+#define AIRPLAY_FMT_ALAC_48000_S24_2 (1ULL << 21)
 #define AIRPLAY_FMT_AAC_LC_44100_2   (1ULL << 22)
+#define AIRPLAY_FMT_AAC_LC_48000_2   (1ULL << 23)
 #define AIRPLAY_FMT_AAC_LC_48000_5_1 (1ULL << 39)
 #define AIRPLAY_FMT_AAC_LC_48000_7_1 (1ULL << 40)
 #define AIRPLAY_SUPPORTED_AUDIO_STREAM AIRPLAY_FMT_ALAC_44100_S16_2
+#define AIRPLAY_SUPPORTED_STEREO_BUFFER_STREAM                    \
+  (AIRPLAY_FMT_ALAC_44100_S16_2 | AIRPLAY_FMT_ALAC_48000_S24_2 |    \
+   AIRPLAY_FMT_AAC_LC_44100_2 | AIRPLAY_FMT_AAC_LC_48000_2)
 #if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
 #define AIRPLAY_SUPPORTED_BUFFER_STREAM                          \
-  (AIRPLAY_FMT_AAC_LC_44100_2 | AIRPLAY_FMT_AAC_LC_48000_5_1 | \
+  (AIRPLAY_SUPPORTED_STEREO_BUFFER_STREAM | AIRPLAY_FMT_AAC_LC_48000_5_1 | \
    AIRPLAY_FMT_AAC_LC_48000_7_1)
 #else
-#define AIRPLAY_SUPPORTED_BUFFER_STREAM AIRPLAY_FMT_AAC_LC_44100_2
+#define AIRPLAY_SUPPORTED_BUFFER_STREAM AIRPLAY_SUPPORTED_STEREO_BUFFER_STREAM
 #endif
 
 /* Pairing identity UUID ("pi" in mDNS and GET /info), lowercase

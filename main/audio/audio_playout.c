@@ -39,9 +39,7 @@ static void live_dither_step(void);
 
 #define I2S_DMA_DESC_NUM  AUDIO_PLAYOUT_DMA_BLOCKS
 #define I2S_DMA_FRAME_NUM AUDIO_PLAYOUT_FRAMES
-/* Rate the channel is created with. In the multichannel build the playout
- * task switches it per stream (44.1 kHz realtime ALAC / stereo AAC, 48 kHz
- * 5.1/7.1 AAC) with audio_playout_set_rate(); s_rate_hz is the current one. */
+/* Initial rate; the playout task switches it to the active stream's rate. */
 #define I2S_RATE_HZ       AUDIO_PIPELINE_RATE_HZ
 #define I2S_MIN_RATE_HZ   44100U
 /* Every descriptor holds one tagged block, plus the batch being written. */
@@ -800,6 +798,7 @@ esp_err_t audio_playout_set_rate(uint32_t rate_hz) {
   if (rate_hz == s_rate_hz) {
     return ESP_OK;
   }
+  const uint32_t previous_rate = s_rate_hz;
   /* The clock can only be reprogrammed in READY: stop and drop the queue. */
   esp_err_t err = audio_playout_flush();
   if (err != ESP_OK) {
@@ -823,8 +822,8 @@ esp_err_t audio_playout_set_rate(uint32_t rate_hz) {
     s_nominal_mclk_hz = rate_hz * 256U;
   }
   live_tune_init();
-  ESP_LOGW(TAG, "I2S rate now %u Hz, MCLK=%" PRIu32 " Hz", (unsigned)rate_hz,
-           s_nominal_mclk_hz);
+  ESP_LOGI(TAG, "I2S RATE %u -> %u Hz, MCLK=%" PRIu32 " Hz",
+           (unsigned)previous_rate, (unsigned)rate_hz, s_nominal_mclk_hz);
   return ESP_OK;
 }
 

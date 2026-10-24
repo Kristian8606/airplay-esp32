@@ -532,3 +532,20 @@ esp_err_t ap2_buffered_fifo_read_head(ap2_buffered_fifo_t *fifo,
   if (!block_storage) return ESP_ERR_INVALID_ARG;
   return fifo_consume_head(fifo, head, block_storage, block_capacity);
 }
+
+esp_err_t ap2_buffered_fifo_copy_head(ap2_buffered_fifo_t *fifo,
+                                      const ap2_buffered_fifo_head_t *head,
+                                      uint8_t *block_storage,
+                                      size_t block_capacity) {
+  if (!fifo || !head || !block_storage || head->wire_len < FIFO_MIN_WIRE_LEN)
+    return ESP_ERR_INVALID_ARG;
+  if ((size_t)head->wire_len - 2U > block_capacity)
+    return ESP_ERR_INVALID_SIZE;
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  const bool valid = fifo_head_is_current_locked(fifo, head);
+  if (valid)
+    fifo_copy_at(fifo, (fifo->read_pos + 2U) % fifo->capacity,
+                 block_storage, (size_t)head->wire_len - 2U);
+  xSemaphoreGive(fifo->fifo_mutex);
+  return valid ? ESP_OK : ESP_ERR_INVALID_STATE;
+}

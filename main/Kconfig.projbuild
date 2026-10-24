@@ -82,9 +82,9 @@ menu "Multichannel Experiment"
             EXPERIMENT. Also advertise AAC-LC 48 kHz 5.1 and 7.1 for buffered
             audio and play a single channel of such a stream on both I2S
             slots (decoded with Fraunhofer FDK AAC). Stereo AAC and realtime
-            (type 96) ALAC still play normally: I2S switches its rate per
-            stream, 44.1 kHz for those and 48 kHz for 5.1/7.1, with a short
-            silence at each switch.
+            (type 96) ALAC still play normally. Buffered stereo supports
+            AAC at 44.1/48 kHz and ALAC at 44.1 kHz/16-bit or 48 kHz/24-bit.
+            I2S follows the input rate, with a short silence at each switch.
 
     choice AIRPLAY_MULTICHANNEL_SPEAKER
         prompt "Default speaker this receiver plays"
@@ -226,8 +226,9 @@ menu "AirPlay Logs and Diagnostics"
             actions.
             When off, these calls are not compiled at all, so no running
             RTSP/PTP/audio function spends time formatting or printing them.
-            Start-up messages, the 2-second audio_status line, SERVO CENTER
-            and all errors are always logged.
+            Start-up messages, NOW PLAYING format/speaker warnings, the
+            2-second audio_status line, SERVO CENTER and all errors are
+            always logged.
 
     config AIRPLAY_LOG_AUDIO_EVENTS
         bool "Log every audible audio event (I2S stop/start, silence, mutes)"
@@ -260,7 +261,9 @@ menu "AirPlay Logs and Diagnostics"
             the play lock, and the readable strings found in the body) and one
             "RTSP RSP" line for each answer. Used to see exactly what the
             sender does around an AutoMix transition or a pause. Turn off when
-            not needed.
+            not needed. This single option controls all RTSP REQ and RTSP RSP
+            lines, including feedback, command, SET_PARAMETER and progress.
+            Disabling it does not disable the requests or playback warnings.
 
     config AIRPLAY_DIAG_PLAYOUT
         bool "Playout diagnostics (DMA underruns, holes, silence, re-primes)"

@@ -15,6 +15,9 @@ struct alac_decoder {
   alac_decoder_config_t config;
   void *handle;
   uint32_t decode_errors;
+  uint8_t *pcm;
+  uint32_t pcm_size;
+  esp_audio_dec_info_t info;
   uint8_t cookie[ALAC_COOKIE_LEN];
 };
 
@@ -73,7 +76,11 @@ static bool open_decoder(alac_decoder_t *d) {
 
 alac_decoder_t *alac_decoder_create(const alac_decoder_config_t *config) {
   if (!config || config->sample_rate <= 0 || config->channels <= 0 ||
-      config->bits_per_sample <= 0 || config->frame_size <= 0) {
+      config->channels > 8 ||
+      (config->bits_per_sample != 16 && config->bits_per_sample != 24) ||
+      config->frame_size <= 0 ||
+      (size_t)config->frame_size >
+          UINT32_MAX / ((size_t)config->channels * config->bits_per_sample)) {
     return NULL;
   }
 
@@ -82,6 +89,13 @@ alac_decoder_t *alac_decoder_create(const alac_decoder_config_t *config) {
     return NULL;
   }
   d->config = *config;
+  d->pcm_size = (uint32_t)((size_t)config->frame_size * config->channels *
+                           (config->bits_per_sample / 8));
+  d->pcm = malloc(d->pcm_size);
+  if (!d->pcm) {
+    alac_decoder_destroy(d);
+    return NULL;
+  }
   if (!open_decoder(d)) {
     alac_decoder_destroy(d);
     return NULL;
@@ -96,19 +110,20 @@ void alac_decoder_destroy(alac_decoder_t *d) {
   if (d->handle) {
     esp_alac_dec_close(d->handle);
   }
+  free(d->pcm);
   free(d);
 }
 
-int alac_decoder_decode(alac_decoder_t *d, const uint8_t *input,
-                        size_t input_len, int16_t *output,
-                        size_t output_capacity_frames,
-                        alac_decode_info_t *info) {
-  if (!d || !d->handle || !input || input_len == 0 || !output ||
+static int decode_pcm(alac_decoder_t *d, const uint8_t *input,
+                      size_t input_len, size_t output_capacity_frames,
+                      alac_decode_info_t *info) {
+  if (!d || !d->handle || !input || input_len == 0 || input_len > UINT32_MAX ||
       output_capacity_frames == 0) {
     return -1;
   }
 
-  const int channels = d->config.channels > 0 ? d->config.channels : 2;
+  const size_t frame_bytes =
+      (size_t)d->config.channels * (d->config.bits_per_sample / 8);
   esp_audio_dec_in_raw_t raw = {
       .buffer = (uint8_t *)input,
       .len = (uint32_t)input_len,
@@ -116,13 +131,27 @@ int alac_decoder_decode(alac_decoder_t *d, const uint8_t *input,
       .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
   };
   esp_audio_dec_out_frame_t frame = {
-      .buffer = (uint8_t *)output,
-      .len = (uint32_t)(output_capacity_frames * (size_t)channels * sizeof(int16_t)),
+      .buffer = d->pcm,
+      .len = d->pcm_size,
       .decoded_size = 0,
   };
-  esp_audio_dec_info_t dec_info = {0};
+  esp_audio_dec_info_t dec_info = d->info;
 
   esp_audio_err_t err = esp_alac_dec_decode(d->handle, &raw, &frame, &dec_info);
+  if (err == ESP_AUDIO_ERR_OK) {
+    if (dec_info.channel != d->config.channels ||
+        dec_info.sample_rate != (uint32_t)d->config.sample_rate ||
+        dec_info.bits_per_sample != d->config.bits_per_sample) {
+      err = ESP_AUDIO_ERR_INVALID_PARAMETER;
+    } else {
+      d->info = dec_info;
+      if (raw.consumed != input_len || frame.decoded_size > d->pcm_size ||
+          frame.decoded_size % frame_bytes != 0 ||
+          frame.decoded_size / frame_bytes > output_capacity_frames) {
+        err = ESP_AUDIO_ERR_INVALID_PARAMETER;
+      }
+    }
+  }
   if (err != ESP_AUDIO_ERR_OK) {
     if ((++d->decode_errors & 63U) == 1U)
       AP_LOGW(TAG, "decode error=%d; resetting ALAC decoder (%lu total)",
@@ -131,21 +160,55 @@ int alac_decoder_decode(alac_decoder_t *d, const uint8_t *input,
     return -1;
   }
 
-  int out_channels = dec_info.channel > 0 ? dec_info.channel : channels;
-  if (out_channels <= 0) {
-    out_channels = 2;
-  }
-  size_t frames = frame.decoded_size / ((size_t)out_channels * sizeof(int16_t));
-  if (frames > output_capacity_frames) {
-    frames = output_capacity_frames;
-  }
   if (info) {
-    info->channels = out_channels;
-    info->sample_rate = dec_info.sample_rate > 0 ? dec_info.sample_rate
-                                                 : d->config.sample_rate;
-    info->bits_per_sample = dec_info.bits_per_sample > 0
-                                ? dec_info.bits_per_sample
-                                : d->config.bits_per_sample;
+    info->channels = dec_info.channel;
+    info->sample_rate = (int)dec_info.sample_rate;
+    info->bits_per_sample = dec_info.bits_per_sample;
   }
-  return (int)frames;
+  return (int)(frame.decoded_size / frame_bytes);
+}
+
+int alac_decoder_decode(alac_decoder_t *d, const uint8_t *input,
+                        size_t input_len, int16_t *output,
+                        size_t output_capacity_frames,
+                        alac_decode_info_t *info) {
+  if (!d || d->config.bits_per_sample != 16 || !output) {
+    return -1;
+  }
+  int frames = decode_pcm(d, input, input_len, output_capacity_frames, info);
+  if (frames > 0) {
+    memcpy(output, d->pcm,
+           (size_t)frames * d->config.channels * sizeof(int16_t));
+  }
+  return frames;
+}
+
+int alac_decoder_decode_float(alac_decoder_t *decoder, const uint8_t *input,
+                              size_t input_len, float *output,
+                              size_t output_capacity_frames,
+                              alac_decode_info_t *info) {
+  if (!decoder || decoder->config.channels != 2 || !output) {
+    return -1;
+  }
+  int frames = decode_pcm(decoder, input, input_len, output_capacity_frames, info);
+  if (frames <= 0) {
+    return frames;
+  }
+
+  const size_t sample_bytes = (size_t)decoder->config.bits_per_sample / 8;
+  const float scale = sample_bytes == 3 ? 0x1p-23f : 0x1p-15f;
+  const int32_t sign = sample_bytes == 3 ? 0x800000 : 0x8000;
+  const uint8_t *sample_data = decoder->pcm;
+  for (size_t sample_index = 0; sample_index < (size_t)frames * 2;
+       ++sample_index, sample_data += sample_bytes) {
+    int32_t sample = (int32_t)sample_data[0] | ((int32_t)sample_data[1] << 8);
+    if (sample_bytes == 3) {
+      sample |= (int32_t)sample_data[2] << 16;
+    }
+    if (sample & sign) {
+      sample -= sign * 2;
+    }
+    output[sample_index] = (float)sample * scale;
+  }
+  return frames;
 }

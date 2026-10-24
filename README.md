@@ -11,10 +11,10 @@ over PTP like Apple's own speakers. Stereo AAC and ALAC still play normally.
 
 ## How it works
 
-1. In `GET /info` the receiver advertises, next to 44.1 kHz stereo AAC, the
-   AirPlay formats **AAC-LC 48 kHz 5.1** and **7.1** (`supportedFormats`, as
-   Shairport Sync does). For surround content the Apple TV then sends a
-   multichannel stream to every such receiver.
+1. In `GET /info` the receiver advertises stereo **ALAC 44.1 kHz/16-bit**,
+   **ALAC 48 kHz/24-bit**, **AAC-LC 44.1/48 kHz**, and, in multichannel builds,
+   **AAC-LC 48 kHz 5.1/7.1** (`supportedFormats`, as Shairport Sync does).
+   For surround content the Apple TV sends a multichannel stream to each receiver.
 2. The stream's AAC is decoded with **Fraunhofer FDK AAC** (the decoder in the
    ESP-IDF audio codec component handles mono/stereo only). A small FDK patch
    synthesizes only the speaker this board plays and outputs just that
@@ -23,12 +23,41 @@ over PTP like Apple's own speakers. Stereo AAC and ALAC still play normally.
 3. The chosen speaker goes to **both I2S slots** (L = R). EQ, loudness and the
    output filters work as usual, so a board can also drive a subwoofer with a
    low-pass filter.
-4. **I2S switches its rate per stream**: 48 kHz for 5.1/7.1, 44.1 kHz for
-   stereo AAC and realtime ALAC.
+4. **I2S follows the actual packet format**: 44.1 or 48 kHz for stereo,
+   48 kHz for surround, and 44.1 kHz for realtime ALAC. Buffered streams can
+   change codec, channels, depth and rate by SSRC without another SETUP.
 
 The rest is the base receiver: AirPlay 2 pairing, buffered (type 103) and
 realtime (type 96) streams, PTP timing with a live-tuned I2S clock, a web UI
 with EQ, loudness, latency and OTA.
+
+### Input formats
+
+| Transport | Codec | Rate | Input channels | Frames/packet |
+|---|---|---|---|---|
+| Realtime UDP (96) | ALAC 16-bit | 44.1 kHz | 2 | 352 |
+| Buffered TCP (103) | ALAC 16-bit | 44.1 kHz | 2 | 352 |
+| Buffered TCP (103) | ALAC 24-bit | 48 kHz | 2 | 352 |
+| Buffered TCP (103) | AAC-LC | 44.1 / 48 kHz | 2 | 1024 |
+| Buffered TCP (103), multichannel build | AAC-LC | 48 kHz | 6 / 8 | 1024 |
+
+ALAC 24-bit samples go directly to the float PCM pipeline without a 16-bit
+intermediate conversion; I2S uses 32-bit slots. AAC decoding currently produces
+16-bit PCM. Stereo builds advertise and play all four buffered stereo formats,
+but do not advertise surround without the FDK multichannel decoder.
+
+SETUP's `audioFormat` supplies omitted rate/depth/frame/channel information;
+explicitly conflicting fields are rejected. Actual buffered packet SSRC is
+authoritative afterwards. Codec/channel changes at the same rate preserve
+queued PCM. A rate change waits for its presentation boundary before retiring
+old-rate PCM and re-priming I2S. An established RTP/PTP map is interpreted at
+the active rate up to the transition packet, then rebased there to keep time
+continuous. Anchor refreshes/retransmissions do not change that policy. A new
+timeline after FLUSH, or the first SSRC, uses the sender anchor at the actual
+packet rate; anchor revisions alone cannot identify an encoding change.
+Format changes are authenticated before touching the pipeline. This is not a
+gapless resampler. Only AAC blocks are muted after startup or a timestamp
+discontinuity, not ALAC.
 
 ## Choosing the speaker
 
@@ -128,15 +157,36 @@ Useful lines in the serial or web log (`http://<board-ip>/logs`):
 
 | Line | Meaning |
 |---|---|
-| `SETUP audioFormat 0x10000000000 -> AAC-LC 48k 7.1` | the format the sender chose |
-| `incoming audio format "AAC 48000 5.1"` | what the packets actually carry (can differ from SETUP) |
-| `I2S rate now 48000 Hz` | the rate switch for this stream |
+| `W ... NOW PLAYING \| AAC-LC \| 48000 Hz \| 7.1 (8ch) \| 16-bit PCM \| Front Right (R) \| decoded #7 -> I2S L=R` | actual surround selection, logged when the decoder applies it |
+| `W ... NOW PLAYING \| ALAC \| 48000 Hz \| stereo (2ch) \| 24-bit PCM \| buffered \| surround selection inactive` | stereo format after successful PCM publication; surround selection does not extract a stereo channel |
+| `SETUP audioFormat=0x10000000000 -> AAC-LC 48000 Hz / 7.1` | the initial format the sender chose |
+| `AUDIO FORMAT ... -> ALAC 48000 Hz / 24-bit / stereo; SSRC ...` | actual input change, old/new SSRC and sequence |
+| `AUDIO PIPELINE ... -> ALAC/48000 Hz/24-bit/2 ch/352 frames` | old/new pipeline codec, rate, depth and block size |
+| `I2S RATE 44100 -> 48000 Hz` | the physical I2S clock has changed successfully |
+| `AUDIO RATE ANCHOR 44100 -> 48000 Hz, rebased at RTP=...` | timing continuity at the rate-change boundary |
 | `MC: decoded channel N = back #0 -> Rear Left (Lrs)` | channel layout of the stream |
 | `MC CPU … avg …% of one core` and `MC CPU stages …` | decode time per frame, split into parse / synthesis / output |
 | `audio_status: … pcm=…ms` | decoded audio queued for I2S; should stay near 850 ms |
 
 For RTSP-level debugging enable **AirPlay Logs and Diagnostics → Log every
 RTSP request and response** (verbose; turn it off afterwards).
+
+This single checkbox (`CONFIG_AIRPLAY_LOG_RTSP_REQUESTS`) controls all
+`RTSP REQ` / `RTSP RSP` lines, including `/feedback`, `/command`, metadata and
+progress requests. It is disabled by default. `NOW PLAYING` warnings remain
+visible with both this option and **Runtime event logs** off; they are emitted
+on stream start, input format changes or applied surround speaker changes,
+not for every packet. The periodic status also includes actual codec, rate and
+intermediate PCM bit depth. I2S slot width is a separate output setting.
+Each playback warning is framed by `================================================`
+on separate warning-level log lines, so the complete format and speaker remain
+easy to find in both serial and web logs.
+
+For hardware regression testing, try realtime screen/system audio, buffered
+44.1/48 kHz stereo AAC, lossless 48 kHz ALAC, and 5.1/7.1 speaker selection.
+Then change tracks/apps and AAC/lossless output without disconnecting AirPlay,
+including 44.1 → 48 → 44.1 kHz, pause/resume and seek. Check both `AUDIO FORMAT`
+and `I2S RATE` logs; a new SETUP is not required for an SSRC format change.
 
 ## Licenses
 
