@@ -948,6 +948,28 @@ aacDecoder_SetSynthChannel(const HANDLE_AACDECODER self,
                            const AUDIO_CHANNEL_TYPE type, const UCHAR index);
 
 /**
+ * \brief airplay-esp32 patch: a clock in microseconds. When set, every frame
+ *        records when synthesis started and ended (after parsing, before
+ *        output), readable with aacDecoder_GetSynthInfo().
+ */
+LINKSPEC_H AAC_DECODER_ERROR aacDecoder_SetTimeHook(const HANDLE_AACDECODER self,
+                                                  INT64 (*clock_us)(void));
+
+/**
+ * \brief airplay-esp32 patch: about the last aacDecoder_DecodeFrame().
+ * \param fastPath     1 if the single-channel output was used: pTimeData then
+ *                     holds only the aacDecoder_SetSynthChannel() channel,
+ *                     mono, CStreamInfo::frameSize samples (numChannels and
+ *                     the channel labels still describe the whole stream).
+ *                     0 for the normal interleaved output of all channels.
+ * \param synthStartUs / synthEndUs  clock values (see aacDecoder_SetTimeHook)
+ *                     at the start and end of synthesis.
+ */
+LINKSPEC_H AAC_DECODER_ERROR aacDecoder_GetSynthInfo(
+    const HANDLE_AACDECODER self, INT *fastPath, INT64 *synthStartUs,
+    INT64 *synthEndUs);
+
+/**
  * \brief              Get free bytes inside decoder internal buffer.
  * \param self         Handle of AAC decoder instance.
  * \param pFreeBytes   Pointer to variable receiving amount of free bytes inside

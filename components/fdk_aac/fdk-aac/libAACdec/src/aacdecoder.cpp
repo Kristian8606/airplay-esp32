@@ -3291,6 +3291,10 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
       aacDecoder_drcDisable(self->hDrcInfo);
     }
 
+    /* airplay-esp32 patch: parsing is done, synthesis starts here. */
+    self->synthPlane = -1;
+    if (self->timeHook) self->tSynthStart = self->timeHook();
+
     /* Create a reverse mapping table */
     UCHAR Reverse_chMapping[((8) * 2)];
     for (c = 0; c < aacChannels; c++) {
@@ -3357,15 +3361,16 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
         }
 
         /* airplay-esp32 patch: channels other than synthType/synthIndex were
-         * parsed above but get no concealment/DRC/filterbank, only silence. */
-        if (self->synthType != ACT_NONE && self->planeLabelsValid &&
-            !(self->planeType[outputChannel] == self->synthType &&
-              self->planeIndex[outputChannel] == self->synthIndex)) {
-          if (timeDataSize >= timeDataChannelOffset * self->aacChannels) {
-            FDKmemclear(pTimeData + offset,
-                        sizeof(PCM_DEC) * self->streamInfo.aacSamplesPerFrame);
+         * parsed above but get no concealment/DRC/filterbank. Their planes are
+         * not even cleared: the single-channel output in aacDecoder_DecodeFrame
+         * never reads them. Only if that fast output is not possible do they
+         * reach the output, as stale data, in channels nobody plays. */
+        if (self->synthType != ACT_NONE && self->planeLabelsValid) {
+          if (!(self->planeType[outputChannel] == self->synthType &&
+                self->planeIndex[outputChannel] == self->synthIndex)) {
+            continue;
           }
-          continue;
+          self->synthPlane = (SCHAR)outputChannel;
         }
 
         if (flags & AACDEC_FLUSH) {
@@ -3508,6 +3513,9 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
         }
       }
     }
+
+    /* airplay-esp32 patch: synthesis done. */
+    if (self->timeHook) self->tSynthEnd = self->timeHook();
 
     if (self->flags[streamIndex] & AC_USAC) {
       int bsPseudoLr = 0;

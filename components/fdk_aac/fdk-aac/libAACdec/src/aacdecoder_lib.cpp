@@ -671,6 +671,29 @@ bail:
 }
 
 /* airplay-esp32 patch: see aacdecoder_lib.h. */
+LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_SetTimeHook(const HANDLE_AACDECODER self,
+                                                    INT64 (*clock_us)(void)) {
+  if (self == NULL) {
+    return AAC_DEC_INVALID_HANDLE;
+  }
+  self->timeHook = clock_us;
+  return AAC_DEC_OK;
+}
+
+/* airplay-esp32 patch: see aacdecoder_lib.h. */
+LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_GetSynthInfo(
+    const HANDLE_AACDECODER self, INT *fastPath, INT64 *synthStartUs,
+    INT64 *synthEndUs) {
+  if (self == NULL) {
+    return AAC_DEC_INVALID_HANDLE;
+  }
+  if (fastPath) *fastPath = self->synthFastPath;
+  if (synthStartUs) *synthStartUs = self->tSynthStart;
+  if (synthEndUs) *synthEndUs = self->tSynthEnd;
+  return AAC_DEC_OK;
+}
+
+/* airplay-esp32 patch: see aacdecoder_lib.h. */
 LINKSPEC_CPP AAC_DECODER_ERROR
 aacDecoder_SetSynthChannel(const HANDLE_AACDECODER self,
                            const AUDIO_CHANNEL_TYPE type, const UCHAR index) {
@@ -1182,10 +1205,13 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
   PCM_AAC *pTimeData3;
   INT pcmLimiterScale = 0;
   INT interleaved = 0;
+  int synthFastOut = 0; /* airplay-esp32 patch: single-channel output */
 
   if (self == NULL) {
     return AAC_DEC_INVALID_HANDLE;
   }
+  self->synthFastPath = 0;
+  self->synthPlane = -1; /* set again by this frame's synthesis */
 
   if (flags & AACDEC_INTR) {
     self->streamInfo.numLostAccessUnits = 0;
@@ -1830,7 +1856,23 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
           }
         }
 
+        /* airplay-esp32 patch: when one channel was synthesized and nothing
+         * downstream needs the others (no SBR/MPS interleaving, no limiter,
+         * no DRC level normalization, plain AAC), skip pcmDmx (it would
+         * reorder and copy all planes) and output just that plane below.
+         * Channel labels are rebuilt by the next frame's parsing anyway. */
+        synthFastOut =
+            (self->synthType != ACT_NONE) && (self->synthPlane >= 0) &&
+            !interleaved && !self->limiterEnableCurr &&
+            !(self->flags[0] & (AC_USAC | AC_RSV603DA)) &&
+            !(self->hDrcInfo->enable &&
+              (self->hDrcInfo->applyExtGain ||
+               self->hDrcInfo->progRefLevelPresent == 1)) &&
+            (numAccessUnits == 1) &&
+            (self->streamInfo.frameSize == self->streamInfo.aacSamplesPerFrame);
+
         /* do PCM post processing */
+        if (!synthFastOut)
         dmxErr = pcmDmx_ApplyFrame(self->hPcmUtils, pTimeData2, timeData2Size,
                                    self->streamInfo.frameSize,
                                    &self->streamInfo.numChannels, interleaved,
@@ -1947,7 +1989,15 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
       goto bail;
     }
 
-    if (self->limiterEnableCurr) {
+    if (synthFastOut) {
+      /* airplay-esp32 patch: the synthesized plane only, mono, scaled exactly
+       * like the non-limiter path below scales every channel. */
+      scaleValuesSaturate(
+          pTimeData,
+          pTimeData2 + self->synthPlane * self->streamInfo.aacSamplesPerFrame,
+          self->streamInfo.frameSize, pcmLimiterScale);
+      self->synthFastPath = 1;
+    } else if (self->limiterEnableCurr) {
       /* use workBufferCore2 buffer for interleaving */
       PCM_LIM *pInterleaveBuffer;
       int blockLength = self->streamInfo.frameSize;

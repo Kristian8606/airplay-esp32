@@ -365,6 +365,16 @@ This structure is allocated once for each CPE. */
   UCHAR planeLabelsValid;
   AUDIO_CHANNEL_TYPE planeType[(8)];
   UCHAR planeIndex[(8)];
+  /* Plane synthesized for synthType/synthIndex this frame, -1 = none. When
+   * set (and nothing needs all channels: no SBR/MPS/limiter/DRC gain),
+   * aacDecoder_DecodeFrame() skips pcmDmx and writes only that plane, mono,
+   * to the output (synthFastPath = 1). See aacDecoder_GetSynthInfo(). */
+  SCHAR synthPlane;
+  UCHAR synthFastPath;
+  /* Optional clock (us) for per-stage timing of the last frame. */
+  INT64 (*timeHook)(void);
+  INT64 tSynthStart;
+  INT64 tSynthEnd;
 };
 
 #define AAC_DEBUG_EXTHLP \

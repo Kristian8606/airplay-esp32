@@ -58,6 +58,12 @@ struct aac_decoder {
   int64_t mc_time_sum_us;
   int64_t mc_time_max_us;
   uint32_t mc_time_frames;
+  /* Per stage (parse / synthesis / output) over the same window, and how
+   * many frames took FDK's single-channel output (local fdk-aac patch). */
+  int64_t mc_stage_sum_us[3];
+  int64_t mc_stage_max_us[3];
+  uint32_t mc_stage_frames;
+  uint32_t mc_fast_frames;
 #endif
 };
 
@@ -169,6 +175,9 @@ static void mc_publish_status(bool active, int channel, int channels,
   taskEXIT_CRITICAL(&s_mc_status_mux);
 }
 
+/* Clock for FDK's per-stage timestamps (local fdk-aac patch). */
+static INT64 mc_clock_us(void) { return (INT64)esp_timer_get_time(); }
+
 static bool open_fdk_decoder(aac_decoder_t *d) {
   mc_trace(MC_STAGE_OPEN, 0);
   d->fdk = aacDecoder_Open(TT_MP4_ADTS, 1);
@@ -191,6 +200,7 @@ static bool open_fdk_decoder(aac_decoder_t *d) {
   d->mc_applied_speaker = -2;
   d->mc_play_channel = -1;
   d->mc_lfe_index = -1;
+  aacDecoder_SetTimeHook(d->fdk, mc_clock_us);
   ESP_LOGW(TAG, "MC: FDK AAC decoder for %d Hz / %d ch (params 0x%x/0x%x/0x%x)",
            d->config.sample_rate, d->config.channels, e1, e2, e3);
   mc_trace(MC_STAGE_IDLE, 0);
@@ -353,9 +363,22 @@ static void mc_apply_speaker(aac_decoder_t *d) {
                     channel >= 0 ? d->mc_label[channel] : "mix");
 }
 
-static void mc_log_peaks(aac_decoder_t *d, int ch, size_t frames) {
+/* At the start of a stream and then every MC_TIMING_EVERY frames. In the
+ * single-channel fast path only the played channel is in mc_pcm (mono). */
+static void mc_log_peaks(aac_decoder_t *d, int ch, size_t frames, bool fast) {
   const uint32_t n = d->mc_decodes;
   if (n > 5 && (n % MC_TIMING_EVERY) != 0) return;
+  if (fast) {
+    int peak = 0;
+    for (size_t f = 0; f < frames; ++f) {
+      int v = d->mc_pcm[f];
+      if (v < 0) v = -v;
+      if (v > peak) peak = v;
+    }
+    ESP_LOGW(TAG, "MC #%lu: %u frames, fast path: channel %d only, peak %d",
+             (unsigned long)n, (unsigned)frames, d->mc_play_channel, peak);
+    return;
+  }
   char peaks[96];
   size_t pos = 0;
   peaks[0] = '\0';
@@ -379,13 +402,24 @@ static void mc_log_peaks(aac_decoder_t *d, int ch, size_t frames) {
   }
   ESP_LOGW(TAG, "MC #%lu: %u frames x %d ch, peaks[%s]", (unsigned long)n,
            (unsigned)frames, ch, peaks);
-  /* With one channel synthesized, every other channel must be silent. */
-  if (d->mc_play_channel >= 0 && played_peak == 0 && other_peak > 0)
-    ESP_LOGE(TAG, "MC: played channel %d is silent but channel %d has signal: "
-                  "synthesis hit the wrong channel", d->mc_play_channel,
-             other_channel);
+  /* Full output with one channel synthesized: the others are stale planes
+   * FDK no longer clears, so only flag a silent played channel when every
+   * channel is synthesized (mix) or the played one is plainly missing. */
+  if (d->mc_play_channel >= 0 && played_peak == 0 && other_peak > 0 &&
+      d->mc_applied_speaker == AAC_SPEAKER_MIX)
+    ESP_LOGE(TAG, "MC: played channel %d is silent but channel %d has signal",
+             d->mc_play_channel, other_channel);
 }
 
+static void mc_account_stage(aac_decoder_t *d, int stage, int64_t us) {
+  d->mc_stage_sum_us[stage] += us;
+  if (us > d->mc_stage_max_us[stage]) d->mc_stage_max_us[stage] = us;
+}
+
+/* Every MC_TIMING_EVERY frames: total decode time per frame against the
+ * frame budget, split into parse (bitstream + spectra of all channels),
+ * synthesis (concealment/DRC/IMDCT of the played channel) and output
+ * (channel reorder + PCM conversion). */
 static void mc_account_time(aac_decoder_t *d, int64_t us, int frame_size,
                             int sample_rate) {
   d->mc_time_sum_us += us;
@@ -401,9 +435,23 @@ static void mc_account_time(aac_decoder_t *d, int64_t us, int frame_size,
            (unsigned long)d->mc_time_frames, (long long)budget_us,
            budget_us > 0 ? (long long)(avg_us * 100 / budget_us) : -1LL,
            (unsigned)uxTaskGetStackHighWaterMark(NULL));
+  if (d->mc_stage_frames > 0) {
+    const int64_t n = d->mc_stage_frames;
+    ESP_LOGW(TAG, "MC CPU stages (avg/max us): parse %lld/%lld, synthesis "
+                  "%lld/%lld, output %lld/%lld; fast single-channel output "
+                  "%lu/%lu frames",
+             (long long)(d->mc_stage_sum_us[0] / n), (long long)d->mc_stage_max_us[0],
+             (long long)(d->mc_stage_sum_us[1] / n), (long long)d->mc_stage_max_us[1],
+             (long long)(d->mc_stage_sum_us[2] / n), (long long)d->mc_stage_max_us[2],
+             (unsigned long)d->mc_fast_frames, (unsigned long)d->mc_time_frames);
+  }
   d->mc_time_sum_us = 0;
   d->mc_time_max_us = 0;
   d->mc_time_frames = 0;
+  memset(d->mc_stage_sum_us, 0, sizeof(d->mc_stage_sum_us));
+  memset(d->mc_stage_max_us, 0, sizeof(d->mc_stage_max_us));
+  d->mc_stage_frames = 0;
+  d->mc_fast_frames = 0;
 }
 
 static int mc_decode(aac_decoder_t *d, const uint8_t *data, size_t len,
@@ -438,21 +486,34 @@ static int mc_decode(aac_decoder_t *d, const uint8_t *data, size_t len,
       si->frameSize <= 0) {
     return -1;
   }
+  INT fast = 0;
+  INT64 synth_start = 0, synth_end = 0;
+  aacDecoder_GetSynthInfo(d->fdk, &fast, &synth_start, &synth_end);
   if (!d->mc_layout_known) {
     mc_build_speaker_map(d, si);
-    mc_apply_speaker(d); /* narrows the mask from the next frame on */
+    mc_apply_speaker(d); /* narrows synthesis from the next frame on */
   }
   ++d->mc_decodes;
   mc_trace(MC_STAGE_IDLE, d->mc_decodes);
+  if (synth_start >= t0 && synth_end >= synth_start && t1 >= synth_end) {
+    mc_account_stage(d, 0, synth_start - t0);
+    mc_account_stage(d, 1, synth_end - synth_start);
+    mc_account_stage(d, 2, t1 - synth_end);
+    ++d->mc_stage_frames;
+  }
+  if (fast) ++d->mc_fast_frames;
   mc_account_time(d, t1 - t0, si->frameSize, si->sampleRate);
 
   const int ch = si->numChannels;
   size_t frames = (size_t)si->frameSize;
-  mc_log_peaks(d, ch, frames);
+  mc_log_peaks(d, ch, frames, fast != 0);
   if (frames > output_capacity_frames) frames = output_capacity_frames;
 
   const int pick = d->mc_play_channel;
-  if (ch >= 3 && pick >= 0 && pick < ch) {
+  if (fast) {
+    /* FDK wrote just the played channel, mono. */
+    mc_pick_channel(d->mc_pcm, 1, 0, frames, output);
+  } else if (ch >= 3 && pick >= 0 && pick < ch) {
     mc_pick_channel(d->mc_pcm, ch, pick, frames, output);
   } else if (ch >= 3) {
     mc_downmix_to_mono(d->mc_pcm, ch, d->mc_lfe_index, frames, output);
