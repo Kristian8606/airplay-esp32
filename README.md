@@ -1,3 +1,7 @@
+![ESP32 AirPlay 2 Surround — light setup](images/airplay-surround-light.png)
+
+![ESP32 AirPlay 2 Surround — home cinema](images/airplay-surround-dark.png)
+
 # esp32-airplay2-surround
 
 An **ESP32-S3 AirPlay 2 receiver that plays one speaker of a 5.1 / 7.1 stream**
