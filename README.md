@@ -2,37 +2,66 @@
 
 # esp32-airplay2-surround
 
-An **ESP32-S3 AirPlay 2 receiver that plays one speaker of a 5.1 / 7.1 stream**
-from an Apple TV. Give each board a position (Front Left, Centre, Subwoofer,
-Rear Right…) and several of them make a wireless surround system, kept in sync
-over PTP like Apple's own speakers. Stereo AAC and ALAC still play normally.
+**Wireless 5.1 / 7.1 surround from Apple TV, built from ESP32-S3 boards.**
+Each board is a full AirPlay 2 receiver that decodes the surround stream and
+plays **one speaker position** of it: Front Left, Centre, Subwoofer, Rear
+Right and so on. Put one board in every speaker, give each its position, and
+together they form a surround system that Apple TV keeps in sync over PTP,
+the same way it drives its own speakers. With ordinary stereo sources every
+board simply plays stereo.
 
-> **Status: experimental.** It works with an Apple TV (Apple Music in Dolby
-> Atmos → 7.1, HBO → 5.1, YouTube → stereo), but it is young: see
+> **Status: experimental.** Tested with an Apple TV: Apple Music in Dolby
+> Atmos arrives as 7.1, HBO as 5.1, YouTube as stereo. See
 > [Limitations](#limitations).
+
+## The idea
+
+Apple TV can send surround sound over AirPlay 2, but only to receivers that
+say they accept it. When it does, every receiver in the group gets the
+**whole** multichannel stream, not only its own part, and all receivers play
+each sample at the same moment because they share one PTP clock.
+
+This project uses exactly that. One ESP32-S3 board cannot drive eight
+speakers, and it does not need to: it only has to receive the full stream and
+play a single channel of it. So:
+
+- **Every board announces 5.1 and 7.1 AAC.** Apple TV then sends the
+  multichannel stream to all of them.
+- **Every board decodes only its own channel.** All channels are parsed, but
+  only the selected one is synthesised, which keeps the CPU load at about
+  40–50 % of one core instead of more than 100 %.
+- **Every board plays that channel on both outputs** of its DAC or amplifier
+  (L = R), so either output can drive the speaker, or both can feed an active
+  subwoofer or a pair of drivers in one cabinet.
+- **The boards never talk to each other.** Timing comes from Apple TV's PTP
+  clock, the same one AirPlay 2 uses for every multi-room group, so adding a
+  speaker is just adding another board to the AirPlay group.
+
+The speaker position is chosen in the board's web page and can be changed
+while music plays. Boards are cheap and independent, so you can start with a
+centre speaker and a subwoofer and add surrounds later.
 
 ## How it works
 
-1. In `GET /info` the receiver advertises stereo **ALAC 44.1 kHz/16-bit**,
-   **ALAC 48 kHz/24-bit**, **AAC-LC 44.1/48 kHz**, and, in multichannel builds,
-   **AAC-LC 48 kHz 5.1/7.1** (`supportedFormats`, as Shairport Sync does).
-   For surround content the Apple TV sends a multichannel stream to each receiver.
-2. All AAC, including mono/stereo in builds with surround disabled, is decoded
-   with **Fraunhofer FDK AAC** to signed32 PCM and directly normalized to
-   float32. For surround, a small FDK patch synthesizes only the speaker this
-   board plays and outputs just that channel, which keeps decoding at roughly
-   40 % of one core instead of over
-   100 %.
-3. The chosen speaker goes to **both I2S slots** (L = R). EQ, loudness and the
-   output filters work as usual, so a board can also drive a subwoofer with a
-   low-pass filter.
-4. **I2S follows the actual packet format**: 44.1 or 48 kHz for stereo,
-   48 kHz for surround, and 44.1 kHz for realtime ALAC. Buffered streams can
-   change codec, channels, depth and rate by SSRC without another SETUP.
+1. **Formats.** In `GET /info` the receiver advertises, in
+   `supportedFormats`, stereo **ALAC 44.1 kHz/16-bit** and **48 kHz/24-bit**,
+   stereo **AAC-LC 44.1 / 48 kHz**, and in multichannel builds **AAC-LC
+   48 kHz 5.1 and 7.1**. The sender picks one per stream.
+2. **Decoding.** All AAC is decoded with **Fraunhofer FDK AAC** to signed
+   32-bit PCM and converted straight to float. For 5.1/7.1 a small FDK patch
+   synthesises only the selected speaker and outputs just that channel.
+   ALAC is decoded with Espressif's ALAC decoder, 24-bit samples also going
+   straight to float.
+3. **Output.** The selected speaker goes to **both I2S slots** (L = R). EQ,
+   loudness and the output filters work as usual, so a board can drive a
+   subwoofer through a low-pass filter.
+4. **Rate.** I2S follows the stream: 44.1 or 48 kHz for stereo, 48 kHz for
+   surround, 44.1 kHz for realtime ALAC.
+5. **Sync.** Playback is timed from the sender's PTP clock with a live-tuned
+   I2S clock, so each board plays every sample at its scheduled time.
 
 The rest is the base receiver: AirPlay 2 pairing, buffered (type 103) and
-realtime (type 96) streams, PTP timing with a live-tuned I2S clock, a web UI
-with EQ, loudness, latency and OTA.
+realtime (type 96) streams, and a web UI with EQ, loudness, latency and OTA.
 
 ### Input formats
 
@@ -44,32 +73,30 @@ with EQ, loudness, latency and OTA.
 | Buffered TCP (103) | AAC-LC | 44.1 / 48 kHz | 2 | 1024 |
 | Buffered TCP (103), multichannel build | AAC-LC | 48 kHz | 6 / 8 | 1024 |
 
-ALAC 24-bit samples go directly to the float PCM pipeline without a 16-bit
-intermediate conversion. AAC uses FDK's signed32 output before 16-bit
-quantization, normalized by 2^31 directly into the same float32 pipeline for
-stereo, selected surround speakers and mono mixes. The FDK PCM limiter is
-disabled as required by this output API; DRC policy and gain are unchanged.
-FDK uses noise-substitution concealment without its default extra frame of
-interpolation delay, so each decoded block keeps its packet's RTP alignment.
-Float32 retains its normal precision (it is not lossless signed32 storage).
-I2S uses 32-bit data in 32-bit slots throughout. AirPlay's **F24 AAC** metadata
-describes the announced format profile, not a lossless source bit depth.
-Stereo builds advertise and play all four buffered stereo formats, but do
-not advertise surround unless multichannel support is enabled.
+Stereo builds advertise and play all four buffered stereo formats; surround is
+advertised only when multichannel support is enabled.
 
-SETUP's `audioFormat` supplies omitted rate/depth/frame/channel information;
-conflicting fields are rejected, except AAC `ss=16/24/32` compatibility hints
-(canonical F24 remains 24); ALAC depth remains strict. Actual buffered packet SSRC is
-authoritative afterwards. Codec/channel changes at the same rate preserve
-queued PCM. A rate change waits for its presentation boundary before retiring
-old-rate PCM and re-priming I2S. An established RTP/PTP map is interpreted at
-the active rate up to the transition packet, then rebased there to keep time
-continuous. Anchor refreshes/retransmissions do not change that policy. A new
-timeline after FLUSH, or the first SSRC, uses the sender anchor at the actual
-packet rate; anchor revisions alone cannot identify an encoding change.
-Format changes are authenticated before touching the pipeline. This is not a
-gapless resampler. Only AAC blocks are muted after startup or a timestamp
-discontinuity, not ALAC.
+**Precision.** ALAC 24-bit and AAC's 32-bit decoder output go into the float
+pipeline without a 16-bit step; I2S uses 32-bit samples. The FDK PCM limiter
+is off (the 32-bit output requires it); DRC is unchanged. AirPlay labels AAC
+as "F24": that describes the stream profile, not a lossless source depth.
+FDK uses noise-substitution concealment, which adds no extra frame of delay,
+so every decoded block stays aligned to its packet's RTP time.
+
+**Format changes.** SETUP's `audioFormat` fills in what the sender leaves out
+(rate, depth, block size, channels); conflicting fields are rejected. After
+that the format of each buffered packet, given by its SSRC, decides: the
+sender can switch codec, channels, depth or rate mid-stream without a new
+SETUP, for example between AAC and lossless ALAC.
+
+- A change of codec or channels at the same rate keeps the queued audio.
+- A change of rate waits until the new audio is due, then retires the
+  old-rate audio and restarts I2S at the new rate. The PTP/RTP time map is
+  rebased at that packet so the timeline stays continuous.
+- A packet that changes the format is authenticated before anything in the
+  pipeline changes.
+- This is not a gapless resampler: a rate change has a short gap. Only AAC
+  blocks are muted at a start or a timestamp jump, not ALAC.
 
 ## Choosing the speaker
 
@@ -224,9 +251,6 @@ and `I2S RATE` logs; a new SETUP is not required for an SSRC format change.
 
 - Based on [airplay-esp32](https://github.com/Kristian8606/airplay-esp32),
   the stereo AirPlay 2 receiver for the ESP32-S3.
-- [Shairport Sync](https://github.com/mikebrady/shairport-sync) as the
-  reference for AirPlay 2 behaviour, including the multichannel
-  `supportedFormats` advertisement.
 - [fdk-aac](https://github.com/mstorsjo/fdk-aac) for the standalone build of
   the Fraunhofer FDK AAC codec.
 
