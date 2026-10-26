@@ -101,9 +101,10 @@ amm-info@iis.fraunhofer.de
 *******************************************************************************/
 
 /* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
- * Library for Android, changed 2026-10-24 for esp32-airplay2-surround
+ * Library for Android, changed 2026-10-24 and 2026-10-26 for esp32-airplay2-surround
  * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
- * synthesis and output for 5.1/7.1 streams, and synthesis timestamps.
+ * synthesis and output for 5.1/7.1 streams, synthesis timestamps, and S32
+ * PCM output before the stock S16 rounding for every channel layout.
  * Every change is marked "airplay-esp32 patch"; the list is in
  * components/fdk_aac/MODIFICATIONS.md. */
 
@@ -1094,6 +1095,18 @@ LINKSPEC_H AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
                                                     INT_PCM *pTimeData,
                                                     const INT timeDataSize,
                                                     const UINT flags);
+
+/* airplay-esp32 patch, 2026-10-26: signed 32-bit PCM output taken before
+ * the standard INT_PCM/S16 rounding. Same flags, sample counts, channel order
+ * and selected-channel semantics as DecodeFrame. LONG is always 32 bits in
+ * FDK. The application must disable AAC_PCM_LIMITER_ENABLE: the stock limiter
+ * has an S16 output, so this API returns AAC_DEC_UNSUPPORTED_FORMAT rather
+ * than silently discarding precision. AAC-SLS output is also unsupported.
+ * This output precision does not describe the source precision of lossy AAC. */
+LINKSPEC_H AAC_DECODER_ERROR aacDecoder_DecodeFrame32(HANDLE_AACDECODER self,
+                                                       LONG *pTimeData,
+                                                       const INT timeDataSize,
+                                                       const UINT flags);
 
 /**
  * \brief       De-allocate all resources of an AAC decoder instance.

@@ -32,6 +32,24 @@ The single-channel output was checked on a host against the full decode:
 7.1 AAC from the FDK encoder decodes bit-identically through both paths for
 each of the 8 channels.
 
+## Changes (2026-10-26)
+
+`libAACdec/include/aacdecoder_lib.h` and `src/aacdecoder_lib.cpp` add
+`aacDecoder_DecodeFrame32()`. It shares the original decoder, history and control
+logic, but exports signed 32-bit PCM from `PCM_DEC` before the stock `INT_PCM`
+16-bit rounding. Both full interleaved output and single-channel synthesis use
+the same scaling as the original output. Full output retains the existing DRC
+normalization, channel mapping and saturation. Invalid output is cleared using
+the appropriate sample width, and null/nonpositive output buffers are rejected.
+The original S16 API remains available; `INT_PCM` and the library's other
+16-bit APIs have not been redefined.
+
+The new API requires the stock S16-output PCM limiter to be disabled and rejects
+AAC-SLS output; it never silently substitutes an upshifted S16 result. The
+application already disables the limiter and advertises AAC-LC. AAC is lossy:
+the output width describes decoder precision, not a recoverable original PCM
+bit depth. The ESP32 wrapper uses this API for stereo as well as surround.
+
 ## No patent license
 
 As `NOTICE` section 3 says, the FDK license grants no patent rights. AAC

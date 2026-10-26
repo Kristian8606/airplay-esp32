@@ -1,14 +1,9 @@
 # Fraunhofer FDK AAC decoder (fdk-aac v2.0.3, github.com/mstorsjo/fdk-aac),
 # decoder libraries only; see fdk-aac/NOTICE for the license.
 #
-# EXPERIMENT: used for 5.1/7.1 AAC, which esp_aac_dec (PacketVideo, stereo
-# only) cannot decode. Built only with CONFIG_AIRPLAY_MULTICHANNEL; otherwise
-# this registers an empty component so normal builds stay unchanged.
-
-if(NOT CONFIG_AIRPLAY_MULTICHANNEL)
-    idf_component_register()
-    return()
-endif()
+# Used for every AAC layout so stereo and surround both retain the internal
+# decoder precision through the S32 output API. Speaker selection remains
+# controlled by CONFIG_AIRPLAY_MULTICHANNEL in the application wrapper.
 
 set(FDK "${CMAKE_CURRENT_SOURCE_DIR}/fdk-aac")
 set(FDK_LIBS

@@ -2,9 +2,10 @@
 
 /* Sample formats of the playout chain.
  *
- * The decoders deliver 16-bit PCM. Right after decoding every sample becomes a
- * float with 1.0 = full scale, and the whole chain stays float: EQ, the PCM
- * FIFO, output volume and loudness. A float cannot overflow on the way, so
+ * AAC delivers signed32 PCM directly to float; buffered ALAC16/24 also
+ * decodes directly to float. Realtime ALAC16 retains its int16 staging.
+ * Every sample becomes a float with 1.0 = full scale, and the chain stays
+ * float: EQ, the PCM FIFO, output volume and loudness. There is ample headroom, so
  * there is no clipping or requantisation anywhere in between.
  *
  * The one and only conversion with saturation is the last step before DMA:
@@ -25,6 +26,13 @@
 typedef int32_t audio_out_sample_t;
 
 #define AUDIO_PCM16_TO_FLOAT (1.0f / 32768.0f)
+#define AUDIO_PCM32_TO_FLOAT (1.0f / 2147483648.0f)
+
+/* Preserve float32's precision from signed32, with no 16-bit intermediate.
+ * S32 has more mantissa bits than float32; this is not lossless S32 PCM. */
+static inline float audio_pcm32_to_float(int32_t x) {
+  return (float)x * AUDIO_PCM32_TO_FLOAT;
+}
 
 /* 16-bit PCM -> float, exact (every int16 value is representable). */
 static inline float audio_pcm16_to_float(int16_t x) {

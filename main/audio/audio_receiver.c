@@ -43,17 +43,12 @@
 
 #define AP2_PACKET_MAX             8192U
 #define AP2_RX_STACK               4096U
-/* The multichannel experiment decodes with FDK AAC on this task. FDK keeps
+/* Every AAC stream decodes with FDK on this task. FDK keeps
  * a dummy channel and work buffers on the stack: CAacDecoder_DecodeFrame alone
  * has a 35.6 KiB frame (-fstack-usage), ~45 KiB at the deepest call. That
  * stack lives in PSRAM so internal RAM is not spent on it. */
-#if defined(CONFIG_AIRPLAY_MULTICHANNEL) && CONFIG_AIRPLAY_MULTICHANNEL
 #define AP2_PROCESS_STACK          65536U
 #define AP2_PROCESS_STACK_PSRAM    1
-#else
-#define AP2_PROCESS_STACK_PSRAM    0
-#define AP2_PROCESS_STACK          6144U
-#endif
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
 #define AP2_STATUS_STACK             6144U
@@ -259,9 +254,9 @@ typedef struct {
   esp_timer_handle_t playout_timer;
   uint8_t *buffered_packet;
   uint8_t *decrypt_buf;
-  int16_t *decode_pcm;            /* AAC decoder output (16-bit) */
+  int16_t *decode_pcm;            /* Realtime ALAC16 staging only */
   int16_t *realtime_stage_pcm;    /* ALAC raw stage read (alias of decode_pcm) */
-  float *pcm_f32;                 /* the same block as float, EQ -> PCM FIFO */
+  float *pcm_f32;                 /* Decoded float32 block, EQ -> PCM FIFO */
   uint8_t *codec_workspace;       /* shared AAC payload / ALAC large buffers */
   size_t codec_workspace_size;
   bool realtime_workspace_bound;
@@ -1289,6 +1284,10 @@ static void audio_status_task(void *arg) {
     ptp_clock_get_snapshot(&ps);
     const uint32_t gm_short = (uint32_t)(ps.grandmaster_clock_id & 0xffffffffU);
     const double ptp_delta_ms = (double)ps.raw_filter_delta_ns / 1000000.0;
+    char input_bits_buffer[16];
+    const char *input_bits = audio_format_input_label(
+        snap.format.codec, snap.format.bits_per_sample,
+        input_bits_buffer, sizeof(input_bits_buffer));
 
     if (task_stream == AUDIO_STREAM_BUFFERED) {
       ap2_buffered_fifo_usage_t usage = {0};
@@ -1321,9 +1320,9 @@ static void audio_status_task(void *arg) {
 
       if (sync_valid && ps.valid) {
         ESP_LOGI(STATUS_TAG,
-                 "%s | %d Hz | %d-bit PCM | sync=%+.2fms | i2s=%+ldppm | ptpD=%+.2fms | "
+                 "%s | %d Hz | %s | sync=%+.2fms | i2s=%+ldppm | ptpD=%+.2fms | "
                  "gm=%08lx%s | fifo=%u/%uKiB rx=%luKB/s | pcm=%.0fms",
-                 snap.format.codec, sr, snap.format.bits_per_sample,
+                 snap.format.codec, sr, input_bits,
                  (double)sync_us / 1000.0, (long)correction_ppm,
                  ptp_delta_ms, (unsigned long)gm_short, control_suffix,
                  (unsigned)(usage.used_bytes / 1024U),
@@ -1331,9 +1330,9 @@ static void audio_status_task(void *arg) {
                  status_frames_to_ms(pcm_frames, sr));
       } else {
         ESP_LOGI(STATUS_TAG,
-                 "%s | %d Hz | %d-bit PCM | sync=%s | i2s=%+ldppm | ptpD=%s | "
+                 "%s | %d Hz | %s | sync=%s | i2s=%+ldppm | ptpD=%s | "
                  "gm=%08lx%s | fifo=%u/%uKiB rx=%luKB/s | pcm=%.0fms",
-                 snap.format.codec, sr, snap.format.bits_per_sample,
+                 snap.format.codec, sr, input_bits,
                  sync_valid ? "valid" : "n/a", (long)correction_ppm,
                  ps.valid ? "valid" : "n/a", (unsigned long)gm_short,
                  control_suffix, (unsigned)(usage.used_bytes / 1024U),
@@ -1373,10 +1372,10 @@ static void audio_status_task(void *arg) {
       }
       if (sync_valid && phase_valid && ps.valid) {
         ESP_LOGI(STATUS_TAG,
-                 "ALAC | sync=%+.2fms | phase=%+.2fms | i2s=%+ldppm | "
+                 "ALAC | %d Hz | %s | sync=%+.2fms | phase=%+.2fms | i2s=%+ldppm | "
                  "ptpD=%+.2fms | gm=%08lx | epoch=%lu | frameq=%lu/%lu | "
                  "raw=%.0fms | pcm=%.0fms",
-                 (double)sync_us / 1000.0, (double)phase_us / 1000.0,
+                 sr, input_bits, (double)sync_us / 1000.0, (double)phase_us / 1000.0,
                  (long)correction_ppm, ptp_delta_ms,
                  (unsigned long)gm_short, (unsigned long)ps.epoch,
                  (unsigned long)usage.work_queue_depth,
@@ -1385,9 +1384,9 @@ static void audio_status_task(void *arg) {
                  status_frames_to_ms(pcm_frames, sr));
       } else {
         ESP_LOGI(STATUS_TAG,
-                 "ALAC | sync=%s | phase=%s | i2s=%+ldppm | ptpD=%s | "
+                 "ALAC | %d Hz | %s | sync=%s | phase=%s | i2s=%+ldppm | ptpD=%s | "
                  "gm=%08lx | epoch=%lu | frameq=%lu/%lu | raw=%.0fms | pcm=%.0fms",
-                 sync_valid ? "valid" : "n/a",
+                 sr, input_bits, sync_valid ? "valid" : "n/a",
                  phase_valid ? "valid" : "n/a",
                  (long)correction_ppm, ps.valid ? "valid" : "n/a",
                  (unsigned long)gm_short, (unsigned long)ps.epoch,
@@ -2327,7 +2326,7 @@ static void ap2_buffered_processor_task(void *arg) {
         aac_decoder_config_t cfg = {
             .sample_rate = payload_format->sample_rate,
             .channels = payload_format->channels,
-            .bits_per_sample = 16,
+            .bits_per_sample = payload_format->bits_per_sample,
         };
         decoder = aac_decoder_create(&cfg);
       } else {
@@ -2379,11 +2378,8 @@ static void ap2_buffered_processor_task(void *arg) {
       aac_decode_info_t info = {0};
       frames = aac_decoder_decode(
           decoder, s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM,
-          (size_t)dec_len, s.decode_pcm, AP2_PCM_CAPACITY_FRAMES, &info);
+          (size_t)dec_len, s.pcm_f32, AP2_PCM_CAPACITY_FRAMES, &info);
       channels = info.channels;
-      if (frames > 0 && channels == 2)
-        audio_pcm16_to_float_block(s.decode_pcm, s.pcm_f32,
-                                   (size_t)frames * 2U);
     } else {
       alac_decode_info_t info = {0};
       frames = alac_decoder_decode_float(
@@ -4162,8 +4158,7 @@ esp_err_t audio_receiver_init(void) {
       s.decode_pcm = malloc(AP2_PCM_CAPACITY_FRAMES * 2U * sizeof(int16_t));
     }
   }
-  /* AAC and ordered ALAC staging are mutually exclusive producers.
-   * start paths require the former owner to acknowledge idle before reuse. */
+  /* Realtime ALAC16 staging retains its existing int16 allocation. */
   s.realtime_stage_pcm = s.decode_pcm;
   if (!s.pcm_f32) {
     /* One decoded block as float (8 KiB). PSRAM: EQ walks it through the
@@ -4403,13 +4398,19 @@ void audio_receiver_set_format(const audio_format_t *f) {
   if (strcmp(previous.codec, f->codec) != 0 ||
       previous.sample_rate != f->sample_rate ||
       previous.bits_per_sample != f->bits_per_sample ||
-      previous.channels != f->channels || previous.frame_size != f->frame_size)
-    ESP_LOGI(TAG, "AUDIO PIPELINE %s/%d Hz/%d-bit/%d ch/%d frames -> "
-                  "%s/%d Hz/%d-bit/%d ch/%d frames",
+      previous.channels != f->channels || previous.frame_size != f->frame_size) {
+    char previous_pcm[16], next_pcm[16];
+    snprintf(previous_pcm, sizeof(previous_pcm), "S%d", previous.bits_per_sample);
+    snprintf(next_pcm, sizeof(next_pcm), "S%d", f->bits_per_sample);
+    ESP_LOGI(TAG, "AUDIO PIPELINE %s/%d Hz/%s/%d ch/%d frames -> "
+                  "%s/%d Hz/%s/%d ch/%d frames",
              previous.codec[0] ? previous.codec : "none", previous.sample_rate,
-             previous.bits_per_sample, previous.channels, previous.frame_size,
-             f->codec, f->sample_rate, f->bits_per_sample, f->channels,
+             strcmp(previous.codec, "AAC") == 0 ? "F24" : previous_pcm,
+             previous.channels, previous.frame_size,
+             f->codec, f->sample_rate,
+             strcmp(f->codec, "AAC") == 0 ? "F24" : next_pcm, f->channels,
              f->frame_size);
+  }
   media_control_wake();
   audio_status_notify();
 }

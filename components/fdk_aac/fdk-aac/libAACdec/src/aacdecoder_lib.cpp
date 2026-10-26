@@ -101,9 +101,10 @@ amm-info@iis.fraunhofer.de
 *******************************************************************************/
 
 /* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
- * Library for Android, changed 2026-10-24 for esp32-airplay2-surround
+ * Library for Android, changed 2026-10-24 and 2026-10-26 for esp32-airplay2-surround
  * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
- * synthesis and output for 5.1/7.1 streams, and synthesis timestamps.
+ * synthesis and output for 5.1/7.1 streams, synthesis timestamps, and S32
+ * PCM output before the stock S16 rounding for every channel layout.
  * Every change is marked "airplay-esp32 patch"; the list is in
  * components/fdk_aac/MODIFICATIONS.md. */
 
@@ -1190,10 +1191,13 @@ static INT aacDecoder_EstimateNumberOfLostFrames(HANDLE_AACDECODER self) {
   return n;
 }
 
-LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
-                                                      INT_PCM *pTimeData,
-                                                      const INT timeDataSize,
-                                                      const UINT flags) {
+/* airplay-esp32 patch: share the entire decode/history/control path between
+ * the unchanged S16 API and the S32 API. Only final PCM export differs. */
+static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
+                                                        INT_PCM *pTimeData,
+                                                        LONG *pTimeData32,
+                                                        const INT timeDataSize,
+                                                        const UINT flags) {
   AAC_DECODER_ERROR ErrorStatus;
   INT layer;
   INT nBits;
@@ -1216,6 +1220,10 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
 
   if (self == NULL) {
     return AAC_DEC_INVALID_HANDLE;
+  }
+  /* airplay-esp32 patch: validate before any error-path buffer clearing. */
+  if ((pTimeData == NULL && pTimeData32 == NULL) || timeDataSize <= 0) {
+    return AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
   }
   self->synthFastPath = 0;
   self->synthPlane = -1; /* set again by this frame's synthesis */
@@ -1996,13 +2004,25 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
       goto bail;
     }
 
+    /* airplay-esp32 patch: never route the wide API through the S16 limiter. */
+    if (pTimeData32 != NULL && self->limiterEnableCurr) {
+      ErrorStatus = AAC_DEC_UNSUPPORTED_FORMAT;
+      goto bail;
+    }
+
     if (synthFastOut) {
       /* airplay-esp32 patch: the synthesized plane only, mono, scaled exactly
        * like the non-limiter path below scales every channel. */
-      scaleValuesSaturate(
-          pTimeData,
-          pTimeData2 + self->synthPlane * self->streamInfo.aacSamplesPerFrame,
-          self->streamInfo.frameSize, pcmLimiterScale);
+      /* airplay-esp32 patch: scale the selected plane without S16 rounding. */
+      const PCM_DEC *plane =
+          pTimeData2 + self->synthPlane * self->streamInfo.aacSamplesPerFrame;
+      if (pTimeData32 != NULL) {
+        scaleValuesSaturate(pTimeData32, plane, self->streamInfo.frameSize,
+                            pcmLimiterScale);
+      } else {
+        scaleValuesSaturate(pTimeData, plane, self->streamInfo.frameSize,
+                            pcmLimiterScale);
+      }
       self->synthFastPath = 1;
     } else if (self->limiterEnableCurr) {
       /* use workBufferCore2 buffer for interleaving */
@@ -2066,7 +2086,25 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
       /* If numChannels = 1 we do not need interleaving. The same applies if SBR
       or MPS are used, since their output is interleaved already (resampled or
       not) */
-      if ((self->streamInfo.numChannels == 1) || (self->sbrEnabled) ||
+      /* airplay-esp32 patch: full-channel export also preserves S32, including
+       * DRC-normalized fallback frames. Scatter directly from planar PCM so
+       * neither history nor the smaller S16 interleave scratch is changed. */
+      if (pTimeData32 != NULL) {
+        const INT samples = self->streamInfo.frameSize;
+        const INT channels = self->streamInfo.numChannels;
+        if (channels == 1 || self->sbrEnabled || self->mpsEnableCurr) {
+          scaleValuesSaturate(pTimeData32, pTimeData2, samples * channels,
+                              pcmLimiterScale);
+        } else {
+          const INT scale = fixmax_I(-31, fixmin_I(31, pcmLimiterScale));
+          for (INT ch = 0; ch < channels; ++ch) {
+            for (INT i = 0; i < samples; ++i) {
+              pTimeData32[i * channels + ch] =
+                  scaleValueSaturate(pTimeData2[ch * samples + i], scale);
+            }
+          }
+        }
+      } else if ((self->streamInfo.numChannels == 1) || (self->sbrEnabled) ||
           (self->mpsEnableCurr)) {
         scaleValuesSaturate(
             pTimeData, pTimeData2,
@@ -2084,6 +2122,9 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
                        self->streamInfo.frameSize);
       }
     }
+  } else if (pTimeData32 != NULL) {
+    /* airplay-esp32 patch: no wide export is implemented for AAC-SLS. */
+    ErrorStatus = AAC_DEC_UNSUPPORTED_FORMAT;
   } /* if (self->streamInfo.extAot != AOT_AAC_SLS)*/
 
 bail:
@@ -2106,10 +2147,30 @@ bail:
   }
 
   if (!IS_OUTPUT_VALID(ErrorStatus)) {
-    FDKmemclear(pTimeData, timeDataSize * sizeof(*pTimeData));
+    /* airplay-esp32 patch: clear the correct width on every invalid output. */
+    if (pTimeData32 != NULL) {
+      FDKmemclear(pTimeData32, (size_t)timeDataSize * sizeof(*pTimeData32));
+    } else {
+      FDKmemclear(pTimeData, (size_t)timeDataSize * sizeof(*pTimeData));
+    }
   }
 
   return ErrorStatus;
+}
+
+/* airplay-esp32 patch: keep the standard S16 ABI and add a distinct S32 API. */
+LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame(HANDLE_AACDECODER self,
+                                                      INT_PCM *pTimeData,
+                                                      const INT timeDataSize,
+                                                      const UINT flags) {
+  return aacDecoder_DecodeFrameInternal(self, pTimeData, NULL, timeDataSize, flags);
+}
+
+LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DecodeFrame32(HANDLE_AACDECODER self,
+                                                        LONG *pTimeData,
+                                                        const INT timeDataSize,
+                                                        const UINT flags) {
+  return aacDecoder_DecodeFrameInternal(self, NULL, pTimeData, timeDataSize, flags);
 }
 
 LINKSPEC_CPP void aacDecoder_Close(HANDLE_AACDECODER self) {

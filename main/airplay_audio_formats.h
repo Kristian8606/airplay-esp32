@@ -12,6 +12,8 @@ typedef struct {
   const char *codec;
   int sample_rate;
   int channels;
+  /* ALAC: encoded integer PCM depth. AAC: AirPlay F24 profile precision;
+   * lossy AAC has no recoverable source PCM depth. Decoder output is separate. */
   int bits_per_sample;
   int frame_size;
   const char *name;
@@ -22,14 +24,14 @@ static const airplay_audio_format_t airplay_audio_formats[] = {
      352, "ALAC 44100 Hz / 16-bit / stereo"},
     {AIRPLAY_FMT_ALAC_48000_S24_2, 0x15000000U, 2, "ALAC", 48000, 2, 24,
      352, "ALAC 48000 Hz / 24-bit / stereo"},
-    {AIRPLAY_FMT_AAC_LC_44100_2, 0x16000000U, 4, "AAC", 44100, 2, 16,
-     1024, "AAC-LC 44100 Hz / stereo"},
-    {AIRPLAY_FMT_AAC_LC_48000_2, 0x17000000U, 4, "AAC", 48000, 2, 16,
-     1024, "AAC-LC 48000 Hz / stereo"},
-    {AIRPLAY_FMT_AAC_LC_48000_5_1, 0x27000000U, 4, "AAC", 48000, 6, 16,
-     1024, "AAC-LC 48000 Hz / 5.1"},
-    {AIRPLAY_FMT_AAC_LC_48000_7_1, 0x28000000U, 4, "AAC", 48000, 8, 16,
-     1024, "AAC-LC 48000 Hz / 7.1"},
+    {AIRPLAY_FMT_AAC_LC_44100_2, 0x16000000U, 4, "AAC", 44100, 2, 24,
+     1024, "AAC-LC 44100 Hz / F24 / stereo"},
+    {AIRPLAY_FMT_AAC_LC_48000_2, 0x17000000U, 4, "AAC", 48000, 2, 24,
+     1024, "AAC-LC 48000 Hz / F24 / stereo"},
+    {AIRPLAY_FMT_AAC_LC_48000_5_1, 0x27000000U, 4, "AAC", 48000, 6, 24,
+     1024, "AAC-LC 48000 Hz / F24 / 5.1"},
+    {AIRPLAY_FMT_AAC_LC_48000_7_1, 0x28000000U, 4, "AAC", 48000, 8, 24,
+     1024, "AAC-LC 48000 Hz / F24 / 7.1"},
 };
 
 static inline const airplay_audio_format_t *airplay_audio_format_by_id(
@@ -88,7 +90,13 @@ static inline const airplay_audio_format_t *airplay_audio_format_resolve(
       (codec_type != -1 && codec_type != selected->codec_type) ||
       (sample_rate != -1 && sample_rate != selected->sample_rate) ||
       (frame_size != -1 && frame_size != selected->frame_size) ||
-      (bits_per_sample != -1 && bits_per_sample != selected->bits_per_sample) ||
+      /* ss is not an encoded PCM depth for AAC. Accept the legacy S16 sender
+       * hint and F24 / 32-bit container hints without selecting an S16 decoder.
+       * ALAC must still match its actual lossless depth exactly. */
+      (bits_per_sample != -1 &&
+       (selected->codec_type == 4
+            ? (bits_per_sample != 16 && bits_per_sample != 24 && bits_per_sample != 32)
+            : bits_per_sample != selected->bits_per_sample)) ||
       (channels != -1 && channels != selected->channels)) return NULL;
   return selected;
 }

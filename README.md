@@ -15,10 +15,11 @@ over PTP like Apple's own speakers. Stereo AAC and ALAC still play normally.
    **ALAC 48 kHz/24-bit**, **AAC-LC 44.1/48 kHz**, and, in multichannel builds,
    **AAC-LC 48 kHz 5.1/7.1** (`supportedFormats`, as Shairport Sync does).
    For surround content the Apple TV sends a multichannel stream to each receiver.
-2. The stream's AAC is decoded with **Fraunhofer FDK AAC** (the decoder in the
-   ESP-IDF audio codec component handles mono/stereo only). A small FDK patch
-   synthesizes only the speaker this board plays and outputs just that
-   channel, which keeps decoding at roughly 40 % of one core instead of over
+2. All AAC, including mono/stereo in builds with surround disabled, is decoded
+   with **Fraunhofer FDK AAC** to signed32 PCM and directly normalized to
+   float32. For surround, a small FDK patch synthesizes only the speaker this
+   board plays and outputs just that channel, which keeps decoding at roughly
+   40 % of one core instead of over
    100 %.
 3. The chosen speaker goes to **both I2S slots** (L = R). EQ, loudness and the
    output filters work as usual, so a board can also drive a subwoofer with a
@@ -42,12 +43,21 @@ with EQ, loudness, latency and OTA.
 | Buffered TCP (103), multichannel build | AAC-LC | 48 kHz | 6 / 8 | 1024 |
 
 ALAC 24-bit samples go directly to the float PCM pipeline without a 16-bit
-intermediate conversion; I2S uses 32-bit slots. AAC decoding currently produces
-16-bit PCM. Stereo builds advertise and play all four buffered stereo formats,
-but do not advertise surround without the FDK multichannel decoder.
+intermediate conversion. AAC uses FDK's signed32 output before 16-bit
+quantization, normalized by 2^31 directly into the same float32 pipeline for
+stereo, selected surround speakers and mono mixes. The FDK PCM limiter is
+disabled as required by this output API; DRC policy and gain are unchanged.
+FDK uses noise-substitution concealment without its default extra frame of
+interpolation delay, so each decoded block keeps its packet's RTP alignment.
+Float32 retains its normal precision (it is not lossless signed32 storage).
+I2S uses 32-bit data in 32-bit slots throughout. AirPlay's **F24 AAC** metadata
+describes the announced format profile, not a lossless source bit depth.
+Stereo builds advertise and play all four buffered stereo formats, but do
+not advertise surround unless multichannel support is enabled.
 
 SETUP's `audioFormat` supplies omitted rate/depth/frame/channel information;
-explicitly conflicting fields are rejected. Actual buffered packet SSRC is
+conflicting fields are rejected, except AAC `ss=16/24/32` compatibility hints
+(canonical F24 remains 24); ALAC depth remains strict. Actual buffered packet SSRC is
 authoritative afterwards. Codec/channel changes at the same rate preserve
 queued PCM. A rate change waits for its presentation boundary before retiring
 old-rate PCM and re-priming I2S. An established RTP/PTP map is interpreted at
@@ -128,8 +138,9 @@ remove the two "Multichannel experiment" lines at the end of
 |---|---|
 | FDK AAC decoding, RTSP, PTP | Wi-Fi driver, LwIP, AAC TCP reader, I2S playout, status / LED / log tasks |
 
-The 64 KiB stack of the decode task lives in PSRAM (FDK keeps ~45 KiB on the
-stack).
+In both build modes the decode task's 64 KiB stack and AAC signed32 scratch
+buffer (64 KiB) live in PSRAM; FDK keeps ~45 KiB on the stack. Scratch allocation
+can fall back to the regular heap if PSRAM allocation fails.
 
 ## Limitations
 
@@ -157,11 +168,11 @@ Useful lines in the serial or web log (`http://<board-ip>/logs`):
 
 | Line | Meaning |
 |---|---|
-| `W ... NOW PLAYING \| AAC-LC \| 48000 Hz \| 7.1 (8ch) \| 16-bit PCM \| Front Right (R) \| decoded #7 -> I2S L=R` | actual surround selection, logged when the decoder applies it |
-| `W ... NOW PLAYING \| ALAC \| 48000 Hz \| stereo (2ch) \| 24-bit PCM \| buffered \| surround selection inactive` | stereo format after successful PCM publication; surround selection does not extract a stereo channel |
-| `SETUP audioFormat=0x10000000000 -> AAC-LC 48000 Hz / 7.1` | the initial format the sender chose |
+| `W ... NOW PLAYING \| AAC-LC \| 48000 Hz \| 24-bit (F24) \| 7.1 (8ch) \| Front Right (R)` | actual surround selection, logged when the decoder applies it |
+| `W ... NOW PLAYING \| ALAC \| 48000 Hz \| 24-bit \| stereo L/R` | stereo format after successful PCM publication |
+| `SETUP audioFormat=0x10000000000 -> AAC-LC 48000 Hz / F24 / 7.1` | the initial format the sender chose; F24 is AAC profile metadata |
 | `AUDIO FORMAT ... -> ALAC 48000 Hz / 24-bit / stereo; SSRC ...` | actual input change, old/new SSRC and sequence |
-| `AUDIO PIPELINE ... -> ALAC/48000 Hz/24-bit/2 ch/352 frames` | old/new pipeline codec, rate, depth and block size |
+| `AUDIO PIPELINE AAC/48000 Hz/F24/8 ch/1024 frames -> ALAC/48000 Hz/S24/2 ch/352 frames` | old/new codec, rate, AirPlay profile or ALAC integer depth, channels and block size |
 | `I2S RATE 44100 -> 48000 Hz` | the physical I2S clock has changed successfully |
 | `AUDIO RATE ANCHOR 44100 -> 48000 Hz, rebased at RTP=...` | timing continuity at the rate-change boundary |
 | `MC: decoded channel N = back #0 -> Rear Left (Lrs)` | channel layout of the stream |
@@ -176,8 +187,11 @@ This single checkbox (`CONFIG_AIRPLAY_LOG_RTSP_REQUESTS`) controls all
 progress requests. It is disabled by default. `NOW PLAYING` warnings remain
 visible with both this option and **Runtime event logs** off; they are emitted
 on stream start, input format changes or applied surround speaker changes,
-not for every packet. The periodic status also includes actual codec, rate and
-intermediate PCM bit depth. I2S slot width is a separate output setting.
+not for every packet. The periodic status also includes codec and rate, with
+AAC's AirPlay profile as `24-bit (F24)`, or ALAC's actual 16/24-bit depth.
+Internal decoder/DSP/I2S details are omitted from playback and status lines.
+AAC's profile does not establish the source recording's bit depth or make
+the lossy codec lossless.
 Each playback warning is framed by `================================================`
 on separate warning-level log lines, so the complete format and speaker remain
 easy to find in both serial and web logs.
