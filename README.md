@@ -168,9 +168,9 @@ remove the two "Multichannel experiment" lines at the end of
 |---|---|
 | FDK AAC decoding, RTSP, PTP | Wi-Fi driver, LwIP, AAC TCP reader, I2S playout, status / LED / log tasks |
 
-The decode task has a 20 KiB stack in internal RAM (it falls back to PSRAM if
-no such block is free at stream start; the log says which); FDK's deepest path
-uses ~11 KiB. The AAC signed32 scratch buffer (64 KiB) lives in PSRAM and can
+The decode task has a 20 KiB stack in PSRAM (internal RAM only as a fallback;
+the log says which); FDK's deepest path uses ~11 KiB. An internal-RAM stack
+was measured and is no faster. The AAC signed32 scratch buffer (64 KiB) lives in PSRAM and can
 fall back to the regular heap.
 
 ## Limitations

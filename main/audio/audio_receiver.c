@@ -45,9 +45,10 @@
 #define AP2_RX_STACK               4096U
 /* Every AAC stream decodes with FDK on this task. With the local FDK patch
  * (CCE work memory on the heap) its deepest path uses ~11 KiB of stack
- * (measured: 54 KiB of 64 KiB never touched on 7.1). The stack is taken from
- * internal RAM, which is faster than PSRAM for FDK's register spills; if no
- * such block is free it falls back to PSRAM. Both are created "WithCaps". */
+ * (measured on the board: 9 KiB of 20 KiB never touched on 7.1). The stack
+ * is taken from PSRAM: an internal-RAM stack measured no faster, and internal
+ * RAM is scarcer (Wi-Fi). Internal RAM is only the fallback. Both are created
+ * "WithCaps". */
 #define AP2_PROCESS_STACK          20480U
 #define AP2_PROCESS_STACK_PSRAM    1 /* created WithCaps: delete WithCaps */
 #define AP2_PLAYOUT_STACK          4096U
@@ -4486,17 +4487,17 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
                       TAG, "buffered FIFO start failed");
   s.port = bound;
   __atomic_store_n(&s.rx_running, true, __ATOMIC_RELEASE);
-  bool stack_internal = true;
+  bool stack_psram = true;
   BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
       ap2_buffered_processor_task, "ap2_buf_proc", AP2_PROCESS_STACK, NULL,
       AP2_DECODE_PRIORITY, &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE,
-      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (created != pdPASS) {
-    stack_internal = false;
+    stack_psram = false;
     created = xTaskCreatePinnedToCoreWithCaps(
         ap2_buffered_processor_task, "ap2_buf_proc", AP2_PROCESS_STACK, NULL,
         AP2_DECODE_PRIORITY, &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   }
   if (created != pdPASS) {
     __atomic_store_n(&s.rx_running, false, __ATOMIC_RELEASE);
@@ -4507,7 +4508,7 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
   ESP_LOGI(TAG, "decoder task stack: %u KiB in %s RAM (internal largest free "
                 "block now %u KiB)",
            (unsigned)(AP2_PROCESS_STACK / 1024U),
-           stack_internal ? "internal" : "PSRAM (no internal block free)",
+           stack_psram ? "PSRAM" : "internal (no PSRAM block free)",
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
                                                        MALLOC_CAP_8BIT) / 1024U));
   AP_LOGI(TAG, "AP2 buffered listener port=%u", (unsigned)s.port);
