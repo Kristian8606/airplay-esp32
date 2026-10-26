@@ -79,6 +79,12 @@ from ~45 KiB to ~11 KiB.
 | `libAACdec/src/aacdecoder_lib.cpp` | The PCM limiter (~46 KiB) is no longer created in `aacDecoder_Open()` but on first use: by the first frame that has the limiter enabled, or by `AAC_PCM_LIMITER_ATTACK_TIME`/`RELEAS_TIME`. A decoder that disables the limiter never allocates it. Without memory such a frame is output unlimited. |
 | `libMpegTPDec/include/tpdec_lib.h`, `src/tpdec_lib.cpp`, `src/tpdec_adts.cpp` | The transport input bit buffer is `TPDEC_INBUF_BYTES` = 16 KiB instead of 32 KiB, used for the allocation, the bit-buffer size and the frame-length and bit-reservoir checks. It still holds two of the largest ADTS frames. |
 
+## Changes (2026-10-26, headroom shift)
+
+| File | Change |
+|---|---|
+| `libAACdec/src/aacdecoder_lib.cpp` | The headroom shift of the decoded planes (`pTimeData2[i] = pTimeData3[i] >> (PCM_OUT_HEADROOM - timeDataHeadroom)`) is postponed when one channel is selected on plain AAC (no SBR, MPS, USAC, RSVD60 or AAC-SLS), because nothing reads the planes until the output path is chosen. The single-channel output then shifts only the plane it plays (1 of up to 8); any other output shifts every plane, as before. Same operation on the same samples, so the output is unchanged. |
+
 ## No patent license
 
 As `NOTICE` section 3 says, the FDK license grants no patent rights. AAC

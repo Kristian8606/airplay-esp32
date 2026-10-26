@@ -105,7 +105,8 @@ amm-info@iis.fraunhofer.de
  * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
  * synthesis and output for 5.1/7.1 streams, synthesis timestamps, S32
  * PCM output before the stock S16 rounding for every channel layout, and the
- * PCM limiter created on first use instead of in aacDecoder_Open().
+ * PCM limiter created on first use instead of in aacDecoder_Open(), and the
+ * headroom shift limited to the played plane on the single-channel output.
  * Every change is marked "airplay-esp32 patch"; the list is in
  * components/fdk_aac/MODIFICATIONS.md. */
 
@@ -1237,6 +1238,9 @@ static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
   INT pcmLimiterScale = 0;
   INT interleaved = 0;
   int synthFastOut = 0; /* airplay-esp32 patch: single-channel output */
+  /* airplay-esp32 patch: headroom shift postponed until the output path is
+   * known; then only the played plane is shifted (see synthFastOut). */
+  int shiftDeferred = 0;
 
   if (self == NULL) {
     return AAC_DEC_INVALID_HANDLE;
@@ -1749,7 +1753,17 @@ static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
       }
 
       {
-        if ((INT)PCM_OUT_HEADROOM != timeDataHeadroom) {
+        /* airplay-esp32 patch: with one channel selected and plain AAC (no
+         * SBR/MPS/USAC: nothing below touches the planes before the output
+         * path is chosen), postpone the shift; the single-channel output
+         * then shifts only the plane it plays. */
+        shiftDeferred = ((INT)PCM_OUT_HEADROOM != timeDataHeadroom) &&
+                        (self->synthType != ACT_NONE) &&
+                        (self->synthPlane >= 0) && !self->sbrEnabled &&
+                        !self->mpsEnableCurr &&
+                        !(self->flags[0] & (AC_USAC | AC_RSV603DA)) &&
+                        (self->streamInfo.extAot != AOT_AAC_SLS);
+        if (((INT)PCM_OUT_HEADROOM != timeDataHeadroom) && !shiftDeferred) {
           for (int i = ((self->streamInfo.frameSize *
                          self->streamInfo.numChannels) -
                         1);
@@ -1911,6 +1925,30 @@ static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
                self->hDrcInfo->progRefLevelPresent == 1)) &&
             (numAccessUnits == 1) &&
             (self->streamInfo.frameSize == self->streamInfo.aacSamplesPerFrame);
+
+        /* airplay-esp32 patch: the postponed headroom shift, exactly as the
+         * stock loop does it: just the played plane for the single-channel
+         * output, every plane otherwise. */
+        if (shiftDeferred) {
+          if (synthFastOut) {
+            const INT first =
+                self->synthPlane * self->streamInfo.aacSamplesPerFrame;
+            for (int i = first + self->streamInfo.frameSize - 1; i >= first;
+                 i--) {
+              pTimeData2[i] = (PCM_DEC)pTimeData3[i] >>
+                              (PCM_OUT_HEADROOM - timeDataHeadroom);
+            }
+          } else {
+            for (int i = ((self->streamInfo.frameSize *
+                           self->streamInfo.numChannels) -
+                          1);
+                 i >= 0; i--) {
+              pTimeData2[i] = (PCM_DEC)pTimeData3[i] >>
+                              (PCM_OUT_HEADROOM - timeDataHeadroom);
+            }
+          }
+          shiftDeferred = 0;
+        }
 
         /* do PCM post processing */
         if (!synthFastOut)
