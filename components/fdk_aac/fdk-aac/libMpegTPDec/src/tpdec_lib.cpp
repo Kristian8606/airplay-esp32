@@ -100,6 +100,13 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-26 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): the input bit buffer size is
+ * TPDEC_INBUF_BYTES (see tpdec_lib.h).
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 #include "tpdec_lib.h"
 
 /* library version */
@@ -186,7 +193,7 @@ struct TRANSPORTDEC {
 #define TPDEC_SKIP_PACKET 1
 
 C_ALLOC_MEM(Ram_TransportDecoder, struct TRANSPORTDEC, 1)
-C_ALLOC_MEM(Ram_TransportDecoderBuffer, UCHAR, (8192 * 4))
+C_ALLOC_MEM(Ram_TransportDecoderBuffer, UCHAR, TPDEC_INBUF_BYTES) /* airplay-esp32 patch */
 
 HANDLE_TRANSPORTDEC transportDec_Open(const TRANSPORT_TYPE transportFmt,
                                       const UINT flags, const UINT nrOfLayers) {
@@ -249,7 +256,7 @@ HANDLE_TRANSPORTDEC transportDec_Open(const TRANSPORT_TYPE transportFmt,
         return NULL;
       }
       for (UINT i = 0; i < nrOfLayers; i++) {
-        FDKinitBitStream(&hInput->bitStream[i], hInput->bsBuffer, (8192 * 4), 0,
+        FDKinitBitStream(&hInput->bitStream[i], hInput->bsBuffer, TPDEC_INBUF_BYTES, 0, /* airplay-esp32 patch */
                          BS_READER);
       }
     }
@@ -857,7 +864,7 @@ static TRANSPORTDEC_ERROR additionalHoldOffNeeded(HANDLE_TRANSPORTDEC hTp,
   checkLengthBits = bufferFullness + (maxAU - 1) * avgBitsPerFrame;
 
   /* Check if buffer is big enough to fullfill buffer fullness condition */
-  if ((checkLengthBits /*+headerBits*/) > (((8192 * 4) << 3) - 7)) {
+  if ((checkLengthBits /*+headerBits*/) > ((TPDEC_INBUF_BYTES << 3) - 7) /* airplay-esp32 patch */) {
     return TRANSPORTDEC_SYNC_ERROR;
   }
 
@@ -1192,7 +1199,7 @@ static TRANSPORTDEC_ERROR synchronization(HANDLE_TRANSPORTDEC hTp,
 
     /* Check if the whole frame would fit the bitstream buffer */
     if (err == TRANSPORTDEC_OK) {
-      if ((checkLengthBits + headerBits) > (((8192 * 4) << 3) - 7)) {
+      if ((checkLengthBits + headerBits) > ((TPDEC_INBUF_BYTES << 3) - 7) /* airplay-esp32 patch */) {
         /* We assume that the size of the transport bit buffer has been
            chosen to meet all system requirements, thus this condition
            is considered a synchronisation error. */
@@ -1323,7 +1330,8 @@ bail:
      the bit buffer. */
   if ((totalBits > 0) && (TRANSPORTDEC_NOT_ENOUGH_BITS == err) &&
       (FDKgetValidBits(hBs) >=
-       (((8192 * 4) * 8 - ((hTp->avgBitRate * hTp->burstPeriod) / 1000)) -
+       /* airplay-esp32 patch: TPDEC_INBUF_BYTES instead of 8192 * 4 */
+       ((TPDEC_INBUF_BYTES * 8 - ((hTp->avgBitRate * hTp->burstPeriod) / 1000)) -
         7))) {
     FDKpushFor(hBs, TPDEC_SYNCSKIP);
     err = TRANSPORTDEC_SYNC_ERROR;

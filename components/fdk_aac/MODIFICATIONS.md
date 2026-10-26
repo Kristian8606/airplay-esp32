@@ -71,6 +71,14 @@ from ~45 KiB to ~11 KiB.
 |---|---|
 | `libAACdec/src/aacdecoder.cpp` | The CCE parsing helper takes its dummy channel and work buffers (~35 KiB) from the heap (`FDKaalloc`/`FDKafree`) for the duration of one CCE element instead of from the stack. If that memory is not available the frame is concealed (`AAC_DEC_DECODE_FRAME_ERROR`). This lets the decoder run on a 20 KiB stack. |
 
+## Changes (2026-10-26, memory)
+
+| File | Change |
+|---|---|
+| `libAACdec/src/aac_ram.cpp` | The time-data work buffer (`WorkBufferCore5`) is `8 * 2048` samples (64 KiB) instead of `8 * 4096 * 2` (256 KiB): enough for 8 channels of AAC-LC and of SBR output. Every user of it checks the size and returns an error rather than writing past it, so a stream that would need more fails cleanly (e.g. DRC deinterleaving of an 8-channel HE-AAC stream). |
+| `libAACdec/src/aacdecoder_lib.cpp` | The PCM limiter (~46 KiB) is no longer created in `aacDecoder_Open()` but on first use: by the first frame that has the limiter enabled, or by `AAC_PCM_LIMITER_ATTACK_TIME`/`RELEAS_TIME`. A decoder that disables the limiter never allocates it. Without memory such a frame is output unlimited. |
+| `libMpegTPDec/include/tpdec_lib.h`, `src/tpdec_lib.cpp`, `src/tpdec_adts.cpp` | The transport input bit buffer is `TPDEC_INBUF_BYTES` = 16 KiB instead of 32 KiB, used for the allocation, the bit-buffer size and the frame-length and bit-reservoir checks. It still holds two of the largest ADTS frames. |
+
 ## No patent license
 
 As `NOTICE` section 3 says, the FDK license grants no patent rights. AAC

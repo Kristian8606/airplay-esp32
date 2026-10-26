@@ -100,8 +100,21 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-26 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): the transport input buffer is
+ * TPDEC_INBUF_BYTES (16 KiB) instead of 32 KiB.
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 #ifndef TPDEC_LIB_H
 #define TPDEC_LIB_H
+
+/* airplay-esp32 patch: size of the transport decoder's input bit buffer
+ * (stock: 8192 * 4). Must be a power of two. 16 KiB still holds two of the
+ * largest ADTS frames (13-bit length, < 8 KiB); AirPlay feeds one frame per
+ * aacDecoder_Fill(). */
+#define TPDEC_INBUF_BYTES (8192 * 2)
 
 #include "tp_data.h"
 

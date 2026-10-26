@@ -103,8 +103,9 @@ amm-info@iis.fraunhofer.de
 /* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
  * Library for Android, changed 2026-10-24 and 2026-10-26 for esp32-airplay2-surround
  * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
- * synthesis and output for 5.1/7.1 streams, synthesis timestamps, and S32
- * PCM output before the stock S16 rounding for every channel layout.
+ * synthesis and output for 5.1/7.1 streams, synthesis timestamps, S32
+ * PCM output before the stock S16 rounding for every channel layout, and the
+ * PCM limiter created on first use instead of in aacDecoder_Open().
  * Every change is marked "airplay-esp32 patch"; the list is in
  * components/fdk_aac/MODIFICATIONS.md. */
 
@@ -716,6 +717,17 @@ aacDecoder_SetSynthChannel(const HANDLE_AACDECODER self,
   return AAC_DEC_OK;
 }
 
+/* airplay-esp32 patch: the PCM limiter (~46 KiB) is created when it is
+ * first needed, not in aacDecoder_Open(): a decoder that keeps it disabled
+ * never allocates it. */
+static AAC_DECODER_ERROR aacDecoder_EnsureLimiter(HANDLE_AACDECODER self) {
+  if (self->hLimiter != NULL) return AAC_DEC_OK;
+  self->hLimiter =
+      pcmLimiter_Create(TDL_ATTACK_DEFAULT_MS, TDL_RELEASE_DEFAULT_MS,
+                        (FIXP_DBL)MAXVAL_DBL, (8), 96000);
+  return (self->hLimiter != NULL) ? AAC_DEC_OK : AAC_DEC_OUT_OF_MEMORY;
+}
+
 LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_SetParam(
     const HANDLE_AACDECODER self, /*!< Handle of the decoder instance */
     const AACDEC_PARAM param,     /*!< Parameter to set               */
@@ -783,6 +795,11 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_SetParam(
       if (value <= 0) { /* module function converts value to unsigned */
         return AAC_DEC_SET_PARAM_FAIL;
       }
+      /* airplay-esp32 patch: create the limiter on first use. */
+      if (aacDecoder_EnsureLimiter(self) != AAC_DEC_OK) {
+        return AAC_DEC_OUT_OF_MEMORY;
+      }
+      hPcmTdl = self->hLimiter;
       switch (pcmLimiter_SetAttack(hPcmTdl, value)) {
         case TDLIMIT_OK:
           break;
@@ -798,6 +815,11 @@ LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_SetParam(
       if (value <= 0) { /* module function converts value to unsigned */
         return AAC_DEC_SET_PARAM_FAIL;
       }
+      /* airplay-esp32 patch: create the limiter on first use. */
+      if (aacDecoder_EnsureLimiter(self) != AAC_DEC_OK) {
+        return AAC_DEC_OUT_OF_MEMORY;
+      }
+      hPcmTdl = self->hLimiter;
       switch (pcmLimiter_SetRelease(hPcmTdl, value)) {
         case TDLIMIT_OK:
           break;
@@ -1083,13 +1105,8 @@ LINKSPEC_CPP HANDLE_AACDECODER aacDecoder_Open(TRANSPORT_TYPE transportFmt,
     goto bail;
   }
 
-  aacDec->hLimiter =
-      pcmLimiter_Create(TDL_ATTACK_DEFAULT_MS, TDL_RELEASE_DEFAULT_MS,
-                        (FIXP_DBL)MAXVAL_DBL, (8), 96000);
-  if (NULL == aacDec->hLimiter) {
-    err = -1;
-    goto bail;
-  }
+  /* airplay-esp32 patch: created on first use (aacDecoder_EnsureLimiter). */
+  aacDec->hLimiter = NULL;
   aacDec->limiterEnableUser = (UCHAR)-1;
   aacDec->limiterEnableCurr = 0;
 
@@ -1387,6 +1404,12 @@ static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
     } else {
       /* Use limiter configuration as requested. */
       self->limiterEnableCurr = self->limiterEnableUser;
+    }
+    /* airplay-esp32 patch: create the limiter the first time a frame needs
+     * it; without memory the frame is output unlimited. */
+    if (self->limiterEnableCurr &&
+        aacDecoder_EnsureLimiter(self) != AAC_DEC_OK) {
+      self->limiterEnableCurr = 0;
     }
 
     /* reset DRC level normalization gain on a per frame basis */

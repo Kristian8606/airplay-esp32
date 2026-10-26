@@ -419,11 +419,15 @@ static void mc_account_time(aac_decoder_t *d, int64_t us, int frame_size,
   const int64_t avg_us = d->mc_time_sum_us / (int64_t)d->mc_time_frames;
   ESP_LOGW(TAG, "MC CPU: FDK decode avg %lld us, max %lld us per frame over %lu "
                 "frames; frame budget %lld us -> avg %lld%% of one core; "
-                "decode task stack never below %u B free",
+                "decode task stack never below %u B free; PSRAM free %u KiB "
+                "(min %u KiB)",
            (long long)avg_us, (long long)d->mc_time_max_us,
            (unsigned long)d->mc_time_frames, (long long)budget_us,
            budget_us > 0 ? (long long)(avg_us * 100 / budget_us) : -1LL,
-           (unsigned)uxTaskGetStackHighWaterMark(NULL));
+           (unsigned)uxTaskGetStackHighWaterMark(NULL),
+           (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024U),
+           (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM) /
+                      1024U));
   if (d->mc_stage_frames > 0) {
     const int64_t n = d->mc_stage_frames;
     ESP_LOGW(TAG, "MC CPU stages (avg/max us): parse %lld/%lld, synthesis "

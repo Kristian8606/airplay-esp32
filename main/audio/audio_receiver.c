@@ -4505,10 +4505,10 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
     ap2_buffered_fifo_stop(s.transport);
     return ESP_FAIL;
   }
-  ESP_LOGI(TAG, "decoder task stack: %u KiB in %s RAM (internal largest free "
+  ESP_LOGI(TAG, "decoder task stack: %u KiB in %s (internal largest free "
                 "block now %u KiB)",
            (unsigned)(AP2_PROCESS_STACK / 1024U),
-           stack_psram ? "PSRAM" : "internal (no PSRAM block free)",
+           stack_psram ? "PSRAM" : "internal RAM (no PSRAM block free)",
            (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
                                                        MALLOC_CAP_8BIT) / 1024U));
   AP_LOGI(TAG, "AP2 buffered listener port=%u", (unsigned)s.port);

@@ -100,6 +100,13 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-26 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): the time-data work buffer
+ * (WorkBufferCore5) is sized for 8 channels of 2048 samples.
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 #include "aac_ram.h"
 #include "aac_rom.h"
 
@@ -173,5 +180,10 @@ C_ALLOC_MEM_OVERLAY(WorkBufferCore1, CWorkBufferCore1, 1, SECT_DATA_L1,
                     WORKBUFFER1_TAG)
 
 /* double buffer size needed for de-/interleaving */
-C_ALLOC_MEM_OVERLAY(WorkBufferCore5, PCM_DEC, (8) * (1024 * 4) * 2,
+/* airplay-esp32 patch: (8) * (1024 * 2) instead of (8) * (1024 * 4) * 2
+ * (256 KiB -> 64 KiB). Enough for 8 channels of AAC-LC (8 x 1024) and of
+ * HE-AAC/SBR output (8 x 2048). Every user checks the size and returns an
+ * error instead of writing past it (CAacDecoder_DecodeFrame, SBR, MPS, the
+ * DRC deinterleave), so a stream that needs more fails cleanly. */
+C_ALLOC_MEM_OVERLAY(WorkBufferCore5, PCM_DEC, (8) * (1024 * 2),
                     SECT_DATA_EXTERN, WORKBUFFER5_TAG)

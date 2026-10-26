@@ -100,6 +100,13 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-26 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): frame length check against
+ * TPDEC_INBUF_BYTES (see tpdec_lib.h).
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 #include "tpdec_adts.h"
 
 #include "FDK_bitstream.h"
@@ -291,7 +298,7 @@ TRANSPORTDEC_ERROR adtsRead_DecodeHeader(HANDLE_ADTS pAdts,
           FDKpushBack(hBs, adtsHeaderLength);
 
           if ((cmp_buffer_fullness + adtsHeaderLength) >
-              (((8192 * 4) << 3) - 7)) {
+              ((TPDEC_INBUF_BYTES << 3) - 7) /* airplay-esp32 patch */) {
             return TRANSPORTDEC_SYNC_ERROR;
           } else {
             return TRANSPORTDEC_NOT_ENOUGH_BITS;
