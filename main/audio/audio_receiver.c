@@ -3249,7 +3249,12 @@ static void ap2_playout_task(void *arg) {
     timing_snapshot_t snap;
     refresh_timing_snapshot(&snap);
     if (snap.format.sample_rate > 0 &&
-        (uint32_t)snap.format.sample_rate != audio_playout_get_rate()) continue;
+        (uint32_t)snap.format.sample_rate != audio_playout_get_rate()) {
+      /* The rate switch at the top of the loop normally fixes this on the
+       * next pass; never spin at this priority if it cannot. */
+      vTaskDelay(1);
+      continue;
+    }
     process_i2s_completions(&snap);
 
     uint32_t desired_rtp = 0;

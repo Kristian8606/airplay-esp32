@@ -767,7 +767,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       return;
     }
 
-    bplist_kv_info_t kv[24];
+    /* The parser rejects a stream dict with more keys than this instead of
+     * cutting it off; realtime SETUPs carry ~20 keys, so leave room. */
+    bplist_kv_info_t kv[32];
     size_t kv_count = 0;
     int64_t audio_format = -1;
     int64_t codec_type = -1;

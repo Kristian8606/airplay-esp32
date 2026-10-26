@@ -15,6 +15,7 @@ struct alac_decoder {
   alac_decoder_config_t config;
   void *handle;
   uint32_t decode_errors;
+  bool short_consume_logged;
   uint8_t *pcm;
   uint32_t pcm_size;
   esp_audio_dec_info_t info;
@@ -139,16 +140,26 @@ static int decode_pcm(alac_decoder_t *d, const uint8_t *input,
 
   esp_audio_err_t err = esp_alac_dec_decode(d->handle, &raw, &frame, &dec_info);
   if (err == ESP_AUDIO_ERR_OK) {
-    if (dec_info.channel != d->config.channels ||
-        dec_info.sample_rate != (uint32_t)d->config.sample_rate ||
-        dec_info.bits_per_sample != d->config.bits_per_sample) {
+    /* A field the decoder leaves at 0 is unknown, not a mismatch: the
+     * realtime path decoded for years without these being reported. */
+    if ((dec_info.channel != 0 && dec_info.channel != d->config.channels) ||
+        (dec_info.sample_rate != 0 &&
+         dec_info.sample_rate != (uint32_t)d->config.sample_rate) ||
+        (dec_info.bits_per_sample != 0 &&
+         dec_info.bits_per_sample != d->config.bits_per_sample)) {
       err = ESP_AUDIO_ERR_INVALID_PARAMETER;
     } else {
       d->info = dec_info;
-      if (raw.consumed != input_len || frame.decoded_size > d->pcm_size ||
+      /* The decoder may stop before trailing alignment bytes of the
+       * packet; only reading past the end is an error. */
+      if (raw.consumed > input_len || frame.decoded_size > d->pcm_size ||
           frame.decoded_size % frame_bytes != 0 ||
           frame.decoded_size / frame_bytes > output_capacity_frames) {
         err = ESP_AUDIO_ERR_INVALID_PARAMETER;
+      } else if (raw.consumed < input_len && !d->short_consume_logged) {
+        d->short_consume_logged = true;
+        ESP_LOGW(TAG, "ALAC packet: decoder used %lu of %u bytes; rest ignored",
+                 (unsigned long)raw.consumed, (unsigned)input_len);
       }
     }
   }
@@ -161,9 +172,11 @@ static int decode_pcm(alac_decoder_t *d, const uint8_t *input,
   }
 
   if (info) {
-    info->channels = dec_info.channel;
-    info->sample_rate = (int)dec_info.sample_rate;
-    info->bits_per_sample = dec_info.bits_per_sample;
+    info->channels = dec_info.channel ? dec_info.channel : d->config.channels;
+    info->sample_rate = dec_info.sample_rate ? (int)dec_info.sample_rate
+                                             : d->config.sample_rate;
+    info->bits_per_sample = dec_info.bits_per_sample ? dec_info.bits_per_sample
+                                                     : d->config.bits_per_sample;
   }
   return (int)(frame.decoded_size / frame_bytes);
 }
