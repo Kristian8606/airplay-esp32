@@ -50,6 +50,20 @@ application already disables the limiter and advertises AAC-LC. AAC is lossy:
 the output width describes decoder precision, not a recoverable original PCM
 bit depth. The ESP32 wrapper uses this API for stereo as well as surround.
 
+## Changes (2026-10-26, speed-ups)
+
+| File | Change |
+|---|---|
+| `libFDK/include/clz.h`, new `libFDK/include/clz_builtin.h` | On Xtensa (`__XTENSA__`, or `FDK_USE_BUILTIN_CLZ` on a host), `fixnormz_D`/`fixnorm_D` use `__builtin_clz`/`__builtin_clrsb` (NSAU/NSA on the ESP32-S3) instead of FDK's one-bit-per-iteration fallback loops. Identical results for all 2^32 inputs. |
+| `libAACdec/src/channel.h`, `channel.cpp` | `CChannelElement_Read()` takes `skipSpectralDecode`; when set, the element's bits are still read but its spectrum is not inverse quantized. |
+| `libAACdec/src/aacdecoder.h`, `aacdecoder.cpp`, `aacdecoder_lib.cpp` | With a channel selected by `aacDecoder_SetSynthChannel()`, elements that do not hold it skip inverse quantization and `CChannelElement_Decode()` (M/S, intensity, PNS, TNS). The element is found from the previous frame's synthesis; a new selection decodes all elements until its channel has been synthesized once. CCE parsing (dummy channel and work buffers, ~35 KiB of stack) moved from `CAacDecoder_DecodeFrame()` into a separate non-inlined function, so that stack is only used when a CCE element occurs; `CAacDecoder_DecodeFrame()` itself drops from 35.6 KiB to ~1 KiB (Xtensa `-fstack-usage`). |
+
+Checked on a host build that emulates the ESP32 (no x86 helpers): FDK-encoded
+7.1, 5.1 and stereo AAC-LC decode bit-identically to the previous version for
+every speaker, with full output, and while switching speakers every 37 frames.
+Instruction counts for one speaker of 7.1 dropped by about half (clz ~32 %,
+element skip a further ~27-37 %); this is a host measurement, not ESP32 timing.
+
 ## No patent license
 
 As `NOTICE` section 3 says, the FDK license grants no patent rights. AAC

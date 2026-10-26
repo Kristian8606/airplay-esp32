@@ -100,6 +100,13 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-26 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): on Xtensa (ESP32) leading-bit
+ * counts use compiler builtins (NSA/NSAU) instead of software loops.
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 #if !defined(CLZ_H)
 #define CLZ_H
 
@@ -119,6 +126,12 @@ amm-info@iis.fraunhofer.de
 #include "ppc/clz_ppc.h"
 
 #endif /* all cores */
+
+/* airplay-esp32 patch: no FDK header exists for Xtensa, so the software
+ * fallbacks below would count leading bits one bit per loop iteration. */
+#if defined(__XTENSA__) || defined(FDK_USE_BUILTIN_CLZ)
+#include "clz_builtin.h"
+#endif
 
 /*************************************************************************
  *************************************************************************

@@ -378,6 +378,10 @@ This structure is allocated once for each CPE. */
    * to the output (synthFastPath = 1). See aacDecoder_GetSynthInfo(). */
   SCHAR synthPlane;
   UCHAR synthFastPath;
+  /* airplay-esp32 patch: read-order index of the channel synthesized in the
+   * previous frame; -1 = unknown. Elements that do not hold it skip inverse
+   * quantization and stereo/PNS/TNS tools (see aacDecoder_SetSynthChannel). */
+  SCHAR synthAacCh;
   /* Optional clock (us) for per-stage timing of the last frame. */
   INT64 (*timeHook)(void);
   INT64 tSynthStart;

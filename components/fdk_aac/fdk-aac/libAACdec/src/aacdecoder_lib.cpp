@@ -708,6 +708,9 @@ aacDecoder_SetSynthChannel(const HANDLE_AACDECODER self,
   if (self == NULL) {
     return AAC_DEC_INVALID_HANDLE;
   }
+  /* airplay-esp32 patch: a new selection decodes every element until its
+   * channel has been synthesized once. */
+  if (self->synthType != type || self->synthIndex != index) self->synthAacCh = -1;
   self->synthType = type;
   self->synthIndex = index;
   return AAC_DEC_OK;

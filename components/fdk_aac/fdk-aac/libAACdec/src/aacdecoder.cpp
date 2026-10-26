@@ -103,7 +103,9 @@ amm-info@iis.fraunhofer.de
 /* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
  * Library for Android, changed 2026-10-24 for esp32-airplay2-surround
  * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
- * synthesis and output for 5.1/7.1 streams, and synthesis timestamps.
+ * synthesis and output for 5.1/7.1 streams, and synthesis timestamps;
+ * changed 2026-10-26: no spectral decoding of elements that do not hold the
+ * selected channel, CCE parsing moved out of CAacDecoder_DecodeFrame.
  * Every change is marked "airplay-esp32 patch"; the list is in
  * components/fdk_aac/MODIFICATIONS.md. */
 
@@ -2485,6 +2487,68 @@ bail:
   return AAC_DEC_OUT_OF_MEMORY;
 }
 
+
+/* airplay-esp32 patch: see the call site in CAacDecoder_DecodeFrame(). */
+static __attribute__((noinline)) AAC_DECODER_ERROR CAacDecoder_ParseCce(
+    HANDLE_AACDECODER self, HANDLE_FDK_BITSTREAM bs, int streamIndex,
+    CProgramConfig *pce, UCHAR *pPreviousElementIndex, MP4_ELEMENT_ID type) {
+  AAC_DECODER_ERROR ErrorStatus = AAC_DEC_OK;
+          CAacDecoderCommonData commonData;
+          CAacDecoderCommonStaticData commonStaticData;
+          CWorkBufferCore1 workBufferCore1;
+          commonStaticData.pWorkBufferCore1 = &workBufferCore1;
+          /* memory for spectral lines temporal on scratch */
+          C_AALLOC_SCRATCH_START(mdctSpec, FIXP_DBL, 1024);
+
+          /* create dummy channel for CCE parsing on stack */
+          CAacDecoderChannelInfo tmpAacDecoderChannelInfo,
+              *pTmpAacDecoderChannelInfo;
+
+          FDKmemclear(mdctSpec, 1024 * sizeof(FIXP_DBL));
+
+          tmpAacDecoderChannelInfo.pDynData = commonData.pAacDecoderDynamicData;
+          tmpAacDecoderChannelInfo.pComData = &commonData;
+          tmpAacDecoderChannelInfo.pComStaticData = &commonStaticData;
+          tmpAacDecoderChannelInfo.pSpectralCoefficient =
+              (SPECTRAL_PTR)mdctSpec;
+          /* Assume AAC-LC */
+          tmpAacDecoderChannelInfo.granuleLength =
+              self->streamInfo.aacSamplesPerFrame / 8;
+          /* Reset PNS data. */
+          CPns_ResetData(
+              &tmpAacDecoderChannelInfo.data.aac.PnsData,
+              &tmpAacDecoderChannelInfo.pComData->pnsInterChannelData);
+          pTmpAacDecoderChannelInfo = &tmpAacDecoderChannelInfo;
+          /* do CCE parsing */
+          ErrorStatus = CChannelElement_Read(
+              bs, &pTmpAacDecoderChannelInfo, NULL, self->streamInfo.aot,
+              &self->samplingRateInfo[streamIndex], self->flags[streamIndex],
+              AC_EL_GA_CCE, self->streamInfo.aacSamplesPerFrame, 1,
+              self->streamInfo.epConfig, self->hInput);
+
+          C_AALLOC_SCRATCH_END(mdctSpec, FIXP_DBL, 1024);
+
+          if (ErrorStatus) {
+            self->frameOK = 0;
+          }
+
+          if (self->frameOK) {
+            /* Lookup the element and decode it only if it belongs to the
+             * current program */
+            if (CProgramConfig_LookupElement(
+                    pce, self->streamInfo.channelConfig,
+                    pTmpAacDecoderChannelInfo->ElementInstanceTag, 0,
+                    self->chMapping, self->channelType, self->channelIndices,
+                    (8), pPreviousElementIndex, self->elements, type)) {
+              /* decoding of CCE not supported */
+            } else {
+              self->frameOK = 0;
+            }
+          }
+        
+  return ErrorStatus;
+}
+
 LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
     HANDLE_AACDECODER self, const UINT flags, PCM_DEC *pTimeData,
     const INT timeDataSize, const int timeDataChannelOffset) {
@@ -2719,7 +2783,12 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
               self->streamInfo.aot, &self->samplingRateInfo[streamIndex],
               self->flags[streamIndex], self->elFlags[element_count],
               self->streamInfo.aacSamplesPerFrame, el_channels,
-              self->streamInfo.epConfig, self->hInput);
+              self->streamInfo.epConfig, self->hInput,
+              /* airplay-esp32 patch: no inverse quantization for an element
+               * that does not hold the selected channel. */
+              self->synthType != ACT_NONE && self->synthAacCh >= 0 &&
+                  !(self->synthAacCh >= aacChannels &&
+                    self->synthAacCh < aacChannels + el_channels));
           if (ErrorStatus != AAC_DEC_OK) {
             self->frameOK = 0;
           }
@@ -2792,58 +2861,10 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
         }
 
         if (self->frameOK) {
-          CAacDecoderCommonData commonData;
-          CAacDecoderCommonStaticData commonStaticData;
-          CWorkBufferCore1 workBufferCore1;
-          commonStaticData.pWorkBufferCore1 = &workBufferCore1;
-          /* memory for spectral lines temporal on scratch */
-          C_AALLOC_SCRATCH_START(mdctSpec, FIXP_DBL, 1024);
-
-          /* create dummy channel for CCE parsing on stack */
-          CAacDecoderChannelInfo tmpAacDecoderChannelInfo,
-              *pTmpAacDecoderChannelInfo;
-
-          FDKmemclear(mdctSpec, 1024 * sizeof(FIXP_DBL));
-
-          tmpAacDecoderChannelInfo.pDynData = commonData.pAacDecoderDynamicData;
-          tmpAacDecoderChannelInfo.pComData = &commonData;
-          tmpAacDecoderChannelInfo.pComStaticData = &commonStaticData;
-          tmpAacDecoderChannelInfo.pSpectralCoefficient =
-              (SPECTRAL_PTR)mdctSpec;
-          /* Assume AAC-LC */
-          tmpAacDecoderChannelInfo.granuleLength =
-              self->streamInfo.aacSamplesPerFrame / 8;
-          /* Reset PNS data. */
-          CPns_ResetData(
-              &tmpAacDecoderChannelInfo.data.aac.PnsData,
-              &tmpAacDecoderChannelInfo.pComData->pnsInterChannelData);
-          pTmpAacDecoderChannelInfo = &tmpAacDecoderChannelInfo;
-          /* do CCE parsing */
-          ErrorStatus = CChannelElement_Read(
-              bs, &pTmpAacDecoderChannelInfo, NULL, self->streamInfo.aot,
-              &self->samplingRateInfo[streamIndex], self->flags[streamIndex],
-              AC_EL_GA_CCE, self->streamInfo.aacSamplesPerFrame, 1,
-              self->streamInfo.epConfig, self->hInput);
-
-          C_AALLOC_SCRATCH_END(mdctSpec, FIXP_DBL, 1024);
-
-          if (ErrorStatus) {
-            self->frameOK = 0;
-          }
-
-          if (self->frameOK) {
-            /* Lookup the element and decode it only if it belongs to the
-             * current program */
-            if (CProgramConfig_LookupElement(
-                    pce, self->streamInfo.channelConfig,
-                    pTmpAacDecoderChannelInfo->ElementInstanceTag, 0,
-                    self->chMapping, self->channelType, self->channelIndices,
-                    (8), &previous_element_index, self->elements, type)) {
-              /* decoding of CCE not supported */
-            } else {
-              self->frameOK = 0;
-            }
-          }
+          /* airplay-esp32 patch: CCE parsing moved out so its ~35 KB of stack locals are
+           * only reserved when a CCE element actually occurs. */
+          ErrorStatus = CAacDecoder_ParseCce(self, bs, streamIndex, pce,
+                                             &previous_element_index, type);
         }
         el_cnt[type]++;
         break;
@@ -3123,7 +3144,12 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
           el_channels = CAacDecoder_GetELChannels(
               type, self->usacStereoConfigIndex[element_count]);
 
-          if (!hdaacDecoded) {
+          /* airplay-esp32 patch: skip M/S, intensity, PNS and TNS for an
+           * element that does not hold the selected channel. */
+          if (!hdaacDecoded &&
+              !(self->synthType != ACT_NONE && self->synthAacCh >= 0 &&
+                !(self->synthAacCh >= aacChannels &&
+                  self->synthAacCh < aacChannels + el_channels))) {
             if (self->pAacDecoderStaticChannelInfo[aacChannels]
                     ->pCpeStaticData != NULL) {
               self->pAacDecoderStaticChannelInfo[aacChannels]
@@ -3301,6 +3327,7 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
     /* airplay-esp32 patch: parsing is done, synthesis starts here. */
     self->synthPlane = -1;
     if (self->timeHook) self->tSynthStart = self->timeHook();
+    SCHAR synthAacChNow = -1; /* airplay-esp32 patch */
 
     /* Create a reverse mapping table */
     UCHAR Reverse_chMapping[((8) * 2)];
@@ -3378,6 +3405,7 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
             continue;
           }
           self->synthPlane = (SCHAR)outputChannel;
+          synthAacChNow = (SCHAR)c; /* airplay-esp32 patch */
         }
 
         if (flags & AACDEC_FLUSH) {
@@ -3521,6 +3549,8 @@ LINKSPEC_CPP AAC_DECODER_ERROR CAacDecoder_DecodeFrame(
       }
     }
 
+    /* airplay-esp32 patch: used by the next frame's element skip. */
+    self->synthAacCh = synthAacChNow;
     /* airplay-esp32 patch: synthesis done. */
     if (self->timeHook) self->tSynthEnd = self->timeHook();
 

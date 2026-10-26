@@ -100,6 +100,13 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-26 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): CChannelElement_Read() can skip
+ * inverse quantization (skipSpectralDecode).
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 #include "channel.h"
 #include "aacdecoder.h"
 #include "block.h"
@@ -417,7 +424,8 @@ AAC_DECODER_ERROR CChannelElement_Read(
     const AUDIO_OBJECT_TYPE aot, SamplingRateInfo *pSamplingRateInfo,
     const UINT flags, const UINT elFlags, const UINT frame_length,
     const UCHAR numberOfChannels, const SCHAR epConfig,
-    HANDLE_TRANSPORTDEC pTpDec) {
+    HANDLE_TRANSPORTDEC pTpDec,
+    const int skipSpectralDecode /* airplay-esp32 patch */) {
   AAC_DECODER_ERROR error = AAC_DEC_OK;
   const element_list_t *list;
   int i, ch, decision_bit;
@@ -887,7 +895,9 @@ AAC_DECODER_ERROR CChannelElement_Read(
 
   } while (list->id[i] != end_of_sequence);
 
-  for (ch = 0; ch < numberOfChannels; ch++) {
+  /* airplay-esp32 patch: the caller sets skipSpectralDecode for an element
+   * nobody plays; its bits are consumed above, its spectrum stays quantized. */
+  for (ch = 0; ch < numberOfChannels && !skipSpectralDecode; ch++) {
     if (pAacDecoderChannelInfo[ch]->renderMode == AACDEC_RENDER_IMDCT ||
         pAacDecoderChannelInfo[ch]->renderMode == AACDEC_RENDER_ELDFB) {
       /* Shows which bands are empty. */

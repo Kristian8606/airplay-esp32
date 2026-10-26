@@ -100,6 +100,13 @@ amm-info@iis.fraunhofer.de
 
 *******************************************************************************/
 
+/* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
+ * Library for Android, changed 2026-10-26 for esp32-airplay2-surround
+ * (github.com/Kristian8606/esp32-airplay2-surround): CChannelElement_Read() can skip
+ * inverse quantization (skipSpectralDecode).
+ * Every change is marked "airplay-esp32 patch"; the list is in
+ * components/fdk_aac/MODIFICATIONS.md. */
+
 #ifndef CHANNEL_H
 #define CHANNEL_H
 
@@ -155,6 +162,7 @@ AAC_DECODER_ERROR CChannelElement_Read(
     const AUDIO_OBJECT_TYPE aot, SamplingRateInfo *pSamplingRateInfo,
     const UINT flags, const UINT elFlags, const UINT frame_length,
     const UCHAR numberOfChannels, const SCHAR epConfig,
-    HANDLE_TRANSPORTDEC pTpDec);
+    HANDLE_TRANSPORTDEC pTpDec,
+    const int skipSpectralDecode = 0 /* airplay-esp32 patch */);
 
 #endif /* #ifndef CHANNEL_H */
