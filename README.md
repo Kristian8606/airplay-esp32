@@ -1,5 +1,3 @@
-![ESP32 AirPlay 2 Surround — light setup](images/airplay-surround-light.png)
-
 ![ESP32 AirPlay 2 Surround — home cinema](images/airplay-surround-dark.png)
 
 # esp32-airplay2-surround
