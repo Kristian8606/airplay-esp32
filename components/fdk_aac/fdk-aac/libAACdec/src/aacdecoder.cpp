@@ -105,7 +105,8 @@ amm-info@iis.fraunhofer.de
  * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
  * synthesis and output for 5.1/7.1 streams, and synthesis timestamps;
  * changed 2026-10-26: no spectral decoding of elements that do not hold the
- * selected channel, CCE parsing moved out of CAacDecoder_DecodeFrame.
+ * selected channel, CCE parsing moved out of CAacDecoder_DecodeFrame with its
+ * work memory taken from the heap instead of the stack.
  * Every change is marked "airplay-esp32 patch"; the list is in
  * components/fdk_aac/MODIFICATIONS.md. */
 
@@ -2488,64 +2489,72 @@ bail:
 }
 
 
-/* airplay-esp32 patch: see the call site in CAacDecoder_DecodeFrame(). */
+/* airplay-esp32 patch: see the call site in CAacDecoder_DecodeFrame().
+ * The dummy channel and work buffers for CCE parsing (~35 KiB) come from the
+ * heap only while a CCE element is parsed, not from the decoder's stack, so
+ * the decode task can run on a small stack in internal RAM. AirPlay senders
+ * do not use CCE; if the memory is not available the frame is concealed. */
+typedef struct {
+  FIXP_DBL mdctSpec[1024]; /* first: FDKaalloc alignment applies to it */
+  CAacDecoderCommonData commonData;
+  CAacDecoderCommonStaticData commonStaticData;
+  CWorkBufferCore1 workBufferCore1;
+  CAacDecoderChannelInfo tmpAacDecoderChannelInfo;
+} CAacDecoderCceScratch;
+
 static __attribute__((noinline)) AAC_DECODER_ERROR CAacDecoder_ParseCce(
     HANDLE_AACDECODER self, HANDLE_FDK_BITSTREAM bs, int streamIndex,
     CProgramConfig *pce, UCHAR *pPreviousElementIndex, MP4_ELEMENT_ID type) {
   AAC_DECODER_ERROR ErrorStatus = AAC_DEC_OK;
-          CAacDecoderCommonData commonData;
-          CAacDecoderCommonStaticData commonStaticData;
-          CWorkBufferCore1 workBufferCore1;
-          commonStaticData.pWorkBufferCore1 = &workBufferCore1;
-          /* memory for spectral lines temporal on scratch */
-          C_AALLOC_SCRATCH_START(mdctSpec, FIXP_DBL, 1024);
+  CAacDecoderCceScratch *scratch = (CAacDecoderCceScratch *)FDKaalloc(
+      sizeof(CAacDecoderCceScratch), ALIGNMENT_DEFAULT);
+  if (scratch == NULL) {
+    self->frameOK = 0;
+    return AAC_DEC_DECODE_FRAME_ERROR;
+  }
+  /* FDKaalloc clears the memory, which also covers the mdctSpec clear. */
+  scratch->commonStaticData.pWorkBufferCore1 = &scratch->workBufferCore1;
 
-          /* create dummy channel for CCE parsing on stack */
-          CAacDecoderChannelInfo tmpAacDecoderChannelInfo,
-              *pTmpAacDecoderChannelInfo;
+  CAacDecoderChannelInfo *pTmpAacDecoderChannelInfo =
+      &scratch->tmpAacDecoderChannelInfo;
+  pTmpAacDecoderChannelInfo->pDynData =
+      scratch->commonData.pAacDecoderDynamicData;
+  pTmpAacDecoderChannelInfo->pComData = &scratch->commonData;
+  pTmpAacDecoderChannelInfo->pComStaticData = &scratch->commonStaticData;
+  pTmpAacDecoderChannelInfo->pSpectralCoefficient =
+      (SPECTRAL_PTR)scratch->mdctSpec;
+  /* Assume AAC-LC */
+  pTmpAacDecoderChannelInfo->granuleLength =
+      self->streamInfo.aacSamplesPerFrame / 8;
+  /* Reset PNS data. */
+  CPns_ResetData(&pTmpAacDecoderChannelInfo->data.aac.PnsData,
+                 &pTmpAacDecoderChannelInfo->pComData->pnsInterChannelData);
+  /* do CCE parsing */
+  ErrorStatus = CChannelElement_Read(
+      bs, &pTmpAacDecoderChannelInfo, NULL, self->streamInfo.aot,
+      &self->samplingRateInfo[streamIndex], self->flags[streamIndex],
+      AC_EL_GA_CCE, self->streamInfo.aacSamplesPerFrame, 1,
+      self->streamInfo.epConfig, self->hInput);
 
-          FDKmemclear(mdctSpec, 1024 * sizeof(FIXP_DBL));
+  if (ErrorStatus) {
+    self->frameOK = 0;
+  }
 
-          tmpAacDecoderChannelInfo.pDynData = commonData.pAacDecoderDynamicData;
-          tmpAacDecoderChannelInfo.pComData = &commonData;
-          tmpAacDecoderChannelInfo.pComStaticData = &commonStaticData;
-          tmpAacDecoderChannelInfo.pSpectralCoefficient =
-              (SPECTRAL_PTR)mdctSpec;
-          /* Assume AAC-LC */
-          tmpAacDecoderChannelInfo.granuleLength =
-              self->streamInfo.aacSamplesPerFrame / 8;
-          /* Reset PNS data. */
-          CPns_ResetData(
-              &tmpAacDecoderChannelInfo.data.aac.PnsData,
-              &tmpAacDecoderChannelInfo.pComData->pnsInterChannelData);
-          pTmpAacDecoderChannelInfo = &tmpAacDecoderChannelInfo;
-          /* do CCE parsing */
-          ErrorStatus = CChannelElement_Read(
-              bs, &pTmpAacDecoderChannelInfo, NULL, self->streamInfo.aot,
-              &self->samplingRateInfo[streamIndex], self->flags[streamIndex],
-              AC_EL_GA_CCE, self->streamInfo.aacSamplesPerFrame, 1,
-              self->streamInfo.epConfig, self->hInput);
+  if (self->frameOK) {
+    /* Lookup the element and decode it only if it belongs to the
+     * current program */
+    if (CProgramConfig_LookupElement(
+            pce, self->streamInfo.channelConfig,
+            pTmpAacDecoderChannelInfo->ElementInstanceTag, 0, self->chMapping,
+            self->channelType, self->channelIndices, (8),
+            pPreviousElementIndex, self->elements, type)) {
+      /* decoding of CCE not supported */
+    } else {
+      self->frameOK = 0;
+    }
+  }
 
-          C_AALLOC_SCRATCH_END(mdctSpec, FIXP_DBL, 1024);
-
-          if (ErrorStatus) {
-            self->frameOK = 0;
-          }
-
-          if (self->frameOK) {
-            /* Lookup the element and decode it only if it belongs to the
-             * current program */
-            if (CProgramConfig_LookupElement(
-                    pce, self->streamInfo.channelConfig,
-                    pTmpAacDecoderChannelInfo->ElementInstanceTag, 0,
-                    self->chMapping, self->channelType, self->channelIndices,
-                    (8), pPreviousElementIndex, self->elements, type)) {
-              /* decoding of CCE not supported */
-            } else {
-              self->frameOK = 0;
-            }
-          }
-        
+  FDKafree(scratch);
   return ErrorStatus;
 }
 

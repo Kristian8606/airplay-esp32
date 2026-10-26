@@ -27,9 +27,10 @@ play a single channel of it. So:
 
 - **Every board announces 5.1 and 7.1 AAC.** Apple TV then sends the
   multichannel stream to all of them.
-- **Every board decodes only its own channel.** All channels are parsed, but
-  only the selected one is synthesised, which keeps the CPU load at about
-  40–50 % of one core instead of more than 100 %.
+- **Every board decodes only its own channel.** The bits of all channels are
+  read, but only the element holding the selected channel is inverse
+  quantised and synthesised, which keeps the CPU load at about a third of one
+  core instead of more than 100 %.
 - **Every board plays that channel on both outputs** of its DAC or amplifier
   (L = R), so either output can drive the speaker, or both can feed an active
   subwoofer or a pair of drivers in one cabinet.
@@ -167,9 +168,10 @@ remove the two "Multichannel experiment" lines at the end of
 |---|---|
 | FDK AAC decoding, RTSP, PTP | Wi-Fi driver, LwIP, AAC TCP reader, I2S playout, status / LED / log tasks |
 
-In both build modes the decode task's 64 KiB stack and AAC signed32 scratch
-buffer (64 KiB) live in PSRAM; FDK keeps ~45 KiB on the stack. Scratch allocation
-can fall back to the regular heap if PSRAM allocation fails.
+The decode task has a 20 KiB stack in internal RAM (it falls back to PSRAM if
+no such block is free at stream start; the log says which); FDK's deepest path
+uses ~11 KiB. The AAC signed32 scratch buffer (64 KiB) lives in PSRAM and can
+fall back to the regular heap.
 
 ## Limitations
 
@@ -179,9 +181,10 @@ can fall back to the regular heap if PSRAM allocation fails.
   films and Atmos mixes.
 - The **7.1 naming** (Apple vs ISO order) has not been confirmed with a channel
   test signal yet (see above).
-- **CPU**: decoding one speaker of 7.1/5.1 takes ~35–50 % of Core 0
-  (parsing all channels is the largest part and cannot be skipped). Mono mix
-  decodes everything and may not keep up.
+- **CPU**: decoding one speaker of 7.1 takes ~31–34 % of Core 0 (measured on a
+  back speaker; centre and LFE should be lower). Reading the bits of every
+  channel cannot be skipped; the other channels are not inverse quantised or
+  synthesised. Mono mix decodes everything and may not keep up.
 - **Realtime ALAC** plays at 44.1 kHz through the rate switch, but it has not
   been tested much in multichannel builds yet.
 - Each switch between 44.1 and 48 kHz has a short silence while I2S is

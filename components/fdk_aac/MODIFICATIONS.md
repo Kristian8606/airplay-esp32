@@ -63,6 +63,13 @@ Checked on a host build that emulates the ESP32 (no x86 helpers): FDK-encoded
 every speaker, with full output, and while switching speakers every 37 frames.
 Instruction counts for one speaker of 7.1 dropped by about half (clz ~32 %,
 element skip a further ~27-37 %); this is a host measurement, not ESP32 timing.
+On the ESP32-S3 (one back speaker of 7.1) the average decode time dropped from
+about 11.3 ms to 7.2 ms per frame, and the decode task's deepest stack use
+from ~45 KiB to ~11 KiB.
+
+| File | Change (2026-10-26, later the same day) |
+|---|---|
+| `libAACdec/src/aacdecoder.cpp` | The CCE parsing helper takes its dummy channel and work buffers (~35 KiB) from the heap (`FDKaalloc`/`FDKafree`) for the duration of one CCE element instead of from the stack. If that memory is not available the frame is concealed (`AAC_DEC_DECODE_FRAME_ERROR`). This lets the decoder run on a 20 KiB stack. |
 
 ## No patent license
 

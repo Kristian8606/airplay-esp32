@@ -43,12 +43,13 @@
 
 #define AP2_PACKET_MAX             8192U
 #define AP2_RX_STACK               4096U
-/* Every AAC stream decodes with FDK on this task. FDK keeps
- * a dummy channel and work buffers on the stack: CAacDecoder_DecodeFrame alone
- * has a 35.6 KiB frame (-fstack-usage), ~45 KiB at the deepest call. That
- * stack lives in PSRAM so internal RAM is not spent on it. */
-#define AP2_PROCESS_STACK          65536U
-#define AP2_PROCESS_STACK_PSRAM    1
+/* Every AAC stream decodes with FDK on this task. With the local FDK patch
+ * (CCE work memory on the heap) its deepest path uses ~11 KiB of stack
+ * (measured: 54 KiB of 64 KiB never touched on 7.1). The stack is taken from
+ * internal RAM, which is faster than PSRAM for FDK's register spills; if no
+ * such block is free it falls back to PSRAM. Both are created "WithCaps". */
+#define AP2_PROCESS_STACK          20480U
+#define AP2_PROCESS_STACK_PSRAM    1 /* created WithCaps: delete WithCaps */
 #define AP2_PLAYOUT_STACK          4096U
 #define AP2_RT_STAGE_STACK         4096U
 #define AP2_STATUS_STACK             6144U
@@ -4485,21 +4486,30 @@ esp_err_t audio_receiver_start_buffered(uint16_t port) {
                       TAG, "buffered FIFO start failed");
   s.port = bound;
   __atomic_store_n(&s.rx_running, true, __ATOMIC_RELEASE);
-#if AP2_PROCESS_STACK_PSRAM
-  if (xTaskCreatePinnedToCoreWithCaps(ap2_buffered_processor_task, "ap2_buf_proc",
-                                      AP2_PROCESS_STACK, NULL, AP2_DECODE_PRIORITY,
-                                      &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE,
-                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-#else
-  if (xTaskCreatePinnedToCore(ap2_buffered_processor_task, "ap2_buf_proc",
-                              AP2_PROCESS_STACK, NULL, AP2_DECODE_PRIORITY,
-                              &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE) != pdPASS) {
-#endif
+  bool stack_internal = true;
+  BaseType_t created = xTaskCreatePinnedToCoreWithCaps(
+      ap2_buffered_processor_task, "ap2_buf_proc", AP2_PROCESS_STACK, NULL,
+      AP2_DECODE_PRIORITY, &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE,
+      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (created != pdPASS) {
+    stack_internal = false;
+    created = xTaskCreatePinnedToCoreWithCaps(
+        ap2_buffered_processor_task, "ap2_buf_proc", AP2_PROCESS_STACK, NULL,
+        AP2_DECODE_PRIORITY, &s.processor_task, AP2_BUFFERED_PROCESSOR_CORE,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  if (created != pdPASS) {
     __atomic_store_n(&s.rx_running, false, __ATOMIC_RELEASE);
     ap2_buffered_fifo_notify(s.transport);
     ap2_buffered_fifo_stop(s.transport);
     return ESP_FAIL;
   }
+  ESP_LOGI(TAG, "decoder task stack: %u KiB in %s RAM (internal largest free "
+                "block now %u KiB)",
+           (unsigned)(AP2_PROCESS_STACK / 1024U),
+           stack_internal ? "internal" : "PSRAM (no internal block free)",
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                       MALLOC_CAP_8BIT) / 1024U));
   AP_LOGI(TAG, "AP2 buffered listener port=%u", (unsigned)s.port);
   return ESP_OK;
 }
