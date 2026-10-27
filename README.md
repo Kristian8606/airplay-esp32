@@ -252,7 +252,7 @@ and `I2S RATE` logs; a new SETUP is not required for an SSRC format change.
 
 ## Credits
 
-- Based on [airplay-esp32](https://github.com/Kristian8606/airplay-esp32),
+- Based on [airplay-esp32](https://github.com/rbouteiller/airplay-esp32.git),
   the stereo AirPlay 2 receiver for the ESP32-S3.
 - [fdk-aac](https://github.com/mstorsjo/fdk-aac) for the standalone build of
   the Fraunhofer FDK AAC codec.
