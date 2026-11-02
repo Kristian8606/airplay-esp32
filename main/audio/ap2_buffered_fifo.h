@@ -83,3 +83,7 @@ esp_err_t ap2_buffered_fifo_read_head(ap2_buffered_fifo_t *fifo,
                                       const ap2_buffered_fifo_head_t *head,
                                       uint8_t *block_storage,
                                       size_t block_capacity);
+esp_err_t ap2_buffered_fifo_copy_head(ap2_buffered_fifo_t *fifo,
+                                      const ap2_buffered_fifo_head_t *head,
+                                      uint8_t *block_storage,
+                                      size_t block_capacity);

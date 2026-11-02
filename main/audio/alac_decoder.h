@@ -24,3 +24,7 @@ int alac_decoder_decode(alac_decoder_t *decoder, const uint8_t *input,
                         size_t input_len, int16_t *output,
                         size_t output_capacity_frames,
                         alac_decode_info_t *info);
+int alac_decoder_decode_float(alac_decoder_t *decoder, const uint8_t *input,
+                              size_t input_len, float *output,
+                              size_t output_capacity_frames,
+                              alac_decode_info_t *info);

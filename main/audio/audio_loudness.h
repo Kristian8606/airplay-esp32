@@ -24,6 +24,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "audio_playout.h" /* audio_playout_get_rate() */
 
 #define AUDIO_LOUDNESS_REF_MAX_DB 20
 #define AUDIO_LOUDNESS_MAX_ATT_DB 40.0f
@@ -33,7 +34,9 @@
 #define AUDIO_LOUDNESS_HIGH_HZ 10500.0f
 #define AUDIO_LOUDNESS_HIGH_SLOPE 1.0f
 #define AUDIO_LOUDNESS_HIGH_DB_PER_DB 0.15f
-#define AUDIO_LOUDNESS_SAMPLE_RATE 44100.0f
+/* The filters run at the current I2S rate (switched per stream; then
+ * audio_loudness_reset() rebuilds them). */
+#define AUDIO_LOUDNESS_SAMPLE_RATE ((float)audio_playout_get_rate())
 
 typedef struct {
   bool enabled;

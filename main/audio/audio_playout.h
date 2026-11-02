@@ -113,3 +113,10 @@ esp_err_t audio_playout_reset_tune(void);
 /* True when the clock can be tuned: the fractional MCLK divider register is
  * rewritten while I2S keeps running (checked at init). */
 bool audio_playout_tune_is_live(void);
+
+/* Current I2S sample rate (Hz). */
+uint32_t audio_playout_get_rate(void);
+/* Switch the I2S sample rate: stops the channel (like audio_playout_flush),
+ * reprograms the clock and resets the MCLK correction to the new nominal.
+ * No-op when already at rate_hz. Playout task only, like flush. */
+esp_err_t audio_playout_set_rate(uint32_t rate_hz);

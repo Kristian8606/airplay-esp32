@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "alac_decoder.h"
+#include "audio_format_log.h"
 #include "audio_crypto.h"
 #include "audio_diag.h"
 #include "esp_heap_caps.h"
@@ -844,6 +845,7 @@ static void alac_worker_task(void *arg) {
       .frame_size = s_rt.cfg.format.frame_size,
   };
   alac_decoder_t *decoder = alac_decoder_create(&dcfg);
+  bool playback_announced = false;
   if (!decoder) {
     ESP_LOGE(TAG, "failed to create ALAC decoder");
     rt_request_stop();
@@ -902,6 +904,11 @@ static void alac_worker_task(void *arg) {
     const bool decoded = decode_audio_packet(decoder, slot->data, packet_len,
                                              slot->retransmitted);
     if (decoded) {
+      if (!playback_announced) {
+        audio_log_stereo_playback(TAG, "ALAC", dcfg.sample_rate,
+                                  dcfg.bits_per_sample, "realtime");
+        playback_announced = true;
+      }
       seen_mark(ext_seq);
       if (may_clear_missing) {
         (void)queue_resend_event(RT_RESEND_EVENT_RECEIVED, ext_seq, 1U, 0U);

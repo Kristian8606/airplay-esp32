@@ -1,20 +1,29 @@
 #include "aac_decoder.h"
+#include "audio_out_sample.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "decoder/impl/esp_aac_dec.h"
-#include "esp_audio_dec.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "airplay_log.h"
+#include "aacdecoder_lib.h"
 
 #define ADTS_HEADER_LEN AAC_DECODER_INPUT_HEADROOM
 #define AAC_INPUT_MAX   8192U
+/* S32 scratch for one AAC-LC access unit. FDK is opened with its full
+ * channel limit (the parameters the surround build runs with); the buffer
+ * matches it so an unexpected layout can never overrun it. Only stereo and
+ * mono are played. 2048 frames leaves room in case the decoder hands out
+ * more than 1024. */
+#define FDK_MAX_CHANNELS 8
+#define FDK_MAX_FRAMES   2048U
 
 struct aac_decoder {
   aac_decoder_config_t config;
-  void *handle;
+  HANDLE_AACDECODER fdk;
+  LONG *pcm; /* FDK signed32 before 16-bit quantization; never INT_PCM. */
   uint32_t decode_errors;
 };
 
@@ -28,7 +37,7 @@ static int adts_frequency_index(int sample_rate) {
       return i;
     }
   }
-  return 4; // AirPlay 2 path is 44.1 kHz in this project.
+  return 4; // 44.1 kHz
 }
 
 static bool has_adts(const uint8_t *data, size_t len) {
@@ -51,30 +60,36 @@ static void make_adts(uint8_t *h, size_t payload_len, int sample_rate,
   h[6] = 0xfc;
 }
 
-static bool open_decoder(aac_decoder_t *d) {
-  if (d->handle) {
-    esp_aac_dec_close(d->handle);
-    d->handle = NULL;
+static bool open_fdk_decoder(aac_decoder_t *d) {
+  d->fdk = aacDecoder_Open(TT_MP4_ADTS, 1);
+  if (!d->fdk) {
+    ESP_LOGE(TAG, "FDK aacDecoder_Open failed");
+    return false;
   }
-
-  esp_aac_dec_cfg_t cfg = ESP_AAC_DEC_CONFIG_DEFAULT();
-  cfg.sample_rate = d->config.sample_rate;
-  cfg.channel = d->config.channels;
-  cfg.bits_per_sample = d->config.bits_per_sample > 0 ? d->config.bits_per_sample : 16;
-  cfg.no_adts_header = false;
-  cfg.aac_plus_enable = false;
-
-  esp_audio_err_t err = esp_aac_dec_open(&cfg, sizeof(cfg), &d->handle);
-  if (err != ESP_AUDIO_ERR_OK) {
-    ESP_LOGE(TAG, "esp_aac_dec_open failed: %d", err);
-    d->handle = NULL;
+  /* No FDK downmix, WAV channel order, and no limiter: DecodeFrame32
+   * requires it disabled. Preserve FDK's existing DRC defaults and scaling;
+   * no extra gain or source-depth assumption. */
+  const AAC_DECODER_ERROR e1 =
+      aacDecoder_SetParam(d->fdk, AAC_PCM_MAX_OUTPUT_CHANNELS, FDK_MAX_CHANNELS);
+  const AAC_DECODER_ERROR e2 =
+      aacDecoder_SetParam(d->fdk, AAC_PCM_OUTPUT_CHANNEL_MAPPING, 1);
+  const AAC_DECODER_ERROR e3 =
+      aacDecoder_SetParam(d->fdk, AAC_PCM_LIMITER_ENABLE, 0);
+  /* RTP already timestamps each AU. FDK's default interpolation adds one
+   * unaccounted frame (1024 samples); noise substitution has no extra delay. */
+  const AAC_DECODER_ERROR e4 =
+      aacDecoder_SetParam(d->fdk, AAC_CONCEAL_METHOD, 1);
+  if (e1 != AAC_DEC_OK || e2 != AAC_DEC_OK || e3 != AAC_DEC_OK || e4 != AAC_DEC_OK) {
+    ESP_LOGE(TAG, "FDK S32 setup failed (params 0x%x/0x%x/0x%x/0x%x)",
+             e1, e2, e3, e4);
     return false;
   }
   return true;
 }
 
 aac_decoder_t *aac_decoder_create(const aac_decoder_config_t *config) {
-  if (!config || config->sample_rate <= 0 || config->channels <= 0) {
+  if (!config || config->sample_rate <= 0 || config->channels <= 0 ||
+      config->channels > 2) {
     return NULL;
   }
 
@@ -83,7 +98,11 @@ aac_decoder_t *aac_decoder_create(const aac_decoder_config_t *config) {
     return NULL;
   }
   d->config = *config;
-  if (!open_decoder(d)) {
+  const size_t bytes = FDK_MAX_FRAMES * FDK_MAX_CHANNELS * sizeof(*d->pcm);
+  d->pcm = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!d->pcm) d->pcm = malloc(bytes);
+  if (!d->pcm || !open_fdk_decoder(d)) {
+    ESP_LOGE(TAG, "Cannot create FDK S32 AAC decoder");
     aac_decoder_destroy(d);
     return NULL;
   }
@@ -94,17 +113,18 @@ void aac_decoder_destroy(aac_decoder_t *d) {
   if (!d) {
     return;
   }
-  if (d->handle) {
-    esp_aac_dec_close(d->handle);
+  if (d->fdk) {
+    aacDecoder_Close(d->fdk);
   }
+  free(d->pcm);
   free(d);
 }
 
 int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
-                       size_t input_len, int16_t *output,
+                       size_t input_len, float *output,
                        size_t output_capacity_frames,
                        aac_decode_info_t *info) {
-  if (!d || !d->handle || !input || input_len == 0 || !output ||
+  if (!d || !d->fdk || !input || input_len == 0 || !output ||
       output_capacity_frames == 0) {
     return -1;
   }
@@ -121,41 +141,43 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
     decode_len = input_len + ADTS_HEADER_LEN;
   }
 
-  const int channels = d->config.channels > 0 ? d->config.channels : 2;
-  esp_audio_dec_in_raw_t raw = {
-      .buffer = (uint8_t *)decode_data,
-      .len = (uint32_t)decode_len,
-      .consumed = 0,
-      .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
-  };
-  esp_audio_dec_out_frame_t frame = {
-      .buffer = (uint8_t *)output,
-      .len = (uint32_t)(output_capacity_frames * (size_t)channels * sizeof(int16_t)),
-      .decoded_size = 0,
-  };
-  esp_audio_dec_info_t dec_info = {0};
-
-  esp_audio_err_t err = esp_aac_dec_decode(d->handle, &raw, &frame, &dec_info);
-  if (err != ESP_AUDIO_ERR_OK) {
-    /* Shairport keeps the AAC decoding chain alive across a bad access unit.
-     * Dropping the AU here lets the codec preserve/recover its overlap history
-     * on the following block instead of manufacturing a new decoder epoch. */
-    if ((++d->decode_errors & 63U) == 1U)
-      AP_LOGW(TAG, "decode error=%d; dropping AAC block without decoder reset (%lu total)",
-               err, (unsigned long)d->decode_errors);
+  UCHAR *in = (UCHAR *)decode_data;
+  UINT in_size = (UINT)decode_len;
+  UINT valid = (UINT)decode_len;
+  AAC_DECODER_ERROR err = aacDecoder_Fill(d->fdk, &in, &in_size, &valid);
+  if (err == AAC_DEC_OK) {
+    err = aacDecoder_DecodeFrame32(d->fdk, d->pcm,
+                                   (INT)(FDK_MAX_FRAMES * FDK_MAX_CHANNELS), 0);
+  }
+  if (err != AAC_DEC_OK) {
+    /* Shairport keeps the AAC decoding chain alive across a bad access unit;
+     * FDK conceals the missing frame from its own history. */
+    if ((++d->decode_errors & 63U) == 1U || d->decode_errors <= 8U)
+      AP_LOGW(TAG, "FDK decode error 0x%x (in %u B, %u left; %lu total)",
+               err, (unsigned)decode_len, (unsigned)valid,
+               (unsigned long)d->decode_errors);
     return -1;
   }
 
-  int out_channels = dec_info.channel > 0 ? dec_info.channel : channels;
-  if (out_channels <= 0) {
-    out_channels = 2;
+  const CStreamInfo *si = aacDecoder_GetStreamInfo(d->fdk);
+  if (!si || si->numChannels <= 0 || si->numChannels > 2 ||
+      si->frameSize <= 0 || (size_t)si->frameSize > FDK_MAX_FRAMES) {
+    return -1;
   }
-  size_t frames = frame.decoded_size / ((size_t)out_channels * sizeof(int16_t));
-  if (frames > output_capacity_frames) {
-    frames = output_capacity_frames;
+
+  size_t frames = (size_t)si->frameSize;
+  if (frames > output_capacity_frames) frames = output_capacity_frames;
+
+  if (si->numChannels == 2) {
+    for (size_t i = 0; i < frames * 2U; ++i)
+      output[i] = audio_pcm32_to_float(d->pcm[i]);
+  } else {
+    for (size_t f = 0; f < frames; ++f) {
+      const float v = audio_pcm32_to_float(d->pcm[f]);
+      output[2 * f] = v;
+      output[2 * f + 1] = v;
+    }
   }
-  if (info) {
-    info->channels = out_channels;
-  }
+  if (info) info->channels = 2;
   return (int)frames;
 }
