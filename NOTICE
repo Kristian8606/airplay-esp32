@@ -1,0 +1,14 @@
+airplay-esp32
+Copyright 2026 Kristian Dimitrov
+
+This repository is licensed under the Apache License, Version 2.0 (see
+LICENSE). The components in components/ carry their own copy of the license
+and a NOTICE.
+
+Not covered by the Apache License:
+- components/ap2_core/src/fairplay/fairplay_tables.c: fixed interop data;
+  see components/ap2_core/NOTICE.
+- components/fdk_aac: the Fraunhofer FDK AAC library under its own license;
+  see components/fdk_aac/fdk-aac/NOTICE.
+- Components fetched by the ESP-IDF component manager, each under its own
+  license.

@@ -418,6 +418,13 @@ request and response** in `menuconfig` (verbose; turn it off afterwards).
 
 ## Licenses and credits
 
+- **This repository** is under the **Apache License 2.0**, Copyright 2026
+  Kristian Dimitrov: [`LICENSE`](LICENSE), [`NOTICE`](NOTICE). The
+  components in `components/` carry their own copy of the license and a
+  `NOTICE`. The exceptions are below.
+- **FairPlay setup replies** (`components/ap2_core/src/fairplay/fairplay_tables.c`)
+  are fixed interop data from reverse engineering, not under the Apache
+  License; see [`components/ap2_core/NOTICE`](components/ap2_core/NOTICE).
 - **Fraunhofer FDK AAC** (`components/fdk_aac/fdk-aac`) is under the
   Fraunhofer FDK license, [`NOTICE`](components/fdk_aac/fdk-aac/NOTICE). The
   copy here is a **Third-Party Modified Version of the Fraunhofer FDK AAC
@@ -426,21 +433,14 @@ request and response** in `menuconfig` (verbose; turn it off afterwards).
   allows redistribution in source and binary form without copyright fees but
   **grants no patent rights**: AAC patent licenses are available through Via
   Licensing or the patent owners.
-- The **rest of this repository** is based on
-  [rbouteiller/airplay-esp32](https://github.com/rbouteiller/airplay-esp32)
-  and is under its **Non-Commercial License**, Copyright (c) 2026 Remi
-  Bouteiller, in [`LICENSE`](LICENSE): use, copying, changes and
-  distribution for non-commercial purposes only; commercial use needs
-  written permission from the copyright holder.
 - Other components (ESP-IDF, `esp_audio_codec`, libsodium, mDNS, cJSON,
   led_strip) come through the ESP-IDF component manager under their own
   licenses.
 
-Originally based on
-[rbouteiller/airplay-esp32](https://github.com/rbouteiller/airplay-esp32).
-AAC decoding through [fdk-aac](https://github.com/mstorsjo/fdk-aac). Sister
-project for 5.1 / 7.1:
+The AirPlay 2 protocol, clock, Wi-Fi, web server and other components come
+from the sister project for 5.1 / 7.1,
 [esp32-airplay2-surround](https://github.com/Kristian8606/esp32-airplay2-surround).
+AAC decoding through [fdk-aac](https://github.com/mstorsjo/fdk-aac).
 
 AirPlay, Apple TV and HomePod are trademarks of Apple Inc. This project is not
 affiliated with or endorsed by Apple.
