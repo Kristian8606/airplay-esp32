@@ -3,13 +3,12 @@
 #include "amp_control.h"
 #include "audio_eq.h"
 #include "audio_loudness.h"
-#include "dns_server.h"
-#include "hap.h"
+#include "ap2_hap.h"
+#include "network/apple_clock.h"
 #include "log_stream.h"
 #include "led.h"
 #include "mdns_airplay.h"
 #include "nvs_flash.h"
-#include "ptp_clock.h"
 #include "rtsp_server.h"
 #include "playback_buttons.h"
 #include "settings.h"
@@ -22,7 +21,6 @@
 #include "freertos/task.h"
 
 static const char *TAG = "main";
-#define AP_IP_ADDR 0x0104A8C0
 
 static void log_memory_state(const char *where) {
   ESP_LOGI(TAG,
@@ -72,7 +70,6 @@ void app_main(void) {
   if (provisioning_only || !wifi_wait_connected(30000)) {
     ESP_LOGW(TAG,
              "STA not connected; captive WiFi setup remains available at 192.168.4.1");
-    dns_server_start(AP_IP_ADDR);
   } else {
     ESP_LOGI(TAG, "WiFi connected");
   }
@@ -82,8 +79,10 @@ void app_main(void) {
    * startup events are captured by the low-priority worker. This is a no-op
    * when diagnostics are disabled or no category is selected. */
   (void)AUDIO_DIAG_INIT();
-  ESP_ERROR_CHECK(ptp_clock_init());
-  ESP_ERROR_CHECK(hap_init());
+  /* The sender's clock: two-way PTP with the master the sender names. The
+   * audio reads it through network/ptp_clock.c. */
+  ESP_ERROR_CHECK(apple_clock_start());
+  ESP_ERROR_CHECK(ap2_hap_identity_init());
   led_init();
 
   if (provisioning_only) {

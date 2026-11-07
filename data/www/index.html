@@ -17,33 +17,15 @@
 <div class='card'><h2>WiFi Speedtest</h2><p style='color:#888;font-size:13px;margin-bottom:12px'>Measure latency and throughput to this device</p><a href='/speedtest' class='btn btn-primary'>Open Speedtest</a></div>
 </div><script>
 function msg(id,txt,type){var e=document.getElementById(id);if(e){e.innerHTML='<div class="msg '+type+'">'+txt+'</div>';setTimeout(function(){e.innerHTML='';},4000);}}
-let remoteSending=false;
 function remoteText(text){document.getElementById('remote-status').textContent=text;}
-function remoteButtons(disabled){document.querySelectorAll('.remote-btn').forEach(b=>b.disabled=disabled);}
 async function sendRemote(command){
- if(remoteSending)return;
- remoteSending=true;remoteButtons(true);remoteText('Sending...');
- const controller=new AbortController();const timeout=setTimeout(()=>controller.abort(),7000);
+ /* The receiver queues commands and the sender does not reply: send and go on. */
+ remoteText('Sending...');
  try{
-  const response=await fetch('/api/audio/remote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:command}),signal:controller.signal});
+  const response=await fetch('/api/audio/remote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:command})});
   if(!response.ok)throw new Error(await response.text());
-  const queued=await response.json();remoteText('Waiting for the phone...');
-  const deadline=Date.now()+5000;
-  while(Date.now()<deadline){
-   await new Promise(resolve=>setTimeout(resolve,250));
-   const reply=await fetch('/api/audio/remote',{cache:'no-store',signal:controller.signal});
-   if(!reply.ok)throw new Error('Cannot read command status');
-   const state=await reply.json();
-   if(state.id!==queued.id)throw new Error('Another command replaced this status. Check the log.');
-   if(state.result==='queued'||state.result==='sent')continue;
-   if(state.result==='acknowledged'){remoteText('Phone acknowledged the command.');return;}
-   if(state.result==='rejected')throw new Error('Phone rejected the command (RTSP '+state.rtsp_status+').');
-   if(state.result==='timeout')throw new Error('No reply from the phone.');
-   throw new Error('Command '+state.result+'. Check the log.');
-  }
-  throw new Error('No confirmation. Check the log before trying again.');
- }catch(error){remoteText(error.name==='AbortError'?'No confirmation. Check the log before trying again.':error.message);}
- finally{clearTimeout(timeout);remoteSending=false;remoteButtons(false);}
+  remoteText('Command sent.');
+ }catch(error){remoteText(error.message);}
 }
 async function scanWiFi(){var l=document.getElementById('wifi-list');l.innerHTML='<div class="msg info">Scanning...</div>';try{var r=await fetch('/api/wifi/scan');var d=await r.json();if(d.success&&d.networks.length){l.innerHTML='';d.networks.forEach(function(n){var i=document.createElement('div');i.className='wifi-item';i.innerHTML='<span class="ssid">'+n.ssid+'</span><span class="rssi">'+n.rssi+' dBm</span>';i.onclick=function(){document.querySelectorAll('.wifi-item').forEach(x=>x.classList.remove('sel'));i.classList.add('sel');document.getElementById('wifi-ssid').value=n.ssid;};l.appendChild(i);});}else l.innerHTML='<div class="msg info">No networks found</div>';}catch(e){l.innerHTML='<div class="msg err">Scan failed</div>';}}
 async function saveWiFi(){var s=document.getElementById('wifi-ssid').value.trim(),p=document.getElementById('wifi-pass').value;if(!s){msg('wifi-msg','Enter network name','err');return;}try{var r=await fetch('/api/wifi/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:s,password:p})});var d=await r.json();if(d.success)msg('wifi-msg','Saved! Restarting...','ok');else msg('wifi-msg',d.error,'err');}catch(e){msg('wifi-msg','Error','err');}}

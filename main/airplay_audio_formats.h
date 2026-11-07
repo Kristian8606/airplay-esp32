@@ -28,6 +28,10 @@ static const airplay_audio_format_t airplay_audio_formats[] = {
      1024, "AAC-LC 44100 Hz / F24 / stereo"},
     {AIRPLAY_FMT_AAC_LC_48000_2, 0x17000000U, 4, "AAC", 48000, 2, 24,
      1024, "AAC-LC 48000 Hz / F24 / stereo"},
+    {AIRPLAY_FMT_AAC_LC_48000_5_1, 0x27000000U, 4, "AAC", 48000, 6, 24,
+     1024, "AAC-LC 48000 Hz / F24 / 5.1"},
+    {AIRPLAY_FMT_AAC_LC_48000_7_1, 0x28000000U, 4, "AAC", 48000, 8, 24,
+     1024, "AAC-LC 48000 Hz / F24 / 7.1"},
 };
 
 static inline const airplay_audio_format_t *airplay_audio_format_by_id(

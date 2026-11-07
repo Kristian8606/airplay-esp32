@@ -1,9 +1,15 @@
+# The receiver firmware: this speaker's audio path (audio/), the sender's
+# clock (network/), the glue the RTSP server and the web server call
+# (sound_engine.*, web_receiver.c) and start-up (main.c). The AirPlay 2
+# protocol, Wi-Fi, web server, settings, LED, logs and OTA are components in
+# ../components.
 set(SRC_FILES
     "main.c"
     "airplay_identity.c"
     "amp_control.c"
-    "settings.c"
-    "led.c"
+    "firmware_id.c"
+    "sound_engine.c"
+    "web_receiver.c"
     "audio/audio_receiver.c"
     "audio/ap2_buffered_fifo.c"
     "audio/audio_eq.c"
@@ -15,35 +21,10 @@ set(SRC_FILES
     "audio/pcm_rtp_ring.c"
     "audio/audio_playout.c"
     "audio/audio_crypto.c"
-    "rtsp/rtsp_server.c"
-    "rtsp/rtsp_conn.c"
-    "rtsp/rtsp_message.c"
-    "rtsp/rtsp_handlers.c"
-    "rtsp/rtsp_fairplay.c"
-    "rtsp/rtsp_crypto.c"
-    "rtsp/rtsp_events.c"
-    "rtsp/rtsp_remote.c"
-    "plist/plist_xml.c"
-    "plist/bplist_parser.c"
-    "plist/bplist_builder.c"
-    "plist/base64.c"
-    "hap/hap.c"
-    "hap/hap_pair_verify.c"
-    "hap/hap_pair_setup.c"
-    "hap/hap_crypto.c"
-    "hap/srp.c"
-    "hap/tlv8.c"
-    "network/wifi.c"
-    "network/mdns_airplay.c"
+    "network/apple_clock.c"
+    "network/apple_clock_core.c"
     "network/ptp_clock.c"
-    "network/ptp_clock_engine.c"
-    "network/socket_utils.c"
-    "network/web_server.c"
-    "network/ota.c"
-    "network/dns_server.c"
-    "network/log_stream.c"
 )
-
 
 if(CONFIG_AIRPLAY_HARDWARE_BUTTONS)
     list(APPEND SRC_FILES "playback_buttons.c")
@@ -64,7 +45,7 @@ endif()
 
 idf_component_register(
     SRCS ${SRC_FILES}
-    INCLUDE_DIRS "." "audio" "rtsp" "plist" "hap" "network"
+    INCLUDE_DIRS "." "audio"
     PRIV_REQUIRES
         esp_driver_gpio
         esp_driver_i2s
@@ -79,6 +60,14 @@ idf_component_register(
         mbedtls
         esp_adc
         fdk_aac
+        ap2_core
+        helpers
+        led
+        log_stream
+        ota
+        settings
+        web_server
+        wifi
 )
 
 # Embed the UI into the OTA application image. File changes automatically
@@ -87,4 +76,16 @@ foreach(page index logs speedtest eq)
     target_add_binary_data(${COMPONENT_LIB}
         "${CMAKE_CURRENT_SOURCE_DIR}/../data/www/${page}.html" BINARY
         RENAME_TO "web_${page}_html")
+endforeach()
+
+# The RTSP server (ap2_core) and the web server call the audio engine, the
+# clock, the amplifier, the identity and the pages of this component: give
+# them its headers and link them with it.
+foreach(lib ap2_core web_server)
+    idf_component_get_property(lib_target ${lib} COMPONENT_LIB)
+    target_include_directories(${lib_target} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/audio"
+        "${CMAKE_CURRENT_SOURCE_DIR}/network")
+    target_link_libraries(${lib_target} PRIVATE ${COMPONENT_LIB})
 endforeach()
