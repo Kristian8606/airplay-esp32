@@ -640,11 +640,11 @@ bool ap2_bplist_int_deep(const uint8_t *p, size_t n, const char *key,
   return read_int(&v, out);
 }
 
-bool ap2_bplist_string_deep(const uint8_t *p, size_t n, const char *key,
-                            char *out, size_t capacity) {
-  bp_obj_t v;
-  if (!capacity || !nested_value(p, n, key, &v)) return false;
+static bool read_string_utf8(const bp_obj_t *value, char *out, size_t capacity) {
+  bp_obj_t v = *value;
+  if (!out || !capacity) return false;
   if (v.kind == BP_KIND_ASCII && v.count < capacity) {
+    if (memchr(v.body, 0, v.count)) return false;
     memcpy(out, v.body, v.count);
     out[v.count] = 0;
     return true;
@@ -670,5 +670,44 @@ bool ap2_bplist_string_deep(const uint8_t *p, size_t n, const char *key,
     }
   }
   out[used] = 0;
+  return true;
+}
+
+
+bool ap2_bplist_string_deep(const uint8_t *p, size_t n, const char *key,
+                            char *out, size_t capacity) {
+  bp_obj_t value;
+  return nested_value(p, n, key, &value) && read_string_utf8(&value, out, capacity);
+}
+
+bool ap2_bplist_configure_request(const uint8_t *plist, size_t plist_len,
+                                  ap2_configure_request_t *out) {
+  bp_doc_t doc;
+  bp_obj_t config, nested;
+  if (!out || !open_root(&doc, &config, plist, plist_len)) return false;
+  memset(out, 0, sizeof(*out));
+  if (bp_dict_find(&doc, &config, "ConfigurationDictionary", &nested)) {
+    if (nested.kind != BP_KIND_DICT) return false;
+    config = nested;
+  }
+  for (uint64_t i = 0; i < config.count; ++i) {
+    bp_obj_t key, value;
+    if (!bp_dict_entry(&doc, &config, i, &key, &value)) return false;
+    if (key_equals(&key, "Device_Name", sizeof("Device_Name") - 1)) {
+      if (out->has_name || !read_string_utf8(&value, out->name, sizeof(out->name)))
+        return false;
+      out->has_name = true;
+    } else if (key_equals(&key, "Enable_HK_Access_Control",
+                           sizeof("Enable_HK_Access_Control") - 1)) {
+      if (out->has_hk_access_control) return false;
+      int64_t enabled;
+      if (value.kind == BP_KIND_SIMPLE && (value.low == 8 || value.low == 9))
+        enabled = value.low == 9;
+      else if (!read_int(&value, &enabled) || (enabled != 0 && enabled != 1))
+        return false;
+      out->has_hk_access_control = true;
+      out->hk_access_control = enabled != 0;
+    }
+  }
   return true;
 }

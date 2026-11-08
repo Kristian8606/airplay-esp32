@@ -156,6 +156,19 @@ bool ap2_pairings_has_admin(void) {
   return admin;
 }
 
+bool ap2_pairings_is_last_admin(const uint8_t *id, size_t id_len) {
+  if (!s_pairs || !id || !id_len || id_len > AP2_PAIRING_ID_MAX) return false;
+  xSemaphoreTake(s_lock, portMAX_DELAY);
+  const int target = find_locked(id, id_len);
+  bool last = target >= 0 && (s_pairs[target].perm & AP2_PERM_ADMIN);
+  for (int i = 0; last && i < AP2_PAIRINGS_MAX; ++i) {
+    if (i != target && s_pairs[i].used && (s_pairs[i].perm & AP2_PERM_ADMIN))
+      last = false;
+  }
+  xSemaphoreGive(s_lock);
+  return last;
+}
+
 bool ap2_pairings_find(const uint8_t *id, size_t id_len, uint8_t *ltpk,
                        uint8_t *perm) {
   if (!s_pairs || !id || id_len == 0 || id_len > AP2_PAIRING_ID_MAX) {
@@ -251,6 +264,22 @@ esp_err_t ap2_pairings_remove(const uint8_t *id, size_t id_len) {
     ESP_LOGI(TAG, "controller %.*s removed%s", (int)id_len, (const char *)id,
              after ? "" : " (no admin left: all pairings cleared)");
   }
+  notify(before, after);
+  return err;
+}
+
+esp_err_t ap2_pairings_clear(void) {
+  if (!s_pairs) return ESP_ERR_INVALID_STATE;
+  xSemaphoreTake(s_lock, portMAX_DELAY);
+  pairing_t previous[AP2_PAIRINGS_MAX];
+  memcpy(previous, s_pairs, TABLE_BYTES);
+  const bool before = has_admin_locked();
+  memset(s_pairs, 0, TABLE_BYTES);
+  const esp_err_t err = save_locked();
+  if (err != ESP_OK) memcpy(s_pairs, previous, TABLE_BYTES);
+  const bool after = has_admin_locked();
+  xSemaphoreGive(s_lock);
+  if (err == ESP_OK) ESP_LOGI(TAG, "HomeKit controllers cleared");
   notify(before, after);
   return err;
 }

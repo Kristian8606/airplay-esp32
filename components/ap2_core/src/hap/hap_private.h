@@ -49,9 +49,7 @@ struct ap2_hap_session {
   uint8_t controller_ltpk[32];
   bool controller_verified;
 
-  /* pair-verify attempts on this connection, and whether the last M2
-   * presented the pairing identifier "pi" (else the MAC). */
-  uint8_t pv_attempts;
+  /* Identifier used by M2; HomeKit always uses the paired "pi" identity. */
   bool pv_id_is_pi;
 };
 

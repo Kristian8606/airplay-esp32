@@ -74,6 +74,17 @@ bool ap2_bplist_stream_crypto(const uint8_t *plist, size_t plist_len,
                               size_t *eiv_len, uint8_t *shk,
                               size_t shk_capacity, size_t *shk_len);
 
+/* AirPlay Home configuration: fields of ConfigurationDictionary (or root),
+ * not arbitrary nested keys. Unknown properties are left to the controller. */
+typedef struct {
+  bool has_name;
+  char name[65]; /* settings limit: 64 UTF-8 bytes plus terminator */
+  bool has_hk_access_control;
+  bool hk_access_control;
+} ap2_configure_request_t;
+bool ap2_bplist_configure_request(const uint8_t *plist, size_t plist_len,
+                                  ap2_configure_request_t *out);
+
 /* ---- Binary plists this accessory sends ----
  *
  * Each returns the length written, or 0 if it does not fit or an argument is

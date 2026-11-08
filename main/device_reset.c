@@ -14,6 +14,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "web_server_internal.h"
+#include "sound_engine.h"
 
 #define RESET_BODY_CAP 128
 #define RESET_ERASE_CHUNK 65536U
@@ -39,6 +40,63 @@ static esp_err_t reset_homekit(void) {
   nvs_close(nvs);
   return err;
 }
+
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+#define HOMEKIT_RESET_STACK_BYTES 3072
+static StaticTask_t s_homekit_reset_tcb;
+static StackType_t s_homekit_reset_stack[HOMEKIT_RESET_STACK_BYTES / sizeof(StackType_t)];
+static TaskHandle_t s_homekit_reset_task;
+static httpd_handle_t s_homekit_reset_server;
+
+static void homekit_reset_work(void *arg) {
+  (void)arg;
+  /* Run on the same HTTP task as Wi-Fi scans, latency measurement, OTA and
+   * the web reset. No other web handler may release or restore audio until
+   * this reset reboots. Its existing internal stack is safe for NVS. */
+  vTaskPrioritySet(NULL, 1);
+  /* The response is already sent; let its connection finish before stopping
+   * the server. */
+  vTaskDelay(pdMS_TO_TICKS(500));
+  ESP_LOGW(TAG, "Apple Home removal: stopping AirPlay before HomeKit reset");
+  web_log_memory("homekit-reset-before");
+  esp_err_t err = web_role_source_stop();
+  for (unsigned waited = 0; !web_role_source_idle() && waited < 5000; waited += 20)
+    vTaskDelay(pdMS_TO_TICKS(20));
+  if (!web_role_source_idle()) err = ESP_ERR_TIMEOUT;
+  if (err == ESP_OK && sound_engine_is_initialized())
+    err = sound_engine_release_for_wifi_scan();
+  if (err == ESP_OK) {
+    web_log_memory("homekit-reset-audio-released");
+    err = reset_homekit();
+  }
+  if (err == ESP_OK) ESP_LOGW(TAG, "HomeKit keys erased; restarting for new pairing");
+  else ESP_LOGE(TAG, "HomeKit removal reset failed: %s; restarting", esp_err_to_name(err));
+  vTaskDelay(pdMS_TO_TICKS(100));
+  esp_restart();
+  for (;;) vTaskDelay(portMAX_DELAY);
+}
+
+static void homekit_reset_task(void *arg) {
+  (void)arg;
+  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  while (!__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE)) vTaskDelay(1);
+  /* Only dispatch here: audio lifecycle changes are serialized on HTTP.
+   * A transiently full control socket must not lose an accepted reset. */
+  for (unsigned attempt = 0; attempt < 50; ++attempt) {
+    if (httpd_queue_work(s_homekit_reset_server, homekit_reset_work, NULL) == ESP_OK)
+      for (;;) vTaskDelay(portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  ESP_LOGE(TAG, "HomeKit reset could not reach web worker; restarting without erasing keys");
+  esp_restart();
+  for (;;) vTaskDelay(portMAX_DELAY);
+}
+
+void device_reset_schedule_homekit(void) {
+  /* Created before the AirPlay server starts. No heap allocation here. */
+  xTaskNotifyGive(s_homekit_reset_task);
+}
+#endif
 
 static esp_err_t reset_factory(void) {
   /* No filesystem is mounted by this firmware. Also erase legacy files in
@@ -132,6 +190,15 @@ static esp_err_t reset_post(httpd_req_t *req) {
 }
 
 esp_err_t device_reset_register(httpd_handle_t server) {
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  if (!s_homekit_reset_task) {
+    s_homekit_reset_server = server;
+    s_homekit_reset_task = xTaskCreateStatic(homekit_reset_task, "hk_reset",
+        sizeof(s_homekit_reset_stack), NULL, 1, s_homekit_reset_stack,
+        &s_homekit_reset_tcb);
+    if (!s_homekit_reset_task) return ESP_ERR_NO_MEM;
+  }
+#endif
   const httpd_uri_t uri = {
       .uri = "/api/system/reset", .method = HTTP_POST, .handler = reset_post};
   return httpd_register_uri_handler(server, &uri);

@@ -89,7 +89,9 @@ The server uses:
 - Requests are RTSP/1.0 style: a request line (method, path, version), headers,
   an empty line, then `Content-Length` bytes of body. Methods are compared
   exactly (upper case); header names are case-insensitive. Any version token
-  is accepted (`HTTP/1.1` too); the reply is always `RTSP/1.0` (decided).
+  is accepted. HTTP/1.1 requests receive HTTP/1.1 replies; RTSP/1.0 requests
+  receive RTSP/1.0 replies. HTTP responses include Content-Length even for
+  an empty body.
 - Every reply: `RTSP/1.0 <code> <text>`, `CSeq` copied from the request (a
   request without `CSeq` gets a reply without it), `Server:
   AirTunes/377.40.00`, then `Content-Type` and `Content-Length` when there
@@ -247,6 +249,12 @@ TLV8 bodies handed to the AirPlay 2 core; the `State` of the request picks
 the step (pair-setup 1, 3, 5; pair-verify 1, 3). Its replies go back as
 `application/octet-stream`.
 
+With HomeKit enabled, every Pair Verify M2 presents the same `pi` identity
+used by `/configure` and full Pair Setup M6. Repeated M1 does not alternate
+the identifier with the MAC address. It still generates fresh ephemeral keys
+and clears the old authentication until the new M3 succeeds. M1 logging
+contains only bounded protocol/HKP/derive header metadata, never key material.
+
 - A client the core refuses with a well-formed message (a wrong proof or
   signature): the core returns `ESP_OK` with its `{State, Error}` reply,
   sent with 200 like any other reply [other receiver: the same].
@@ -260,15 +268,65 @@ transient pair-setup also ends in an encrypted connection. Encryption
 starts with the reply after the step that makes `ap2_hap_established()`
 true. The core sets both channel keys before that and fails the step if
 it cannot (470, above); `ap2_hap_channel_key()` returns the session's own
-key and is never NULL, so nothing more is checked. The pairing
-steps do not touch flash (only `ap2_hap_identity_init()` does, and the
-firmware calls it at start-up).
+key and is never NULL, so nothing more is checked. Transient setup and
+Pair Verify do not write persistent state. Full setup M5 and controller
+add/remove/clear operations persist pairings through an internal-stack worker;
+`ap2_hap_identity_init()` loads or creates the accessory identity at boot.
 
 ### `POST /fp-setup`
 
 The FairPlay setup reply from the AirPlay 2 core (142 or 32 bytes,
 `application/octet-stream`). A message it does not know: one warning line,
 reply one byte `0x00`.
+
+### HomeKit configuration and removal
+
+With HomeKit enabled, encrypted `POST /configure` accepts a binary plist
+`ConfigurationDictionary` with `Device_Name` and/or
+`Enable_HK_Access_Control`. Empty-body requests query the current state.
+Known fields are type/size checked before any mutation; unrelated nested keys
+are not interpreted as configuration. Changes require a verified stored admin,
+except initial configuration on an unowned transient session. Enabling HomeKit
+access requires an existing admin. Playback ACL remains 0.
+
+`Device_Name` is saved through the existing internal-stack settings worker,
+then the Wi-Fi hostname and both `_airplay`/`_raop` instance names are updated.
+Replies report the effective saved name, not just an echo of the request.
+
+Authenticated `Enable_HK_Access_Control=false`, or removal of the final
+stored administrator through `/pair-remove` or `/pairings`, requests the same
+HomeKit reset as the web button. The final encrypted response is sent first;
+then a statically allocated dispatcher (3072 internal stack bytes, priority 1)
+queues cleanup onto the existing HTTP task. This serializes it with Wi-Fi scans,
+latency measurements, OTA and the web reset through reboot. Cleanup lowers the
+HTTP task to priority 1, stops the RTSP server, waits for its tasks to exit, releases the audio engine's
+workers/buffers, and erases `airplay/hk_pairs`, `ed25519_pub`, and `ed25519_sec`
+through the shared web-reset helper. It restarts the device for fresh pairing.
+Wi-Fi, EQ, and other audio settings remain saved. The accessory identity key
+is regenerated on that restart; the MAC-derived pairing identifier stays stable.
+
+The reset request uses a cached effective name and the existing reply buffers;
+it creates no settings/store task and performs no NVS writes before the audio
+memory is released. Concurrent protocol requests are refused while reset is
+pending. A failure to send the response does not cancel an already authenticated
+removal. Stop/release/erase failures are logged and followed by a recovery reboot;
+failed cleanup is not reported in the log as successful erasure.
+
+Removing a regular controller, or one administrator when another remains,
+continues to persist the table and revoke that controller's control/event
+sessions without restarting. Unauthenticated or transient clients cannot
+request a reset of an owned home.
+
+This follows the AirPlay configuration interface; it does not invent a room
+name property. Assigning an accessory to a room is exposed by Apple's HMHome
+API. The exact room-change traffic of the physical Home app remains to be
+verified; successful rename handling alone does not establish room reassignment.
+
+Protocol references:
+- [Apple HAP pairing removal implementation](https://github.com/apple/HomeKitADK/blob/master/HAP/HAPPairingPairings.c)
+- [AirPlay home integration, HISetAccessControlEnabled](https://github.com/xueming1988/test1/blob/1b6a732fda35f3423b12edabbaf4bc9389b41a98/middleware/private/mfi_airplay/MapleSDK/Sources/AirPlayHomeIntegrationUtilities.c)
+- [OpenAirPlay configuration handler](https://github.com/openairplay/airplay2-receiver/blob/master/ap2-receiver.py)
+- [Apple HMHome room assignment API](https://developer.apple.com/documentation/homekit/hmhome/assignaccessory(_:to:completionhandler:))
 
 ### `SETUP` (no `streams` in the body)
 
@@ -562,4 +620,6 @@ task created for it.
 
 ## Open points
 
-None.
+Physical Apple Home removal/re-add and room reassignment need validation with
+the updated image. Host regressions verify configuration removal, fresh admin
+enrollment, revocation, saved names and reply framing, not Home app behavior.

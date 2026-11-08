@@ -242,7 +242,7 @@ const char *rtsp_reason(int code) {
 
 size_t rtsp_reply_head(char *out, size_t capacity, int code, const char *cseq,
                        const char *extra, const char *content_type,
-                       size_t body_len) {
+                       size_t body_len, bool http) {
   size_t n = 0;
   int w;
 
@@ -254,7 +254,7 @@ size_t rtsp_reply_head(char *out, size_t capacity, int code, const char *cseq,
   } while (0)
 
   if (capacity == 0) return 0;
-  APPEND("RTSP/1.0 %d %s\r\n", code, rtsp_reason(code));
+  APPEND("%s %d %s\r\n", http ? "HTTP/1.1" : "RTSP/1.0", code, rtsp_reason(code));
   if (cseq != NULL) APPEND("CSeq: %s\r\n", cseq);
   APPEND("Server: %s\r\n", AIRPLAY_SERVER_HEADER);
   if (extra != NULL) APPEND("%s", extra);
@@ -262,8 +262,8 @@ size_t rtsp_reply_head(char *out, size_t capacity, int code, const char *cseq,
     APPEND("Content-Type: %s\r\n", content_type != NULL
                                        ? content_type
                                        : "application/octet-stream");
-    APPEND("Content-Length: %zu\r\n", body_len);
   }
+  if (http || body_len > 0) APPEND("Content-Length: %zu\r\n", body_len);
   APPEND("\r\n");
 #undef APPEND
   return n;

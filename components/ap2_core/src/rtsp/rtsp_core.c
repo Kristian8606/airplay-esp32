@@ -48,10 +48,12 @@ static const char PUBLIC_METHODS[] =
     "SETRATEANCHORTIME, LOUDNESSNORMALIZATION\r\n";
 
 struct rtsp_conn {
+  struct rtsp_conn *next;
   uint32_t peer_ip;
   void *port_ctx;
   unsigned id;
   bool closing;
+  bool reply_http;
 
   ap2_hap_session_t *hap;
   bool encrypted;
@@ -82,15 +84,18 @@ typedef struct {
   size_t body_len;
   const char *extra;
   bool close;
+  bool homekit_reset;
 } reply_t;
 
 static struct {
+  rtsp_conn_t *connections;
   rtsp_conn_t *holder; /* the connection that holds the session */
   bool stream;
   int64_t stream_type;
   int sample_rate;
   double volume;
   bool volume_known;
+  bool homekit_reset_pending;
   unsigned next_conn_id;
 } s;
 
@@ -414,7 +419,13 @@ static void do_pair(rtsp_conn_t *c, const rtsp_msg_t *m, reply_t *r,
     if (step == 3) { fn = ap2_hap_setup_m3; last = true; }
     if (step == 5) { fn = ap2_hap_setup_m5; last = true; }
   } else {
-    if (step == 1) fn = ap2_hap_verify_m1;
+    if (step == 1) {
+      const char *hkp = rtsp_msg_header(m, "X-Apple-HKP");
+      const char *derive = rtsp_msg_header(m, "X-Apple-Pair-Derive");
+      RTSP_LOGI("[%u] pair-verify M1: protocol=%.8s HKP=%.8s derive=%.8s", c->id,
+                m->start[2], hkp ? hkp : "-", derive ? derive : "-");
+      fn = ap2_hap_verify_m1;
+    }
     if (step == 3) { fn = ap2_hap_verify_m3; last = true; }
   }
   if (fn != NULL) {
@@ -444,25 +455,76 @@ static void do_pair(rtsp_conn_t *c, const rtsp_msg_t *m, reply_t *r,
 }
 
 #ifdef CONFIG_AIRPLAY_HOMEKIT
+static void revoke_homekit_connections(rtsp_conn_t *requester, reply_t *reply) {
+  /* Called with the core lock held. Keep the current encrypted channel long
+   * enough to send M2/configure; shut down its socket only after that reply. */
+  for (rtsp_conn_t *peer = s.connections; peer; peer = peer->next) {
+    if (peer->closing || !ap2_hap_controller_revoked(peer->hap)) continue;
+    peer->closing = true;
+    if (s.holder == peer) session_end();
+    event_port_close(peer);
+    if (peer == requester) reply->close = true;
+    else rtsp_port_conn_close(peer);
+  }
+}
+
+static void homekit_reset_after_reply(rtsp_conn_t *c, reply_t *r) {
+  s.homekit_reset_pending = true;
+  c->closing = true;
+  r->close = true;
+  r->homekit_reset = true;
+  RTSP_LOGW("HomeKit removal accepted: reset after reply");
+}
+
 static void do_configure(rtsp_conn_t *c, const rtsp_msg_t *m, reply_t *r) {
-  if (!c->encrypted || !c->paired || !is_bplist(m)) {
+  if (!c->encrypted || !c->paired) {
     refuse(r, CODE_AUTH_REQUIRED, "configure needs an encrypted paired connection");
     return;
   }
-  int64_t hk = 1;
-  char name[DEVICE_NAME_MAX] = {0};
-  /* Access restrictions/passwords are not implemented. The reply explicitly
-   * reports effective ACL 0 and omits Password; it still supplies pi/key. */
-  if (!ap2_bplist_string_deep(m->body, m->body_len, "Device_Name", name, sizeof(name)))
-    (void)rtsp_port_settings_get_name(name, sizeof(name));
-  name[sizeof(name) - 1] = 0;
-  (void)ap2_bplist_int_deep(m->body, m->body_len, "Enable_HK_Access_Control", &hk);
-  char pi[AIRPLAY_PAIRING_ID_LEN];
+  ap2_configure_request_t config = {0};
+  if (m->body_len && (!is_bplist(m) ||
+      !ap2_bplist_configure_request(m->body, m->body_len, &config))) {
+    refuse(r, CODE_BAD_REQUEST, "invalid ConfigurationDictionary");
+    return;
+  }
+  uint8_t permission = 0;
+  const bool admin = ap2_hap_controller(c->hap, NULL, NULL, &permission) &&
+                     (permission & AP2_PERM_ADMIN);
+  const bool initial = ap2_hap_setup_transient(c->hap) && ap2_pairings_count() == 0;
+  if ((config.has_name || config.has_hk_access_control) && !admin && !initial) {
+    refuse(r, CODE_AUTH_REQUIRED, "configure changes need a verified administrator");
+    return;
+  }
+  if (config.has_hk_access_control && config.hk_access_control &&
+      !ap2_pairings_has_admin()) {
+    refuse(r, CODE_WRONG_STATE, "add a HomeKit administrator before enabling access control");
+    return;
+  }
+  const bool reset = admin && config.has_hk_access_control &&
+                     !config.hk_access_control;
+  if (!reset && config.has_name && rtsp_port_settings_set_name(config.name) != ESP_OK) {
+    refuse(r, CODE_INTERNAL, "speaker name was not saved or announced");
+    return;
+  }
+  char name[DEVICE_NAME_MAX], pi[AIRPLAY_PAIRING_ID_LEN];
+  const esp_err_t name_err = reset
+      ? rtsp_port_homekit_reset_name(name, sizeof(name))
+      : rtsp_port_settings_get_name(name, sizeof(name));
+  if (name_err != ESP_OK) {
+    refuse(r, CODE_INTERNAL, "cannot read speaker name");
+    return;
+  }
   airplay_get_pairing_id(pi, sizeof(pi));
   r->body_len = ap2_reply_configure(c->body, sizeof(c->body), pi,
-                                     ap2_hap_identity_public_key(), name, hk != 0);
+      ap2_hap_identity_public_key(), name, !reset && ap2_pairings_has_admin());
   r->content_type = CT_BPLIST;
-  if (!r->body_len) refuse(r, CODE_INTERNAL, "configure reply does not fit");
+  if (!r->body_len) {
+    refuse(r, CODE_INTERNAL, "configure reply does not fit");
+    return;
+  }
+  if (!reset && config.has_name) RTSP_LOGI("HomeKit configure: speaker name saved and announced");
+  if (reset) homekit_reset_after_reply(c, r);
+  else revoke_homekit_connections(c, r);
 }
 
 static void do_pairings(rtsp_conn_t *c, const rtsp_msg_t *m, reply_t *r) {
@@ -513,11 +575,18 @@ static void do_pairings(rtsp_conn_t *c, const rtsp_msg_t *m, reply_t *r) {
       err = ap2_pairings_add(id, id_len, pk, perm);
       if (err == ESP_OK && first) ap2_hap_set_controller(c->hap, id, id_len, perm);
     } else if (method == REMOVE && id_ok) {
-      err = ap2_pairings_remove(id, id_len);
-      if (err == ESP_ERR_NOT_FOUND) err = ESP_OK;
+      if (ap2_pairings_is_last_admin(id, id_len)) {
+        homekit_reset_after_reply(c, r);
+        err = ESP_OK;
+      } else {
+        err = ap2_pairings_remove(id, id_len);
+        if (err == ESP_ERR_NOT_FOUND) err = ESP_OK;
+      }
     }
-    if (err == ESP_OK) error = 0;
-    else if (err == ESP_ERR_NO_MEM) error = AP2_TLV_ERROR_MAX_PEERS;
+    if (err == ESP_OK) {
+      error = 0;
+      revoke_homekit_connections(c, r);
+    } else if (err == ESP_ERR_NO_MEM) error = AP2_TLV_ERROR_MAX_PEERS;
   }
   ap2_tlv8_writer_t w;
   ap2_tlv8_writer_init(&w, c->body, sizeof(c->body));
@@ -1002,6 +1071,16 @@ static void handle(rtsp_conn_t *c, const rtsp_msg_t *m, reply_t *r) {
   const char *uri = m->start[1];
 
   log_request(c, m);
+  if (s.homekit_reset_pending) {
+    r->close = true;
+    refuse(r, 503, "HomeKit reset in progress");
+    return;
+  }
+  if (c->closing) {
+    r->close = true;
+    refuse(r, CODE_AUTH_REQUIRED, "connection is closing");
+    return;
+  }
   if (m->body_state == RTSP_BODY_TOO_LARGE) {
     refuse(r, CODE_TOO_LARGE, "body over the limit");
     return;
@@ -1079,6 +1158,8 @@ rtsp_conn_t *rtsp_conn_new(uint32_t peer_ip, void *port_ctx) {
   rtsp_reader_init(&c->reader, RTSP_BODY_MAX);
   rtsp_port_lock();
   c->id = ++s.next_conn_id;
+  c->next = s.connections;
+  s.connections = c;
   rtsp_port_unlock();
   return c;
 }
@@ -1114,7 +1195,7 @@ static int send_reply(rtsp_conn_t *c, const char *cseq, const reply_t *r,
   snprintf(extra, sizeof(extra), "%s%s", r->extra != NULL ? r->extra : "",
            r->close ? "Connection: close\r\n" : "");
   head_len = rtsp_reply_head(c->head, sizeof(c->head), r->code, cseq, extra,
-                             r->content_type, r->body_len);
+                             r->content_type, r->body_len, c->reply_http);
   if (head_len == 0) return -1;
 #ifdef CONFIG_AIRPLAY_LOG_RTSP_REQUESTS
   RTSP_LOGI("[%u] reply %d body %zu", c->id, r->code, r->body_len);
@@ -1165,10 +1246,44 @@ static int process_plain(rtsp_conn_t *c, const uint8_t *data, size_t len,
         *used_out = used;
         return -1;
       }
+      c->reply_http = rtsp_str_ieq(c->reader.msg.start[2], "HTTP/1.1") ||
+                      rtsp_str_ieq(c->reader.msg.start[2], "HTTP/1.0");
+      const bool verify_trace = path_is(c->reader.msg.start[1], "/pair-verify");
+      rtsp_pairing_memory_t mem_before = {0}, mem_after;
+      uint32_t arrived = 0, locked = 0, handled = 0;
+      if (verify_trace) {
+        rtsp_port_pairing_memory(&mem_before);
+        arrived = rtsp_port_now_ms();
+      }
       rtsp_port_lock();
+      if (verify_trace) locked = rtsp_port_now_ms();
       handle(c, &c->reader.msg, &r);
       rtsp_port_unlock();
+      if (verify_trace) handled = rtsp_port_now_ms();
       rc = send_reply(c, cseq, &r, send, ctx);
+      if (verify_trace) {
+        const uint32_t sent = rtsp_port_now_ms();
+        rtsp_port_pairing_memory(&mem_after);
+        const uint8_t *pk = ap2_hap_identity_public_key();
+        /* Log only after sending: do not add console latency to M2. Key
+         * bytes below are a public identity tag, never session/private keys. */
+        RTSP_LOGI("[%u] pair-verify reply=%d body=%zu send=%d wait=%" PRIu32
+                  "ms work=%" PRIu32 "ms tx=%" PRIu32 "ms pk=%02x%02x%02x%02x",
+                  c->id, r.code, r.body_len, rc, locked - arrived,
+                  handled - locked, sent - handled, pk[0], pk[1], pk[2], pk[3]);
+        RTSP_LOGI("[%u] pair-verify RAM bytes before/after: internal=%" PRIu32
+                  "/%" PRIu32 " largest=%" PRIu32 "/%" PRIu32
+                  " PSRAM=%" PRIu32 "/%" PRIu32 " largest=%" PRIu32 "/%" PRIu32,
+                  c->id, mem_before.internal_free, mem_after.internal_free,
+                  mem_before.internal_largest, mem_after.internal_largest,
+                  mem_before.psram_free, mem_after.psram_free,
+                  mem_before.psram_largest, mem_after.psram_largest);
+      }
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+      /* The removal was authenticated before this point. Complete it even
+       * if the peer disconnects while its final response is being sent. */
+      if (r.homekit_reset) rtsp_port_homekit_reset();
+#endif
       rtsp_reader_next(&c->reader);
       if (rc != 0 || r.close) {
         *used_out = used;
@@ -1228,6 +1343,9 @@ void rtsp_conn_end(rtsp_conn_t *c) {
     session_end();
   }
   event_port_close(c);
+  rtsp_conn_t **link = &s.connections;
+  while (*link && *link != c) link = &(*link)->next;
+  if (*link) *link = c->next;
   rtsp_port_unlock();
   rtsp_reader_next(&c->reader);
   ap2_hap_session_delete(c->hap);

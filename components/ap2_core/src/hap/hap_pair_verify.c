@@ -51,6 +51,9 @@ esp_err_t ap2_hap_verify_m1(ap2_hap_session_t *session, const uint8_t *input,
     return ESP_ERR_INVALID_ARG;
   }
 
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  const bool restarting = session->pair_verify_state == AP2_HAP_VERIFY_M2;
+#endif
   session->controller_verified = false;
   session->controller_id_len = 0;
   session->session_established = false;
@@ -63,17 +66,12 @@ esp_err_t ap2_hap_verify_m1(ap2_hap_session_t *session, const uint8_t *input,
 
   /* We sign (our key | our id | client's key). */
 #ifdef CONFIG_AIRPLAY_HOMEKIT
-  /* HomeKit controllers know this accessory by "pi" (/configure). If a
-   * controller rejects that M2 and starts over on the same connection, the
-   * next M1 presents the MAC this receiver used before HomeKit, and so on. */
-  session->pv_id_is_pi = (session->pv_attempts % 2U) == 0U;
-  session->pv_attempts++;
-  const char *id = ap2_hap_presented_id(session->pv_id_is_pi);
-  if (session->pv_attempts > 1) {
-    ESP_LOGW(TAG, "pair-verify M1 #%u: the previous M2 was not accepted, "
-             "presenting %s %s", (unsigned)session->pv_attempts,
-             session->pv_id_is_pi ? "pi" : "device ID", id);
-  }
+  /* Use the same identity advertised in /configure and signed in pair-setup
+   * M6. Retrying verification must not turn this accessory into another ID. */
+  session->pv_id_is_pi = true;
+  const char *id = ap2_hap_presented_id(true);
+  if (restarting)
+    ESP_LOGW(TAG, "pair-verify restarted before M3; retaining HomeKit identity %s", id);
 #else
   const char *id = ap2_hap_identity_id();
 #endif

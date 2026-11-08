@@ -76,6 +76,8 @@ bool ap2_hap_setup_transient(const ap2_hap_session_t *session);
  * no verified controller. id is not NUL-terminated. */
 bool ap2_hap_controller(const ap2_hap_session_t *session, const char **id,
                         size_t *id_len, uint8_t *perm);
+/* A formerly verified controller has been removed or its stored key changed. */
+bool ap2_hap_controller_revoked(const ap2_hap_session_t *session);
 void ap2_hap_set_controller(ap2_hap_session_t *session, const uint8_t *id,
                             size_t id_len, uint8_t perm);
 

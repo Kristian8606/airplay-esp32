@@ -128,6 +128,11 @@ bool ap2_hap_controller(const ap2_hap_session_t *session, const char **id,
   return true;
 }
 
+bool ap2_hap_controller_revoked(const ap2_hap_session_t *session) {
+  return session && session->controller_verified &&
+         !ap2_hap_controller(session, NULL, NULL, NULL);
+}
+
 void ap2_hap_set_controller(ap2_hap_session_t *session, const uint8_t *id,
                             size_t id_len, uint8_t perm) {
   if (!session || !id || id_len == 0 ||

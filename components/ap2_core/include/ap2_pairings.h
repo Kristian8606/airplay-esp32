@@ -26,6 +26,8 @@ esp_err_t ap2_pairings_init(void);
 /* Number of stored controllers / whether at least one is an admin. */
 size_t ap2_pairings_count(void);
 bool ap2_pairings_has_admin(void);
+/* True only for an existing admin with no other admin remaining. */
+bool ap2_pairings_is_last_admin(const uint8_t *id, size_t id_len);
 
 /* Looks a controller up; ltpk (32 bytes) and perm may be NULL. */
 bool ap2_pairings_find(const uint8_t *id, size_t id_len, uint8_t *ltpk,
@@ -39,6 +41,10 @@ esp_err_t ap2_pairings_add(const uint8_t *id, size_t id_len,
 /* Removes a controller (ESP_ERR_NOT_FOUND if unknown). Removing the last
  * admin removes every pairing, as HAP requires. */
 esp_err_t ap2_pairings_remove(const uint8_t *id, size_t id_len);
+
+/* Removes every controller, preserving the accessory identity and settings.
+ * RAM is restored if the persistent write fails. */
+esp_err_t ap2_pairings_clear(void);
 
 /* /pair-list reply: State 2 and every pairing (identifier, public key,
  * permissions), separated by TLV separators. Returns the length, 0 when it

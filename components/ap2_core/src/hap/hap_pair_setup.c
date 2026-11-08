@@ -57,6 +57,7 @@ esp_err_t ap2_hap_setup_m1(ap2_hap_session_t *session, const uint8_t *input,
 
 #ifdef CONFIG_AIRPLAY_HOMEKIT
   if (!wants_transient(input, input_len) && ap2_pairings_has_admin()) {
+    ESP_LOGW(TAG, "HomeKit pair-setup unavailable: an administrator is still paired");
     return ap2_hap_write_error(SETUP_STATE_M2, AP2_TLV_ERROR_UNAVAILABLE,
                                output, output_capacity, output_len);
   }

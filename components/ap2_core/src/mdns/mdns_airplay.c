@@ -117,6 +117,26 @@ void mdns_airplay_init(void)
   }
 }
 
+esp_err_t mdns_airplay_update_name(const char *name) {
+  if (!name) return ESP_ERR_INVALID_ARG;
+  if (!s_ready) return ESP_ERR_INVALID_STATE;
+  char host[WIFI_HOSTNAME_MAX_LEN + 1], mac[MDNS_AIRPLAY_MAC_STR_LEN];
+  char airplay[MDNS_AIRPLAY_LABEL_MAX + 1], raop[MDNS_AIRPLAY_LABEL_MAX + 1];
+  wifi_sanitize_hostname(name, host, sizeof(host));
+  wifi_get_mac_str(mac, sizeof(mac));
+  mdns_airplay_airplay_instance(name, airplay);
+  mdns_airplay_raop_instance(mac, name, raop);
+  const esp_err_t a = mdns_hostname_set(host);
+  const esp_err_t b = mdns_service_instance_name_set("_airplay", "_tcp", airplay);
+  const esp_err_t c = mdns_service_instance_name_set("_raop", "_tcp", raop);
+  if (a != ESP_OK || b != ESP_OK || c != ESP_OK) {
+    ESP_LOGW(TAG, "Updating speaker name: %s / %s / %s",
+             esp_err_to_name(a), esp_err_to_name(b), esp_err_to_name(c));
+    return a != ESP_OK ? a : b != ESP_OK ? b : c;
+  }
+  return ESP_OK;
+}
+
 void mdns_airplay_update_flags(void) {
 #ifdef CONFIG_AIRPLAY_HOMEKIT
   char flags[12];
