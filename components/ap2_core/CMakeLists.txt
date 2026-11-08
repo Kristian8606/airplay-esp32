@@ -10,6 +10,7 @@ idf_component_register(
         "src/hap/hap_crypto.c"
         "src/hap/hap_pair_setup.c"
         "src/hap/hap_pair_verify.c"
+        "src/hap/hap_pairings.c"
         "src/hap/srp.c"
         "src/hap/tlv8.c"
         "src/plist/bplist_parser.c"

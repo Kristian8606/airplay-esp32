@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "aes/esp_aes.h"
+#include "ap2_pairings.h"
 #include "esp_log.h"
 #include "ap2_hap.h"
 #include "hap_private.h"
@@ -34,7 +35,7 @@ esp_err_t ap2_hap_verify_m1(ap2_hap_session_t *session, const uint8_t *input,
                             size_t output_capacity, size_t *output_len) {
   uint8_t client_public[AP2_HAP_X25519_KEY_SIZE];
   size_t client_public_len = 0;
-  uint8_t signed_part[2 * AP2_HAP_X25519_KEY_SIZE + 17];
+  uint8_t signed_part[2 * AP2_HAP_X25519_KEY_SIZE + AP2_PAIRING_ID_MAX];
   uint8_t signature[crypto_sign_BYTES];
   uint8_t inner[64 + crypto_sign_BYTES];
   uint8_t cipher[sizeof(inner) + AP2_HAP_POLY1305_TAG_SIZE];
@@ -50,13 +51,32 @@ esp_err_t ap2_hap_verify_m1(ap2_hap_session_t *session, const uint8_t *input,
     return ESP_ERR_INVALID_ARG;
   }
 
+  session->controller_verified = false;
+  session->controller_id_len = 0;
+  session->session_established = false;
+  session->pair_verify_state = 0;
+  session->pair_setup_transient = false;
   err = agree_on_secret(session, client_public);
   if (err != ESP_OK) {
     return err;
   }
 
   /* We sign (our key | our id | client's key). */
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  /* HomeKit controllers know this accessory by "pi" (/configure). If a
+   * controller rejects that M2 and starts over on the same connection, the
+   * next M1 presents the MAC this receiver used before HomeKit, and so on. */
+  session->pv_id_is_pi = (session->pv_attempts % 2U) == 0U;
+  session->pv_attempts++;
+  const char *id = ap2_hap_presented_id(session->pv_id_is_pi);
+  if (session->pv_attempts > 1) {
+    ESP_LOGW(TAG, "pair-verify M1 #%u: the previous M2 was not accepted, "
+             "presenting %s %s", (unsigned)session->pv_attempts,
+             session->pv_id_is_pi ? "pi" : "device ID", id);
+  }
+#else
   const char *id = ap2_hap_identity_id();
+#endif
   size_t id_len = strlen(id);
   memcpy(signed_part, session->session_public_key, AP2_HAP_X25519_KEY_SIZE);
   memcpy(signed_part + AP2_HAP_X25519_KEY_SIZE, id, id_len);
@@ -108,9 +128,10 @@ esp_err_t ap2_hap_verify_m3(ap2_hap_session_t *session, const uint8_t *input,
     return ESP_ERR_INVALID_ARG;
   }
 
-  /* The message is authenticated by the key from M2. Its signature is not
-   * checked: no client keys are stored, so there is nothing to check it
-   * against. Pairing does not limit who may connect. */
+  /* The message is authenticated by the key from M2. The signature is
+   * checked only for a stored HomeKit controller; any other client keeps
+   * the open AirPlay access (acl=0): pairing does not limit who may
+   * connect. */
   if (session->pair_verify_state != AP2_HAP_VERIFY_M2 ||
       !ap2_tlv8_get(input, input_len, AP2_TLV_ENCRYPTED_DATA, cipher,
                     sizeof(cipher), &cipher_len) ||
@@ -121,6 +142,47 @@ esp_err_t ap2_hap_verify_m3(ap2_hap_session_t *session, const uint8_t *input,
                         output_capacity, output_len);
     return ESP_ERR_INVALID_STATE;
   }
+
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+  {
+    /* A stored controller proves it owns its long-term key: a signature
+     * over (client's key | its id | our key). */
+    const size_t plain_len = cipher_len - AP2_HAP_POLY1305_TAG_SIZE;
+    uint8_t id[AP2_PAIRING_ID_MAX], sig[crypto_sign_BYTES], ltpk[32];
+    uint8_t info[2 * AP2_HAP_X25519_KEY_SIZE + AP2_PAIRING_ID_MAX];
+    size_t id_len = 0, sig_len = 0;
+    uint8_t perm = 0;
+    session->controller_verified = false;
+    session->controller_id_len = 0;
+    if (ap2_tlv8_get(plain, plain_len, AP2_TLV_IDENTIFIER, id, sizeof(id),
+                     &id_len) &&
+        id_len > 0 && ap2_pairings_find(id, id_len, ltpk, &perm)) {
+      memcpy(info, session->client_public_key, AP2_HAP_X25519_KEY_SIZE);
+      memcpy(info + AP2_HAP_X25519_KEY_SIZE, id, id_len);
+      memcpy(info + AP2_HAP_X25519_KEY_SIZE + id_len, session->session_public_key,
+             AP2_HAP_X25519_KEY_SIZE);
+      if (!ap2_tlv8_get(plain, plain_len, AP2_TLV_SIGNATURE, sig, sizeof(sig),
+                        &sig_len) ||
+          sig_len != sizeof(sig) ||
+          crypto_sign_verify_detached(sig, info,
+                                      2 * AP2_HAP_X25519_KEY_SIZE + id_len,
+                                      ltpk) != 0) {
+        ESP_LOGE(TAG, "pair-verify: paired controller %.*s failed its "
+                 "signature check", (int)id_len, (const char *)id);
+        return ap2_hap_write_error(AP2_HAP_VERIFY_M4, AP2_TLV_ERROR_AUTHENTICATION,
+                                    output, output_capacity, output_len);
+      }
+      ap2_hap_set_controller(session, id, id_len, perm);
+      ESP_LOGI(TAG, "pair-verify: HomeKit controller %.*s (%s), accepted our %s",
+               (int)id_len, (const char *)id,
+               (perm & AP2_PERM_ADMIN) ? "admin" : "user",
+               session->pv_id_is_pi ? "pi" : "device ID");
+    } else if (id_len > 0) {
+      ESP_LOGD(TAG, "pair-verify: controller %.*s is not paired (open access)",
+               (int)id_len, (const char *)id);
+    }
+  }
+#endif
 
   esp_err_t err = ap2_hap_set_control_keys(session, session->shared_secret,
                                            sizeof(session->shared_secret), false);

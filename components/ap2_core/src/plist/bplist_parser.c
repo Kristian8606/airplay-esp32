@@ -589,3 +589,86 @@ bool ap2_bplist_stream_crypto(const uint8_t *plist, size_t plist_len,
   }
   return false;
 }
+
+/* HomeKit /configure nests values inside dictionaries. Every traversed
+ * entry consumes the same shared budget, including siblings of cycles. */
+static bool find_nested(const bp_doc_t *doc, const bp_obj_t *obj,
+                         const char *name, bp_obj_t *out, int depth,
+                         unsigned *budget) {
+  if (*budget == 0) return false;
+  --*budget;
+  if (depth > BP_MAX_DEPTH) return false;
+  if (obj->kind == BP_KIND_DICT) {
+    for (uint64_t i = 0; i < obj->count && *budget; ++i) {
+      bp_obj_t key, value;
+      --*budget;
+      if (!bp_dict_entry(doc, obj, i, &key, &value)) return false;
+      if (key_equals(&key, name, strlen(name))) { *out = value; return true; }
+    }
+    for (uint64_t i = 0; i < obj->count && *budget; ++i) {
+      bp_obj_t key, value;
+      if (!bp_dict_entry(doc, obj, i, &key, &value)) return false;
+      if (find_nested(doc, &value, name, out, depth + 1, budget)) return true;
+    }
+  } else if (obj->kind == BP_KIND_ARRAY) {
+    for (uint64_t i = 0; i < obj->count && *budget; ++i) {
+      bp_obj_t value;
+      if (!bp_get(doc, bp_ref(doc, obj->body, i), &value)) return false;
+      if (find_nested(doc, &value, name, out, depth + 1, budget)) return true;
+    }
+  }
+  return false;
+}
+
+static bool nested_value(const uint8_t *p, size_t n, const char *key,
+                           bp_obj_t *out) {
+  bp_doc_t doc;
+  bp_obj_t root;
+  unsigned budget = BP_MAX_VISITS;
+  return open_root(&doc, &root, p, n) &&
+         find_nested(&doc, &root, key, out, 0, &budget);
+}
+
+bool ap2_bplist_int_deep(const uint8_t *p, size_t n, const char *key,
+                         int64_t *out) {
+  bp_obj_t v;
+  if (!nested_value(p, n, key, &v)) return false;
+  if (v.kind == BP_KIND_SIMPLE && (v.low == 8 || v.low == 9)) {
+    *out = v.low == 9;
+    return true;
+  }
+  return read_int(&v, out);
+}
+
+bool ap2_bplist_string_deep(const uint8_t *p, size_t n, const char *key,
+                            char *out, size_t capacity) {
+  bp_obj_t v;
+  if (!capacity || !nested_value(p, n, key, &v)) return false;
+  if (v.kind == BP_KIND_ASCII && v.count < capacity) {
+    memcpy(out, v.body, v.count);
+    out[v.count] = 0;
+    return true;
+  }
+  if (v.kind != BP_KIND_UTF16) return false;
+  size_t used = 0;
+  for (uint64_t i = 0; i < v.count; ++i) {
+    uint32_t cp = read_be(v.body + 2 * i, 2);
+    if (cp >= 0xD800 && cp <= 0xDBFF) {
+      if (++i >= v.count) return false;
+      uint32_t low = read_be(v.body + 2 * i, 2);
+      if (low < 0xDC00 || low > 0xDFFF) return false;
+      cp = 0x10000 + ((cp - 0xD800) << 10) + low - 0xDC00;
+    } else if (cp >= 0xDC00 && cp <= 0xDFFF) return false;
+    size_t bytes = cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (bytes >= capacity - used || cp == 0) return false;
+    if (bytes == 1) out[used++] = cp;
+    else {
+      out[used++] = (bytes == 2 ? 0xC0 : bytes == 3 ? 0xE0 : 0xF0) |
+                    (cp >> (6 * (bytes - 1)));
+      for (size_t j = bytes - 1; j > 0; --j)
+        out[used++] = 0x80 | ((cp >> (6 * (j - 1))) & 0x3F);
+    }
+  }
+  out[used] = 0;
+  return true;
+}

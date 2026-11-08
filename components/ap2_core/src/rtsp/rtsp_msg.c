@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "airplay_identity.h"
 #include "rtsp_port.h"
@@ -192,7 +193,14 @@ rtsp_read_result_t rtsp_reader_feed(rtsp_reader_t *reader, const uint8_t *data,
       *consumed = used;
       return RTSP_READ_MESSAGE;
     }
-    if (m->body_len > reader->body_max) {
+    const char *type = rtsp_msg_header(m, "Content-Type");
+    const bool artwork = strcmp(m->start[0], "SET_PARAMETER") == 0 &&
+                         type && strncasecmp(type, "image/", 6) == 0;
+    if (artwork && m->body_len <= RTSP_ARTWORK_MAX) {
+      /* Consume every byte to preserve framing, without retaining the image.
+       * This also works across encrypted 1024-byte control frames. */
+      reader->phase = PHASE_DISCARD;
+    } else if (m->body_len > reader->body_max || artwork) {
       m->body_state = RTSP_BODY_TOO_LARGE;
       reader->phase = PHASE_DISCARD;
     } else {

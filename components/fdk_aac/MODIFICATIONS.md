@@ -44,9 +44,9 @@ the appropriate sample width, and null/nonpositive output buffers are rejected.
 The original S16 API remains available; `INT_PCM` and the library's other
 16-bit APIs have not been redefined.
 
-The new API requires the stock S16-output PCM limiter to be disabled and rejects
-AAC-SLS output; it never silently substitutes an upshifted S16 result. The
-application already disables the limiter and advertises AAC-LC. AAC is lossy:
+The original October S32 API required the stock S16-output PCM limiter to be
+disabled. The November S32 limiter extension below removes that restriction.
+AAC-SLS output remains unsupported; no upshifted S16 output is substituted. AAC is lossy:
 the output width describes decoder precision, not a recoverable original PCM
 bit depth. The ESP32 wrapper uses this API for stereo as well as surround.
 
@@ -90,3 +90,38 @@ from ~45 KiB to ~11 KiB.
 As `NOTICE` section 3 says, the FDK license grants no patent rights. AAC
 patent licenses are available through Via Licensing or the patent owners;
 using this code is your responsibility in that respect.
+
+## Changes (2026-11-08, S32 PCM limiter test)
+
+- libPCMutils/src/limiter.cpp shares the original lookahead, peak detection and
+  gain smoothing with pcmLimiter_Apply32. Only final output conversion differs:
+  S32 has no S16 rounding. The existing S16 API/ABI remains available.
+- libAACdec/src/aacdecoder_lib.cpp routes wide frames to the S32 limiter,
+  bounds-checks the interleave scratch, and exports actual extra PCM delay,
+  limiter-only reset and limiter-only tail drain. Drain feeds zeros only to
+  the PCM limiter, not to AAC synthesis/DRC history; it uses bounded scratch
+  chunks and resets after emitting the pending delay frames.
+- The firmware's experimental AIRPLAY_AAC_FDK_LIMITER option is default off;
+  sdkconfig.limiter-test enables it for the current HomeKit test image.
+  Limiter allocation is required during wrapper creation so memory failure
+  cannot silently switch an enabled test to unlimited audio.
+- PCM RTP tags subtract actual lookahead (720 frames at48kHz,661 at44.1kHz).
+  The PTP estimator, I2S servo, float EQ/volume/loudness and ALAC path are
+  unchanged. This limiter cannot prevent clipping introduced by later DSP.
+- Muted/invalidated sequences clear limiter history; a muted AU's delayed tail
+  is cleared too. Contiguous pause/resume retains pending valid audio. The
+  final valid tail drains at FIN, forward gap, same-rate codec change, or its
+  impending DMA deadline when no subsequent AU is ready. Future-AU waits are
+  capped at20ms while a tail is pending, inside the DMA+40ms drain margin.
+  Normal FIN preserves
+  raw AUs while this option is enabled; queued replacement TCP connections
+  can still supersede that old epoch immediately. Explicit stop/FLUSH and
+  new epochs continue to cancel old audio through sequence/generation checks.
+
+Host checks in tests/fdk_limiter use the actual modified decoder and limiter,
+bounds instrumentation, FFmpeg-generated AAC, and the real PCM FIFO. They cover
+S32 low bits, peak attenuation, S16 numeric compatibility, full final-tail output,
+RTP wrap, muted/seek tails, deadline drain followed by contiguous resume, TCP
+FIN/partial AU, and replacement input before EOF acknowledgment. Full quiet AAC
+on/off waveforms match after exact delay compensation at48/44.1kHz, including the
+final samples. CPU budget and acoustic synchronization require board testing.

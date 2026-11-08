@@ -4,6 +4,7 @@
 #include "audio_eq.h"
 #include "audio_loudness.h"
 #include "ap2_hap.h"
+#include "ap2_pairings.h"
 #include "network/apple_clock.h"
 #include "log_stream.h"
 #include "led.h"
@@ -21,6 +22,13 @@
 #include "freertos/task.h"
 
 static const char *TAG = "main";
+
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+static void homekit_changed(bool paired) {
+  ESP_LOGI(TAG, "HomeKit: %s a home", paired ? "added to" : "removed from");
+  mdns_airplay_update_flags();
+}
+#endif
 
 static void log_memory_state(const char *where) {
   ESP_LOGI(TAG,
@@ -96,6 +104,9 @@ void app_main(void) {
     ESP_ERROR_CHECK(audio_receiver_init());
     log_memory_state("post-audio-init");
     mdns_airplay_init();
+#ifdef CONFIG_AIRPLAY_HOMEKIT
+    ap2_pairings_set_changed_cb(homekit_changed);
+#endif
     ESP_ERROR_CHECK(rtsp_server_start());
     esp_err_t buttons_err = playback_buttons_init();
     if (buttons_err != ESP_OK) {

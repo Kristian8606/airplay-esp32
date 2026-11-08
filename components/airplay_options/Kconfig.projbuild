@@ -22,9 +22,50 @@ menu "AirPlay Receiver"
         int "Setup AP channel"
         default 1
         range 1 13
+    config AIRPLAY_AAC_FDK_LIMITER
+        bool "Test FDK PCM limiter (S32, lookahead compensated)"
+        default n
+        help
+            Enable FDK peak limiting before the float DSP chain. Preserve S32
+            output and compensate actual lookahead in decoded PCM RTP tags.
+            Does not limit peaks introduced later by EQ or loudness.
+
     config ENABLE_AIRPLAY_ARTWORK
         bool "Advertise artwork support"
+        default y if AIRPLAY_HOMEKIT
         default n
+        help
+            Adds 1 (artwork) to the metadata types in the _raop TXT record
+            "md", so senders also send the cover of each track. The cover is
+            accepted and not kept; without it senders send only text and
+            progress.
+
+    config AIRPLAY_HOMEKIT
+        bool "HomeKit: allow adding the speaker to a home"
+        default y
+        help
+            Complete the full (non-transient) pair-setup the Home app uses to
+            add an AirPlay speaker, store the home's controllers
+            (/pair-add, /pair-remove, /pair-list), answer /configure and
+            advertise status flag bit 10 (0x400) while paired, like an
+            AirPort Express in a home. The model, manufacturer, serial number
+            and firmware version are announced as the Home app shows them.
+            AirPlay without a home keeps working as before.
+
+    config AIRPLAY_HOMEKIT_MANUFACTURER
+        string "Manufacturer (TXT manufacturer, shown in the Home app)"
+        default "Espressif"
+        depends on AIRPLAY_HOMEKIT
+
+    config AIRPLAY_HOMEKIT_SETUP_CODE
+        string "HomeKit pair-setup code"
+        default "3939"
+        depends on AIRPLAY_HOMEKIT
+        help
+            SRP password of the full pair-setup. The Home app adds AirPlay
+            speakers without asking for a code; 3939 is the fixed AirPlay
+            code (also used for transient pairing). If the add fails with
+            "pair-setup M3: wrong code" in the log, try 0000.
 
     menu "Hardware playback buttons"
         config AIRPLAY_HARDWARE_BUTTONS
@@ -79,12 +120,15 @@ menu "AirPlay Receiver"
 
     config AIRPLAY_MODEL_ID
         string "AirPlay model identifier"
+        default "AirPlaySpeaker1,1" if AIRPLAY_HOMEKIT
         default "AudioAccessory6,1"
         help
             The model this receiver announces to AirPlay senders (mDNS
             "model"/"am" and GET /info). The sender picks the icon it
             shows from it. AudioAccessory6,1 = HomePod (2nd generation),
-            the HomePod icon. A name Apple does not know gives a generic
+            the HomePod icon. With HomeKit the default is a third-party
+            speaker (AirPlaySpeaker1,1): the Home app does not offer a
+            HomePod model under Add Accessory. A name Apple does not know gives a generic
             speaker icon. Changing it may change how a sender treats the
             receiver: check that lossless and AAC streams still arrive.
 endmenu

@@ -9,6 +9,14 @@
 #include "esp_log.h"
 #include "airplay_log.h"
 #include "aacdecoder_lib.h"
+#include "sdkconfig.h"
+
+#define AAC_LIMITER_ATTACK_MS 15U
+#if defined(CONFIG_AIRPLAY_AAC_FDK_LIMITER) && CONFIG_AIRPLAY_AAC_FDK_LIMITER
+#define AAC_LIMITER_ENABLED 1
+#else
+#define AAC_LIMITER_ENABLED 0
+#endif
 
 #define ADTS_HEADER_LEN AAC_DECODER_INPUT_HEADROOM
 #define AAC_INPUT_MAX   8192U
@@ -25,6 +33,9 @@ struct aac_decoder {
   HANDLE_AACDECODER fdk;
   LONG *pcm; /* FDK signed32 before 16-bit quantization; never INT_PCM. */
   uint32_t decode_errors;
+  uint32_t limiter_delay_frames;
+  uint32_t next_input_rtp;
+  bool have_next_rtp;
 };
 
 static const char *TAG = "aac_dec_v1";
@@ -66,22 +77,27 @@ static bool open_fdk_decoder(aac_decoder_t *d) {
     ESP_LOGE(TAG, "FDK aacDecoder_Open failed");
     return false;
   }
-  /* No FDK downmix, WAV channel order, and no limiter: DecodeFrame32
-   * requires it disabled. Preserve FDK's existing DRC defaults and scaling;
-   * no extra gain or source-depth assumption. */
+  /* Keep DRC/channel mapping unchanged; the S32 limiter is an explicit
+   * test option with its own lookahead compensation. */
   const AAC_DECODER_ERROR e1 =
       aacDecoder_SetParam(d->fdk, AAC_PCM_MAX_OUTPUT_CHANNELS, FDK_MAX_CHANNELS);
   const AAC_DECODER_ERROR e2 =
       aacDecoder_SetParam(d->fdk, AAC_PCM_OUTPUT_CHANNEL_MAPPING, 1);
   const AAC_DECODER_ERROR e3 =
-      aacDecoder_SetParam(d->fdk, AAC_PCM_LIMITER_ENABLE, 0);
+      aacDecoder_SetParam(d->fdk, AAC_PCM_LIMITER_ENABLE, AAC_LIMITER_ENABLED);
   /* RTP already timestamps each AU. FDK's default interpolation adds one
    * unaccounted frame (1024 samples); noise substitution has no extra delay. */
   const AAC_DECODER_ERROR e4 =
       aacDecoder_SetParam(d->fdk, AAC_CONCEAL_METHOD, 1);
-  if (e1 != AAC_DEC_OK || e2 != AAC_DEC_OK || e3 != AAC_DEC_OK || e4 != AAC_DEC_OK) {
-    ESP_LOGE(TAG, "FDK S32 setup failed (params 0x%x/0x%x/0x%x/0x%x)",
-             e1, e2, e3, e4);
+  /* Reserve the limiter at open, instead of silently falling back to an
+   * unlimited frame on allocation failure. Do not allocate it when off. */
+  const AAC_DECODER_ERROR e5 = AAC_LIMITER_ENABLED
+      ? aacDecoder_SetParam(d->fdk, AAC_PCM_LIMITER_ATTACK_TIME, AAC_LIMITER_ATTACK_MS)
+      : AAC_DEC_OK;
+  if (e1 != AAC_DEC_OK || e2 != AAC_DEC_OK || e3 != AAC_DEC_OK ||
+      e4 != AAC_DEC_OK || e5 != AAC_DEC_OK) {
+    ESP_LOGE(TAG, "FDK S32 setup failed (params 0x%x/0x%x/0x%x/0x%x/0x%x)",
+             e1, e2, e3, e4, e5);
     return false;
   }
   return true;
@@ -98,6 +114,8 @@ aac_decoder_t *aac_decoder_create(const aac_decoder_config_t *config) {
     return NULL;
   }
   d->config = *config;
+  d->limiter_delay_frames = AAC_LIMITER_ENABLED
+      ? (uint32_t)config->sample_rate * AAC_LIMITER_ATTACK_MS / 1000U : 0;
   const size_t bytes = FDK_MAX_FRAMES * FDK_MAX_CHANNELS * sizeof(*d->pcm);
   d->pcm = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!d->pcm) d->pcm = malloc(bytes);
@@ -106,7 +124,54 @@ aac_decoder_t *aac_decoder_create(const aac_decoder_config_t *config) {
     aac_decoder_destroy(d);
     return NULL;
   }
+  if (AAC_LIMITER_ENABLED)
+    ESP_LOGI(TAG, "FDK PCM limiter ON: S32, lookahead %lu frames, RTP compensated",
+             (unsigned long)d->limiter_delay_frames);
   return d;
+}
+
+uint32_t aac_decoder_limiter_delay_frames(const aac_decoder_t *d) {
+  return d ? d->limiter_delay_frames : 0;
+}
+
+uint32_t aac_decoder_tail_wait_ms(const aac_decoder_t *d, uint32_t requested,
+                                   uint32_t maximum) {
+  return d && d->have_next_rtp && d->limiter_delay_frames && requested > maximum
+             ? maximum : requested;
+}
+
+bool aac_decoder_tail_due(const aac_decoder_t *d, uint32_t wanted,
+                            uint32_t lead) {
+  if (!d || !d->have_next_rtp || !d->limiter_delay_frames || lead > INT32_MAX)
+    return false;
+  const uint32_t start = d->next_input_rtp - d->limiter_delay_frames;
+  return (int32_t)(start - wanted) <= (int32_t)lead;
+}
+
+int aac_decoder_drain(aac_decoder_t *d, float *out, size_t cap,
+                       aac_decode_info_t *info) {
+  if (info) memset(info, 0, sizeof(*info));
+  if (!d || !out || !info) return -1;
+  if (!d->have_next_rtp) return 0;
+  const uint32_t delay = d->limiter_delay_frames;
+  if (delay > cap) return -1;
+  UINT frames = 0;
+  if (aacDecoder_DrainLimiter32(d->fdk, d->pcm,
+                                 FDK_MAX_FRAMES * FDK_MAX_CHANNELS,
+                                 &frames) != AAC_DEC_OK || frames != delay)
+    return -1;
+  const CStreamInfo *si = aacDecoder_GetStreamInfo(d->fdk);
+  if (frames && (!si || si->numChannels < 1 || si->numChannels > 2)) return -1;
+  for (UINT f = 0; f < frames; ++f) {
+    out[2*f] = audio_pcm32_to_float(d->pcm[f * si->numChannels]);
+    out[2*f+1] = audio_pcm32_to_float(d->pcm[f * si->numChannels +
+                                                (si->numChannels == 2 ? 1 : 0)]);
+  }
+  info->channels = 2;
+  info->limiter_delay_frames = delay;
+  info->output_rtp = d->next_input_rtp - delay;
+  d->have_next_rtp = false;
+  return (int)frames;
 }
 
 void aac_decoder_destroy(aac_decoder_t *d) {
@@ -123,12 +188,19 @@ void aac_decoder_destroy(aac_decoder_t *d) {
 int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
                        size_t input_len, float *output,
                        size_t output_capacity_frames,
+                       uint32_t input_rtp, bool mute_output,
                        aac_decode_info_t *info) {
+  if (info) memset(info, 0, sizeof(*info));
   if (!d || !d->fdk || !input || input_len == 0 || !output ||
       output_capacity_frames == 0) {
     return -1;
   }
 
+  /* Pause with a contiguous RTP sequence preserves the pending music.
+   * A new/muted sequence cannot carry old PCM or gain into the new one. */
+  if (mute_output || !d->have_next_rtp || input_rtp != d->next_input_rtp) {
+    if (aacDecoder_ResetLimiter(d->fdk) != AAC_DEC_OK) return -1;
+  }
   const uint8_t *decode_data = input;
   size_t decode_len = input_len;
   if (!has_adts(input, input_len)) {
@@ -150,6 +222,8 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
                                    (INT)(FDK_MAX_FRAMES * FDK_MAX_CHANNELS), 0);
   }
   if (err != AAC_DEC_OK) {
+    (void)aacDecoder_ResetLimiter(d->fdk);
+    d->have_next_rtp = false;
     /* Shairport keeps the AAC decoding chain alive across a bad access unit;
      * FDK conceals the missing frame from its own history. */
     if ((++d->decode_errors & 63U) == 1U || d->decode_errors <= 8U)
@@ -178,6 +252,19 @@ int aac_decoder_decode(aac_decoder_t *d, uint8_t *input,
       output[2 * f + 1] = v;
     }
   }
-  if (info) info->channels = 2;
+  d->limiter_delay_frames = aacDecoder_GetLimiterDelay(d->fdk);
+  d->next_input_rtp = input_rtp + (uint32_t)frames;
+  d->have_next_rtp = true;
+  if (mute_output) {
+    memset(output, 0, frames * 2U * sizeof(*output));
+    /* Also discard this muted AU's tail, which otherwise leaks out during
+     * the next unmuted AU even though output[] was zeroed. */
+    if (aacDecoder_ResetLimiter(d->fdk) != AAC_DEC_OK) return -1;
+  }
+  if (info) {
+    info->channels = 2;
+    info->limiter_delay_frames = d->limiter_delay_frames;
+    info->output_rtp = input_rtp - d->limiter_delay_frames;
+  }
   return (int)frames;
 }

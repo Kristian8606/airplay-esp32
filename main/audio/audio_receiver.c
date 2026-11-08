@@ -1918,11 +1918,24 @@ static bool buffered_select_format(
   return valid;
 }
 
+static void buffered_drain_limiter(aac_decoder_t *decoder, uint32_t pcm_generation,
+                                   uint32_t seq, uint32_t stream_epoch) {
+  if (!decoder) return;
+  aac_decode_info_t tail = {0};
+  const int frames = aac_decoder_drain(decoder, s.pcm_f32,
+                                        AP2_PCM_CAPACITY_FRAMES, &tail);
+  if (frames > 0)
+    (void)pcm_store_with_backpressure(tail.output_rtp, s.pcm_f32, (size_t)frames,
+                                      tail.channels, pcm_generation, seq, stream_epoch);
+  else if (frames < 0) ESP_LOGW(TAG, "AAC limiter tail drain failed");
+}
+
 static void ap2_buffered_processor_task(void *arg) {
   (void)arg;
   aac_decoder_t *decoder = NULL;
   alac_decoder_t *alac = NULL;
   uint32_t decoder_format_generation = 0;
+  uint32_t tail_seq = 0, tail_epoch = 0, tail_generation = 0;
   uint32_t current_ssrc = 0;
   bool playback_announced = false;
   uint32_t seen_stream_epoch = 0;
@@ -2010,6 +2023,15 @@ static void ap2_buffered_processor_task(void *arg) {
     const esp_err_t peek_err = ap2_buffered_fifo_peek_head(
         s.transport, AP2_PACKET_MAX, &head);
     if (peek_err != ESP_OK) {
+      uint32_t wanted_tail = 0;
+      const uint32_t margin = AUDIO_PLAYOUT_DMA_BLOCKS * AUDIO_PLAYOUT_FRAMES +
+          (uint32_t)((uint64_t)(snap.format.sample_rate > 0 ? snap.format.sample_rate : 44100) *
+                     (2U * AP2_NO_TIMING_WAIT_MS) / 1000U);
+      const bool eof = ap2_buffered_fifo_eof_pending(s.transport);
+      if (eof || (wanted_rtp_now(&snap, &wanted_tail) &&
+                  aac_decoder_tail_due(decoder, wanted_tail, margin)))
+        buffered_drain_limiter(decoder, tail_generation, tail_seq, tail_epoch);
+      if (eof) ap2_buffered_fifo_ack_eof(s.transport);
       if (__atomic_load_n(&s.rx_running, __ATOMIC_ACQUIRE)) ap2_buffered_fifo_wait(s.transport, AP2_NO_TIMING_WAIT_MS);
       continue;
     }
@@ -2118,6 +2140,8 @@ static void ap2_buffered_processor_task(void *arg) {
           continue;
         }
       }
+      if (decoder && snap.format.sample_rate == payload_format->sample_rate)
+        buffered_drain_limiter(decoder, tail_generation, tail_seq, tail_epoch);
       if (!buffered_select_format(payload_format, &head, &decision, packet.rtp,
                                     packets_played_in_sequence != 0,
                                     seen_pcm_generation)) {
@@ -2207,6 +2231,10 @@ static void ap2_buffered_processor_task(void *arg) {
      * packet remains at the raw FIFO head while waiting, so AutoMix can park
      * 90-120 seconds of compressed audio cheaply in the large FIFO. */
     if (lead >= max_lead) {
+      const uint32_t margin = AUDIO_PLAYOUT_DMA_BLOCKS * AUDIO_PLAYOUT_FRAMES +
+          (uint32_t)((uint64_t)sr * (2U * AP2_NO_TIMING_WAIT_MS) / 1000U);
+      if (aac_decoder_tail_due(decoder, wanted, margin))
+        buffered_drain_limiter(decoder, tail_generation, tail_seq, tail_epoch);
       const int32_t very_early_threshold =
           (int32_t)(((int64_t)sr * (AP2_PCM_TARGET_MS + 200U)) / 1000LL);
       if (!very_early_signalled && lead > very_early_threshold) {
@@ -2220,6 +2248,7 @@ static void ap2_buffered_processor_task(void *arg) {
       uint32_t wait_ms =
           (uint32_t)(((uint64_t)frame_samples * 2000ULL) / (uint64_t)sr);
       if (wait_ms == 0U) wait_ms = 1U;
+      wait_ms = aac_decoder_tail_wait_ms(decoder, wait_ms, AP2_NO_TIMING_WAIT_MS);
       ap2_buffered_fifo_wait(s.transport, wait_ms);
       continue;
     }
@@ -2275,8 +2304,9 @@ static void ap2_buffered_processor_task(void *arg) {
       }
       if (timestamp_difference < 0 &&
           (uint32_t)(-(int64_t)timestamp_difference) > frame_samples &&
-          pcm_rewind_for_resend(packet.rtp, snap.pcm_generation, packet.seq,
-                                packet.stream_epoch)) {
+          pcm_rewind_for_resend(packet.rtp -
+                                (is_aac ? aac_decoder_limiter_delay_frames(decoder) : 0U),
+                                snap.pcm_generation, packet.seq, packet.stream_epoch)) {
         /* Re-sent timeline: this packet and the ones after it replace the
          * PCM from packet.rtp on. The block is still muted (the decoder's
          * history is from the other timeline). */
@@ -2305,6 +2335,13 @@ static void ap2_buffered_processor_task(void *arg) {
                    (unsigned long)too_old_skipped);
         continue;
       }
+    }
+
+    if (is_aac && decoder && packets_played_in_sequence != 0 &&
+        timestamp_difference > 0) {
+      /* The last pre-gap AU is valid unless FLUSH explicitly cancelled it.
+       * Publish its tail before resetting/muting the new sequence. */
+      buffered_drain_limiter(decoder, tail_generation, tail_seq, tail_epoch);
     }
 
     if ((!decoder && !alac) ||
@@ -2365,13 +2402,21 @@ static void ap2_buffered_processor_task(void *arg) {
 
     int channels = 2;
     int frames;
+    uint32_t pcm_rtp = packet.rtp;
     if (is_aac) {
       /* FDK signed32 -> float; no 16-bit intermediate. */
       aac_decode_info_t info = {0};
       frames = aac_decoder_decode(
           decoder, s.decrypt_buf + AAC_DECODER_INPUT_HEADROOM,
-          (size_t)dec_len, s.pcm_f32, AP2_PCM_CAPACITY_FRAMES, &info);
+          (size_t)dec_len, s.pcm_f32, AP2_PCM_CAPACITY_FRAMES,
+          packet.rtp, mute, &info);
       channels = info.channels;
+      pcm_rtp = info.output_rtp;
+      if (frames > 0) {
+        tail_seq = packet.seq;
+        tail_epoch = packet.stream_epoch;
+        tail_generation = snap.pcm_generation;
+      }
     } else {
       /* ALAC 16/24-bit decodes straight to float: no 16-bit intermediate. */
       alac_decode_info_t info = {0};
@@ -2399,9 +2444,8 @@ static void ap2_buffered_processor_task(void *arg) {
     }
 #endif
 
-    /* Muting is after AAC decode (so MDCT/codec history advances) but before
-     * EQ, matching Shairport's intent: the decoder sees the real first block,
-     * while the downstream audio chain receives silence for its duration. */
+    /* The AAC adapter advances codec history, mutes this output, and also
+     * discards its limiter tail. The RTP diagnostic still names the input AU. */
     if (mute) {
       {
         uint32_t now_rtp = 0;
@@ -2412,11 +2456,9 @@ static void ap2_buffered_processor_task(void *arg) {
         aevt_post(AEVT_AAC_MUTE, NULL, (int32_t)packet.seq, (int32_t)packet.rtp,
                   timestamp_difference, lead_ms);
       }
-      memset(s.pcm_f32, 0,
-             (size_t)frames * (size_t)channels * sizeof(float));
     }
     const pcm_store_result_t stored = pcm_store_with_backpressure(
-        packet.rtp, s.pcm_f32, (size_t)frames, channels,
+        pcm_rtp, s.pcm_f32, (size_t)frames, channels,
         snap.pcm_generation, packet.seq, packet.stream_epoch);
     if (stored == PCM_STORE_PUBLISHED) {
       if (!playback_announced) {

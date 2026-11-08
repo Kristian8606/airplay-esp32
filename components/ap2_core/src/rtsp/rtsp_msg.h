@@ -11,6 +11,7 @@
  * ESP-IDF. */
 
 /* The start line and headers together. */
+#define RTSP_ARTWORK_MAX (2 * 1024 * 1024)
 #define RTSP_HEAD_MAX 4096
 #define RTSP_MAX_HEADERS 32
 /* At least 16 KiB must be accepted (spec); bodies go to rtsp_port_malloc. */

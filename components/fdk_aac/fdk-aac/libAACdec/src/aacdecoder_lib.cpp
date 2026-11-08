@@ -101,7 +101,7 @@ amm-info@iis.fraunhofer.de
 *******************************************************************************/
 
 /* MODIFIED: Third-Party Modified Version of the Fraunhofer FDK AAC Codec
- * Library for Android, changed 2026-10-24 and 2026-10-26 for esp32-airplay2-surround
+ * Library for Android, changed 2026-10-24, 2026-10-26 and 2026-11-08 for esp32-airplay2-surround
  * (github.com/Kristian8606/esp32-airplay2-surround): single-channel
  * synthesis and output for 5.1/7.1 streams, synthesis timestamps, S32
  * PCM output before the stock S16 rounding for every channel layout, and the
@@ -2068,12 +2068,6 @@ static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
       goto bail;
     }
 
-    /* airplay-esp32 patch: never route the wide API through the S16 limiter. */
-    if (pTimeData32 != NULL && self->limiterEnableCurr) {
-      ErrorStatus = AAC_DEC_UNSUPPORTED_FORMAT;
-      goto bail;
-    }
-
     if (synthFastOut) {
       /* airplay-esp32 patch: the synthesized plane only, mono, scaled exactly
        * like the non-limiter path below scales every channel. */
@@ -2103,7 +2097,13 @@ static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
       } else {
         pInterleaveBuffer = (PCM_LIM *)self->workBufferCore2;
 
-        /* applyLimiter requests for interleaved data */
+        /* airplay-esp32 patch: the reduced Core2 scratch must hold every
+         * interleaved S32 sample (also for a non-LC stream). */
+        if ((UINT)(self->streamInfo.numChannels * blockLength) >
+            GetRequiredMemWorkBufferCore2() / sizeof(PCM_LIM)) {
+          ErrorStatus = AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
+          goto bail;
+        }
         /* Interleave ouput buffer */
         FDK_interleave(pTimeData2, pInterleaveBuffer,
                        self->streamInfo.numChannels, blockLength,
@@ -2127,9 +2127,18 @@ static AAC_DECODER_ERROR aacDecoder_DecodeFrameInternal(HANDLE_AACDECODER self,
             self->streamInfo.frameSize, self->streamInfo.numChannels, 1, 1);
       }
 
-      pcmLimiter_Apply(self->hLimiter, pInterleaveBuffer, pTimeData,
-                       pGainPerSample, pcmLimiterScale,
-                       self->streamInfo.frameSize);
+      /* airplay-esp32 patch: preserve the requested output precision. */
+      TDLIMITER_ERROR limited = pTimeData32 != NULL
+          ? pcmLimiter_Apply32(self->hLimiter, pInterleaveBuffer, pTimeData32,
+                               pGainPerSample, pcmLimiterScale,
+                               self->streamInfo.frameSize)
+          : pcmLimiter_Apply(self->hLimiter, pInterleaveBuffer, pTimeData,
+                             pGainPerSample, pcmLimiterScale,
+                             self->streamInfo.frameSize);
+      if (limited != TDLIMIT_OK) {
+        ErrorStatus = AAC_DEC_UNKNOWN;
+        goto bail;
+      }
 
       {
         /* Announce the additional limiter output delay */
@@ -2264,6 +2273,47 @@ LINKSPEC_CPP void aacDecoder_Close(HANDLE_AACDECODER self) {
   }
 
   CAacDecoder_Close(self);
+}
+
+/* airplay-esp32 patch (2026-11-08): only the added PCM limiter delay,
+ * separate from the codec/DRC delay in CStreamInfo.outputDelay. */
+LINKSPEC_CPP UINT aacDecoder_GetLimiterDelay(HANDLE_AACDECODER self) {
+  return self != NULL && self->limiterEnableCurr && self->hLimiter != NULL
+             ? pcmLimiter_GetDelay(self->hLimiter) : 0;
+}
+
+LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_ResetLimiter(HANDLE_AACDECODER self) {
+  if (self == NULL) return AAC_DEC_INVALID_HANDLE;
+  if (self->hLimiter == NULL) return AAC_DEC_OK;
+  return pcmLimiter_Reset(self->hLimiter) == TDLIMIT_OK
+             ? AAC_DEC_OK : AAC_DEC_UNKNOWN;
+}
+
+/* airplay-esp32 patch: drain only PCM lookahead; do not synthesize an
+ * additional AAC access unit or alter AAC/DRC codec history. */
+LINKSPEC_CPP AAC_DECODER_ERROR aacDecoder_DrainLimiter32(
+    HANDLE_AACDECODER self, LONG *output, INT capacity, UINT *frames) {
+  if (self == NULL || output == NULL || frames == NULL || capacity < 0)
+    return AAC_DEC_INVALID_HANDLE;
+  *frames = 0;
+  const UINT delay = aacDecoder_GetLimiterDelay(self);
+  const INT channels = self->streamInfo.numChannels;
+  if (delay == 0) return AAC_DEC_OK;
+  if (channels <= 0 || (UINT)capacity / (UINT)channels < delay)
+    return AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
+  const UINT chunk = GetRequiredMemWorkBufferCore2() / sizeof(PCM_LIM) / channels;
+  if (!chunk) return AAC_DEC_OUTPUT_BUFFER_TOO_SMALL;
+  PCM_LIM *zeros = (PCM_LIM *)self->workBufferCore2;
+  for (UINT done = 0; done < delay;) {
+    const UINT n = fMin(chunk, delay - done);
+    FDKmemclear(zeros, n * channels * sizeof(PCM_LIM));
+    if (pcmLimiter_Apply32(self->hLimiter, zeros, output + done * channels,
+                           NULL, self->hLimiter->scaling, n) != TDLIMIT_OK)
+      return AAC_DEC_UNKNOWN;
+    done += n;
+  }
+  *frames = delay;
+  return aacDecoder_ResetLimiter(self);
 }
 
 LINKSPEC_CPP CStreamInfo *aacDecoder_GetStreamInfo(HANDLE_AACDECODER self) {

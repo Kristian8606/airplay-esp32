@@ -97,6 +97,9 @@ size_t ap2_reply_feedback(uint8_t *out, size_t capacity, int64_t stream_type,
 
 /* What the RTSP /info reply says about the accessory. */
 typedef struct {
+  const char *manufacturer;
+  const char *serial_number;
+  const char *firmware_revision;
   const char *device_id;         /* "deviceid", AA:BB:CC:DD:EE:FF */
   const char *name;              /* "name", UTF-8 */
   const char *model;             /* "model" */
@@ -114,6 +117,14 @@ typedef struct {
 } ap2_info_t;
 
 size_t ap2_reply_info(uint8_t *out, size_t capacity, const ap2_info_t *info);
+
+size_t ap2_reply_configure(uint8_t *out, size_t capacity, const char *identifier,
+                            const uint8_t public_key[32], const char *name,
+                            bool hk_access_control);
+/* Nested configuration keys; bools are also accepted as integers. */
+bool ap2_bplist_int_deep(const uint8_t *p, size_t n, const char *key, int64_t *out);
+bool ap2_bplist_string_deep(const uint8_t *p, size_t n, const char *key,
+                            char *out, size_t capacity);
 
 /* Messages on the event channel. */
 /* A media remote command, 0 to 5. */

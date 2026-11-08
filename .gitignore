@@ -8,7 +8,12 @@ sdkconfig
 sdkconfig.*
 !sdkconfig.defaults
 !sdkconfig.defaults.*
+!sdkconfig.homekit
 
 # macOS metadata
 .DS_Store
 **/.DS_Store
+
+!tests/homekit/stubs/sdkconfig.h
+
+!sdkconfig.limiter-test

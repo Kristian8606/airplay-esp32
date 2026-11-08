@@ -197,18 +197,22 @@ When that connection closes, the session ends as with `TEARDOWN`.
 `/feedback` answers 200 without a body; `GET_PARAMETER volume` answers the
 current volume. Only the holder drives the engine.
 
-**A second sender** [probe, other receiver, log]: its `SETUP` without
-streams is answered as usual and its own event port listens at once, as
-for the holder; the first sender keeps the session. A real iPhone connects
-to that event port right after the reply while an Apple TV holds the
-session, and gives up when the port does not accept [log]; the other
-receiver also opens it before the reply. Its `RECORD` and `TEARDOWN`
-change nothing (200). Its first `SETUP` with a
-stream takes the session: the first sender's stream stops and its
-connection is closed, then the second sender's session starts (clock, event
-port, volume, amplifier) and its stream is set up. AirPlay 2 receivers
-always allow this take-over. After an ignored `TEARDOWN` the Gateway closed
-that second connection [probe].
+**A second sender (HomeKit build):** a successful encrypted session SETUP
+without streams transfers audio ownership immediately, unless
+`isRemoteControlOnly` is true. Prepare the new pairing-derived audio key and
+event port before stopping the old owner. If either preparation fails,
+leave the old owner and playback untouched. After successful preparation,
+stop the previous stream/session, request closure of its control connection,
+and select the new sender's clock. A closing old connection cannot reclaim
+the session; its late control requests cannot drive the new owner's audio.
+Repeated SETUP by the current holder keeps its event port, clock and audio.
+
+Session ownership does not start buffered audio. AAC/buffered ALAC stream
+SETUP only starts reception; RECORD is an acknowledgment. Playback starts
+with SETRATEANCHORTIME rate 1 and the engine still requires valid timing and
+PCM. Pause or stream TEARDOWN keeps the owner for subsequent playback.
+Remote-control-only connections never take ownership or change the running
+audio. The non-HomeKit build retains takeover at stream SETUP.
 
 ## Requests
 

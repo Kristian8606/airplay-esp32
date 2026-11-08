@@ -52,6 +52,7 @@ struct ap2_buffered_fifo {
   SemaphoreHandle_t control_wake;
 
   bool connected;
+  bool input_eof;
   int listen_sock;
   int client_sock;
   uint16_t port;
@@ -94,6 +95,7 @@ static void fifo_discard_all(ap2_buffered_fifo_t *fifo) {
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
   fifo->total_read = fifo->total_written;
+  __atomic_store_n(&fifo->input_eof, false, __ATOMIC_RELEASE);
   /* Any in-flight read belongs to the previous byte stream. */
   (void)next_epoch(fifo);
   xSemaphoreGive(fifo->fifo_mutex);
@@ -156,6 +158,7 @@ static void tcp_reader_task(void *arg) {
     fifo->total_written = 0;
     fifo->total_read = 0;
     fifo->connected = true;
+    __atomic_store_n(&fifo->input_eof, false, __ATOMIC_RELEASE);
     fifo->client_sock = c;
     (void)next_epoch(fifo);
     xSemaphoreGive(fifo->fifo_mutex);
@@ -171,6 +174,7 @@ static void tcp_reader_task(void *arg) {
     bool stall_logged = false;
 #endif
 
+    bool orderly_eof = false;
     while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
       size_t write_pos = 0;
       size_t request = 0;
@@ -209,6 +213,7 @@ static void tcp_reader_task(void *arg) {
             fifo->client_sock == c)
           AP_LOGI(TAG, "buffered TCP: %s from the sender (errno %d)",
                    n == 0 ? "orderly close" : "receive error", n == 0 ? 0 : errno);
+        orderly_eof = n == 0;
         break;
       }
 #if defined(ESP_PLATFORM) && defined(CONFIG_AIRPLAY_DIAG_AUTOMIX) && CONFIG_AIRPLAY_DIAG_AUTOMIX
@@ -247,16 +252,40 @@ static void tcp_reader_task(void *arg) {
     xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
     if (fifo->client_sock == c) fifo->client_sock = -1;
     fifo->connected = false;
-    fifo->read_pos = fifo->write_pos;
-    fifo->occupancy = 0;
-    fifo->total_read = fifo->total_written;
-    (void)next_epoch(fifo);
+    __atomic_store_n(&fifo->input_eof, false, __ATOMIC_RELEASE);
+#if defined(CONFIG_AIRPLAY_AAC_FDK_LIMITER) && CONFIG_AIRPLAY_AAC_FDK_LIMITER
+    if (orderly_eof && __atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE)) {
+      /* Keep queued AUs and their epoch until the decoder drains its tail. */
+      __atomic_store_n(&fifo->input_eof, true, __ATOMIC_RELEASE);
+    } else
+#else
+    (void)orderly_eof;
+#endif
+    {
+      fifo->read_pos = fifo->write_pos;
+      fifo->occupancy = 0;
+      fifo->total_read = fifo->total_written;
+      (void)next_epoch(fifo);
+    }
     xSemaphoreGive(fifo->fifo_mutex);
 
     (void)shutdown(c, SHUT_RDWR);
     close(c);
     signal_all(fifo);
     AP_LOGI(TAG, "buffered TCP disconnected");
+    while (__atomic_load_n(&fifo->running, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&fifo->input_eof, __ATOMIC_ACQUIRE)) {
+      fd_set pending;
+      FD_ZERO(&pending);
+      FD_SET(fifo->listen_sock, &pending);
+      struct timeval now = {0, 0};
+      if (select(fifo->listen_sock + 1, &pending, NULL, NULL, &now) > 0) {
+        /* A new TCP input supersedes the old epoch, also while paused. */
+        __atomic_store_n(&fifo->input_eof, false, __ATOMIC_RELEASE);
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
   }
 
   __atomic_store_n(&fifo->reader_task, NULL, __ATOMIC_RELEASE);
@@ -348,6 +377,7 @@ void ap2_buffered_fifo_stop(ap2_buffered_fifo_t *fifo) {
   client = fifo->client_sock;
   fifo->client_sock = -1;
   fifo->connected = false;
+  __atomic_store_n(&fifo->input_eof, false, __ATOMIC_RELEASE);
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
   fifo->total_read = fifo->total_written;
@@ -391,6 +421,7 @@ static void ap2_buffered_fifo_abort_client(ap2_buffered_fifo_t *fifo) {
   client = fifo->client_sock;
   fifo->client_sock = -1;
   fifo->connected = false;
+  __atomic_store_n(&fifo->input_eof, false, __ATOMIC_RELEASE);
   fifo->read_pos = fifo->write_pos;
   fifo->occupancy = 0;
   fifo->total_read = fifo->total_written;
@@ -431,6 +462,35 @@ static void fifo_copy_at(const ap2_buffered_fifo_t *fifo, size_t pos,
   if (first > len) first = len;
   memcpy(dst, fifo->buffer + pos, first);
   if (first < len) memcpy(dst + first, fifo->buffer, len - first);
+}
+
+bool ap2_buffered_fifo_eof_pending(ap2_buffered_fifo_t *fifo) {
+  return fifo && __atomic_load_n(&fifo->input_eof, __ATOMIC_ACQUIRE);
+}
+
+void ap2_buffered_fifo_ack_eof(ap2_buffered_fifo_t *fifo) {
+  if (!fifo) return;
+  xSemaphoreTake(fifo->fifo_mutex, portMAX_DELAY);
+  if (ap2_buffered_fifo_eof_pending(fifo)) {
+    if (fifo->occupancy >= 2) {
+      uint8_t bytes[2];
+      fifo_copy_at(fifo, fifo->read_pos, bytes, sizeof(bytes));
+      size_t len = ((size_t)bytes[0] << 8) | bytes[1];
+      if (len >= FIFO_MIN_WIRE_LEN && len <= fifo->occupancy) {
+        xSemaphoreGive(fifo->fifo_mutex);
+        return; /* A complete packet must be consumed first. */
+      }
+    }
+    if (fifo->occupancy)
+      ESP_LOGW(TAG, "EOF: discarding %u bytes of an incomplete audio packet",
+                (unsigned)fifo->occupancy);
+    fifo->read_pos = fifo->write_pos;
+    fifo->occupancy = 0;
+    fifo->total_read = fifo->total_written;
+    __atomic_store_n(&fifo->input_eof, false, __ATOMIC_RELEASE);
+  }
+  xSemaphoreGive(fifo->fifo_mutex);
+  signal_all(fifo);
 }
 
 esp_err_t ap2_buffered_fifo_peek_head(ap2_buffered_fifo_t *fifo,

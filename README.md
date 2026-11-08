@@ -24,7 +24,9 @@ one for the office and a stereo pair for the living room.
   and other AirPlay 2 speakers.
 - 🎵 **High-quality stereo**: lossless **ALAC 48 kHz / 24-bit** and
   44.1 kHz / 16-bit, **AAC 44.1 / 48 kHz** decoded with Fraunhofer FDK at
-  32-bit precision. The whole chain to the DAC stays 32-bit.
+  32-bit output precision, followed by float DSP and 32-bit I2S output.
+- 🏡 **Apple Home / HomeKit**: add the speaker to a room, see album artwork
+  and track information, and control playback and volume from the Home app.
 - 🔀 **Follows the source**: the I2S output switches between 44.1 and 48 kHz
   with the stream, so nothing is resampled.
 - 🎛️ **Web interface**: 2 × 24-band parametric EQ / active crossover,
@@ -41,6 +43,7 @@ one for the office and a stereo pair for the living room.
 ## Contents
 
 - [Gallery](#gallery)
+- [Apple Home / HomeKit](#apple-home--homekit)
 - [How it works](#how-it-works)
 - [What you need](#what-you-need)
 - [Assembly and wiring](#assembly-and-wiring)
@@ -68,6 +71,33 @@ Click an image to open it full size.
     </td>
   </tr>
 </table>
+
+## Apple Home / HomeKit
+
+**The speaker works in Apple Home**, with album artwork, track information,
+playback controls and volume while playing over AirPlay. It is added as an
+AirPlay speaker and can be assigned to a room.
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="images/IMG_1578.PNG"><img src="images/IMG_1578.PNG" alt="ESP32 AirPlay speaker in Apple Home showing album artwork, track information and playback controls" width="280"></a>
+    </td>
+    <td align="center" width="50%">
+      <a href="images/IMG_1579.PNG"><img src="images/IMG_1579.PNG" alt="Another ESP32 AirPlay speaker in Apple Home showing current album artwork and volume controls" width="280"></a>
+    </td>
+  </tr>
+</table>
+
+On the same Wi-Fi network, use **Add Accessory** in Apple Home to add the
+speaker. HomeKit and artwork support are enabled by default for a fresh build.
+For an existing configuration, check **AirPlay Receiver** in `menuconfig`:
+enable **HomeKit: allow adding the speaker to a home** and **Advertise artwork
+support**, and use **AirPlay model identifier** `AirPlaySpeaker1,1`.
+
+Artwork is shown in Apple Home; the board's web interface remains focused on
+playback and device settings. AirPlay playback also works without adding the
+speaker to a home.
 
 ## How it works
 
@@ -228,7 +258,7 @@ idf.py menuconfig
 | Menu | What you can set |
 |---|---|
 | **I2S Playout** | BCLK / LRCK / DATA / MCLK GPIOs, default output latency of your DAC, wired latency measurement, web admin password |
-| **AirPlay Receiver** | setup Wi-Fi name and password, hardware buttons |
+| **AirPlay Receiver** | setup Wi-Fi name and password, HomeKit pairing, artwork, speaker model, optional AAC limiter, hardware buttons |
 | **Amplifier Power Control** | amplifier enable GPIO, active level, power-off delay |
 | **RGB Audio/VU LED** | LED on/off, GPIO, brightness, modes |
 | **AirPlay Logs and Diagnostics** | log detail |
@@ -268,6 +298,8 @@ with it.
    Apple TV use the audio output in Control Center.
 4. **Group it.** Tick several speakers in the same AirPlay menu (HomePods,
    other boards, other AirPlay 2 speakers) and they play together.
+5. **Add it to Apple Home** to assign a room and access artwork and playback
+   controls (see [Apple Home / HomeKit](#apple-home--homekit)).
 
 > [!TIP]
 > If your DAC or amplifier adds delay (a DSP, a soundbar input), set
@@ -346,10 +378,17 @@ surround from an Apple TV see the sister project
    32-bit output API: signed 32-bit straight to float, without a 16-bit step.
    **ALAC** uses Espressif's decoder; 24-bit samples also go straight to
    float.
-2. **DSP** in 32-bit float: source routing, EQ / crossover, loudness, volume.
-   Nothing clips on the way.
-3. **I2S** with 32-bit samples in 32-bit slots at the stream's rate (44.1 or
-   48 kHz). The only conversion with saturation is the last step before DMA.
+2. **Optional AAC limiter.** The experimental FDK limiter keeps S32 output
+   and compensates its lookahead in the PCM RTP timestamps: 720 frames at
+   48 kHz or 661 at 44.1 kHz (about 15 ms). It is **off by default**; enable
+   **Test FDK PCM limiter (S32, lookahead compensated)** in `menuconfig` for
+   testing. ALAC bypasses it.
+3. **DSP** in 32-bit float: source routing, EQ / crossover, loudness, volume.
+   Float processing preserves headroom, but EQ or loudness can still produce
+   peaks above the final output range. The AAC limiter is before these stages
+   and does not protect against peaks they introduce.
+4. **I2S** with 32-bit samples in 32-bit slots at the stream's rate (44.1 or
+   48 kHz). Float PCM is converted to signed 32-bit with saturation before DMA.
 
 ### Synchronisation
 
@@ -367,14 +406,14 @@ leaves every speaker at the same moment.
 | Compressed stream buffer | 6 MB in PSRAM |
 | Decoded audio ahead of the output | ~850 ms |
 | Decode task stack | 20 KiB in PSRAM |
-| Firmware size | ~1.9 MB of a 3 MB app partition (two partitions for OTA) |
+| Firmware size | ~2.0 MB of a 3 MiB app partition (two partitions for OTA) |
 
 | Core 0 | Core 1 |
 |---|---|
 | Wi-Fi, RTSP, PTP, AAC decode / EQ, realtime ALAC receive and decode | I2S playout, ordered ALAC staging / EQ, buffered stream reader |
 
 The FDK changes (32-bit output, hardware bit counting on the ESP32-S3,
-smaller buffers, lazy limiter) are listed in
+smaller buffers and the optional S32 limiter) are listed in
 [`components/fdk_aac/MODIFICATIONS.md`](components/fdk_aac/MODIFICATIONS.md).
 
 ## Limitations
@@ -396,6 +435,7 @@ smaller buffers, lazy limiter) are listed in
 | Problem | Check |
 |---|---|
 | The speaker does not appear in the AirPlay menu | Same Wi-Fi network as the sender; the board's IP in your router; guest networks often block AirPlay. |
+| AirPlay works but the speaker cannot be added to Apple Home | Enable HomeKit and use model `AirPlaySpeaker1,1` in **AirPlay Receiver**; see [Apple Home / HomeKit](#apple-home--homekit). |
 | No sound | **Mute** buttons and **Source mode** on `/eq`; PCM5102A **XSMT** jumper; wiring of BCLK / LRCK / DATA; amplifier enable GPIO. |
 | Dropouts | Wi-Fi signal at the speaker (`/speedtest`, RSSI on the main page). |
 | Speaker early or late in a group | **Output Latency** of that board (DSP, external processors). |
@@ -442,7 +482,7 @@ from the sister project for 5.1 / 7.1,
 [esp32-airplay2-surround](https://github.com/Kristian8606/esp32-airplay2-surround).
 AAC decoding through [fdk-aac](https://github.com/mstorsjo/fdk-aac).
 
-AirPlay, Apple TV and HomePod are trademarks of Apple Inc. This project is not
+AirPlay, Apple TV, HomePod and HomeKit are trademarks of Apple Inc. This project is not
 affiliated with or endorsed by Apple.
 
 <p align="center">
