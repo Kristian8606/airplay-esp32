@@ -1,0 +1,138 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+#include "device_reset.h"
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "cJSON.h"
+#include "esp_log.h"
+#include "esp_partition.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "web_server_internal.h"
+
+#define RESET_BODY_CAP 128
+#define RESET_ERASE_CHUNK 65536U
+static const char *TAG = "device_reset";
+static bool s_ready;
+
+void device_reset_mark_ready(void) {
+  __atomic_store_n(&s_ready, true, __ATOMIC_RELEASE);
+}
+
+static esp_err_t reset_homekit(void) {
+  /* These are the persistent keys owned by hap.c and hap_pairings.c.
+   * RTSP is idle before this runs; reboot discards their cached RAM tables. */
+  static const char *const keys[] = {"hk_pairs", "ed25519_pub", "ed25519_sec"};
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open("airplay", NVS_READWRITE, &nvs);
+  if (err != ESP_OK) return err;
+  for (size_t i = 0; err == ESP_OK && i < sizeof(keys) / sizeof(keys[0]); ++i) {
+    err = nvs_erase_key(nvs, keys[i]);
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+  }
+  if (err == ESP_OK) err = nvs_commit(nvs);
+  nvs_close(nvs);
+  return err;
+}
+
+static esp_err_t reset_factory(void) {
+  /* No filesystem is mounted by this firmware. Also erase legacy files in
+   * its data partition; never touch app/OTA/PHY/encryption-key partitions. */
+  const esp_partition_t *storage = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "storage");
+  if (storage) {
+    for (size_t off = 0; off < storage->size;) {
+      size_t len = storage->size - off;
+      if (len > RESET_ERASE_CHUNK) len = RESET_ERASE_CHUNK;
+      esp_err_t err = esp_partition_erase_range(storage, off, len);
+      if (err != ESP_OK) return err;
+      off += len;
+      vTaskDelay(1);
+    }
+  }
+  /* Erase the entire default NVS partition, not a list of current settings:
+   * this also removes obsolete namespaces and old versions of saved blobs. */
+  return nvs_flash_erase();
+}
+
+static esp_err_t reset_post(httpd_req_t *req) {
+  if (!web_admin_ok(req)) return ESP_OK;
+  if (!__atomic_load_n(&s_ready, __ATOMIC_ACQUIRE)) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "Still starting. Try again shortly.");
+  }
+  char type[64], site[32];
+  if (httpd_req_get_hdr_value_str(req, "Content-Type", type, sizeof(type)) != ESP_OK ||
+      strncmp(type, "application/json", 16) != 0 ||
+      (type[16] != '\0' && type[16] != ';')) {
+    httpd_resp_set_status(req, "415 Unsupported Media Type");
+    return httpd_resp_sendstr(req, "Use application/json.");
+  }
+  if (httpd_req_get_hdr_value_str(req, "Sec-Fetch-Site", site, sizeof(site)) == ESP_OK &&
+      strcmp(site, "cross-site") == 0) {
+    httpd_resp_set_status(req, "403 Forbidden");
+    return httpd_resp_sendstr(req, "Cross-site reset rejected.");
+  }
+  char body[RESET_BODY_CAP];
+  if (web_recv_json(req, body, sizeof(body)) != ESP_OK ||
+      memchr(body, '\0', req->content_len) != NULL) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid reset request");
+    return ESP_FAIL; /* close a partially read/oversized request */
+  }
+  cJSON *json = cJSON_ParseWithOpts(body, NULL, true);
+  const cJSON *mode = cJSON_GetObjectItemCaseSensitive(json, "mode");
+  const cJSON *confirm = cJSON_GetObjectItemCaseSensitive(json, "confirm");
+  const bool factory = cJSON_IsString(mode) && strcmp(mode->valuestring, "factory") == 0;
+  const bool homekit = cJSON_IsString(mode) && strcmp(mode->valuestring, "homekit") == 0;
+  const bool valid = cJSON_IsObject(json) && cJSON_GetArraySize(json) == 2 &&
+      (factory || homekit) && cJSON_IsString(confirm) &&
+      strcmp(confirm->valuestring, factory ? "ERASE ALL" : "RESET HOMEKIT") == 0;
+  cJSON_Delete(json);
+  if (!valid)
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Confirm the selected reset");
+
+  /* The one HTTP task serializes web setters. Keep it inside this handler
+   * until reboot, so no queued request can write cached settings after erase.
+   * Its existing internal stack is safe while flash caches are suspended. */
+  const UBaseType_t priority = uxTaskPriorityGet(NULL);
+  vTaskPrioritySet(NULL, 1);
+  bool paused = false;
+  if (web_audio_pause(req, "Reset", &paused) != ESP_OK) {
+    vTaskPrioritySet(NULL, priority);
+    return ESP_OK; /* existing maintenance recovery already answered */
+  }
+  ESP_LOGW(TAG, "%s reset: source stopped, erasing saved data",
+           factory ? "Factory" : "HomeKit");
+  const esp_err_t err = factory ? reset_factory() : reset_homekit();
+  httpd_resp_set_type(req, HTTPD_TYPE_JSON);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  if (err == ESP_OK) {
+    httpd_resp_sendstr(req, factory
+        ? "{\"success\":true,\"mode\":\"factory\",\"restarting\":true}"
+        : "{\"success\":true,\"mode\":\"homekit\",\"restarting\":true}");
+  } else {
+    ESP_LOGE(TAG, "Reset incomplete: %s; restarting", esp_err_to_name(err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    char answer[160];
+    snprintf(answer, sizeof(answer),
+             "{\"success\":false,\"restarting\":true,\"error\":\"Reset incomplete (%s). Restarting; retry after reboot.\"}",
+             esp_err_to_name(err));
+    httpd_resp_sendstr(req, answer);
+  }
+  /* Even partial erasure must not return to live services with stale keys.
+   * The response reports erase outcome, not just acceptance of the request. */
+  vTaskDelay(pdMS_TO_TICKS(500));
+  esp_restart();
+  return ESP_OK;
+}
+
+esp_err_t device_reset_register(httpd_handle_t server) {
+  const httpd_uri_t uri = {
+      .uri = "/api/system/reset", .method = HTTP_POST, .handler = reset_post};
+  return httpd_register_uri_handler(server, &uri);
+}

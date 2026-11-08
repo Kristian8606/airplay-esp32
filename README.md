@@ -74,9 +74,9 @@ Click an image to open it full size.
 
 ## Apple Home / HomeKit
 
-**The speaker works in Apple Home**, with album artwork, track information,
-playback controls and volume while playing over AirPlay. It is added as an
-AirPlay speaker and can be assigned to a room.
+**Add the speaker to Apple Home** and assign it to a room. During AirPlay
+playback, the Home app shows album artwork and track information, with
+playback and volume controls.
 
 <table>
   <tr>
@@ -89,15 +89,8 @@ AirPlay speaker and can be assigned to a room.
   </tr>
 </table>
 
-On the same Wi-Fi network, use **Add Accessory** in Apple Home to add the
-speaker. HomeKit and artwork support are enabled by default for a fresh build.
-For an existing configuration, check **AirPlay Receiver** in `menuconfig`:
-enable **HomeKit: allow adding the speaker to a home** and **Advertise artwork
-support**, and use **AirPlay model identifier** `AirPlaySpeaker1,1`.
-
-Artwork is shown in Apple Home; the board's web interface remains focused on
-playback and device settings. AirPlay playback also works without adding the
-speaker to a home.
+HomeKit integration, album artwork support, manufacturer and model can be
+configured under **AirPlay Receiver** in `idf.py menuconfig`.
 
 ## How it works
 
@@ -321,6 +314,7 @@ Everything is configured in the browser at `http://<board-ip>/`.
 | **Output Latency** | delay of your hardware after the ESP (DAC, DSP), so all speakers in a group stay in sync; *Measure* runs a wired loopback test |
 | **Firmware Update** | OTA update with a `.bin` file |
 | **System** | IP, MAC, memory, firmware, uptime, reset reason, Wi-Fi network, signal, channel, PHY and BSSID; restart |
+| **Reset** | **Reset HomeKit** forgets pairing and keeps Wi-Fi/audio settings; **Factory Reset** erases all saved data and restarts for Wi-Fi setup |
 | **Audio EQ / System Logs / WiFi Speedtest** | links to the pages below |
 
 ### Audio EQ page (`/eq`)
@@ -341,8 +335,15 @@ crossover stays at the same frequency whatever the source.
 - **`/speedtest`**: ping, download and upload between the browser and the
   board, to check Wi-Fi where the speaker stands.
 
+**Resetting the speaker:** both reset actions ask for confirmation and stop
+AirPlay before erasing data. **Factory Reset** additionally requires typing
+`ERASE ALL`; it clears Wi-Fi networks, name, EQ/routing/preamps, loudness,
+volume, output latency and pairing keys. After a HomeKit reset, remove the
+old speaker entry from Apple Home before adding it again. The installed
+firmware and its build-time defaults remain in place.
+
 **Security:** with a **Web UI admin password** set in `menuconfig`, firmware
-updates, restart, Wi-Fi and name changes and the latency settings and test
+updates, restart, both reset actions, Wi-Fi and name changes and the latency settings and test
 require the user `admin` and that password.
 
 ## Technical details

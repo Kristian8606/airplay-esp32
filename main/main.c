@@ -1,3 +1,4 @@
+#include "device_reset.h"
 #include "audio_receiver.h"
 #include "audio_diag.h"
 #include "amp_control.h"
@@ -90,7 +91,13 @@ void app_main(void) {
   /* The sender's clock: two-way PTP with the master the sender names. The
    * audio reads it through network/ptp_clock.c. */
   ESP_ERROR_CHECK(apple_clock_start());
-  ESP_ERROR_CHECK(ap2_hap_identity_init());
+  e = ap2_hap_identity_init();
+  if (e != ESP_OK) {
+    ESP_LOGE(TAG, "AirPlay identity/pairings unavailable (%s); web reset remains available",
+             esp_err_to_name(e));
+    device_reset_mark_ready();
+    return; /* no AirPlay service may write while recovering bad stored keys */
+  }
   led_init();
 
   if (provisioning_only) {
@@ -124,6 +131,8 @@ void app_main(void) {
     ESP_LOGI(TAG, "airplay-esp32 %s ready; setup UI: http://192.168.4.1/",
              fw_version);
   }
+
+  device_reset_mark_ready();
 
   /* All services own their workers. Return so IDF frees the main stack. */
 }

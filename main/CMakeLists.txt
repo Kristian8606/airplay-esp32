@@ -8,6 +8,7 @@ set(SRC_FILES
     "airplay_identity.c"
     "amp_control.c"
     "firmware_id.c"
+    "device_reset.c"
     "sound_engine.c"
     "web_receiver.c"
     "audio/audio_receiver.c"

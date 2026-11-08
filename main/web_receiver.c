@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "sdkconfig.h"
 #include "settings.h"
+#include "device_reset.h"
 
 static const char *TAG = "web_receiver";
 
@@ -445,6 +446,7 @@ bool web_role_source_idle(void) { return rtsp_server_is_idle(); }
 esp_err_t web_role_source_start(void) { return rtsp_server_start(); }
 
 void web_role_register(httpd_handle_t server) {
+  ESP_ERROR_CHECK(device_reset_register(server));
 #define REG(U, M, H)                                                     \
   do {                                                                   \
     httpd_uri_t x = {.uri = U, .method = M, .handler = H};               \
