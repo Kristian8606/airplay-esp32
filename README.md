@@ -81,10 +81,10 @@ playback and volume controls.
 <table>
   <tr>
     <td align="center" width="50%">
-      <a href="images/IMG_1578.PNG"><img src="images/IMG_1578.PNG" alt="ESP32 AirPlay speaker in Apple Home showing album artwork, track information and playback controls" width="280"></a>
+      <a href="images/IMG_1578.jpg"><img src="images/IMG_1578.jpg" alt="ESP32 AirPlay speaker in Apple Home showing album artwork, track information and playback controls" width="280"></a>
     </td>
     <td align="center" width="50%">
-      <a href="images/IMG_1579.PNG"><img src="images/IMG_1579.PNG" alt="Another ESP32 AirPlay speaker in Apple Home showing current album artwork and volume controls" width="280"></a>
+      <a href="images/IMG_1579.jpg"><img src="images/IMG_1579.jpg" alt="Another ESP32 AirPlay speaker in Apple Home showing current album artwork and volume controls" width="280"></a>
     </td>
   </tr>
 </table>

@@ -130,7 +130,8 @@ typedef enum {
   SET_SET_VOLUME,
   SET_PERSIST_VOLUME,
   SET_GET_NAME,
-  SET_SET_NAME
+  SET_SET_NAME,
+  SET_ANNOUNCE_NAME
 } settings_op_t;
 
 typedef struct {
@@ -161,6 +162,10 @@ static void settings_task(void *arg) {
       job->err = settings_set_device_name(job->name);
       if (job->err == ESP_OK)
         job->err = settings_get_device_name(job->name, sizeof(job->name));
+      break;
+    case SET_ANNOUNCE_NAME:
+      /* The saved name, as settings normalized it. */
+      job->err = settings_get_device_name(job->name, sizeof(job->name));
       if (job->err == ESP_OK) {
         wifi_set_hostname(job->name);
         job->err = mdns_airplay_update_name(job->name);
@@ -248,6 +253,10 @@ esp_err_t rtsp_port_settings_set_name(const char *name) {
 #endif
   heap_caps_free(job);
   return err;
+}
+
+esp_err_t rtsp_port_settings_announce_name(void) {
+  return run_settings_err(SET_ANNOUNCE_NAME, 0.0f);
 }
 
 esp_err_t rtsp_port_udp_pair(uint16_t *data_port, uint16_t *control_port) {
