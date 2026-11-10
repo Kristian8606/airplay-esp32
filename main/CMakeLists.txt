@@ -22,8 +22,6 @@ set(SRC_FILES
     "audio/pcm_rtp_ring.c"
     "audio/audio_playout.c"
     "audio/audio_crypto.c"
-    "network/apple_clock.c"
-    "network/apple_clock_core.c"
     "network/ptp_clock.c"
 )
 
@@ -62,6 +60,7 @@ idf_component_register(
         esp_adc
         fdk_aac
         ap2_core
+        apple_clock
         helpers
         led
         log_stream

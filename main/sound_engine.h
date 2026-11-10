@@ -1,6 +1,6 @@
 #pragma once
 
-/* The audio engine under the names the RTSP server (components/ap2_core) and
+/* The audio engine under the names the RTSP server (ap2_core) and
  * the web server (components/web_server) call: this speaker's own audio path,
  * audio/audio_receiver.c. The types are the engine's own. */
 #include <stdbool.h>

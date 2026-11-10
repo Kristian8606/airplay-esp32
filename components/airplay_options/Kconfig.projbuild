@@ -1,16 +1,3 @@
-menu "Sender Clock"
-    config AIRPLAY_APPLE_CLOCK_ASYM_US
-        int "Path asymmetry correction (us)"
-        default 0
-        range -2000 2000
-        help
-            Added to the sender's time from both directions. Two-way PTP
-            cannot see a difference between the two directions of the path;
-            if a measurement against a HomePod (microphone, oscilloscope)
-            shows a constant one, set it here. Positive: this speaker plays
-            earlier.
-endmenu
-
 menu "AirPlay Receiver"
     config DEFAULT_AP_SSID
         string "Setup AP SSID"

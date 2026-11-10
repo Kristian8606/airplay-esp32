@@ -463,9 +463,12 @@ request and response** in `menuconfig` (verbose; turn it off afterwards).
   Kristian Dimitrov: [`LICENSE`](LICENSE), [`NOTICE`](NOTICE). The
   components in `components/` carry their own copy of the license and a
   `NOTICE`. The exceptions are below.
-- **FairPlay setup replies** (`components/ap2_core/src/fairplay/fairplay_tables.c`)
-  are fixed interop data from reverse engineering, not under the Apache
-  License; see [`components/ap2_core/NOTICE`](components/ap2_core/NOTICE).
+- **AirPlay 2 protocol core** (`ap2_core`, `apple_clock`) comes from
+  [esp-airplay2-core](https://github.com/Kristian8606/esp-airplay2-core)
+  (Apache License 2.0) through the ESP-IDF component manager. Its
+  **FairPlay setup replies** (`src/fairplay/fairplay_tables.c`) are fixed
+  interop data from reverse engineering, not under the Apache License; see
+  the [`NOTICE` of ap2_core](https://github.com/Kristian8606/esp-airplay2-core/blob/v1.0.0/components/ap2_core/NOTICE).
 - **Fraunhofer FDK AAC** (`components/fdk_aac/fdk-aac`) is under the
   Fraunhofer FDK license, [`NOTICE`](components/fdk_aac/fdk-aac/NOTICE). The
   copy here is a **Third-Party Modified Version of the Fraunhofer FDK AAC

@@ -6,7 +6,7 @@
 #include "audio_loudness.h"
 #include "ap2_hap.h"
 #include "ap2_pairings.h"
-#include "network/apple_clock.h"
+#include "apple_clock.h"
 #include "log_stream.h"
 #include "led.h"
 #include "mdns_airplay.h"
