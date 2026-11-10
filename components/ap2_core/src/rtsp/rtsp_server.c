@@ -9,7 +9,6 @@
 #include <string.h>
 
 #include "esp_heap_caps.h"
-#include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
@@ -22,9 +21,7 @@
 #include "settings.h"
 #include "mdns_airplay.h"
 #include "wifi.h"
-#ifdef CONFIG_AIRPLAY_HOMEKIT
-#include "device_reset.h"
-#endif
+#include "ap2_port.h"
 
 #define RTSP_TCP_PORT 7000
 #define MAX_CONTROL 8
@@ -64,6 +61,7 @@ static SemaphoreHandle_t s_lock;
 static slot_t s_slots[MAX_SLOTS];
 static volatile bool s_running;  /* the listener task is alive */
 static volatile bool s_stopping;
+static bool s_reset_in_progress;
 #ifdef CONFIG_AIRPLAY_HOMEKIT
 static char s_reset_name[128];
 #endif
@@ -96,7 +94,7 @@ void *rtsp_port_malloc(size_t size) {
 void rtsp_port_free(void *ptr) { heap_caps_free(ptr); }
 
 #ifdef CONFIG_AIRPLAY_HOMEKIT
-void rtsp_port_homekit_reset(void) { device_reset_schedule_homekit(); }
+void rtsp_port_homekit_reset(void) { ap2_port_homekit_reset_schedule(); }
 esp_err_t rtsp_port_homekit_reset_name(char *name, size_t len) {
   if (!name || !len) return ESP_ERR_INVALID_ARG;
   rtsp_port_lock();
@@ -119,7 +117,7 @@ uint32_t rtsp_port_now_ms(void) {
 }
 
 void rtsp_port_device_mac(uint8_t mac[6]) {
-  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) memset(mac, 0, 6);
+  if (ap2_port_device_mac(mac) != ESP_OK) memset(mac, 0, 6);
 }
 
 /* Settings may read and write flash. With the cache off a task whose stack
@@ -591,12 +589,22 @@ static void listener_task(void *arg) {
 
 /* ---- rtsp_server.h ---- */
 
+void rtsp_server_begin_reset(void) {
+  rtsp_port_lock();
+  s_reset_in_progress = true;
+  rtsp_port_unlock();
+}
+
 esp_err_t rtsp_server_start(void) {
   struct sockaddr_in addr = {0};
   int one = 1;
   int fd;
 
   rtsp_port_lock();
+  if (s_reset_in_progress) {
+    rtsp_port_unlock();
+    return ESP_ERR_INVALID_STATE;
+  }
   if (s_running) {
     rtsp_port_unlock();
     /* still ending after a stop (spec "Interface to the firmware") */

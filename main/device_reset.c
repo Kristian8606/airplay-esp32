@@ -15,6 +15,8 @@
 #include "nvs_flash.h"
 #include "web_server_internal.h"
 #include "sound_engine.h"
+#include "rtsp_server.h"
+#include "ap2_port.h"
 
 #define RESET_BODY_CAP 128
 #define RESET_ERASE_CHUNK 65536U
@@ -54,6 +56,7 @@ static void homekit_reset_work(void *arg) {
    * the web reset. No other web handler may release or restore audio until
    * this reset reboots. Its existing internal stack is safe for NVS. */
   vTaskPrioritySet(NULL, 1);
+  rtsp_server_begin_reset();
   /* The response is already sent; let its connection finish before stopping
    * the server. */
   vTaskDelay(pdMS_TO_TICKS(500));
@@ -92,7 +95,7 @@ static void homekit_reset_task(void *arg) {
   for (;;) vTaskDelay(portMAX_DELAY);
 }
 
-void device_reset_schedule_homekit(void) {
+void ap2_port_homekit_reset_schedule(void) {
   /* Created before the AirPlay server starts. No heap allocation here. */
   xTaskNotifyGive(s_homekit_reset_task);
 }
@@ -164,6 +167,9 @@ static esp_err_t reset_post(httpd_req_t *req) {
     vTaskPrioritySet(NULL, priority);
     return ESP_OK; /* existing maintenance recovery already answered */
   }
+  /* After the pause: a failed pause restarts AirPlay itself. From here
+   * on nothing may start it again before the reboot. */
+  rtsp_server_begin_reset();
   ESP_LOGW(TAG, "%s reset: source stopped, erasing saved data",
            factory ? "Factory" : "HomeKit");
   const esp_err_t err = factory ? reset_factory() : reset_homekit();

@@ -198,6 +198,10 @@ static void change_volume(double volume) {
 void rtsp_core_remote_volume(double volume) {
   if (s.holder == NULL) return;
   change_volume(volume);
+#ifdef CONFIG_AIRPLAY_LOG_RTSP_REQUESTS
+  RTSP_LOGI("volume from remote command, q15 %" PRId32,
+            rtsp_volume_to_q15(volume));
+#endif
 }
 
 /* ---- Session ---- */
@@ -957,6 +961,11 @@ static void do_set_parameter(rtsp_conn_t *c, const rtsp_msg_t *m,
   if (have_volume && holds(c)) {
     volume = rtsp_volume_clamp(volume);
     change_volume(volume);
+#ifdef CONFIG_AIRPLAY_LOG_RTSP_REQUESTS
+    char text[24];
+    rtsp_format_volume(volume, text, sizeof(text));
+    RTSP_LOGI("volume %s, q15 %" PRId32, text, rtsp_volume_to_q15(volume));
+#endif
   }
 }
 
