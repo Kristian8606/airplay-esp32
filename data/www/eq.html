@@ -34,12 +34,16 @@
 <div class='row'><span id='slope-label'>Slope</span><div class='seg' id='slope' role='group' aria-labelledby='slope-label'><button type='button' data-s='12'>LR2 &middot; 12 dB/oct</button><button type='button' data-s='24'>LR4 &middot; 24 dB/oct</button><button type='button' data-s='48'>LR8 &middot; 48 dB/oct</button></div></div>
 <div class='row crossover-frequency'><label for='xo-r'>Frequency</label><input type='range' id='xo-r' min='0' max='1000' step='1'><input type='number' class='num' id='xo-n' min='800' max='8000' step='any' aria-label='Crossover frequency in Hz'><span>Hz</span></div>
 <div class='row'><span>Tweeter on</span><b id='tw-side'></b><button type='button' class='pill' id='swap'>Swap outputs</button></div>
+<div id='driver-alignment'></div>
 <p class='hint' style='margin-top:12px'>The crossover runs even when EQ is off. Selecting LR2 inverts the tweeter automatically.</p>
 </div>
 <details class='card'>
 <summary>Equalizer</summary>
 <div class='toggle'><input type='checkbox' id='eq-enabled'><label for='eq-enabled'>Enable EQ and preamp</label></div>
 <div class='row' style='margin-bottom:16px'><button type='button' class='pill' data-mute='left'>Mute amp L</button><button type='button' class='pill' data-mute='right'>Mute amp R</button><span>Output mutes act immediately.</span></div>
+<div class='row' id='stereo-import' hidden><button type='button' class='pill' data-import='both'>Import REW for both</button></div>
+<input type='file' id='rew-file' accept='.txt,text/plain' hidden>
+<div id='rew-msg' role='status' hidden></div>
 <div id='ways'></div>
 </details>
 </fieldset>
@@ -59,7 +63,7 @@
 <div id='eq-msg' role='status'>Loading settings…</div>
 </div>
 </div><script>
-const NB=24,FS=48000,TYPES=['PK','LS','HS','LP','HP','BP','NOTCH'],GAIN_T=['PK','LS','HS'],Q_T=['PK','LP','HP','BP','NOTCH'];
+const NB=24,FS=48000,TYPES=['PK','LS','HS','LP','HP','BP','NOTCH'],GAIN_T=['PK','PK_REW','LS','HS'],Q_T=['PK','PK_REW','LP','HP','BP','NOTCH'];
 const F0=[25,33,44,58,77,100,135,180,235,310,410,550,720,950,1300,1700,2200,2900,3800,5000,6700,8800,12000,16000];
 const SIDES=['left','right'];
 const ROLE_HINT={
@@ -68,16 +72,16 @@ const ROLE_HINT={
   right:'Both amp outputs use the right channel from the music.',
   stereo:'L plays on amp L. R plays on amp R.'
 };
-const TIP={PK:'Peak: frequency, gain, Q',LS:'Low shelf: frequency, gain (fixed slope)',HS:'High shelf: frequency, gain (fixed slope)',LP:'Low-pass 12 dB/oct: frequency, Q',HP:'High-pass 12 dB/oct: frequency, Q',BP:'Band-pass: frequency, Q',NOTCH:'Notch: frequency, Q'};
-const S={enabled:false,channel_mode:'stereo',mode:'mono',twOut:0,slope:24,xo:2500,ways:{},sel:{left:null,right:null},applied:null,live:true,dirty:false};
+const TIP={PK:'Peak: frequency, gain, Q',PK_REW:'Peak: frequency, gain, REW Q',LS:'Low shelf: frequency, gain (fixed slope)',HS:'High shelf: frequency, gain (fixed slope)',LP:'Low-pass 12 dB/oct: frequency, Q',HP:'High-pass 12 dB/oct: frequency, Q',BP:'Band-pass: frequency, Q',NOTCH:'Notch: frequency, Q'};
+const S={enabled:false,channel_mode:'stereo',mode:'mono',twOut:0,slope:24,xo:2500,ways:{},sel:{left:null,right:null,shared:null},applied:null,live:true,dirty:false,legacy:false};
 const muted={left:false,right:false};
 function msg(t,c){document.getElementById('eq-msg').innerHTML=t?'<div class="msg '+c+'">'+t+'</div>':'';}
 function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-function fk(f){if(f<1000)return String(Math.round(f*10)/10);let s=(f/1000).toFixed(f%1000?(f%100?2:1):0);if(s.includes('.'))s=s.replace(/0+$/,'').replace(/\.$/,'');return s+'k';}
-function qk(q){return String(Math.round(q*100)/100);}
+function fk(f){return f<1000?String(Math.round(f*100)/100):Number((f/1000).toFixed(5))+'k';}
+function qk(q){return String(Math.round(q*1000)/1000);}
 function parseFreq(v){v=String(v).trim().toLowerCase().replace(',','.');return v.endsWith('k')?parseFloat(v)*1000:parseFloat(v);}
 function defBand(i){return{f:F0[i],q:2,g:0,t:'PK',on:true};}
-function bandsFrom(list){const b=[];for(let i=0;i<NB;i++){const f=list&&list[i];b.push(f?{f:Number(f.frequency_hz)||F0[i],q:Number(f.q)||0.707,g:Number(f.gain_db)||0,t:TYPES.includes(f.type)?f.type:'PK',on:f.enabled!==false}:defBand(i));}return b;}
+function bandsFrom(list){const b=[];for(let i=0;i<NB;i++){const f=list&&list[i];b.push(f?{f:Number(f.frequency_hz)||F0[i],q:Number(f.q)||0.707,g:Number(f.gain_db)||0,t:f.type==='PK_REW'||TYPES.includes(f.type)?f.type:'PK',on:f.enabled!==false}:defBand(i));}return b;}
 function wayFrom(d,side){return{b:bandsFrom(d[side+'_filters']),pre:Number(d[side+'_preamp_db']??d.preamp_db??0),dly:Number(d[side+'_delay_ms']||0),inv:!!d[side+'_invert']};}
 function neutral(b){return GAIN_T.includes(b.t)&&b.g===0;}
 function filtersOf(w){return w.b.map(b=>({enabled:b.on&&!neutral(b),type:b.t,frequency_hz:b.f,gain_db:b.g,q:b.q}));}
@@ -91,19 +95,86 @@ function collect(){
     cfg[side+'_invert']=way.inv;
     cfg[side+'_delay_ms']=way.dly;
   }
+  if(!S.legacy){
+    cfg.shared_preamp_db=S.ways.shared.pre;
+    cfg.shared_filters=filtersOf(S.ways.shared);
+  }
   return cfg;
+}
+function parseRew(text){
+  const lines=text.split(/\r\n?|\n/);
+  const profile=text.match(/^\s*Equalis[ez]er\s*:\s*([^\r\n]+)/im);
+  if(profile&&!/^Generic$/i.test(profile[1].trim())){
+    throw new Error('Select the Generic equaliser in REW and export the filter settings again.');
+  }
+  const filters=[];
+  const num='([+-]?(?:\\d+(?:[.,]\\d+)?|[.,]\\d+))';
+  const peak=new RegExp('^Fc\\s+'+num+'\\s*Hz\\s+Gain\\s+'+num+'\\s*dB\\s+Q\\s+'+num+'$','i');
+  for(const line of lines){
+    const slot=line.match(/^\s*Filter\s+(\d+)\b(.*)$/i);
+    if(!slot)continue;
+    const entry=slot[2].match(/^:\s*(ON|OFF)(?:\s+(\S+))?(?:\s+(.*?))?\s*$/i);
+    const name='Filter '+slot[1];
+    if(!entry)throw new Error(name+' has invalid settings.');
+    const [,enabled,type,params]=entry;
+    if(enabled.toUpperCase()==='OFF'||/^none$/i.test(type||''))continue;
+    if(!/^PK$/i.test(type||''))throw new Error(name+' uses '+(type||'an unknown type')+'. REW import supports PK filters.');
+    const values=peak.exec(params||'');
+    if(!values)throw new Error(name+' must have a frequency, gain and Q.');
+    const [f,g,q]=values.slice(1).map(v=>Number(v.replace(',','.')));
+    if(!(f>=10&&f<=20000&&g>=-24&&g<=24&&q>=0.05&&q<=50)){
+      throw new Error(name+' is outside the supported frequency, gain or Q range.');
+    }
+    filters.push({f,g,q,t:'PK_REW',on:true});
+    if(filters.length>NB)throw new Error('Import supports up to '+NB+' active filters per EQ.');
+  }
+  if(!filters.length)throw new Error('No active PK filters found. Use Export filter settings as text in REW.');
+  return filters;
+}
+function rewMessage(text,type){
+  const el=document.getElementById('rew-msg');
+  el.textContent=text;
+  el.className='msg '+type;
+  el.hidden=!text;
+}
+let rewRead=0;
+async function importRew(file,target){
+  const read=++rewRead;
+  try{
+    if(file.size>65536)throw new Error('Select a REW filter settings text file.');
+    const text=await file.text();
+    if(read!==rewRead)return;
+    const targets=target==='both'?SIDES:[target];
+    if(!targets.every(id=>ids().includes(id))||document.getElementById('eq-settings').disabled){
+      throw new Error('Select the REW file again for the current EQ.');
+    }
+    const filters=parseRew(text);
+    for(const id of targets){
+      S.ways[id].b=Array.from({length:NB},(_,i)=>filters[i]?{...filters[i]}:defBand(i));
+      S.sel[id]=null;
+    }
+    if(target==='shared')S.legacy=false;
+    S.enabled=true;
+    document.getElementById('eq-enabled').checked=true;
+    renderWays();
+    changed();
+    rewMessage('Loaded '+filters.length+' REW PK filters for '+(target==='both'?'left and right EQ':wayName(target))+'.','ok');
+  }catch(error){
+    if(read===rewRead)rewMessage(error.message,'err');
+  }
 }
 function layoutApplied(){return S.applied!==null&&S.mode===S.applied.mode&&(S.mode==='mono'||S.twOut===S.applied.twOut);}
 function setRole(role){S.channel_mode=S.mode==='biamp'&&role==='stereo'?'mono':role;}
 function isTweeter(side){return side===SIDES[S.twOut];}
-function otherSide(side){return side==='left'?'right':'left';}
 function outLabel(side){return side==='left'?'Amp L':'Amp R';}
-function wayName(side){return S.mode==='biamp'?(isTweeter(side)?'Tweeter':'Woofer'):outLabel(side);}
-function wayColor(side){return S.mode==='biamp'?(isTweeter(side)?'#b9a8ff':'#ff5c93'):'#8b7bff';}
-function ids(){return S.mode==='biamp'&&S.twOut?[SIDES[1],SIDES[0]]:SIDES;}
+function driverName(side){return isTweeter(side)?'Tweeter':'Woofer';}
+function wayName(id){return id==='shared'?'Shared EQ':id==='left'?'Left EQ':'Right EQ';}
+function wayColor(id){return id==='right'?'#ff5c93':'#8b7bff';}
+function ids(){return S.mode==='mono'&&S.channel_mode==='stereo'?SIDES:['shared'];}
 /* Response curve: the firmware's biquads (audio_eq.c calc_biquad) at 48 kHz. */
 const NP=180,FR=[],TR=[];for(let i=0;i<=NP;i++){const f=20*Math.pow(1000,i/NP),w=2*Math.PI*f/FS;FR.push(f);TR.push([Math.cos(w),Math.sin(w),Math.cos(2*w),Math.sin(2*w)]);}
 function bq(t,f,g,q){const K=Math.tan(Math.PI*f/FS),V=Math.pow(10,Math.abs(g)/20),r2=Math.SQRT2,sv=Math.sqrt(2*V),KK=K*K;let n,b0,b1,b2,a1,a2;
+if(t==='PK_REW')q*=Math.sqrt(V);
 switch(t){case'LP':n=1/(1+K/q+KK);b0=KK*n;b1=2*b0;b2=b0;a1=2*(KK-1)*n;a2=(1-K/q+KK)*n;break;
 case'HP':n=1/(1+K/q+KK);b0=n;b1=-2*b0;b2=b0;a1=2*(KK-1)*n;a2=(1-K/q+KK)*n;break;
 case'BP':n=1/(1+K/q+KK);b0=K/q*n;b1=0;b2=-b0;a1=2*(KK-1)*n;a2=(1-K/q+KK)*n;break;
@@ -113,29 +184,54 @@ case'HS':if(g>=0){n=1/(1+r2*K+KK);b0=(V+sv*K+KK)*n;b1=2*(KK-V)*n;b2=(V-sv*K+KK)*
 default:if(g>=0){n=1/(1+K/q+KK);b0=(1+V*K/q+KK)*n;b1=2*(KK-1)*n;b2=(1-V*K/q+KK)*n;a1=b1;a2=(1-K/q+KK)*n;}else{n=1/(1+V*K/q+KK);b0=(1+K/q+KK)*n;b1=2*(KK-1)*n;b2=(1-K/q+KK)*n;a1=b1;a2=(1-V*K/q+KK)*n;}}
 return[b0,b1,b2,a1,a2];}
 function magDb(k,j){const c=TR[j],nr=k[0]+k[1]*c[0]+k[2]*c[2],ni=-(k[1]*c[1]+k[2]*c[3]),dr=1+k[3]*c[0]+k[4]*c[2],di=-(k[3]*c[1]+k[4]*c[3]);return 10*Math.log10((nr*nr+ni*ni)/(dr*dr+di*di));}
-function xoSecs(id){if(S.mode!=='biamp')return[];const t=isTweeter(id)?'HP':'LP',qs=S.slope===12?[0.5]:S.slope===48?[0.5411961,1.306563,0.5411961,1.306563]:[Math.SQRT1_2,Math.SQRT1_2];return qs.map(q=>bq(t,S.xo,0,q));}
-function resp(id){const w=S.ways[id],ks=S.enabled?w.b.filter(b=>b.on&&!neutral(b)&&b.f<FS/2).map(b=>bq(b.t,b.f,b.g,b.q)):[],xs=xoSecs(id),pre=S.enabled?w.pre:0;return FR.map((f,j)=>{let d=pre;for(const k of ks)d+=magDb(k,j);for(const k of xs)d+=magDb(k,j);return d;});}
+function xoSecs(id){const t=isTweeter(id)?'HP':'LP',qs=S.slope===12?[0.5]:S.slope===48?[0.5411961,1.306563,0.5411961,1.306563]:[Math.SQRT1_2,Math.SQRT1_2];return qs.map(q=>bq(t,S.xo,0,q));}
+function resp(id){
+  const w=S.ways[id],pre=S.enabled?w.pre:0;
+  const ks=S.enabled?w.b.filter(b=>b.on&&!neutral(b)&&b.f<FS/2).map(b=>bq(b.t,b.f,b.g,b.q)):[];
+  return FR.map((_,j)=>ks.reduce((db,k)=>db+magDb(k,j),pre));
+}
 const X=f=>34+Math.log10(f/20)/3*558,Y=d=>8+(18-Math.max(-30,Math.min(18,d)))/48*170;
 function pts(r){return r.map((d,j)=>X(FR[j]).toFixed(1)+','+Y(d).toFixed(1)).join(' ');}
 function draw(id){const svg=document.getElementById('sv-'+id);if(!svg)return;const narrow=svg.clientWidth>0&&svg.clientWidth<480,fz=narrow?18:11;let o='';
 for(const d of [18,12,6,0,-6,-12,-18,-24,-30]){const y=Y(d).toFixed(1);o+="<line x1='34' x2='592' y1='"+y+"' y2='"+y+"' stroke='rgba(255,255,255,"+(d?0.07:0.22)+")'/>";if(d%12===0)o+="<text x='28' y='"+(Y(d)+fz/3).toFixed(1)+"' fill='#9aa0ad' font-size='"+fz+"' text-anchor='end'>"+(d>0?'+'+d:d)+"</text>";}
 for(const [f,t] of [[20,'20'],[50,'50'],[100,'100'],[200,'200'],[500,'500'],[1000,'1k'],[2000,'2k'],[5000,'5k'],[10000,'10k'],[20000,'20k']]){const x=X(f).toFixed(1);o+="<line x1='"+x+"' x2='"+x+"' y1='8' y2='178' stroke='rgba(255,255,255,0.06)'/>";if(narrow&&!['20','100','1k','10k'].includes(t))continue;o+="<text x='"+x+"' y='194' fill='#9aa0ad' font-size='"+fz+"' text-anchor='middle'>"+t+"</text>";}
-if(S.mode==='biamp'){const other=otherSide(id),x=X(S.xo).toFixed(1);o+="<polyline points='"+pts(resp(other))+"' fill='none' stroke='"+wayColor(other)+"' stroke-width='1.5' stroke-dasharray='4 3' opacity='0.45'/><line x1='"+x+"' x2='"+x+"' y1='8' y2='178' stroke='#8d8d93' stroke-dasharray='2 3'/>";}
-const r=resp(id);o+="<polyline points='"+pts(r)+"' fill='none' stroke='"+wayColor(id)+"' stroke-width='2.5'/>";
+const r=resp(id),outputs=[];
+if(S.mode==='biamp'){
+  const x=X(S.xo).toFixed(1);
+  o+="<line x1='"+x+"' x2='"+x+"' y1='8' y2='178' stroke='#8d8d93' stroke-dasharray='2 3'/>";
+  for(const side of SIDES){
+    const sections=xoSecs(side);
+    const output=r.map((db,j)=>sections.reduce((level,k)=>level+magDb(k,j),db));
+    outputs.push(...output);
+    o+="<polyline points='"+pts(output)+"' fill='none' stroke='"+(isTweeter(side)?'#b9a8ff':'#ff5c93')+"' stroke-width='1.5' stroke-dasharray='4 3'><title>"+driverName(side)+"</title></polyline>";
+  }
+}
+o+="<polyline points='"+pts(r)+"' fill='none' stroke='"+wayColor(id)+"' stroke-width='2.5'/>";
 S.ways[id].b.forEach((b,i)=>{if((b.on&&!neutral(b))||S.sel[id]===i){const g=GAIN_T.includes(b.t)?b.g:0;o+="<circle cx='"+X(Math.min(20000,Math.max(20,b.f))).toFixed(1)+"' cy='"+Y(g).toFixed(1)+"' r='"+(S.sel[id]===i?5:3)+"' fill='"+wayColor(id)+"'/>";}});
-svg.innerHTML=o;head(id,r);}
+svg.innerHTML=o;head(id,outputs.length?outputs:r);}
 function drawAll(){ids().forEach(draw);}
 /* Headroom: the EQ works in float and the volume follows it, so a boost
  * clips only near full volume. Offer the level that removes it. */
 function head(id,r){const el=document.getElementById('hr-'+id);if(!el)return;if(!S.enabled){el.className='badge';el.textContent='EQ off';return;}const pk=Math.max(...r);if(pk>0.05){const w=S.ways[id],to=Math.max(-24,Math.floor((w.pre-pk)*10)/10);el.className='badge hot';el.innerHTML='Peak +'+pk.toFixed(1)+' dB, may clip at full volume <button type="button" class="pill" data-fix="'+id+'" data-to="'+to+'" style="margin-left:6px;padding:2px 8px">Level '+to.toFixed(1)+' dB</button>';}else{el.className='badge ok';el.textContent='Headroom OK';}}
 function gtxt(b){return GAIN_T.includes(b.t)?(b.g>0?'+':'')+(Math.round(b.g*10)/10):b.t==='NOTCH'?'N':b.t;}
-function bandHtml(id,b,i){const hg=GAIN_T.includes(b.t),hq=Q_T.includes(b.t),n=i+1;return "<div class='c"+(S.sel[id]===i?' sel':'')+"' data-i='"+i+"' title='"+TIP[b.t]+"'><span class='g' id='g-"+id+"-"+i+"'>"+gtxt(b)+"</span><input type='range' min='-18' max='18' step='0.5' value='"+(hg?b.g:0)+"' data-i='"+i+"'"+(hg?'':' disabled')+" aria-label='Band "+n+" gain'><input class='t' data-i='"+i+"' data-k='f' value='"+fk(b.f)+"' aria-label='Band "+n+" frequency'><input class='t' data-i='"+i+"' data-k='q' value='"+qk(b.q)+"'"+(hq?'':' disabled')+" aria-label='Band "+n+" Q'></div>";}
-function cardHtml(id){const w=S.ways[id],name=wayName(id);let h="<div class='eq-way'><div class='way-head'><span class='dot' style='background:"+wayColor(id)+"'></span><h2>"+name+"</h2>"+(S.mode==='biamp'?"<span class='count'>"+outLabel(id)+"</span>":"")+"<span style='flex:1'></span><span class='badge' id='hr-"+id+"'></span></div>";
-h+="<div class='row'><span>Level (preamp)</span><input type='number' class='num' data-w='"+id+"' data-k='pre' min='-24' max='0' step='0.1' value='"+w.pre+"'><span>dB</span>";
-if(S.mode==='biamp')h+="<span style='margin-left:8px'>Delay</span><input type='number' class='num' data-w='"+id+"' data-k='dly' min='0' max='2' step='0.01' value='"+w.dly+"'><span>ms <span id='cm-"+id+"'></span></span><button type='button' class='pill"+(w.inv?' on':'')+"' data-inv='"+id+"'>Invert polarity</button>";
+function bandHtml(id,b,i){const hg=GAIN_T.includes(b.t),hq=Q_T.includes(b.t),n=i+1;return "<div class='c"+(S.sel[id]===i?' sel':'')+"' data-i='"+i+"' title='"+TIP[b.t]+"'><span class='g' id='g-"+id+"-"+i+"'>"+gtxt(b)+"</span><input type='range' min='-24' max='24' step='0.05' value='"+(hg?b.g:0)+"' data-i='"+i+"'"+(hg?'':' disabled')+" aria-label='Band "+n+" gain'><input class='t' data-i='"+i+"' data-k='f' value='"+fk(b.f)+"' aria-label='Band "+n+" frequency'><input class='t' data-i='"+i+"' data-k='q' value='"+qk(b.q)+"'"+(hq?'':' disabled')+" aria-label='Band "+n+" Q'></div>";}
+function importButton(id){
+  return "<button type='button' class='pill' data-import='"+id+"' aria-label='Import REW for "+wayName(id)+"'>Import REW</button>";
+}
+function cardHtml(id){const w=S.ways[id],name=wayName(id);let h="<div class='eq-way'><div class='way-head'><span class='dot' style='background:"+wayColor(id)+"'></span><h2>"+name+"</h2><span style='flex:1'></span><span class='badge' id='hr-"+id+"'></span></div>";
+h+="<div class='row'><span>Level (preamp)</span><input type='number' class='num' data-w='"+id+"' data-k='pre' min='-24' max='0' step='0.1' value='"+w.pre+"' aria-label='"+name+" preamp in dB'><span>dB</span>"+importButton(id);
 h+="</div><svg class='eq-graph' id='sv-"+id+"' viewBox='0 0 600 200' role='img' aria-label='"+name+" response'></svg><div class='strip-wrap'><div class='strip' data-w='"+id+"'><div style='display:flex;flex-direction:column;gap:3px;align-items:flex-end'><span class='lab' style='height:14px'>dB</span><span style='height:120px'></span><span class='lab' style='line-height:22px'>Hz</span><span class='lab' style='line-height:22px'>Q</span></div>";
 w.b.forEach((b,i)=>{h+=bandHtml(id,b,i);});return h+"</div></div><div class='row band-row' id='br-"+id+"'></div></div>";}
-function bandRow(id){const el=document.getElementById('br-'+id);if(!el)return;const i=S.sel[id];if(i==null){el.innerHTML="<span>Tap a band to choose its type. Frequencies: 120 or 1.2k.</span><span style='flex:1'></span><button type='button' class='pill warn' data-flat='"+id+"'>Reset all bands</button>";return;}const b=S.ways[id].b[i];el.innerHTML="<span>Band "+(i+1)+"</span>"+TYPES.map(t=>"<button type='button' class='pill"+(b.t===t?' on':'')+"' data-t='"+t+"' data-w='"+id+"' title='"+TIP[t]+"'>"+(t==='NOTCH'?'Notch':t)+"</button>").join('')+"<span style='flex:1'></span><button type='button' class='pill' data-reset='"+id+"'>Reset band</button>";}
+function bandRow(id){const el=document.getElementById('br-'+id);if(!el)return;const i=S.sel[id];if(i==null){el.innerHTML="<span>Tap a band to choose its type. Frequencies: 120 or 1.2k.</span><span style='flex:1'></span><button type='button' class='pill warn' data-flat='"+id+"'>Reset all bands</button>";return;}const b=S.ways[id].b[i];el.innerHTML="<span>Band "+(i+1)+(b.t==='PK_REW'?' (REW Q)':'')+"</span>"+TYPES.map(t=>"<button type='button' class='pill"+(b.t===t||(t==='PK'&&b.t==='PK_REW')?' on':'')+"' data-t='"+t+"' data-w='"+id+"' title='"+TIP[t]+"'>"+(t==='NOTCH'?'Notch':t)+"</button>").join('')+"<span style='flex:1'></span><button type='button' class='pill' data-reset='"+id+"'>Reset band</button>";}
+function renderAlignment(){
+  const el=document.getElementById('driver-alignment');
+  if(S.mode!=='biamp'){el.innerHTML='';return;}
+  el.innerHTML=[SIDES[1-S.twOut],SIDES[S.twOut]].map(id=>{
+    const w=S.ways[id],name=driverName(id);
+    return "<div class='row' style='margin-top:12px'><b>"+name+"</b><span>Delay</span><input type='number' class='num' data-w='"+id+"' data-k='dly' min='0' max='2' step='0.01' value='"+w.dly+"' aria-label='"+name+" delay in ms'><span>ms <span id='cm-"+id+"'></span></span><button type='button' class='pill"+(w.inv?' on':'')+"' data-inv='"+id+"' aria-pressed='"+w.inv+"'>Invert polarity</button></div>";
+  }).join('');
+  SIDES.forEach(cm);
+}
 function cm(id){const el=document.getElementById('cm-'+id);if(el)el.textContent=S.ways[id].dly>0?'(about '+Math.round(S.ways[id].dly*34.3)+' cm)':'';}
 function paintMute(){document.querySelectorAll('[data-mute]').forEach(b=>{const s=b.dataset.mute;b.textContent=(muted[s]?'Unmute ':'Mute ')+outLabel(s);b.classList.toggle('warn',muted[s]);b.setAttribute('aria-pressed',String(muted[s]));});}
 function showMuteState(d){muted.left=!!d.left_muted;muted.right=!!d.right_muted;paintMute();}
@@ -175,12 +271,23 @@ function renderTop(){
   markSelected('#slope button','s',S.slope);
   renderFrequency();
   document.getElementById('tw-side').textContent=outLabel(SIDES[S.twOut]);
+  renderAlignment();
   document.getElementById('layout-pending').innerHTML=layoutApplied()?'':"<div class='pending'>Confirm the amplifier wiring with Apply &amp; Save to resume live adjustments.</div>";
 }
-function renderWays(){document.getElementById('ways').innerHTML=ids().map(cardHtml).join('');ids().forEach(id=>{bandRow(id);draw(id);cm(id);});paintMute();}
+function renderWays(){
+  const active=ids(),stereo=active.length===2;
+  document.getElementById('stereo-import').hidden=!stereo;
+  const container=document.getElementById('ways');
+  if(!stereo&&S.legacy){
+    container.innerHTML="<p class='pending'>This speaker is using the saved EQ on each output. Choose Shared EQ to use one EQ for both outputs.</p><div class='row' style='margin-top:12px'>"+importButton('shared')+"<button type='button' class='pill' id='use-shared'>Use Shared EQ</button></div>";
+  }else{
+    container.innerHTML=active.map(cardHtml).join('');
+    active.forEach(id=>{bandRow(id);draw(id);});
+  }
+  paintMute();
+}
 function renderAll(){renderTop();renderWays();}
 function select(id,i){S.sel[id]=i;document.querySelectorAll('.strip[data-w="'+id+'"] .c').forEach(x=>x.classList.toggle('sel',Number(x.dataset.i)===i));bandRow(id);draw(id);}
-function redrawFor(id){draw(id);if(S.mode==='biamp')draw(otherSide(id));}
 async function writeEq(action,config){
   const r=await fetch('/api/eq?action='+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(config)});
   if(!r.ok){
@@ -275,7 +382,8 @@ async function loadEq(){
     S.twOut=d.tweeter_output==='right'?1:0;
     S.slope=[12,24,48].includes(Number(d.crossover_slope_db))?Number(d.crossover_slope_db):24;
     S.xo=Number(d.crossover_hz)||2500;
-    for(const side of SIDES)S.ways[side]=wayFrom(d,side);
+    for(const id of [...SIDES,'shared'])S.ways[id]=wayFrom(d,id);
+    S.legacy=!!d.legacy_output_eq;
     S.applied={mode:S.mode,twOut:S.twOut};
     S.dirty=false;
     document.getElementById('eq-enabled').checked=S.enabled;
@@ -290,20 +398,22 @@ async function loadEq(){
 let muteBusy=false;
 async function toggleMute(side){if(muteBusy)return;muteBusy=true;try{const r=await fetch('/api/audio/mute',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:side,muted:!muted[side]})});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();if(!d.success)throw new Error('Request failed');showMuteState(d);msg((side==='left'?'Left':'Right')+' output '+(muted[side]?'muted.':'unmuted.'),'ok');}catch(e){msg('Mute failed: '+esc(e.message),'err');}finally{muteBusy=false;}}
 document.addEventListener('click',e=>{const t=e.target,ds=t.dataset||{};
-const m=t.closest('#mode button');if(m){if(m.dataset.m!==S.mode){S.mode=m.dataset.m;setRole(S.channel_mode);renderAll();changed();}return;}
-const role=t.closest('#roles button');if(role){if(role.dataset.role!==S.channel_mode){setRole(role.dataset.role);renderRole();changed();}return;}
+const m=t.closest('#mode button');if(m){if(m.dataset.m!==S.mode){S.mode=m.dataset.m;setRole(S.channel_mode);rewMessage('','');renderAll();changed();}return;}
+const role=t.closest('#roles button');if(role){if(role.dataset.role!==S.channel_mode){setRole(role.dataset.role);rewMessage('','');renderRole();renderWays();changed();}return;}
 const sb=t.closest('#slope button');if(sb){const s=Number(sb.dataset.s);if(s!==S.slope){const tweeter=S.ways[SIDES[S.twOut]];if(s===12)tweeter.inv=true;else if(S.slope===12)tweeter.inv=false;S.slope=s;renderAll();changed();}return;}
 if(t.id==='swap'){
-  // Move the driver settings with the tweeter and woofer.
-  [S.ways.left,S.ways.right]=[S.ways.right,S.ways.left];
-  [S.sel.left,S.sel.right]=[S.sel.right,S.sel.left];
+  // Driver alignment follows the wiring. Stereo EQ stays with the source.
+  const fields=S.legacy?['dly','inv','b','pre']:['dly','inv'];
+  for(const key of fields)[S.ways.left[key],S.ways.right[key]]=[S.ways.right[key],S.ways.left[key]];
   S.twOut=1-S.twOut;
   renderAll();
   changed();
   return;
 }
-if(ds.inv){const w=S.ways[ds.inv];w.inv=!w.inv;t.classList.toggle('on',w.inv);changed();return;}
-if(ds.t){const id=ds.w,b=S.ways[id].b[S.sel[id]];b.t=ds.t;b.on=true;renderWays();changed();return;}
+if(ds.inv){const w=S.ways[ds.inv];w.inv=!w.inv;t.classList.toggle('on',w.inv);t.setAttribute('aria-pressed',String(w.inv));changed();return;}
+if(ds.import){const picker=document.getElementById('rew-file');picker.dataset.target=ds.import;picker.value='';picker.click();return;}
+if(t.id==='use-shared'){S.legacy=false;renderWays();changed();return;}
+if(ds.t){const id=ds.w,b=S.ways[id].b[S.sel[id]];if(b.t!=='PK_REW'||ds.t!=='PK')b.t=ds.t;b.on=true;renderWays();changed();return;}
 if(ds.reset){const id=ds.reset;S.ways[id].b[S.sel[id]]=defBand(S.sel[id]);renderWays();changed();return;}
 if(ds.flat){if(!confirm('Reset all 24 bands for '+wayName(ds.flat)+'?'))return;S.ways[ds.flat].b=S.ways[ds.flat].b.map((_,i)=>defBand(i));S.sel[ds.flat]=null;renderWays();changed();return;}
 if(ds.fix){S.ways[ds.fix].pre=Number(ds.to);renderWays();changed();return;}
@@ -313,13 +423,14 @@ const c=t.closest('.strip .c');if(c&&t.tagName!=='INPUT'){const id=c.parentEleme
 document.addEventListener('focusin',e=>{const c=e.target.closest&&e.target.closest('.strip .c');if(c){const id=c.parentElement.dataset.w,i=Number(c.dataset.i);if(S.sel[id]!==i)select(id,i);}});
 document.addEventListener('input',e=>{const t=e.target;
 if(t.id==='xo-r'){setFrequency(Math.round(800*Math.pow(10,Number(t.value)/1000)/10)*10,false);return;}
-const st=t.closest('.strip');if(st&&t.type==='range'){const id=st.dataset.w,i=Number(t.dataset.i),b=S.ways[id].b[i];b.g=Number(t.value);b.on=true;document.getElementById('g-'+id+'-'+i).textContent=gtxt(b);if(S.sel[id]!==i)select(id,i);redrawFor(id);changed();}});
+const st=t.closest('.strip');if(st&&t.type==='range'){const id=st.dataset.w,i=Number(t.dataset.i),b=S.ways[id].b[i];b.g=Number(t.value);b.on=true;document.getElementById('g-'+id+'-'+i).textContent=gtxt(b);if(S.sel[id]!==i)select(id,i);draw(id);changed();}});
 document.addEventListener('change',e=>{const t=e.target;
 if(t.id==='live'){S.live=t.checked;schedulePreview();return;}
 if(t.id==='eq-enabled'){S.enabled=t.checked;drawAll();changed();return;}
+if(t.id==='rew-file'){if(t.files.length)importRew(t.files[0],t.dataset.target);return;}
 if(t.id==='xo-n'){const n=Number(t.value);if(!(n>=800&&n<=8000)){t.value=S.xo;msg('Enter a crossover frequency from 800 to 8000 Hz.','err');return;}setFrequency(n);return;}
-const st=t.closest('.strip');if(st&&t.dataset.k){const id=st.dataset.w,b=S.ways[id].b[Number(t.dataset.i)];if(t.dataset.k==='f'){const n=parseFreq(t.value);if(!(n>=10&&n<=20000)){t.value=fk(b.f);msg('Frequency: 10 Hz to 20 kHz.','err');return;}b.f=Math.round(n*100)/100;t.value=fk(b.f);}else{const n=parseFloat(String(t.value).replace(',','.'));if(!(n>=0.05&&n<=50)){t.value=qk(b.q);msg('Q: 0.05 to 50.','err');return;}b.q=Math.round(n*1000)/1000;t.value=qk(b.q);}b.on=true;redrawFor(id);changed();return;}
-const id=t.dataset.w,k=t.dataset.k;if(id&&(k==='pre'||k==='dly')){const n=parseFloat(String(t.value).replace(',','.')),w=S.ways[id],lo=k==='pre'?-24:0,hi=k==='pre'?0:2;if(!(n>=lo&&n<=hi)){t.value=w[k];msg(k==='pre'?'Level: -24 to 0 dB.':'Delay: 0 to 2 ms.','err');return;}w[k]=Math.round(n*100)/100;t.value=w[k];if(k==='dly')cm(id);redrawFor(id);changed();}});
+const st=t.closest('.strip');if(st&&t.dataset.k){const id=st.dataset.w,b=S.ways[id].b[Number(t.dataset.i)];if(t.dataset.k==='f'){const n=parseFreq(t.value);if(!(n>=10&&n<=20000)){t.value=fk(b.f);msg('Frequency: 10 Hz to 20 kHz.','err');return;}b.f=Math.round(n*100)/100;t.value=fk(b.f);}else{const n=parseFloat(String(t.value).replace(',','.'));if(!(n>=0.05&&n<=50)){t.value=qk(b.q);msg('Q: 0.05 to 50.','err');return;}b.q=Math.round(n*1000)/1000;t.value=qk(b.q);}b.on=true;draw(id);changed();return;}
+const id=t.dataset.w,k=t.dataset.k;if(id&&(k==='pre'||k==='dly')){const n=parseFloat(String(t.value).replace(',','.')),w=S.ways[id],lo=k==='pre'?-24:0,hi=k==='pre'?0:2;if(!(n>=lo&&n<=hi)){t.value=w[k];msg(k==='pre'?'Level: -24 to 0 dB.':'Delay: 0 to 2 ms.','err');return;}w[k]=Math.round(n*100)/100;t.value=w[k];if(k==='dly')cm(id);else draw(id);changed();}});
 window.addEventListener('beforeunload',e=>{if(S.dirty){e.preventDefault();e.returnValue='';}});
 window.addEventListener('resize',drawAll);
 let loud=null,loudBusy=false;

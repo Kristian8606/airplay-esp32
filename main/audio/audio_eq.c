@@ -47,7 +47,7 @@ typedef struct {
 } biquad_state_t;
 
 /* Everything calculated from one configuration at one sample rate: what
- * audio_eq_process() runs. Index 0 = left output, 1 = right output. */
+ * audio_eq_process() runs. Index 0 = left or shared EQ, 1 = right EQ. */
 typedef struct {
   audio_eq_config_t config;
   biquad_coeff_t coeff[2][AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
@@ -57,6 +57,7 @@ typedef struct {
   uint8_t slot[2][AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
   uint8_t active[2];
   float preamp_gain[2];
+  bool shared_eq;
   /* Bi-amp: high-pass on the tweeter output, low-pass on the other. */
   biquad_coeff_t xover[2][XOVER_MAX_SECTIONS];
   uint8_t xover_sections;
@@ -124,15 +125,16 @@ static bool delay_valid(float ms) {
   return eq_is_finite(ms) && ms >= 0.0f && ms <= AUDIO_EQ_DELAY_MAX_MS;
 }
 
+static bool preamp_valid(float db) {
+  return eq_is_finite(db) && db >= -24.0f && db <= 0.0f;
+}
+
 bool audio_eq_validate_config(const audio_eq_config_t *config) {
   if (!config || config->version != AUDIO_EQ_CONFIG_VERSION ||
       config->enabled > 1 || config->channel_mode >= AUDIO_EQ_CHANNEL_COUNT ||
-      !eq_is_finite(config->left_preamp_db) || config->left_preamp_db < -24.0f ||
-      config->left_preamp_db > 0.0f ||
-      !eq_is_finite(config->right_preamp_db) || config->right_preamp_db < -24.0f ||
-      config->right_preamp_db > 0.0f ||
-      config->left.filter_count > AUDIO_EQ_MAX_FILTERS_PER_CHANNEL ||
-      config->right.filter_count > AUDIO_EQ_MAX_FILTERS_PER_CHANNEL ||
+      !preamp_valid(config->left_preamp_db) ||
+      !preamp_valid(config->right_preamp_db) ||
+      !preamp_valid(config->shared_preamp_db) || config->legacy_output_eq > 1U ||
       config->output_mode >= AUDIO_EQ_OUTPUT_COUNT ||
       config->tweeter_output > 1U ||
       (config->xover_slope_db != 12U && config->xover_slope_db != 24U &&
@@ -145,9 +147,11 @@ bool audio_eq_validate_config(const audio_eq_config_t *config) {
     return false;
   }
 
-  const audio_eq_output_config_t *outputs[2] = {&config->left, &config->right};
-  for (int ch = 0; ch < 2; ++ch) {
+  const audio_eq_output_config_t *outputs[] = {
+      &config->left, &config->right, &config->shared};
+  for (size_t ch = 0; ch < sizeof(outputs) / sizeof(outputs[0]); ++ch) {
     const audio_eq_output_config_t *output = outputs[ch];
+    if (output->filter_count > AUDIO_EQ_MAX_FILTERS_PER_CHANNEL) return false;
     for (uint8_t i = 0; i < output->filter_count; ++i) {
       const audio_eq_filter_config_t *f = &output->filters[i];
       if (f->enabled > 1 || f->type >= AUDIO_EQ_FILTER_COUNT ||
@@ -185,6 +189,13 @@ typedef struct {
   audio_eq_output_config_t right;
 } audio_eq_config_v3_t;
 
+static bool has_enabled_filters(const audio_eq_output_config_t *output) {
+  for (uint8_t i = 0; i < output->filter_count; ++i) {
+    if (output->filters[i].enabled) return true;
+  }
+  return false;
+}
+
 static esp_err_t audio_eq_load_config(audio_eq_config_t *out) {
   if (!out) return ESP_ERR_INVALID_ARG;
   audio_eq_default_config(out);
@@ -212,42 +223,41 @@ static esp_err_t audio_eq_load_config(audio_eq_config_t *out) {
   if (len == sizeof(saved.current) &&
       audio_eq_validate_config(&saved.current)) {
     *out = saved.current;
+    return ESP_OK;
+  }
+
+  if (len == offsetof(audio_eq_config_t, shared) && saved.current.version == 4U) {
+    /* The saved v4 layout is exactly the prefix before the shared EQ. */
+    memcpy(out, &saved.current, len);
+    out->version = AUDIO_EQ_CONFIG_VERSION;
   } else if (len == sizeof(saved.v3) && saved.v3.version == 3U) {
-    /* Convert in RAM; the next explicit Save writes version 4. Both
-     * outputs keep playing the full range (mono), as before. */
-    audio_eq_default_config(out);
     out->enabled = saved.v3.enabled;
     out->channel_mode = saved.v3.channel_mode;
     out->left_preamp_db = saved.v3.left_preamp_db;
     out->right_preamp_db = saved.v3.right_preamp_db;
     out->left = saved.v3.left;
     out->right = saved.v3.right;
-    if (!audio_eq_validate_config(out)) {
-      audio_eq_default_config(out);
-      ESP_LOGW(TAG, "Ignoring invalid version-3 EQ config");
-    } else {
-      ESP_LOGI(TAG, "Version-3 EQ config loaded: outputs mono (full range)");
-    }
   } else if (len == sizeof(saved.v2) && saved.v2.version == 2U) {
-    /* Convert in RAM; the next explicit Save writes version 4. */
-    audio_eq_default_config(out);
     out->enabled = saved.v2.enabled;
     out->channel_mode = saved.v2.channel_mode;
     out->left_preamp_db = saved.v2.preamp_db;
     out->right_preamp_db = saved.v2.preamp_db;
     out->left = saved.v2.left;
     out->right = saved.v2.right;
-    if (!audio_eq_validate_config(out)) {
-      audio_eq_default_config(out);
-      ESP_LOGW(TAG, "Ignoring invalid version-2 EQ config");
-    } else {
-      ESP_LOGI(TAG, "Shared preamp migrated to both output channels");
-    }
   } else {
     ESP_LOGW(TAG, "Ignoring invalid/old EQ config (size=%u)",
              (unsigned)len);
+    return ESP_OK;
   }
 
+  if (!audio_eq_validate_config(out)) {
+    audio_eq_default_config(out);
+    ESP_LOGW(TAG, "Ignoring invalid legacy EQ config");
+    return ESP_OK;
+  }
+  out->legacy_output_eq = out->left_preamp_db != 0.0f ||
+      out->right_preamp_db != 0.0f || has_enabled_filters(&out->left) ||
+      has_enabled_filters(&out->right);
   return ESP_OK;
 }
 
@@ -277,7 +287,8 @@ static bool calc_biquad(audio_eq_filter_type_t type, float frequency_hz,
    * are both handled correctly. */
   const double K = tan(M_PI * (double)frequency_hz / (double)sample_rate);
   const double V = pow(10.0, fabs((double)peak_gain_db) / 20.0);
-  const double Q = (double)q;
+  /* Convert REW's RBJ peaking Q to the equivalent EarLevel Q. */
+  const double Q = type == AUDIO_EQ_FILTER_PK_REW ? (double)q * sqrt(V) : (double)q;
   double norm = 1.0;
   double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
 
@@ -318,6 +329,7 @@ static bool calc_biquad(audio_eq_filter_type_t type, float frequency_hz,
       a2 = (1.0 - K / Q + K * K) * norm;
       break;
 
+    case AUDIO_EQ_FILTER_PK_REW:
     case AUDIO_EQ_FILTER_PK:
       if (peak_gain_db >= 0.0f) {
         norm = 1.0 / (1.0 + K / Q + K * K);
@@ -459,13 +471,22 @@ static bool build_plan(const audio_eq_config_t *config, int sample_rate,
   memset(plan, 0, sizeof(*plan));
   plan->config = *config;
   if (sample_rate <= 0) return false;
-  if (!prepare_output(&config->left, plan->coeff[0], plan->type[0],
-                      plan->slot[0], &plan->active[0], sample_rate, "left") ||
-      !prepare_output(&config->right, plan->coeff[1], plan->type[1],
-                      plan->slot[1], &plan->active[1], sample_rate, "right")) {
+  plan->shared_eq = !config->legacy_output_eq &&
+      (config->output_mode == AUDIO_EQ_OUTPUT_BIAMP ||
+       config->channel_mode != AUDIO_EQ_CHANNEL_STEREO);
+  const audio_eq_output_config_t *first =
+      plan->shared_eq ? &config->shared : &config->left;
+  if (!prepare_output(first, plan->coeff[0], plan->type[0],
+                      plan->slot[0], &plan->active[0], sample_rate,
+                      plan->shared_eq ? "shared" : "left") ||
+      (!plan->shared_eq &&
+       !prepare_output(&config->right, plan->coeff[1], plan->type[1],
+                       plan->slot[1], &plan->active[1], sample_rate, "right"))) {
     return false;
   }
-  plan->preamp_gain[0] = powf(10.0f, config->left_preamp_db / 20.0f);
+  const float first_preamp =
+      plan->shared_eq ? config->shared_preamp_db : config->left_preamp_db;
+  plan->preamp_gain[0] = powf(10.0f, first_preamp / 20.0f);
   plan->preamp_gain[1] = powf(10.0f, config->right_preamp_db / 20.0f);
 
   if (config->output_mode == AUDIO_EQ_OUTPUT_BIAMP) {
@@ -627,7 +648,8 @@ esp_err_t audio_eq_apply_config(const audio_eq_config_t *config) {
     const bool was_ready = s_eq.ready;
     const bool was_enabled = s_eq.plan.config.enabled != 0U;
     const bool mode_changed =
-        s_eq.plan.config.channel_mode != config->channel_mode;
+        s_eq.plan.config.channel_mode != config->channel_mode ||
+        s_eq.plan.shared_eq != built->shared_eq;
     uint8_t old_active[2];
     uint8_t old_type[2][AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
     uint8_t old_slot[2][AUDIO_EQ_MAX_FILTERS_PER_CHANNEL];
@@ -754,7 +776,8 @@ static inline float source_of(const float *frame,
                                          : frame[1];
 }
 
-/* One source feeds both independent chains (mono mix, left or right). */
+/* Equalize the selected source once, then send it to both outputs.
+ * The independent right chain is used only for a saved legacy layout. */
 static inline void process_source_eq(float *pcm, size_t frames,
                                      audio_eq_channel_mode_t mode) {
   const eq_plan_t *p = &s_eq.plan;
@@ -763,8 +786,10 @@ static inline void process_source_eq(float *pcm, size_t frames,
     const float source = source_of(&pcm[k], mode);
     pcm[k] = process_chain_hot(source, p->coeff[0], s_eq.state[0],
                                p->active[0], p->preamp_gain[0]);
-    pcm[k + 1] = process_chain_hot(source, p->coeff[1], s_eq.state[1],
-                                   p->active[1], p->preamp_gain[1]);
+    pcm[k + 1] = p->shared_eq
+        ? pcm[k]
+        : process_chain_hot(source, p->coeff[1], s_eq.state[1],
+                            p->active[1], p->preamp_gain[1]);
   }
 }
 
@@ -780,7 +805,7 @@ static inline void process_source_bypass(float *pcm, size_t frames,
   }
 }
 
-/* Bi-amp, on each output after its EQ: crossover, polarity, delay. One
+/* Bi-amp, on each output after EQ: crossover, polarity, delay. One
  * output at a time, so its sections and state stay in registers. */
 static void process_biamp(float *pcm, size_t frames) {
   const eq_plan_t *p = &s_eq.plan;
@@ -920,6 +945,7 @@ const char *audio_eq_filter_type_name(audio_eq_filter_type_t type) {
     case AUDIO_EQ_FILTER_NOTCH: return "NOTCH";
     case AUDIO_EQ_FILTER_LS: return "LS";
     case AUDIO_EQ_FILTER_HS: return "HS";
+    case AUDIO_EQ_FILTER_PK_REW: return "PK_REW";
     default: return "PK";
   }
 }

@@ -204,10 +204,13 @@ static void eq_config_to_json(const audio_eq_config_t *cfg, cJSON *root) {
       audio_eq_channel_mode_name((audio_eq_channel_mode_t)cfg->channel_mode));
   cJSON_AddNumberToObject(root, "left_preamp_db", cfg->left_preamp_db);
   cJSON_AddNumberToObject(root, "right_preamp_db", cfg->right_preamp_db);
+  cJSON_AddNumberToObject(root, "shared_preamp_db", cfg->shared_preamp_db);
+  cJSON_AddBoolToObject(root, "legacy_output_eq", cfg->legacy_output_eq != 0U);
   cJSON *left = cJSON_AddArrayToObject(root, "left_filters");
   cJSON *right = cJSON_AddArrayToObject(root, "right_filters");
   eq_output_to_json(&cfg->left, left);
   eq_output_to_json(&cfg->right, right);
+  eq_output_to_json(&cfg->shared, cJSON_AddArrayToObject(root, "shared_filters"));
   /* The amplifier outputs (used in bi-amp only, always reported). */
   cJSON_AddStringToObject(
       root, "output_mode",
@@ -405,6 +408,7 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
   cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "channel_mode");
   cJSON *left = cJSON_GetObjectItemCaseSensitive(root, "left_filters");
   cJSON *right = cJSON_GetObjectItemCaseSensitive(root, "right_filters");
+  cJSON *shared = cJSON_GetObjectItemCaseSensitive(root, "shared_filters");
   audio_eq_channel_mode_t parsed_mode;
 
   bool valid = cJSON_IsBool(enabled) && cJSON_IsString(mode) &&
@@ -414,6 +418,12 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
                parse_eq_output(left, &cfg.left) &&
                parse_eq_output(right, &cfg.right) &&
                parse_eq_outputs(root, &cfg);
+
+  if (valid && shared) {
+    valid = parse_eq_output(shared, &cfg.shared) &&
+            json_number(root, "shared_preamp_db", &cfg.shared_preamp_db);
+    cfg.legacy_output_eq = 0U;
+  }
 
   if (valid) {
     cfg.enabled = cJSON_IsTrue(enabled) ? 1U : 0U;

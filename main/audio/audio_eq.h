@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define AUDIO_EQ_CONFIG_VERSION 4U
+#define AUDIO_EQ_CONFIG_VERSION 5U
 #define AUDIO_EQ_MAX_FILTERS_PER_CHANNEL 24U
 
 /* Bi-amp: the crossover between the two amplifier outputs. */
@@ -29,6 +29,7 @@ typedef enum {
   AUDIO_EQ_FILTER_NOTCH,
   AUDIO_EQ_FILTER_LS,
   AUDIO_EQ_FILTER_HS,
+  AUDIO_EQ_FILTER_PK_REW, /* Peaking with the Q convention of REW Generic. */
   AUDIO_EQ_FILTER_COUNT
 } audio_eq_filter_type_t;
 
@@ -41,8 +42,8 @@ typedef enum {
 } audio_eq_channel_mode_t;
 
 /* What the two amplifier outputs drive.
- *   mono:   both outputs play the speaker's full range (one driver or two in
- *           parallel), each through its own EQ chain.
+ *   mono:   both outputs play the speaker's full range, in either stereo
+ *           or a single source routed to both outputs.
  *   bi-amp: one output drives the tweeter, the other the woofer; there is no
  *           passive crossover in the speaker, so the DSP crossover is the
  *           only one. It runs even with the EQ disabled, and the tweeter
@@ -77,8 +78,7 @@ typedef struct {
   float right_preamp_db;
   audio_eq_output_config_t left;
   audio_eq_output_config_t right;
-  /* Version 4: the amplifier outputs. All of it is used in bi-amp only.
-   * "left"/"right" above and below are the physical amplifier outputs. */
+  /* Version 4: the amplifier outputs and crossover. */
   uint8_t output_mode;    /* audio_eq_output_mode_t */
   uint8_t tweeter_output; /* 0 = left output, 1 = right output */
   uint8_t xover_slope_db; /* Linkwitz-Riley: 12 (LR2), 24 (LR4), 48 (LR8) */
@@ -86,6 +86,11 @@ typedef struct {
   float xover_hz;
   float left_delay_ms;
   float right_delay_ms;
+  /* Version 5: the EQ used for a single source before it feeds both outputs. */
+  audio_eq_output_config_t shared;
+  float shared_preamp_db;
+  uint8_t legacy_output_eq; /* Keep the saved v2–v4 EQ until Shared EQ is chosen. */
+  uint8_t reserved_v5[3];
 } audio_eq_config_t;
 
 /* Load the saved configuration and initialise the runtime DSP state. */
@@ -102,11 +107,11 @@ bool audio_eq_validate_config(const audio_eq_config_t *config);
  * saturated only once, right before DMA.
  * Source selection:
  *   stereo: L source -> left EQ, R source -> right EQ
- *   mono:   (L+R)/2 -> both independent EQ chains
- *   left:   L source -> both independent EQ chains
- *   right:  R source -> both independent EQ chains
+ *   mono:   (L+R)/2 -> shared EQ -> both outputs
+ *   left:   L source -> shared EQ -> both outputs
+ *   right:  R source -> shared EQ -> both outputs
  * With bi-amp, stereo is taken as mono (both outputs drive one speaker).
- * Bi-amp then runs on each output: preamp, EQ, crossover (high-pass on the
+ * Bi-amp then runs on each output: crossover (high-pass on the
  * tweeter output, low-pass on the woofer output), polarity, delay. LR2 sums
  * flat only with one output inverted (the tweeter, by convention); LR4 and
  * LR8 sum flat in phase. A change of the output layout (mode, tweeter

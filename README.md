@@ -179,30 +179,25 @@ On the common purple PCM5102A module check the solder jumpers on the back:
 **FLT = L, DEMP = L, XSMT = H** (otherwise the DAC stays muted), **FMT = L**
 (I2S).
 
-The DAC has a **left and a right output**, and the **Source mode** on the EQ
-page decides what each of them carries:
+The DAC has a **left and a right output**. Use **Speaker wiring** and
+**This speaker plays** on the EQ page to route them.
 
 | Setup | Connection | Setup on the EQ page |
 |---|---|---|
-| **Stereo speaker** (two drivers, left and right) | L OUT → CH1 → left speaker, R OUT → CH2 → right speaker | Source mode **Stereo** |
-| **One speaker on a one-channel amplifier** | L OUT → amp input | Source mode **Mono**, so the speaker gets both channels |
-| **Active 2-way (woofer + tweeter)** | L OUT → CH1 → **woofer**, R OUT → CH2 → **tweeter** | Source mode **Mono** + a crossover: low-pass on the **Left output**, high-pass on the **Right output** |
-| **Stereo pair from two boards** | each board drives its own speaker | Source mode **Left input** on one board, **Right input** on the other |
-| **Powered speaker / active subwoofer** | L/R OUT → its line input | Stereo, or a low-pass for a subwoofer |
+| **Stereo speaker** (two drivers, left and right) | L OUT → CH1 → left speaker, R OUT → CH2 → right speaker | **Full range** · **Stereo** |
+| **One speaker on a one-channel amplifier** | L OUT → amp input | **Full range** · **Mono** |
+| **Active 2-way (woofer + tweeter)** | L OUT → CH1 → **woofer**, R OUT → CH2 → **tweeter** | **Bi-amp** · **Mono**, with **Tweeter on Amp R** |
+| **Stereo pair from two boards** | each board drives its own speaker | **Left** on one board and **Right** on the other. Choose wiring on each board to match its speaker |
+| **Powered speaker / active subwoofer** | L/R OUT → its line input | **Stereo**, or **Mono** with a low-pass for a subwoofer |
 
 **Active 2-way crossover** (one example, adjust to your drivers):
 
-1. Open `http://<board-ip>/eq`, tick **Enable EQ and preamp** and set
-   **Source mode** to **Mono**.
-2. **Left Output Filters** (woofer): two **LP** filters at the crossover
-   frequency (e.g. 2500 Hz), **Q 0.707** each. Two stacked Butterworth
-   filters make a 24 dB/oct Linkwitz-Riley slope.
-3. **Right Output Filters** (tweeter): two **HP** filters at the same
-   frequency, **Q 0.707** each.
-4. Tweeters are usually louder: lower the **Right preamp** until both
-   drivers sound balanced. Add peak or shelf filters to correct each
-   driver's response.
-5. **Apply & Save**: the change is live and stored, no restart needed.
+1. Open `http://<board-ip>/eq` and choose **Bi-amp** and **Mono**.
+2. Choose the crossover frequency and slope in **Crossover**, then set
+   **Tweeter on** to the amplifier output that drives the tweeter.
+3. Choose **Apply & Save** and confirm the wiring.
+4. To EQ the whole speaker, enable EQ and adjust **Shared EQ**. The crossover
+   sends the appropriate part of the corrected signal to each driver.
 
 > [!WARNING]
 > Always set the tweeter's high-pass **before** playing loud. Full-range
@@ -323,13 +318,25 @@ Everything is configured in the browser at `http://<board-ip>/`.
 |---|---|
 | **Speaker wiring** | **Full range** for two full-range outputs. **Bi-amp** splits the signal between a woofer and a tweeter, with an adjustable Linkwitz–Riley crossover and a selectable tweeter output. |
 | **This speaker plays** | **Mono** mixes L and R. **Left** or **Right** feeds the selected input to both outputs, including both drivers in bi-amp. **Stereo** sends L to amp L and R to amp R and is available in Full range. |
-| **Equalizer** | Two independent chains of up to **24 biquad filters** and a preamp per output. In bi-amp, each driver also has delay and polarity controls. The output mute buttons act immediately. |
+| **Equalizer** | **Stereo** has separate Left and Right EQ. **Mono**, **Left** and **Right** use Shared EQ before the signal goes to both outputs. Each EQ supports up to **24 biquad filters** and a preamp. In Bi-amp, the crossover also provides driver delay and polarity controls. |
 | **Loudness** | ISO 226 compensation restores bass and treble at low volumes. Loudness settings save immediately. |
 | **Apply while adjusting** | Previews channel selection, EQ and crossover adjustments on the current wiring. Bi-amp frequency has a logarithmic slider from 800 Hz to 8 kHz and a numeric entry. |
 | **Apply & Save** | Applies and saves the wiring, input role, crossover and EQ settings. Changes to wiring or the tweeter output require confirmation. |
 
 Filters are recalculated for the stream's sample rate (44.1 or 48 kHz), so a
 crossover stays at the same frequency whatever the source.
+
+To import room correction, select **Generic** in the REW EQ window and use
+**Export filter settings as text**. Load the file with **Import REW** in
+Shared EQ, Left EQ or Right EQ. In Stereo, **Import REW for both** loads the
+same filters into both channels. The import replaces the selected EQ's bands
+with the active peaking (PK) filters from the file. Use **Apply & Save** to
+keep the settings after a restart.
+
+In Bi-amp, measure with both drivers playing through the crossover, then
+import that measurement's filters into **Shared EQ**. If you update from an
+older firmware with saved per-output EQ, your correction stays active
+until you import into Shared EQ or choose **Use Shared EQ**.
 
 ### Other pages
 
