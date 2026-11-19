@@ -73,6 +73,9 @@ CONFIG_HTTPD_WS_SUPPORT=y
 # Keep I2S DMA EOF timing alive while flash cache is temporarily disabled.
 CONFIG_I2S_ISR_IRAM_SAFE=y
 
+# AAC peak limiting with RTP-compensated lookahead.
+CONFIG_AIRPLAY_AAC_FDK_LIMITER=y
+
 # Amplifier power control
 CONFIG_AIRPLAY_AMP_CONTROL=y
 CONFIG_AIRPLAY_AMP_GPIO=21

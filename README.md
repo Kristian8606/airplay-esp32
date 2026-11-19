@@ -321,10 +321,12 @@ Everything is configured in the browser at `http://<board-ip>/`.
 
 | Card | What it does |
 |---|---|
-| **Source** | **Stereo** (L → left EQ, R → right EQ), **Mono** ((L+R)/2 → both), **Left input** or **Right input** → both outputs |
-| **Loudness** | ISO 226 loudness compensation: restores bass and treble at low volume, following the volume live |
-| **Left / Right Output Filters** | two independent chains of up to **24 biquad filters** each: peak, low-pass, high-pass, band-pass, notch, low shelf, high shelf; a **preamp** and a **mute** button per output |
-| **Apply & Save** | applies live and stores in flash |
+| **Speaker wiring** | **Full range** for two full-range outputs. **Bi-amp** splits the signal between a woofer and a tweeter, with an adjustable Linkwitz–Riley crossover and a selectable tweeter output. |
+| **This speaker plays** | **Mono** mixes L and R. **Left** or **Right** feeds the selected input to both outputs, including both drivers in bi-amp. **Stereo** sends L to amp L and R to amp R and is available in Full range. |
+| **Equalizer** | Two independent chains of up to **24 biquad filters** and a preamp per output. In bi-amp, each driver also has delay and polarity controls. The output mute buttons act immediately. |
+| **Loudness** | ISO 226 compensation restores bass and treble at low volumes. Loudness settings save immediately. |
+| **Apply while adjusting** | Previews channel selection, EQ and crossover adjustments on the current wiring. Bi-amp frequency has a logarithmic slider from 800 Hz to 8 kHz and a numeric entry. |
+| **Apply & Save** | Applies and saves the wiring, input role, crossover and EQ settings. Changes to wiring or the tweeter output require confirmation. |
 
 Filters are recalculated for the stream's sample rate (44.1 or 48 kHz), so a
 crossover stays at the same frequency whatever the source.
@@ -381,13 +383,10 @@ surround from an Apple TV see the sister project
    float.
 2. **Optional AAC limiter.** The experimental FDK limiter keeps S32 output
    and compensates its lookahead in the PCM RTP timestamps: 720 frames at
-   48 kHz or 661 at 44.1 kHz (about 15 ms). It is **off by default**; enable
-   **Test FDK PCM limiter (S32, lookahead compensated)** in `menuconfig` for
-   testing. ALAC bypasses it.
+   48 kHz or 661 at 44.1 kHz (about 15 ms). The project defaults enable it.
+   Use **Test FDK PCM limiter (S32, lookahead compensated)** in `menuconfig`
+   to toggle it. ALAC bypasses it.
 3. **DSP** in 32-bit float: source routing, EQ / crossover, loudness, volume.
-   Float processing preserves headroom, but EQ or loudness can still produce
-   peaks above the final output range. The AAC limiter is before these stages
-   and does not protect against peaks they introduce.
 4. **I2S** with 32-bit samples in 32-bit slots at the stream's rate (44.1 or
    48 kHz). Float PCM is converted to signed 32-bit with saturation before DMA.
 
