@@ -35,7 +35,7 @@
 <div class='row crossover-frequency'><label for='xo-r'>Frequency</label><input type='range' id='xo-r' min='0' max='1000' step='1'><input type='number' class='num' id='xo-n' min='800' max='8000' step='any' aria-label='Crossover frequency in Hz'><span>Hz</span></div>
 <div class='row'><span>Tweeter on</span><b id='tw-side'></b><button type='button' class='pill' id='swap'>Swap outputs</button></div>
 <div id='driver-alignment'></div>
-<p class='hint' style='margin-top:12px'>The crossover runs even when EQ is off. Selecting LR2 inverts the tweeter automatically.</p>
+<p class='hint' style='margin-top:12px'>The crossover runs even when EQ is off. Selecting LR2 inverts the tweeter automatically. Tweeters are usually louder than woofers: lower the tweeter's Level until both drivers sound balanced.</p>
 </div>
 <details class='card'>
 <summary>Equalizer</summary>
@@ -201,7 +201,9 @@ if(S.mode==='biamp'){
   o+="<line x1='"+x+"' x2='"+x+"' y1='8' y2='178' stroke='#8d8d93' stroke-dasharray='2 3'/>";
   for(const side of SIDES){
     const sections=xoSecs(side);
-    const output=r.map((db,j)=>sections.reduce((level,k)=>level+magDb(k,j),db));
+    // Each driver's level comes after the crossover (with the EQ off too).
+    const lvl=S.legacy?0:S.ways[side].pre;
+    const output=r.map((db,j)=>sections.reduce((level,k)=>level+magDb(k,j),db+lvl));
     outputs.push(...output);
     o+="<polyline points='"+pts(output)+"' fill='none' stroke='"+(isTweeter(side)?'#b9a8ff':'#ff5c93')+"' stroke-width='1.5' stroke-dasharray='4 3'><title>"+driverName(side)+"</title></polyline>";
   }
@@ -228,7 +230,7 @@ function renderAlignment(){
   if(S.mode!=='biamp'){el.innerHTML='';return;}
   el.innerHTML=[SIDES[1-S.twOut],SIDES[S.twOut]].map(id=>{
     const w=S.ways[id],name=driverName(id);
-    return "<div class='row' style='margin-top:12px'><b>"+name+"</b><span>Delay</span><input type='number' class='num' data-w='"+id+"' data-k='dly' min='0' max='2' step='0.01' value='"+w.dly+"' aria-label='"+name+" delay in ms'><span>ms <span id='cm-"+id+"'></span></span><button type='button' class='pill"+(w.inv?' on':'')+"' data-inv='"+id+"' aria-pressed='"+w.inv+"'>Invert polarity</button></div>";
+    return "<div class='row' style='margin-top:12px'><b>"+name+"</b><span>Level</span><input type='number' class='num' data-w='"+id+"' data-k='pre' min='-24' max='0' step='0.1' value='"+w.pre+"' aria-label='"+name+" level in dB'><span>dB</span><span>Delay</span><input type='number' class='num' data-w='"+id+"' data-k='dly' min='0' max='2' step='0.01' value='"+w.dly+"' aria-label='"+name+" delay in ms'><span>ms <span id='cm-"+id+"'></span></span><button type='button' class='pill"+(w.inv?' on':'')+"' data-inv='"+id+"' aria-pressed='"+w.inv+"'>Invert polarity</button></div>";
   }).join('');
   SIDES.forEach(cm);
 }
@@ -403,7 +405,7 @@ const role=t.closest('#roles button');if(role){if(role.dataset.role!==S.channel_
 const sb=t.closest('#slope button');if(sb){const s=Number(sb.dataset.s);if(s!==S.slope){const tweeter=S.ways[SIDES[S.twOut]];if(s===12)tweeter.inv=true;else if(S.slope===12)tweeter.inv=false;S.slope=s;renderAll();changed();}return;}
 if(t.id==='swap'){
   // Driver alignment follows the wiring. Stereo EQ stays with the source.
-  const fields=S.legacy?['dly','inv','b','pre']:['dly','inv'];
+  const fields=S.legacy?['dly','inv','b','pre']:['dly','inv','pre'];
   for(const key of fields)[S.ways.left[key],S.ways.right[key]]=[S.ways.right[key],S.ways.left[key]];
   S.twOut=1-S.twOut;
   renderAll();
@@ -430,7 +432,7 @@ if(t.id==='eq-enabled'){S.enabled=t.checked;drawAll();changed();return;}
 if(t.id==='rew-file'){if(t.files.length)importRew(t.files[0],t.dataset.target);return;}
 if(t.id==='xo-n'){const n=Number(t.value);if(!(n>=800&&n<=8000)){t.value=S.xo;msg('Enter a crossover frequency from 800 to 8000 Hz.','err');return;}setFrequency(n);return;}
 const st=t.closest('.strip');if(st&&t.dataset.k){const id=st.dataset.w,b=S.ways[id].b[Number(t.dataset.i)];if(t.dataset.k==='f'){const n=parseFreq(t.value);if(!(n>=10&&n<=20000)){t.value=fk(b.f);msg('Frequency: 10 Hz to 20 kHz.','err');return;}b.f=Math.round(n*100)/100;t.value=fk(b.f);}else{const n=parseFloat(String(t.value).replace(',','.'));if(!(n>=0.05&&n<=50)){t.value=qk(b.q);msg('Q: 0.05 to 50.','err');return;}b.q=Math.round(n*1000)/1000;t.value=qk(b.q);}b.on=true;draw(id);changed();return;}
-const id=t.dataset.w,k=t.dataset.k;if(id&&(k==='pre'||k==='dly')){const n=parseFloat(String(t.value).replace(',','.')),w=S.ways[id],lo=k==='pre'?-24:0,hi=k==='pre'?0:2;if(!(n>=lo&&n<=hi)){t.value=w[k];msg(k==='pre'?'Level: -24 to 0 dB.':'Delay: 0 to 2 ms.','err');return;}w[k]=Math.round(n*100)/100;t.value=w[k];if(k==='dly')cm(id);else draw(id);changed();}});
+const id=t.dataset.w,k=t.dataset.k;if(id&&(k==='pre'||k==='dly')){const n=parseFloat(String(t.value).replace(',','.')),w=S.ways[id],lo=k==='pre'?-24:0,hi=k==='pre'?0:2;if(!(n>=lo&&n<=hi)){t.value=w[k];msg(k==='pre'?'Level: -24 to 0 dB.':'Delay: 0 to 2 ms.','err');return;}w[k]=Math.round(n*100)/100;t.value=w[k];if(k==='dly')cm(id);else drawAll();changed();}});
 window.addEventListener('beforeunload',e=>{if(S.dirty){e.preventDefault();e.returnValue='';}});
 window.addEventListener('resize',drawAll);
 let loud=null,loudBusy=false;

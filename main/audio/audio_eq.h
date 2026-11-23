@@ -74,6 +74,8 @@ typedef struct {
   uint8_t enabled;
   uint8_t channel_mode;
   uint16_t reserved;
+  /* Left/right EQ preamps; with bi-amp and Shared EQ, each driver's level
+   * after the crossover instead (applied with the EQ off too). */
   float left_preamp_db;
   float right_preamp_db;
   audio_eq_output_config_t left;
@@ -112,7 +114,7 @@ bool audio_eq_validate_config(const audio_eq_config_t *config);
  *   right:  R source -> shared EQ -> both outputs
  * With bi-amp, stereo is taken as mono (both outputs drive one speaker).
  * Bi-amp then runs on each output: crossover (high-pass on the
- * tweeter output, low-pass on the woofer output), polarity, delay. LR2 sums
+ * tweeter output, low-pass on the woofer output), level, polarity, delay. LR2 sums
  * flat only with one output inverted (the tweeter, by convention); LR4 and
  * LR8 sum flat in phase. A change of the output layout (mode, tweeter
  * output, slope, polarity, delay) under running audio fades both outputs

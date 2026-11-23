@@ -62,6 +62,9 @@ typedef struct {
   biquad_coeff_t xover[2][XOVER_MAX_SECTIONS];
   uint8_t xover_sections;
   uint32_t delay_frames[2];
+  /* Bi-amp with Shared EQ: each driver's level (left/right_preamp_db), after
+   * the crossover. 1 otherwise (a legacy layout has them in its chains). */
+  float out_gain[2];
   int sample_rate;
 } eq_plan_t;
 
@@ -513,6 +516,10 @@ static bool build_plan(const audio_eq_config_t *config, int sample_rate,
       }
     }
     plan->xover_sections = n;
+    plan->out_gain[0] =
+        plan->shared_eq ? powf(10.0f, config->left_preamp_db / 20.0f) : 1.0f;
+    plan->out_gain[1] =
+        plan->shared_eq ? powf(10.0f, config->right_preamp_db / 20.0f) : 1.0f;
     plan->delay_frames[0] = delay_frames(config->left_delay_ms, sample_rate);
     plan->delay_frames[1] = delay_frames(config->right_delay_ms, sample_rate);
   }
@@ -541,11 +548,12 @@ static void log_layout(const char *what, const audio_eq_config_t *c) {
   }
   AP_LOGI(TAG,
           "%s: outputs bi-amp, tweeter on %s, crossover %.0f Hz LR%u, "
-          "invert L=%u R=%u, delay L=%.2f R=%.2f ms",
+          "invert L=%u R=%u, delay L=%.2f R=%.2f ms, level L=%.1f R=%.1f dB",
           what, c->tweeter_output ? "right" : "left", (double)c->xover_hz,
           (unsigned)(c->xover_slope_db / 6U), (unsigned)(c->invert_mask & 1U),
           (unsigned)((c->invert_mask >> 1) & 1U), (double)c->left_delay_ms,
-          (double)c->right_delay_ms);
+          (double)c->right_delay_ms, (double)c->left_preamp_db,
+          (double)c->right_preamp_db);
 }
 
 static bool prepare_for_rate_unlocked(int sample_rate) {
@@ -805,7 +813,7 @@ static inline void process_source_bypass(float *pcm, size_t frames,
   }
 }
 
-/* Bi-amp, on each output after EQ: crossover, polarity, delay. One
+/* Bi-amp, on each output after EQ: crossover, level, polarity, delay. One
  * output at a time, so its sections and state stay in registers. */
 static void process_biamp(float *pcm, size_t frames) {
   const eq_plan_t *p = &s_eq.plan;
@@ -814,14 +822,14 @@ static void process_biamp(float *pcm, size_t frames) {
     const biquad_coeff_t *c = p->xover[ch];
     biquad_state_t *st = s_eq.xover_state[ch];
     const bool invert = ((p->config.invert_mask >> ch) & 1U) != 0U;
+    const float gain = invert ? -p->out_gain[ch] : p->out_gain[ch];
     float *line = s_eq.delay_line[ch];
     const uint32_t d = p->delay_frames[ch];
     uint32_t w = s_eq.delay_pos;
     for (size_t i = 0; i < frames; ++i) {
       float x = pcm[i * 2 + (size_t)ch];
       for (uint8_t k = 0; k < n; ++k) x = biquad_process(x, &c[k], &st[k]);
-      if (invert) x = -x;
-      line[w] = x;
+      line[w] = x * gain;
       pcm[i * 2 + (size_t)ch] = line[(w - d) & DELAY_MASK];
       w = (w + 1U) & DELAY_MASK;
     }

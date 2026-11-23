@@ -196,7 +196,10 @@ The DAC has a **left and a right output**. Use **Speaker wiring** and
 2. Choose the crossover frequency and slope in **Crossover**, then set
    **Tweeter on** to the amplifier output that drives the tweeter.
 3. Choose **Apply & Save** and confirm the wiring.
-4. To EQ the whole speaker, enable EQ and adjust **Shared EQ**. The crossover
+4. Tweeters are usually louder: lower the tweeter's **Level** in
+   **Crossover** until both drivers sound balanced. Each driver's level
+   comes after the crossover and works with EQ off too.
+5. To EQ the whole speaker, enable EQ and adjust **Shared EQ**. The crossover
    sends the appropriate part of the corrected signal to each driver.
 
 > [!WARNING]
@@ -318,7 +321,7 @@ Everything is configured in the browser at `http://<board-ip>/`.
 |---|---|
 | **Speaker wiring** | **Full range** for two full-range outputs. **Bi-amp** splits the signal between a woofer and a tweeter, with an adjustable Linkwitz–Riley crossover and a selectable tweeter output. |
 | **This speaker plays** | **Mono** mixes L and R. **Left** or **Right** feeds the selected input to both outputs, including both drivers in bi-amp. **Stereo** sends L to amp L and R to amp R and is available in Full range. |
-| **Equalizer** | **Stereo** has separate Left and Right EQ. **Mono**, **Left** and **Right** use Shared EQ before the signal goes to both outputs. Each EQ supports up to **24 biquad filters** and a preamp. In Bi-amp, the crossover also provides driver delay and polarity controls. |
+| **Equalizer** | **Stereo** has separate Left and Right EQ. **Mono**, **Left** and **Right** use Shared EQ before the signal goes to both outputs. Each EQ supports up to **24 biquad filters** and a preamp. In Bi-amp, the crossover also provides driver level, delay and polarity controls. |
 | **Loudness** | ISO 226 compensation restores bass and treble at low volumes. Loudness settings save immediately. |
 | **Apply while adjusting** | Previews channel selection, EQ and crossover adjustments on the current wiring. Bi-amp frequency has a logarithmic slider from 800 Hz to 8 kHz and a numeric entry. |
 | **Apply & Save** | Applies and saves the wiring, input role, crossover and EQ settings. Changes to wiring or the tweeter output require confirmation. |
