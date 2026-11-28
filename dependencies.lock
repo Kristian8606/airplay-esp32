@@ -1,6 +1,6 @@
 dependencies:
   ap2_core:
-    component_hash: f86953925fcf5c9ed963ff08b9a62c4c0df60f8020df3d5fd9863f7f3cbb068a
+    component_hash: 1727f2237d6ed1c4a11266cfb99c395b1f7655935d118b286919fef0236d825e
     dependencies:
     - name: idf
       version: '>=6.1'
@@ -12,9 +12,9 @@ dependencies:
       git: https://github.com/Kristian8606/esp-airplay2-core.git
       path: components/ap2_core
       type: git
-    version: e72edfd17a992c54cff985a70bfbf3175264a62a
+    version: fd6bd0e3a7a1db0fa79ad6db6ccff2346b121bf7
   apple_clock:
-    component_hash: 9bc1b6fac052dd9cf5215f2014b388773fe17fff85510300cf10baf24c578fb8
+    component_hash: 9f70c07e06b88fdccf245b4dda28555e3723cf90367fd22cfafc8ad60b562c3c
     dependencies:
     - name: idf
       version: '>=6.1'
@@ -22,7 +22,7 @@ dependencies:
       git: https://github.com/Kristian8606/esp-airplay2-core.git
       path: components/apple_clock
       type: git
-    version: e72edfd17a992c54cff985a70bfbf3175264a62a
+    version: fd6bd0e3a7a1db0fa79ad6db6ccff2346b121bf7
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -86,6 +86,6 @@ direct_dependencies:
 - espressif/libsodium
 - espressif/mdns
 - idf
-manifest_hash: ce70260bef01c387cd6280944a46fdf1ebd72b50b61f02317a3185da8dec2ca9
+manifest_hash: 9b61417f46495b15aa62f6076577aac42283ef153d2a5319c66ac6046157fc21
 target: esp32s3
 version: 3.0.0
